@@ -1,0 +1,186 @@
+name: ci
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  # ── DEPENDENCIES → POSTGRES → REDIS → FASTAPI → COLLECT(==26) → TESTS → HTTP ─
+  test:
+    name: integration-tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cie
+          POSTGRES_PASSWORD: cie
+          POSTGRES_DB: cie
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U cie"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: cie
+      POSTGRES_PASSWORD: cie
+      POSTGRES_DB: cie
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      EXPECTED_TESTS: "38"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install full dependencies from PyPI
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      # Hard gate: a missing web/test dependency must FAIL the job, never skip.
+      - name: Fail if FastAPI / httpx / pytest missing
+        run: python -c "import fastapi, httpx, pytest; print('web+test deps present')"
+
+      # Real reachability: not just 'container running' — SELECT 1 and PING.
+      - name: Verify PostgreSQL (SELECT 1) and Redis (PING)
+        run: |
+          python - <<'PY'
+          import asyncio, asyncpg, redis.asyncio as redis
+          async def main():
+              conn = await asyncpg.connect(host="localhost", port=5432, user="cie", password="cie", database="cie")
+              assert await conn.fetchval("SELECT 1") == 1
+              await conn.close()
+              r = redis.from_url("redis://localhost:6379/0")
+              assert await r.ping() is True
+              await r.aclose()
+              print("postgres SELECT 1 OK / redis PING OK")
+          asyncio.run(main())
+          PY
+
+      # Collection proof: pytest must collect EXACTLY 26. No auto-correction —
+      # on mismatch, print the full collection and FAIL for analysis.
+      - name: Collect tests and assert exactly 26
+        run: |
+          pytest --collect-only -q | tee /tmp/collect.log
+          python - <<'PY'
+          import os, sys
+          expected = int(os.environ["EXPECTED_TESTS"])
+          lines = [l.strip() for l in open("/tmp/collect.log") if "::" in l]
+          count = len(lines)
+          print(f"Collected: {count} | Expected: {expected}")
+          if count != expected:
+              print(f"::error::pytest collected {count} tests, expected {expected}. Difference above — analyse, do not auto-correct.")
+              sys.exit(1)
+          PY
+
+      # Execute. pytest exit code fails on any failure/error. Then a guard
+      # enforces skipped == 0 and passed == 26.
+      - name: Run pytest and enforce 26 passed / 0 skipped
+        run: |
+          pytest -v -ra | tee /tmp/pytest.log
+          python - <<'PY'
+          import os, re, sys
+          expected = int(os.environ["EXPECTED_TESTS"])
+          log = open("/tmp/pytest.log").read()
+          skipped = int((re.search(r"(\d+) skipped", log) or [0, "0"])[1]) if re.search(r"(\d+) skipped", log) else 0
+          if skipped > 0:
+              print(f"::error::{skipped} test(s) skipped — skips are not allowed.")
+              sys.exit(1)
+          m = re.search(r"(\d+) passed", log)
+          passed = int(m.group(1)) if m else 0
+          if passed != expected:
+              print(f"::error::Expected {expected} passed, got {passed}.")
+              sys.exit(1)
+          print(f"{passed} passed, 0 skipped OK")
+          PY
+
+      # Real HTTP checks against a live FastAPI process talking to real PG+Redis.
+      - name: Start FastAPI and probe /health, /health/live, /health/ready over HTTP
+        run: |
+          uvicorn main:app --host 127.0.0.1 --port 8000 &
+          APP_PID=$!
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health/live >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          echo "--- /health/live ---"; curl -fsS http://127.0.0.1:8000/health/live; echo
+          echo "--- /health ---";      curl -fsS http://127.0.0.1:8000/health; echo
+          echo "--- /health/ready ---"
+          READY_CODE=$(curl -s -o /tmp/ready.json -w '%{http_code}' http://127.0.0.1:8000/health/ready)
+          cat /tmp/ready.json; echo
+          python - <<'PY'
+          import json, sys
+          d = json.loads(open("/tmp/ready.json").read())
+          # /health/ready must be UP (deps are healthy in CI)
+          if d.get("overall") != "UP":
+              print(f"::error::/health/ready overall != UP: {d}")
+              sys.exit(1)
+          print("health endpoints OK: ready overall =", d["overall"])
+          PY
+          if [ "$READY_CODE" != "200" ]; then
+            echo "::error::/health/ready returned HTTP $READY_CODE, expected 200"
+            kill $APP_PID; exit 1
+          fi
+          kill $APP_PID
+
+  # ── LINT + MYPY ────────────────────────────────────────────────────────────
+  quality:
+    name: ruff-and-mypy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Ruff (lint + import order)
+        run: ruff check main.py test_app.py
+      - name: Mypy (type check)
+        run: mypy main.py
+
+  # ── DOCKER BUILD (reel) ────────────────────────────────────────────────────
+  docker-build:
+    name: docker-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image (real build; job fails if build fails)
+        run: docker build -t crypto-intelligence-engine-backend:ci ./backend
+
+  # ── SECURITY (echoue si un outil manque ou trouve quelque chose) ───────────
+  security:
+    name: security
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pip-audit (fails on known CVE or if tool missing)
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+      - name: gitleaks (secret scan; fails on any finding)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

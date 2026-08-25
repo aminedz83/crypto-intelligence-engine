@@ -50,19 +50,24 @@ class ClassifyFreshnessTests(unittest.TestCase):
         self.assertEqual(classify_freshness(None, 10, now=NOW), DataQualityStatus.MISSING)
 
     def test_valid(self):
-        self.assertEqual(classify_freshness(NOW - timedelta(seconds=5), 10, now=NOW), DataQualityStatus.VALID)
+        ts = NOW - timedelta(seconds=5)
+        self.assertEqual(classify_freshness(ts, 10, now=NOW), DataQualityStatus.VALID)
 
     def test_boundary_is_valid(self):
-        self.assertEqual(classify_freshness(NOW - timedelta(seconds=10), 10, now=NOW), DataQualityStatus.VALID)
+        ts = NOW - timedelta(seconds=10)
+        self.assertEqual(classify_freshness(ts, 10, now=NOW), DataQualityStatus.VALID)
 
     def test_stale(self):
-        self.assertEqual(classify_freshness(NOW - timedelta(seconds=11), 10, now=NOW), DataQualityStatus.STALE)
+        ts = NOW - timedelta(seconds=11)
+        self.assertEqual(classify_freshness(ts, 10, now=NOW), DataQualityStatus.STALE)
 
     def test_future_timestamp_is_invalid(self):
-        self.assertEqual(classify_freshness(NOW + timedelta(seconds=5), 10, now=NOW), DataQualityStatus.INVALID)
+        ts = NOW + timedelta(seconds=5)
+        self.assertEqual(classify_freshness(ts, 10, now=NOW), DataQualityStatus.INVALID)
 
     def test_naive_timestamp_is_invalid(self):
-        self.assertEqual(classify_freshness(datetime(2026, 8, 24, 11, 59, 55), 10, now=NOW), DataQualityStatus.INVALID)
+        ts = datetime(2026, 8, 24, 11, 59, 55)
+        self.assertEqual(classify_freshness(ts, 10, now=NOW), DataQualityStatus.INVALID)
 
 
 class QualifiedValueTests(unittest.TestCase):
@@ -78,23 +83,32 @@ class QualifiedValueTests(unittest.TestCase):
 
 # ----------------------------- health model -----------------------------
 class AggregateHealthTests(unittest.TestCase):
+    @staticmethod
+    def _c(state):
+        return ComponentHealth("x", state)
+
     def test_empty_is_unknown(self):
         self.assertEqual(aggregate_health([]), HealthState.UNKNOWN)
 
     def test_all_up(self):
-        self.assertEqual(aggregate_health([ComponentHealth("a", HealthState.UP), ComponentHealth("b", HealthState.UP)]), HealthState.UP)
+        comps = [self._c(HealthState.UP), self._c(HealthState.UP)]
+        self.assertEqual(aggregate_health(comps), HealthState.UP)
 
     def test_any_down_wins(self):
-        self.assertEqual(aggregate_health([ComponentHealth("a", HealthState.UP), ComponentHealth("b", HealthState.DOWN)]), HealthState.DOWN)
+        comps = [self._c(HealthState.UP), self._c(HealthState.DOWN)]
+        self.assertEqual(aggregate_health(comps), HealthState.DOWN)
 
     def test_down_outranks_degraded(self):
-        self.assertEqual(aggregate_health([ComponentHealth("a", HealthState.DEGRADED), ComponentHealth("b", HealthState.DOWN)]), HealthState.DOWN)
+        comps = [self._c(HealthState.DEGRADED), self._c(HealthState.DOWN)]
+        self.assertEqual(aggregate_health(comps), HealthState.DOWN)
 
     def test_unknown_prevents_up(self):
-        self.assertEqual(aggregate_health([ComponentHealth("a", HealthState.UP), ComponentHealth("b", HealthState.UNKNOWN)]), HealthState.DEGRADED)
+        comps = [self._c(HealthState.UP), self._c(HealthState.UNKNOWN)]
+        self.assertEqual(aggregate_health(comps), HealthState.DEGRADED)
 
     def test_degraded_when_only_degraded(self):
-        self.assertEqual(aggregate_health([ComponentHealth("a", HealthState.UP), ComponentHealth("b", HealthState.DEGRADED)]), HealthState.DEGRADED)
+        comps = [self._c(HealthState.UP), self._c(HealthState.DEGRADED)]
+        self.assertEqual(aggregate_health(comps), HealthState.DEGRADED)
 
 
 class HealthReportTests(unittest.TestCase):
@@ -173,7 +187,8 @@ class ReadinessEndpointFailureTests(unittest.TestCase):
         self.assertEqual(r.json()["overall"], "DOWN")
 
     def test_health_200_but_surfaces_down_detail(self):
-        r = self._client(HealthState.DOWN, HealthState.UP, db_detail="connection refused").get("/health")
+        client = self._client(HealthState.DOWN, HealthState.UP, db_detail="connection refused")
+        r = client.get("/health")
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertEqual(body["overall"], "DOWN")

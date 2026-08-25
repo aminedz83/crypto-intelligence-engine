@@ -46,7 +46,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install full dependencies from PyPI
-        run: pip install -r requirements.txt -r requirements-dev.txt
+        run: pip install -r requirements.txt
 
       # Hard gate: a missing web/test dependency must FAIL the job, never skip.
       - name: Fail if FastAPI / httpx / pytest missing
@@ -147,7 +147,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install -r requirements.txt -r requirements-dev.txt
+        run: pip install -r requirements.txt
       - name: Ruff (lint + import order)
         run: ruff check main.py test_app.py
       - name: Mypy (type check)

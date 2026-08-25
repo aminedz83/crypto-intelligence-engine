@@ -14,6 +14,8 @@ No fabricated data. No real order/withdrawal capability exists anywhere.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import sys
 import time
@@ -23,14 +25,15 @@ from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
+import httpx
 import redis.asyncio as aioredis
-from fastapi import APIRouter, FastAPI, Response, status
+from fastapi import APIRouter, FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import Field
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -38,6 +41,11 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+
+try:
+    import websockets
+except ImportError:  # pragma: no cover - only needed when the WS feed is used
+    websockets = None  # type: ignore[assignment]
 
 
 # ============================ logging ============================
@@ -312,6 +320,296 @@ async def api_root() -> dict:
     }
 
 
+# ============================ market data (Phase 2) ============================
+# Provider: Coinbase Advanced Trade PUBLIC market data. Endpoints verified against
+# the official docs (docs.cdp.coinbase.com):
+#   REST base  : https://api.coinbase.com/api/v3/brokerage   (public market data,
+#                no authentication)
+#   WS (public): wss://advanced-trade-ws.coinbase.com        (market channels work
+#                without auth; subscribe within 5s; heartbeats keep it open)
+# No API key, no orders, no withdrawals. No fabricated data: absent/late/invalid
+# data is surfaced as MISSING/STALE/INVALID/UNKNOWN, never invented.
+
+COINBASE_REST_URL = "https://api.coinbase.com/api/v3/brokerage"
+COINBASE_WS_URL = "wss://advanced-trade-ws.coinbase.com"
+WS_INITIAL_BACKOFF = 1.0
+WS_MAX_BACKOFF = 60.0
+WS_ALLOWED_CHANNELS = {
+    "ticker", "ticker_batch", "candles", "market_trades", "level2", "status", "heartbeats",
+}
+
+
+def parse_iso8601(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 string to aware UTC. Returns None if absent/invalid/naive
+    (never invents a timestamp)."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+@dataclass(frozen=True)
+class MarketDatum:
+    source: str
+    symbol: str
+    value: Optional[float]
+    timestamp: Optional[datetime]
+    status: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        age: Optional[float] = None
+        if self.timestamp is not None:
+            age = max(0.0, (utcnow() - self.timestamp).total_seconds())
+        return {
+            "source": self.source,
+            "symbol": self.symbol,
+            "value": self.value,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+            "freshness_seconds": age,
+            "quality": self.status.value,
+        }
+
+
+def ticker_datum_from_payload(
+    symbol: str, payload: Any, now: Optional[datetime] = None
+) -> MarketDatum:
+    """Build a qualified MarketDatum from a Coinbase ticker payload. Pure, no network.
+    Coinbase returns recent trades; we use the latest trade's price + time."""
+    src = "coinbase"
+    trades = payload.get("trades") if isinstance(payload, dict) else None
+    if not isinstance(trades, list) or not trades or not isinstance(trades[0], dict):
+        return MarketDatum(src, symbol, None, None, DataQualityStatus.MISSING)
+    latest = trades[0]
+    try:
+        price = float(latest.get("price"))
+    except (TypeError, ValueError):
+        return MarketDatum(src, symbol, None, None, DataQualityStatus.INVALID)
+    if price <= 0:
+        return MarketDatum(src, symbol, None, None, DataQualityStatus.INVALID)
+    ts = parse_iso8601(latest.get("time"))
+    quality = classify_freshness(ts, settings.ticker_max_age_seconds, now=now)
+    return MarketDatum(src, symbol, price, ts, quality)
+
+
+class CoinbaseProvider:
+    """Public REST access to Coinbase Advanced Trade market data. No API key."""
+
+    SOURCE = "coinbase"
+
+    def __init__(self, rest_url: str = COINBASE_REST_URL) -> None:
+        self.rest_url = rest_url.rstrip("/")
+        self.client: Optional[httpx.AsyncClient] = None
+
+    async def connect(self) -> None:
+        if self.client is None:
+            self.client = httpx.AsyncClient(
+                base_url=self.rest_url, timeout=10.0, headers={"Accept": "application/json"}
+            )
+
+    async def disconnect(self) -> None:
+        if self.client is not None:
+            await self.client.aclose()
+            self.client = None
+
+    async def _get(self, path: str, params: Optional[dict] = None) -> dict:
+        if self.client is None:
+            await self.connect()
+        assert self.client is not None
+        resp = await self.client.get(path, params=params)
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Coinbase returned a non-object JSON response")
+        return payload
+
+    async def get_ticker(self, symbol: str) -> MarketDatum:
+        symbol = symbol.upper()
+        payload = await self._get(f"/market/products/{symbol}/ticker")
+        return ticker_datum_from_payload(symbol, payload)
+
+    async def health_check(self) -> bool:
+        try:
+            payload = await self._get("/market/products/BTC-USD")
+            return isinstance(payload, dict)
+        except Exception:  # noqa: BLE001 - health probe must not raise
+            log.warning("Coinbase REST health check failed", exc_info=True)
+            return False
+
+
+def ws_backoff(attempt: int) -> float:
+    """Capped exponential backoff in seconds. attempt starts at 1."""
+    return min(WS_MAX_BACKOFF, WS_INITIAL_BACKOFF * 2 ** max(0, attempt - 1))
+
+
+class MarketWsManager:
+    """Coinbase PUBLIC market-data WebSocket manager. Idle until start() is called.
+    Builds real subscribe messages (verified format) and never fabricates data."""
+
+    SOURCE = "coinbase"
+
+    def __init__(self, url: str = COINBASE_WS_URL) -> None:
+        self.url = url
+        self.running = False
+        self.websocket: Any = None
+        self.subscriptions: Dict[str, set] = {}
+        self.last_message_at: Optional[datetime] = None
+        self.attempt = 0
+        self._task: Optional[asyncio.Task] = None
+
+    @staticmethod
+    def build_subscribe(channel: str, products: List[str]) -> Dict[str, object]:
+        return {
+            "type": "subscribe",
+            "channel": channel,
+            "product_ids": [p.upper() for p in products],
+        }
+
+    async def start(self) -> None:
+        if websockets is None:
+            raise RuntimeError("websockets dependency is not installed")
+        if self.running:
+            return
+        self.running = True
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self) -> None:
+        self.running = False
+        if self.websocket is not None:
+            try:
+                await self.websocket.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.websocket = None
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def subscribe(self, channel: str, products: List[str]) -> None:
+        prods = {p.upper() for p in products}
+        self.subscriptions.setdefault(channel, set()).update(prods)
+        if self.websocket is not None:
+            await self.websocket.send(json.dumps(self.build_subscribe(channel, sorted(prods))))
+
+    async def _run_loop(self) -> None:  # pragma: no cover - needs a live socket
+        while self.running:
+            try:
+                async with websockets.connect(
+                    self.url, ping_interval=20, ping_timeout=20, close_timeout=5
+                ) as ws:
+                    self.websocket = ws
+                    self.attempt = 0
+                    for channel, prods in list(self.subscriptions.items()):
+                        await ws.send(json.dumps(self.build_subscribe(channel, sorted(prods))))
+                    # Heartbeats keep sparse subscriptions open (Coinbase docs).
+                    await ws.send(json.dumps({"type": "subscribe", "channel": "heartbeats"}))
+                    async for raw in ws:
+                        self.last_message_at = utcnow()
+                        self._handle(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.websocket = None
+                if not self.running:
+                    break
+                self.attempt += 1
+                delay = ws_backoff(self.attempt)
+                log.warning("Coinbase WS disconnected: %s - reconnecting in %.1fs", exc, delay)
+                await asyncio.sleep(delay)
+
+    def _handle(self, raw: str) -> None:  # pragma: no cover - needs a live socket
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            log.warning("Ignoring invalid JSON from Coinbase WS")
+            return
+        if isinstance(msg, dict) and msg.get("type") == "error":
+            log.error("Coinbase WS error: %s", msg)
+        # Distribution of real ticks to consumers is a later increment; nothing is
+        # fabricated here.
+
+    async def health_check(self) -> Dict[str, object]:
+        connected = self.websocket is not None
+        age: Optional[float] = None
+        if self.last_message_at is not None:
+            age = (utcnow() - self.last_message_at).total_seconds()
+        return {
+            "connected": connected,
+            "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
+            "last_message_age_seconds": age,
+            "quality": (
+                DataQualityStatus.VALID.value if connected else DataQualityStatus.UNKNOWN.value
+            ),
+        }
+
+
+market_provider = CoinbaseProvider()
+market_ws = MarketWsManager()
+
+
+class WsSubscribeRequest(BaseModel):
+    channel: str
+    products: List[str]
+
+
+@api_router.get("/market/ticker/{symbol}")
+async def market_ticker(symbol: str) -> dict:
+    try:
+        datum = await market_provider.get_ticker(symbol)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": str(exc)}
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500, detail={"status": "UNKNOWN", "reason": str(exc)}
+        ) from exc
+    return datum.to_dict()
+
+
+@api_router.post("/market/websocket/start")
+async def market_ws_start() -> dict:
+    await market_ws.start()
+    return {"status": "started", "source": "coinbase", "endpoint": COINBASE_WS_URL}
+
+
+@api_router.post("/market/websocket/stop")
+async def market_ws_stop() -> dict:
+    await market_ws.stop()
+    return {"status": "stopped", "source": "coinbase"}
+
+
+@api_router.post("/market/websocket/subscribe")
+async def market_ws_subscribe(req: WsSubscribeRequest) -> dict:
+    if req.channel not in WS_ALLOWED_CHANNELS:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "Unsupported public channel"}
+        )
+    if not req.products:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "At least one product required"}
+        )
+    await market_ws.subscribe(req.channel, req.products)
+    return {
+        "status": "subscribed",
+        "channel": req.channel,
+        "products": [p.upper() for p in req.products],
+    }
+
+
+@api_router.get("/market/websocket/health")
+async def market_ws_health() -> dict:
+    return await market_ws.health_check()
+
+
 # ============================ frontend serving ============================
 def _frontend_dir(cfg: Settings) -> Path:
     """Resolve the frontend directory. FRONTEND_DIR overrides; otherwise the
@@ -349,8 +647,13 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(
             "live_trading_enabled=True but this build supports paper trading only."
         )
-    yield
-    log.info("Shutting down %s", settings.app_name)
+    await market_provider.connect()
+    try:
+        yield
+    finally:
+        await market_ws.stop()
+        await market_provider.disconnect()
+        log.info("Shutting down %s", settings.app_name)
 
 
 def create_app() -> FastAPI:

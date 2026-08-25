@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Crypto Intelligence Engine</title>
+  <meta name="description" content="Real-time crypto intelligence & paper-trading terminal. Single-file build. Paper-only, real data, honest data quality." />
+  <style>
+/* Crypto Intelligence Engine — core design system
+   Identity: "data-integrity terminal". Deep blue-charcoal base, tabular
+   monospace readouts, one reserved cyan accent for LIVE. Semantic status
+   colors carry meaning (never decoration). System font stacks only — no CDN,
+   no network dependency. */
+
+:root {
+  /* ---- Surfaces (deep blue-charcoal, not pure black) ---- */
+  --bg-0: #0b1017;   /* app background */
+  --bg-1: #10161f;   /* rail / topbar */
+  --bg-2: #141c27;   /* card surface */
+  --bg-3: #1b2531;   /* elevated / hover */
+  --line: #223042;   /* hairline borders */
+  --line-soft: #1a2431;
+
+  /* ---- Text ---- */
+  --fg-0: #e6edf3;   /* primary */
+  --fg-1: #aeb9c6;   /* secondary */
+  --fg-2: #6f7d8c;   /* muted / captions */
+  --fg-3: #4a5665;   /* disabled */
+
+  /* ---- Brand / LIVE accent (reserved) ---- */
+  --live: #34d6c4;
+  --live-dim: #1f7a72;
+  --brand: #6ea8fe;
+
+  /* ---- Semantic status (data quality + system) ---- */
+  --ok: #3fb968;        /* VALID / UP / ONLINE */
+  --warn: #e0a63c;      /* STALE / DEGRADED */
+  --bad: #e5544b;       /* INVALID / DOWN / OFFLINE */
+  --unknown: #7c8896;   /* UNKNOWN / not probed */
+  --conflict: #b487f0;  /* CONFLICTED */
+  --info: #5aa9e6;
+
+  /* ---- Signals (trade direction) ---- */
+  --long: #3fb968;
+  --short: #e5544b;
+
+  /* ---- Type ---- */
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+  /* ---- Scale ---- */
+  --r-sm: 6px; --r-md: 9px; --r-lg: 13px;
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px;
+  --rail-w: 232px; --topbar-h: 56px;
+  --shadow: 0 1px 0 rgba(255,255,255,.02), 0 8px 24px rgba(0,0,0,.35);
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg-0);
+  color: var(--fg-0);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+a { color: var(--brand); text-decoration: none; }
+h1, h2, h3, h4 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+button { font-family: inherit; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+
+/* ============================ App shell ============================ */
+.app {
+  display: grid;
+  grid-template-columns: var(--rail-w) 1fr;
+  grid-template-rows: var(--topbar-h) 1fr;
+  grid-template-areas: "rail topbar" "rail main";
+  height: 100vh;
+}
+
+/* ---- Rail (left nav) ---- */
+.rail {
+  grid-area: rail;
+  background: var(--bg-1);
+  border-right: 1px solid var(--line);
+  display: flex; flex-direction: column;
+  overflow-y: auto;
+}
+.rail__brand {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: 0 var(--sp-4); height: var(--topbar-h);
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.rail__mark {
+  width: 26px; height: 26px; border-radius: 7px;
+  background: linear-gradient(135deg, var(--live), var(--live-dim));
+  box-shadow: 0 0 0 1px rgba(52,214,196,.25) inset;
+  display: grid; place-items: center; color: #04120f; font-weight: 800;
+  font-family: var(--mono); font-size: 13px;
+}
+.rail__title { font-size: 13px; font-weight: 700; letter-spacing: .02em; }
+.rail__title small { display: block; color: var(--fg-2); font-weight: 500; font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; }
+
+.nav { padding: var(--sp-3) var(--sp-2); }
+.nav__group-label {
+  color: var(--fg-3); font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+  padding: var(--sp-3) var(--sp-3) var(--sp-1);
+}
+.nav__item {
+  display: flex; align-items: center; gap: var(--sp-3);
+  width: 100%; border: 0; background: transparent; color: var(--fg-1);
+  padding: 8px var(--sp-3); border-radius: var(--r-sm); cursor: pointer;
+  font-size: 13px; text-align: left; transition: background .12s, color .12s;
+}
+.nav__item:hover { background: var(--bg-2); color: var(--fg-0); }
+.nav__item[aria-current="page"] { background: var(--bg-3); color: var(--fg-0); }
+.nav__item[aria-current="page"] .nav__dot { background: var(--live); box-shadow: 0 0 8px var(--live); }
+.nav__dot { width: 6px; height: 6px; border-radius: 50%; background: var(--fg-3); flex: 0 0 auto; }
+.nav__phase { margin-left: auto; font-size: 9.5px; color: var(--fg-3); font-family: var(--mono); }
+
+/* ---- Topbar ---- */
+.topbar {
+  grid-area: topbar;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: var(--sp-4);
+  padding: 0 var(--sp-5);
+}
+.topbar__title { font-size: 15px; font-weight: 600; }
+.topbar__spacer { flex: 1; }
+.integrity { display: flex; align-items: center; gap: var(--sp-4); }
+.integrity__item { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--fg-1); }
+.integrity__label { color: var(--fg-2); text-transform: uppercase; letter-spacing: .06em; font-size: 10px; }
+.clock { font-size: 12px; color: var(--fg-1); }
+.live-pill {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--bg-2); font-size: 11px; color: var(--fg-1);
+}
+.live-pill__dot { width: 7px; height: 7px; border-radius: 50%; background: var(--unknown); }
+.live-pill--live .live-pill__dot { background: var(--live); box-shadow: 0 0 8px var(--live); animation: pulse 2s ease-in-out infinite; }
+.live-pill--stale .live-pill__dot { background: var(--warn); }
+.live-pill--offline .live-pill__dot { background: var(--bad); }
+
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+
+/* ---- Main ---- */
+.main { grid-area: main; overflow-y: auto; padding: var(--sp-5); }
+.view { animation: viewIn .18s ease; }
+.view__head { display: flex; align-items: baseline; gap: var(--sp-3); margin-bottom: var(--sp-5); }
+.view__head h2 { font-size: 18px; }
+.view__head p { color: var(--fg-2); font-size: 12.5px; margin: 0; }
+@keyframes viewIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+/* ---- Responsive ---- */
+@media (max-width: 900px) {
+  .app { grid-template-columns: 64px 1fr; }
+  .rail__title, .nav__group-label, .nav__phase { display: none; }
+  .rail__brand { justify-content: center; padding: 0; }
+  .nav__item { justify-content: center; }
+}
+@media (max-width: 620px) {
+  .integrity { display: none; }
+  .main { padding: var(--sp-4); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
+/* Reusable components: the data-integrity chip + freshness bar are the
+   signature elements — they appear on every panel so provenance is always
+   visible. Nothing here fabricates a value; empty/unknown states are explicit. */
+
+/* ---- Grid ---- */
+.grid { display: grid; gap: var(--sp-4); }
+.grid--kpi { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.grid--2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+
+/* ---- Card ---- */
+.card {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.card__head {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--line-soft);
+}
+.card__title { font-size: 12.5px; font-weight: 600; color: var(--fg-0); }
+.card__title small { color: var(--fg-2); font-weight: 500; }
+.card__head-right { margin-left: auto; display: flex; align-items: center; gap: var(--sp-2); }
+.card__body { padding: var(--sp-4); }
+
+/* ---- KPI ---- */
+.kpi__label { color: var(--fg-2); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.kpi__value { font-size: 26px; margin-top: 6px; font-family: var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.kpi__value--unknown { color: var(--unknown); font-size: 18px; }
+.kpi__sub { margin-top: 4px; font-size: 11.5px; color: var(--fg-2); }
+
+/* ---- Status chip (data quality + system state) ---- */
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 8px; border-radius: 999px;
+  font-size: 10.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+  border: 1px solid transparent; font-family: var(--mono);
+}
+.chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.chip--valid, .chip--up, .chip--online { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); background: color-mix(in srgb, var(--ok) 10%, transparent); }
+.chip--stale, .chip--degraded { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.chip--invalid, .chip--down, .chip--offline, .chip--bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 35%, transparent); background: color-mix(in srgb, var(--bad) 10%, transparent); }
+.chip--unknown, .chip--missing { color: var(--unknown); border-color: color-mix(in srgb, var(--unknown) 35%, transparent); background: color-mix(in srgb, var(--unknown) 10%, transparent); }
+.chip--conflicted { color: var(--conflict); border-color: color-mix(in srgb, var(--conflict) 35%, transparent); background: color-mix(in srgb, var(--conflict) 10%, transparent); }
+.chip--long { color: var(--long); border-color: color-mix(in srgb, var(--long) 35%, transparent); background: color-mix(in srgb, var(--long) 10%, transparent); }
+.chip--short { color: var(--short); border-color: color-mix(in srgb, var(--short) 35%, transparent); background: color-mix(in srgb, var(--short) 10%, transparent); }
+
+/* ---- Freshness bar (signature): shows data age vs its budget ---- */
+.freshness { display: inline-flex; align-items: center; gap: 6px; }
+.freshness__track { width: 46px; height: 4px; border-radius: 2px; background: var(--bg-3); overflow: hidden; }
+.freshness__fill { height: 100%; width: 0%; background: var(--ok); transition: width .3s ease, background .3s ease; }
+.freshness__fill--stale { background: var(--warn); }
+.freshness__fill--expired { background: var(--bad); }
+.freshness__age { font-size: 10px; color: var(--fg-2); font-family: var(--mono); }
+
+/* ---- Table ---- */
+.table-wrap { overflow-x: auto; }
+table.data { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+table.data th {
+  text-align: left; color: var(--fg-2); font-weight: 600; font-size: 10.5px;
+  text-transform: uppercase; letter-spacing: .06em;
+  padding: 8px var(--sp-3); border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg-2);
+}
+table.data td { padding: 9px var(--sp-3); border-bottom: 1px solid var(--line-soft); }
+table.data td.num, table.data th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+table.data tbody tr:hover, table.data tbody tr:hover { background: var(--bg-3); }
+
+/* ---- Buttons / inputs ---- */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 12px; border-radius: var(--r-sm); cursor: pointer;
+  background: var(--bg-3); color: var(--fg-0); border: 1px solid var(--line); font-size: 12.5px;
+  transition: background .12s, border-color .12s;
+}
+.btn:hover { background: var(--line); }
+.btn--primary { background: var(--live-dim); border-color: var(--live-dim); color: #eafffb; }
+.btn--primary:hover { background: var(--live); color: #04120f; }
+.input, .select {
+  background: var(--bg-1); border: 1px solid var(--line); color: var(--fg-0);
+  padding: 7px 10px; border-radius: var(--r-sm); font-size: 12.5px; font-family: inherit;
+}
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field label { font-size: 10.5px; color: var(--fg-2); text-transform: uppercase; letter-spacing: .06em; }
+
+/* ---- Empty / not-implemented state ---- */
+.empty {
+  border: 1px dashed var(--line); border-radius: var(--r-lg);
+  padding: var(--sp-6); text-align: center; color: var(--fg-2); background: var(--bg-1);
+}
+.empty__badge {
+  display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono);
+  font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--unknown); border: 1px solid color-mix(in srgb, var(--unknown) 35%, transparent);
+  padding: 4px 10px; border-radius: 999px; margin-bottom: var(--sp-3);
+}
+.empty h3 { color: var(--fg-1); font-size: 14px; margin-bottom: 6px; }
+.empty p { max-width: 520px; margin: 0 auto; font-size: 12.5px; }
+.empty code { font-family: var(--mono); color: var(--fg-1); background: var(--bg-3); padding: 1px 6px; border-radius: 4px; }
+
+/* ---- Skeleton (loading, never fake content) ---- */
+.skeleton { background: linear-gradient(90deg, var(--bg-3) 25%, var(--line) 37%, var(--bg-3) 63%); background-size: 400% 100%; animation: shimmer 1.4s ease infinite; border-radius: 4px; color: transparent; }
+@keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+
+/* ---- Banner ---- */
+.banner {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4); border-radius: var(--r-md);
+  border: 1px solid var(--line); background: var(--bg-1); font-size: 12.5px; margin-bottom: var(--sp-4);
+}
+.banner--safe { border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+.banner__k { font-family: var(--mono); color: var(--ok); }
+/* Dashboard-specific layout */
+.dash-grid { display: grid; grid-template-columns: 2fr 1fr; gap: var(--sp-4); }
+@media (max-width: 1000px) { .dash-grid { grid-template-columns: 1fr; } }
+.watch { display: flex; flex-direction: column; }
+.watch__row { display: grid; grid-template-columns: 1.4fr 1fr 1fr auto; align-items: center; gap: var(--sp-3); padding: 10px var(--sp-4); border-bottom: 1px solid var(--line-soft); }
+.watch__row:last-child { border-bottom: 0; }
+.watch__sym { font-weight: 600; }
+.watch__sym small { display: block; color: var(--fg-2); font-size: 10.5px; font-weight: 500; }
+/* Scanner-specific layout */
+.scanner__filters { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin-bottom: var(--sp-4); }
+.scanner__filters .field { min-width: 130px; }
+.scanner__count { color: var(--fg-2); font-size: 11.5px; margin-left: auto; align-self: flex-end; }
+
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="rail">
+      <div class="rail__brand">
+        <div class="rail__mark">CIE</div>
+        <div class="rail__title">Crypto Intelligence<small>Engine · Paper</small></div>
+      </div>
+      <nav class="nav" id="nav" aria-label="Primary"></nav>
+    </aside>
+    <header class="topbar">
+      <div class="topbar__title" id="view-title">Dashboard</div>
+      <div class="topbar__spacer"></div>
+      <div class="integrity">
+        <div class="integrity__item"><span class="integrity__label">Overall</span><span class="mono" id="integrity-overall">UNKNOWN</span></div>
+        <div class="integrity__item"><span class="integrity__label">Updated</span><span class="mono" id="last-update">—</span></div>
+        <div class="integrity__item"><span class="integrity__label">UTC</span><span class="mono clock" id="clock">—</span></div>
+      </div>
+      <div class="live-pill live-pill--offline" id="live-pill"><span class="live-pill__dot"></span><span id="live-text">OFFLINE</span></div>
+    </header>
+    <main class="main" id="main"></main>
+  </div>
+  <noscript><p style="padding:24px;color:#aeb9c6">This terminal requires JavaScript to load real data from the backend.</p></noscript>
+
+  <script>
+  "use strict";
+  (function () {
+    // ============================ quality ============================
+    var Quality = Object.freeze({ VALID:"VALID", STALE:"STALE", INVALID:"INVALID", MISSING:"MISSING", CONFLICTED:"CONFLICTED", UNKNOWN:"UNKNOWN" });
+    function classifyFreshness(ts, maxAgeSec, nowMs) {
+      nowMs = (nowMs == null) ? Date.now() : nowMs;
+      if (ts == null) return Quality.MISSING;
+      if (typeof ts !== "number" || Number.isNaN(ts)) return Quality.INVALID;
+      var age = (nowMs - ts) / 1000;
+      if (age < 0) return Quality.INVALID;
+      if (age <= maxAgeSec) return Quality.VALID;
+      return Quality.STALE;
+    }
+
+    // ============================ format ============================
+    var NA = "—";
+    function fmtPrice(v) {
+      if (v == null || Number.isNaN(v)) return NA;
+      var abs = Math.abs(v), dp = abs >= 1 ? 2 : abs >= 0.01 ? 4 : 8;
+      return v.toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp });
+    }
+    function fmtPct(v) { if (v == null || Number.isNaN(v)) return NA; return (v >= 0 ? "+" : "") + v.toFixed(2) + "%"; }
+
+    // ============================ net ============================
+    function resolveApiBase(override, origin) {
+      if (override) return String(override).replace(/\/$/, "");
+      if (origin) return String(origin).replace(/\/$/, "");
+      return "";
+    }
+
+    // ============================ state ============================
+    function createStore(initial) {
+      var state = Object.assign({}, initial || {}), subs = new Set();
+      return {
+        get: function (k) { return k === undefined ? state : state[k]; },
+        set: function (patch) { state = Object.assign({}, state, patch); subs.forEach(function (fn) { fn(state); }); },
+        subscribe: function (fn) { subs.add(fn); return function () { subs.delete(fn); }; }
+      };
+    }
+
+    // ============================ api ============================
+    var Result = Object.freeze({ OK:"OK", ERROR:"ERROR", NOT_IMPLEMENTED:"NOT_IMPLEMENTED" });
+    function ApiClient(opts) {
+      opts = opts || {};
+      this.base = resolveApiBase(opts.base, opts.origin);
+      this._fetch = opts.fetchImpl || (typeof fetch !== "undefined" ? fetch.bind(window) : null);
+    }
+    ApiClient.prototype._get = function (path, o) {
+      o = o || {}; var timeoutMs = o.timeoutMs || 5000, self = this;
+      if (!self._fetch) return Promise.resolve({ result: Result.ERROR, error: "no fetch", status: 0 });
+      var ctrl = new AbortController(), t = setTimeout(function () { ctrl.abort(); }, timeoutMs);
+      return self._fetch(self.base + path, { signal: ctrl.signal, headers: { Accept: "application/json" } })
+        .then(function (res) {
+          return res.json().catch(function () { return null; }).then(function (data) {
+            return { result: res.ok ? Result.OK : Result.ERROR, status: res.status, data: data };
+          });
+        })
+        .catch(function (err) { return { result: Result.ERROR, status: 0, error: String(err && err.message ? err.message : err) }; })
+        .then(function (r) { clearTimeout(t); return r; });
+    };
+    ApiClient.prototype.health = function () { return this._get("/health"); };
+    ApiClient.prototype.live = function () { return this._get("/health/live"); };
+    ApiClient.prototype.ready = function () { return this._get("/health/ready"); };
+    ApiClient.prototype.apiRoot = function () { return this._get("/api/v1/"); };
+
+    // ============================ ui helpers ============================
+    function el(tag, attrs, children) {
+      attrs = attrs || {}; var node = document.createElement(tag);
+      for (var k in attrs) { var v = attrs[k]; if (v == null) continue;
+        if (k === "class") node.className = v;
+        else if (k === "html") node.innerHTML = v;
+        else if (k.indexOf("on") === 0 && typeof v === "function") node.addEventListener(k.slice(2), v);
+        else node.setAttribute(k, v); }
+      (children == null ? [] : [].concat(children)).forEach(function (c) {
+        if (c == null) return; node.appendChild(typeof c === "string" ? document.createTextNode(c) : c); });
+      return node;
+    }
+    function chip(text, kind) { return el("span", { class: "chip chip--" + String(kind).toLowerCase() }, [text]); }
+    function card(title, sub, headRight, body) {
+      var right = el("div", { class: "card__head-right" }, [].concat(headRight || []));
+      var head = el("div", { class: "card__head" }, [ el("div", { class: "card__title" }, [title, sub ? el("small", {}, [" · " + sub]) : null]), right ]);
+      return el("div", { class: "card" }, [head, el("div", { class: "card__body" }, [].concat(body || []))]);
+    }
+    function freshnessBar(fraction, modifierClass, ageLabel) {
+      var fill = el("div", { class: "freshness__fill " + (modifierClass || "") });
+      fill.style.width = Math.round(Math.min(1, Math.max(0, fraction)) * 100) + "%";
+      return el("div", { class: "freshness" }, [ el("div", { class: "freshness__track" }, [fill]), ageLabel ? el("span", { class: "freshness__age" }, [ageLabel]) : null ]);
+    }
+    function notImplemented(engine, phase, mod) {
+      return el("div", { class: "empty" }, [
+        el("div", { class: "empty__badge" }, ["● Not implemented"]),
+        el("h3", {}, [engine + " engine"]),
+        el("p", {}, [ "This view goes live when its backend engine is built (Phase " + phase + "). No data is shown here because none exists yet — the terminal never fabricates values. Backend module: ", el("code", {}, [mod || engine.toLowerCase()]), "." ])
+      ]);
+    }
+    function viewHead(title, desc) { return el("div", { class: "view__head" }, [el("h2", {}, [title]), desc ? el("p", {}, [desc]) : null]); }
+    function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); return node; }
+
+    // ============================ views registry ============================
+    var VIEWS = [
+      { id:"dashboard",    label:"Dashboard",    group:"Overview", impl:true },
+      { id:"scanner",      label:"Scanner",      group:"Markets",  impl:false, phase:7,  module:"technical" },
+      { id:"signals",      label:"Signals",      group:"Markets",  impl:false, phase:8,  module:"strategies" },
+      { id:"positions",    label:"Positions",    group:"Trading",  impl:false, phase:10, module:"paper_trading" },
+      { id:"history",      label:"History",      group:"Trading",  impl:false, phase:10, module:"paper_trading" },
+      { id:"news",         label:"News",         group:"Intel",    impl:false, phase:4,  module:"news" },
+      { id:"macro",        label:"Macro",        group:"Intel",    impl:false, phase:5,  module:"macro" },
+      { id:"geopolitical", label:"Geopolitical", group:"Intel",    impl:false, phase:5,  module:"geopolitical" },
+      { id:"onchain",      label:"On-chain",     group:"Intel",    impl:false, phase:6,  module:"onchain" },
+      { id:"strategies",   label:"Strategies",   group:"Research", impl:false, phase:8,  module:"strategies" },
+      { id:"backtesting",  label:"Backtesting",  group:"Research", impl:false, phase:12, module:"backtesting" },
+      { id:"ai",           label:"AI Council",   group:"Research", impl:false, phase:11, module:"ai" },
+      { id:"risk",         label:"Risk",         group:"Research", impl:false, phase:9,  module:"risk" },
+      { id:"performance",  label:"Performance",  group:"Research", impl:false, phase:14, module:"performance" },
+      { id:"system",       label:"System",       group:"Ops",      impl:true },
+      { id:"settings",     label:"Settings",     group:"Ops",      impl:true }
+    ];
+    function viewById(id) { for (var i = 0; i < VIEWS.length; i++) if (VIEWS[i].id === id) return VIEWS[i]; return null; }
+    var DEFAULT_VIEW = "dashboard";
+
+    // ============================ view renderers ============================
+    var WATCH = ["BTC/USD", "ETH/USD", "SOL/USD"];
+
+    function dashSystemCard(health) {
+      var overall = "UNKNOWN", items = [];
+      if (health && health.result === Result.OK && health.data) {
+        overall = health.data.overall || "UNKNOWN";
+        items = (health.data.components || []).map(function (c) {
+          return el("div", { class: "integrity__item" }, [ el("span", { class: "integrity__label" }, [c.name]), chip(c.state, c.state) ]);
+        });
+      } else { items = [el("p", { class: "kpi__sub" }, ["Backend unreachable — status UNKNOWN."])]; }
+      return card("System integrity", "live probe", chip(overall, overall), el("div", { class: "grid", style: "gap:10px" }, items));
+    }
+    function watchRow(sym) {
+      return el("div", { class: "watch__row" }, [
+        el("div", { class: "watch__sym" }, [sym, el("small", {}, ["spot"])]),
+        el("div", { class: "num", style: "color:var(--fg-2)" }, [NA]),
+        freshnessBar(1, "freshness__fill--expired", "—"),
+        chip("UNKNOWN", "UNKNOWN")
+      ]);
+    }
+    function renderDashboard(ctx) {
+      var root = el("div", { class: "view" }, [
+        viewHead("Dashboard", "Real system state now; market data activates in Phase 2."),
+        el("div", { class: "banner banner--safe" }, [ el("span", { class: "banner__k" }, ["PAPER-ONLY"]), el("span", {}, ["No real orders and no withdrawals exist in this build. LIVE_TRADING_ENABLED=false."]) ])
+      ]);
+      var grid = el("div", { class: "dash-grid" });
+      var watch = card("Watchlist", WATCH.length + " assets", chip("UNKNOWN", "UNKNOWN"), el("div", { class: "watch" }, WATCH.map(watchRow)));
+      var sysHolder = el("div", {}, [card("System integrity", "loading", null, el("p", { class: "kpi__sub" }, ["Probing backend…"]))]);
+      grid.appendChild(watch); grid.appendChild(sysHolder); root.appendChild(grid);
+      ctx.api.health().then(function (h) { clear(sysHolder).appendChild(dashSystemCard(h)); });
+      return root;
+    }
+
+    function sysComponentRow(c) {
+      return el("tr", {}, [
+        el("td", {}, [c.name]), el("td", {}, [chip(c.state, c.state)]),
+        el("td", { class: "num" }, [c.latency_ms != null ? c.latency_ms + " ms" : NA]),
+        el("td", { style: "color:var(--fg-2)" }, [c.detail || NA])
+      ]);
+    }
+    function sysTable(health, live) {
+      var rows = [];
+      rows.push(el("tr", {}, [
+        el("td", {}, ["fastapi"]),
+        el("td", {}, [chip(live && live.result === Result.OK ? "UP" : "DOWN", live && live.result === Result.OK ? "UP" : "DOWN")]),
+        el("td", { class: "num" }, [NA]),
+        el("td", { style: "color:var(--fg-2)" }, [live && live.result === Result.OK ? "liveness ok" : "no liveness response"])
+      ]));
+      if (health && health.result === Result.OK && health.data) (health.data.components || []).forEach(function (c) { rows.push(sysComponentRow(c)); });
+      return el("div", { class: "table-wrap" }, [ el("table", { class: "data" }, [
+        el("thead", {}, [el("tr", {}, [ el("th", {}, ["Component"]), el("th", {}, ["State"]), el("th", { class: "num" }, ["Latency"]), el("th", {}, ["Detail"]) ])]),
+        el("tbody", {}, rows) ]) ]);
+    }
+    function renderSystem(ctx) {
+      var holder = el("div", {}, [card("Components", "live probe", null, el("p", { class: "kpi__sub" }, ["Probing…"]))]);
+      var root = el("div", { class: "view" }, [ viewHead("System", "Liveness and dependency health, probed in real time."), holder ]);
+      Promise.all([ctx.api.health(), ctx.api.live()]).then(function (r) {
+        var h = r[0], l = r[1], overall = (h && h.result === Result.OK && h.data) ? h.data.overall : "UNKNOWN";
+        clear(holder).appendChild(card("Components", "live probe", chip(overall, overall), sysTable(h, l)));
+      });
+      return root;
+    }
+
+    function settingsRow(label, value, chipKind) {
+      return el("div", { style: "display:flex; align-items:center; gap:10px" }, [
+        el("span", { class: "integrity__label", style: "min-width:110px" }, [label]),
+        chipKind ? chip(value, chipKind) : el("span", { class: "num" }, [value])
+      ]);
+    }
+    function renderSettings(ctx) {
+      var apiHolder = el("div", {}, [card("Service", "reading /api/v1/", null, el("p", { class: "kpi__sub" }, ["Reading…"]))]);
+      ctx.api.apiRoot().then(function (r) {
+        var ok = r.result === Result.OK && r.data;
+        var rows = el("div", { class: "grid", style: "gap:10px" }, [
+          settingsRow("Service", ok ? r.data.service : NA),
+          settingsRow("Phase", ok ? String(r.data.phase) : NA),
+          settingsRow("Status", ok ? r.data.status : "unreachable"),
+          settingsRow("Execution", "paper-only (no real orders)", "UP"),
+          settingsRow("Live trading", "disabled", "DOWN")
+        ]);
+        clear(apiHolder).appendChild(card("Service", ok ? "connected" : "unreachable", chip(ok ? "UP" : "DOWN", ok ? "UP" : "DOWN"), rows));
+      });
+      var base = (typeof localStorage !== "undefined" && localStorage.getItem("cie.apiBase")) || "";
+      var input = el("input", { class: "input", placeholder: "same origin", value: base, style: "min-width:260px" });
+      var saveBtn = el("button", { class: "btn btn--primary", onclick: function () {
+        if (typeof localStorage !== "undefined") localStorage.setItem("cie.apiBase", input.value.trim());
+        location.reload();
+      } }, ["Save & reload"]);
+      var apiBaseCard = card("API base URL", "advanced", null, el("div", { class: "field" }, [
+        el("label", {}, ["Backend base URL (blank = same origin as this page)"]),
+        el("div", { style: "display:flex; gap:8px" }, [input, saveBtn])
+      ]));
+      return el("div", { class: "view" }, [ viewHead("Settings", "Safety posture is read-only in this build."), el("div", { class: "grid grid--2" }, [apiHolder, apiBaseCard]) ]);
+    }
+
+    function renderNotImplemented(v) {
+      return el("div", { class: "view" }, [
+        viewHead(v.label, "Live once the " + v.module + " engine ships (Phase " + v.phase + ")."),
+        notImplemented(v.label, v.phase, v.module)
+      ]);
+    }
+    var RENDERERS = { dashboard: renderDashboard, system: renderSystem, settings: renderSettings };
+
+    // ============================ app bootstrap ============================
+    var apiBase = (typeof localStorage !== "undefined" && localStorage.getItem("cie.apiBase")) || "";
+    var ctx = { api: new ApiClient({ base: apiBase, origin: location.origin }), store: createStore({ view: DEFAULT_VIEW, health: null }) };
+
+    function buildNav() {
+      var nav = document.getElementById("nav"); clear(nav); var currentGroup = null;
+      VIEWS.forEach(function (v) {
+        if (v.group !== currentGroup) { currentGroup = v.group; nav.appendChild(el("div", { class: "nav__group-label" }, [v.group])); }
+        nav.appendChild(el("button", { class: "nav__item", "data-view": v.id, onclick: function () { location.hash = "#/" + v.id; } }, [
+          el("span", { class: "nav__dot" }), el("span", {}, [v.label]), v.impl ? null : el("span", { class: "nav__phase" }, ["P" + v.phase])
+        ]));
+      });
+    }
+    function setActiveNav(id) {
+      var items = document.querySelectorAll(".nav__item");
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].getAttribute("data-view") === id) items[i].setAttribute("aria-current", "page");
+        else items[i].removeAttribute("aria-current");
+      }
+    }
+    function mountView(id) {
+      var view = viewById(id) || viewById(DEFAULT_VIEW), main = document.getElementById("main");
+      document.getElementById("view-title").textContent = view.label; setActiveNav(view.id); clear(main);
+      var renderer = RENDERERS[view.id] || function () { return renderNotImplemented(view); };
+      main.appendChild(renderer(ctx));
+    }
+    function currentViewId() { var m = location.hash.match(/^#\/([a-z-]+)/); return (m && viewById(m[1])) ? m[1] : DEFAULT_VIEW; }
+    function updateTopbar(health) {
+      var pill = document.getElementById("live-pill"), overall = "UNKNOWN", cls = "live-pill--offline", text = "OFFLINE";
+      if (health && health.result === Result.OK && health.data) {
+        overall = health.data.overall;
+        if (overall === "UP") { cls = "live-pill--live"; text = "LIVE"; }
+        else if (overall === "DEGRADED") { cls = "live-pill--stale"; text = "DEGRADED"; }
+        else { cls = "live-pill--offline"; text = overall; }
+      }
+      pill.className = "live-pill " + cls;
+      document.getElementById("live-text").textContent = text;
+      document.getElementById("integrity-overall").textContent = overall;
+    }
+    function pollHealth() {
+      ctx.api.health().then(function (h) {
+        ctx.store.set({ health: h }); updateTopbar(h);
+        document.getElementById("last-update").textContent = new Date().toLocaleTimeString();
+      });
+    }
+    function startClock() {
+      function tick() { document.getElementById("clock").textContent = new Date().toISOString().slice(11, 19) + "Z"; }
+      tick(); setInterval(tick, 1000);
+    }
+    function boot() {
+      buildNav(); startClock();
+      if (!location.hash) location.hash = "#/" + DEFAULT_VIEW;
+      mountView(currentViewId());
+      window.addEventListener("hashchange", function () { mountView(currentViewId()); });
+      pollHealth(); setInterval(pollHealth, 10000);
+    }
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else boot();
+  })();
+  </script>
+</body>
+</html>

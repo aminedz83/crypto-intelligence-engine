@@ -312,3 +312,144 @@ class ApiOnlyRegressionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ----------------------------- market data (Phase 2) -----------------------------
+from datetime import timedelta as _td  # noqa: E402
+
+from main import (  # noqa: E402
+    CoinbaseProvider,
+    MarketDatum,
+    MarketWsManager,
+    parse_iso8601,
+    ticker_datum_from_payload,
+    ws_backoff,
+)
+
+
+class ParseIso8601Tests(unittest.TestCase):
+    def test_valid_z_suffix(self):
+        dt = parse_iso8601("2026-08-24T12:00:00Z")
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.tzinfo, timezone.utc)
+
+    def test_naive_returns_none(self):
+        self.assertIsNone(parse_iso8601("2026-08-24T12:00:00"))
+
+    def test_garbage_returns_none(self):
+        self.assertIsNone(parse_iso8601("not-a-date"))
+
+    def test_non_string_returns_none(self):
+        self.assertIsNone(parse_iso8601(12345))
+
+
+class TickerDatumTests(unittest.TestCase):
+    def _payload(self, price, when):
+        return {"trades": [{"price": price, "time": when}]}
+
+    def test_valid_recent_is_valid(self):
+        now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+        ts = (now - _td(seconds=2)).isoformat().replace("+00:00", "Z")
+        d = ticker_datum_from_payload("BTC-USD", self._payload("50000.5", ts), now=now)
+        self.assertEqual(d.value, 50000.5)
+        self.assertEqual(d.status, DataQualityStatus.VALID)
+
+    def test_old_is_stale(self):
+        now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+        ts = (now - _td(seconds=999)).isoformat().replace("+00:00", "Z")
+        d = ticker_datum_from_payload("BTC-USD", self._payload("50000", ts), now=now)
+        self.assertEqual(d.status, DataQualityStatus.STALE)
+
+    def test_no_trades_is_missing(self):
+        d = ticker_datum_from_payload("BTC-USD", {"trades": []})
+        self.assertEqual(d.status, DataQualityStatus.MISSING)
+        self.assertIsNone(d.value)
+
+    def test_bad_price_is_invalid(self):
+        d = ticker_datum_from_payload("BTC-USD", self._payload("abc", "2026-08-24T12:00:00Z"))
+        self.assertEqual(d.status, DataQualityStatus.INVALID)
+
+    def test_non_positive_price_is_invalid(self):
+        d = ticker_datum_from_payload("BTC-USD", self._payload("0", "2026-08-24T12:00:00Z"))
+        self.assertEqual(d.status, DataQualityStatus.INVALID)
+
+    def test_to_dict_shape(self):
+        d = MarketDatum("coinbase", "BTC-USD", 100.0, None, DataQualityStatus.MISSING)
+        out = d.to_dict()
+        self.assertEqual(
+            set(out), {"source", "symbol", "value", "timestamp", "freshness_seconds", "quality"}
+        )
+        self.assertEqual(out["quality"], "MISSING")
+
+
+class WsManagerPureTests(unittest.TestCase):
+    def test_build_subscribe_format(self):
+        msg = MarketWsManager.build_subscribe("ticker", ["btc-usd", "eth-usd"])
+        self.assertEqual(msg["type"], "subscribe")
+        self.assertEqual(msg["channel"], "ticker")
+        self.assertEqual(msg["product_ids"], ["BTC-USD", "ETH-USD"])
+
+    def test_backoff_grows_and_caps(self):
+        self.assertEqual(ws_backoff(1), 1.0)
+        self.assertEqual(ws_backoff(2), 2.0)
+        self.assertLessEqual(ws_backoff(50), 60.0)
+
+    def test_health_disconnected_is_unknown(self):
+        async def run():
+            return await MarketWsManager().health_check()
+        h = asyncio.run(run())
+        self.assertFalse(h["connected"])
+        self.assertEqual(h["quality"], "UNKNOWN")
+
+
+class MarketEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self._orig = main.market_provider
+
+    def tearDown(self):
+        main.market_provider = self._orig
+
+    def _client_with_provider(self, provider):
+        main.market_provider = provider
+        return TestClient(create_app())
+
+    def test_ticker_ok(self):
+        class FakeProvider:
+            async def get_ticker(self, symbol):
+                return MarketDatum(
+                    "coinbase", symbol.upper(), 42.0, None, DataQualityStatus.MISSING
+                )
+        r = self._client_with_provider(FakeProvider()).get("/api/v1/market/ticker/btc-usd")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["symbol"], "BTC-USD")
+        self.assertEqual(body["value"], 42.0)
+        self.assertEqual(body["quality"], "MISSING")
+
+    def test_ticker_upstream_error_503(self):
+        class FailingProvider:
+            async def get_ticker(self, symbol):
+                raise httpx.ConnectError("upstream down")
+        r = self._client_with_provider(FailingProvider()).get("/api/v1/market/ticker/btc-usd")
+        self.assertEqual(r.status_code, 503)
+
+    def test_ws_subscribe_rejects_unknown_channel(self):
+        client = TestClient(create_app())
+        r = client.post(
+            "/api/v1/market/websocket/subscribe",
+            json={"channel": "bogus", "products": ["BTC-USD"]},
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_ws_health_endpoint_ok(self):
+        client = TestClient(create_app())
+        r = client.get("/api/v1/market/websocket/health")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("connected", r.json())
+
+
+class CoinbaseProviderConfigTests(unittest.TestCase):
+    def test_uses_verified_public_rest_base(self):
+        self.assertEqual(
+            CoinbaseProvider().rest_url, "https://api.coinbase.com/api/v3/brokerage"
+        )

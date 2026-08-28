@@ -6,10 +6,12 @@ FastAPI + httpx. No conditional skip: a missing dependency fails the run rather
 than skipping.
 """
 
+import asyncio
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 from fastapi.testclient import TestClient
 
 import main

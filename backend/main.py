@@ -712,7 +712,14 @@ def candle_from_payload(
     open_ = _to_float(item.get("open"))
     close = _to_float(item.get("close"))
     volume = _to_float(item.get("volume"))
-    if start is None or None in (low, high, open_, close, volume):
+    if (
+        start is None
+        or low is None
+        or high is None
+        or open_ is None
+        or close is None
+        or volume is None
+    ):
         return Candle(start, low, high, open_, close, volume, DataQualityStatus.INVALID)
     if low < 0 or high < 0 or open_ < 0 or close < 0 or volume < 0:
         return Candle(start, low, high, open_, close, volume, DataQualityStatus.INVALID)

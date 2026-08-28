@@ -400,11 +400,8 @@ def ticker_datum_from_payload(
     if not isinstance(trades, list) or not trades or not isinstance(trades[0], dict):
         return MarketDatum(src, symbol, None, None, DataQualityStatus.MISSING)
     latest = trades[0]
-    try:
-        price = float(latest.get("price"))
-    except (TypeError, ValueError):
-        return MarketDatum(src, symbol, None, None, DataQualityStatus.INVALID)
-    if price <= 0:
+    price = _to_float(latest.get("price"))
+    if price is None or price <= 0:
         return MarketDatum(src, symbol, None, None, DataQualityStatus.INVALID)
     ts = parse_iso8601(latest.get("time"))
     quality = classify_freshness(ts, settings.ticker_max_age_seconds, now=now)
@@ -562,7 +559,7 @@ class MarketWsManager:
                 log.warning("Coinbase WS disconnected: %s - reconnecting in %.1fs", exc, delay)
                 await asyncio.sleep(delay)
 
-    def _handle(self, raw: str) -> None:  # pragma: no cover - needs a live socket
+    def _handle(self, raw: str | bytes) -> None:  # pragma: no cover - needs a live socket
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:

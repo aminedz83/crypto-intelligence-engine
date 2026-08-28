@@ -338,6 +338,21 @@ WS_ALLOWED_CHANNELS = {
     "ticker", "ticker_batch", "candles", "market_trades", "level2", "status", "heartbeats",
 }
 
+# Candles (defined before CoinbaseProvider: used as a default arg in get_candles).
+# friendly -> (Coinbase enum, bucket duration in seconds)
+GRANULARITIES: Dict[str, tuple] = {
+    "1m": ("ONE_MINUTE", 60),
+    "5m": ("FIVE_MINUTE", 300),
+    "15m": ("FIFTEEN_MINUTE", 900),
+    "30m": ("THIRTY_MINUTE", 1800),
+    "1h": ("ONE_HOUR", 3600),
+    "2h": ("TWO_HOUR", 7200),
+    "4h": ("FOUR_HOUR", 14400),
+    "6h": ("SIX_HOUR", 21600),
+    "1d": ("ONE_DAY", 86400),
+}
+CANDLE_MAX_LIMIT = 350
+
 
 def parse_iso8601(value: Any) -> Optional[datetime]:
     """Parse an ISO-8601 string to aware UTC. Returns None if absent/invalid/naive
@@ -638,20 +653,6 @@ async def market_ws_health() -> dict:
 # limit (max 350). Response: {"candles":[{start,low,high,open,close,volume}]} where
 # every field is a STRING and `start` is a UNIX timestamp in seconds.
 # NOT the old Exchange API (which used integer-second granularities 60/300/...).
-
-# friendly -> (Coinbase enum, bucket duration in seconds)
-GRANULARITIES: Dict[str, tuple] = {
-    "1m": ("ONE_MINUTE", 60),
-    "5m": ("FIVE_MINUTE", 300),
-    "15m": ("FIFTEEN_MINUTE", 900),
-    "30m": ("THIRTY_MINUTE", 1800),
-    "1h": ("ONE_HOUR", 3600),
-    "2h": ("TWO_HOUR", 7200),
-    "4h": ("FOUR_HOUR", 14400),
-    "6h": ("SIX_HOUR", 21600),
-    "1d": ("ONE_DAY", 86400),
-}
-CANDLE_MAX_LIMIT = 350
 
 
 @dataclass(frozen=True)

@@ -432,6 +432,28 @@ class CoinbaseProvider:
         payload = await self._get(f"/market/products/{symbol}/ticker")
         return ticker_datum_from_payload(symbol, payload)
 
+    async def get_candles(self, symbol: str, granularity: str, limit: int = CANDLE_MAX_LIMIT):
+        """Fetch qualified candles from Coinbase Advanced Trade (public, no auth).
+        Verified params: granularity string enum + start/end UNIX seconds, max 350."""
+        if granularity not in GRANULARITIES:
+            raise ValueError(f"Unsupported granularity: {granularity}")
+        enum_value, bucket_seconds = GRANULARITIES[granularity]
+        limit = max(1, min(int(limit), CANDLE_MAX_LIMIT))
+        end = int(utcnow().timestamp())
+        start = end - limit * bucket_seconds
+        symbol = symbol.upper()
+        payload = await self._get(
+            f"/market/products/{symbol}/candles",
+            params={
+                "start": str(start),
+                "end": str(end),
+                "granularity": enum_value,
+                "limit": limit,
+            },
+        )
+        # A candle is "recent enough" within ~2 buckets of its own timeframe.
+        return candles_from_payload(payload, max_age_seconds=bucket_seconds * 2)
+
     async def health_check(self) -> bool:
         try:
             payload = await self._get("/market/products/BTC-USD")
@@ -608,6 +630,140 @@ async def market_ws_subscribe(req: WsSubscribeRequest) -> dict:
 @api_router.get("/market/websocket/health")
 async def market_ws_health() -> dict:
     return await market_ws.health_check()
+
+
+# ---- candles (Coinbase Advanced Trade, verified OpenAPI) --------------------
+# GET /api/v3/brokerage/market/products/{product_id}/candles (public, no auth).
+# Query: start, end (UNIX seconds, required), granularity (string enum, required),
+# limit (max 350). Response: {"candles":[{start,low,high,open,close,volume}]} where
+# every field is a STRING and `start` is a UNIX timestamp in seconds.
+# NOT the old Exchange API (which used integer-second granularities 60/300/...).
+
+# friendly -> (Coinbase enum, bucket duration in seconds)
+GRANULARITIES: Dict[str, tuple] = {
+    "1m": ("ONE_MINUTE", 60),
+    "5m": ("FIVE_MINUTE", 300),
+    "15m": ("FIFTEEN_MINUTE", 900),
+    "30m": ("THIRTY_MINUTE", 1800),
+    "1h": ("ONE_HOUR", 3600),
+    "2h": ("TWO_HOUR", 7200),
+    "4h": ("FOUR_HOUR", 14400),
+    "6h": ("SIX_HOUR", 21600),
+    "1d": ("ONE_DAY", 86400),
+}
+CANDLE_MAX_LIMIT = 350
+
+
+@dataclass(frozen=True)
+class Candle:
+    start: Optional[datetime]
+    low: Optional[float]
+    high: Optional[float]
+    open: Optional[float]
+    close: Optional[float]
+    volume: Optional[float]
+    status: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "start": self.start.isoformat() if self.start else None,
+            "low": self.low,
+            "high": self.high,
+            "open": self.open,
+            "close": self.close,
+            "volume": self.volume,
+            "quality": self.status.value,
+        }
+
+
+def _to_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _unix_seconds_to_dt(value: Any) -> Optional[datetime]:
+    """Coinbase candle `start` is a UNIX timestamp in seconds, as a string.
+    Returns aware UTC, or None if unparseable (never invents a timestamp)."""
+    try:
+        seconds = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def candle_from_payload(
+    item: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> Candle:
+    """Convert one Coinbase candle object into a qualified Candle. Pure, no network.
+    Invalid timestamp or unparseable OHLCV -> INVALID; never fabricated."""
+    if not isinstance(item, dict):
+        return Candle(None, None, None, None, None, None, DataQualityStatus.INVALID)
+    start = _unix_seconds_to_dt(item.get("start"))
+    low = _to_float(item.get("low"))
+    high = _to_float(item.get("high"))
+    open_ = _to_float(item.get("open"))
+    close = _to_float(item.get("close"))
+    volume = _to_float(item.get("volume"))
+    if start is None or None in (low, high, open_, close, volume):
+        return Candle(start, low, high, open_, close, volume, DataQualityStatus.INVALID)
+    if low < 0 or high < 0 or open_ < 0 or close < 0 or volume < 0:
+        return Candle(start, low, high, open_, close, volume, DataQualityStatus.INVALID)
+    status = classify_freshness(start, max_age_seconds, now=now)
+    return Candle(start, low, high, open_, close, volume, status)
+
+
+def candles_from_payload(
+    payload: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> tuple:
+    """Parse a Coinbase candles response into (list[Candle], overall_status).
+    Empty/malformed -> ([], MISSING)."""
+    raw = payload.get("candles") if isinstance(payload, dict) else None
+    if not isinstance(raw, list) or not raw:
+        return [], DataQualityStatus.MISSING
+    candles = [candle_from_payload(item, max_age_seconds, now=now) for item in raw]
+    if all(c.status == DataQualityStatus.INVALID for c in candles):
+        return candles, DataQualityStatus.INVALID
+    return candles, DataQualityStatus.VALID
+
+
+@api_router.get("/market/candles/{symbol}")
+async def market_candles(
+    symbol: str, granularity: str = "1m", limit: int = CANDLE_MAX_LIMIT
+) -> dict:
+    if granularity not in GRANULARITIES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "INVALID",
+                "reason": "Unsupported granularity",
+                "allowed": sorted(GRANULARITIES),
+            },
+        )
+    try:
+        candles, status = await market_provider.get_candles(symbol, granularity, limit)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": str(exc)}
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500, detail={"status": "UNKNOWN", "reason": str(exc)}
+        ) from exc
+    return {
+        "source": "coinbase",
+        "symbol": symbol.upper(),
+        "granularity": granularity,
+        "count": len(candles),
+        "quality": status.value,
+        "candles": [c.to_dict() for c in candles],
+    }
 
 
 # ============================ frontend serving ============================

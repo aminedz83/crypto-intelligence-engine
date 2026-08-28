@@ -453,3 +453,157 @@ class CoinbaseProviderConfigTests(unittest.TestCase):
         self.assertEqual(
             CoinbaseProvider().rest_url, "https://api.coinbase.com/api/v3/brokerage"
         )
+
+
+# ----------------------------- candles (Phase 2) -----------------------------
+from main import (  # noqa: E402
+    CANDLE_MAX_LIMIT,
+    GRANULARITIES,
+    Candle,
+    candle_from_payload,
+    candles_from_payload,
+)
+
+_CANDLE_NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _candle_item(start_unix, low="100", high="110", open_="105", close="108", volume="12.5"):
+    return {
+        "start": str(start_unix),
+        "low": low,
+        "high": high,
+        "open": open_,
+        "close": close,
+        "volume": volume,
+    }
+
+
+class CandleParsingTests(unittest.TestCase):
+    def test_valid_payload_converts(self):
+        start = int((_CANDLE_NOW - _td(seconds=30)).timestamp())
+        c = candle_from_payload(_candle_item(start), 120, now=_CANDLE_NOW)
+        self.assertEqual(c.status, DataQualityStatus.VALID)
+        self.assertEqual(c.low, 100.0)
+        self.assertEqual(c.high, 110.0)
+        self.assertEqual(c.open, 105.0)
+        self.assertEqual(c.close, 108.0)
+
+    def test_start_is_unix_seconds_to_utc(self):
+        # 1639508050 -> 2021-12-14T20:14:10Z (seconds, not ms)
+        c = candle_from_payload(_candle_item(1639508050), 10**12, now=_CANDLE_NOW)
+        self.assertEqual(c.start.year, 2021)
+        self.assertEqual(c.start.tzinfo, timezone.utc)
+
+    def test_price_parsed_as_float(self):
+        c = candle_from_payload(_candle_item(1639508050, low="140.21"), 10**12, now=_CANDLE_NOW)
+        self.assertEqual(c.low, 140.21)
+
+    def test_volume_parsed_as_float(self):
+        item = _candle_item(1639508050, volume="56437345")
+        c = candle_from_payload(item, 10**12, now=_CANDLE_NOW)
+        self.assertEqual(c.volume, 56437345.0)
+
+    def test_invalid_timestamp_is_invalid(self):
+        item = _candle_item(1639508050)
+        item["start"] = "not-a-number"
+        c = candle_from_payload(item, 120, now=_CANDLE_NOW)
+        self.assertEqual(c.status, DataQualityStatus.INVALID)
+
+    def test_bad_price_is_invalid(self):
+        item = _candle_item(1639508050, high="abc")
+        c = candle_from_payload(item, 10**12, now=_CANDLE_NOW)
+        self.assertEqual(c.status, DataQualityStatus.INVALID)
+
+    def test_stale_candle_detected(self):
+        start = int((_CANDLE_NOW - _td(seconds=1000)).timestamp())
+        c = candle_from_payload(_candle_item(start), 120, now=_CANDLE_NOW)
+        self.assertEqual(c.status, DataQualityStatus.STALE)
+
+    def test_empty_response_is_missing(self):
+        candles, status = candles_from_payload({"candles": []}, 120, now=_CANDLE_NOW)
+        self.assertEqual(candles, [])
+        self.assertEqual(status, DataQualityStatus.MISSING)
+
+
+
+class CandleGranularityTests(unittest.TestCase):
+    def test_nine_official_granularities(self):
+        self.assertEqual(
+            sorted(GRANULARITIES),
+            sorted(["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "1d"]),
+        )
+
+    def test_maps_to_official_enum_values(self):
+        enums = {v[0] for v in GRANULARITIES.values()}
+        self.assertEqual(
+            enums,
+            {
+                "ONE_MINUTE", "FIVE_MINUTE", "FIFTEEN_MINUTE", "THIRTY_MINUTE",
+                "ONE_HOUR", "TWO_HOUR", "FOUR_HOUR", "SIX_HOUR", "ONE_DAY",
+            },
+        )
+
+
+class CandleProviderRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_limit_clamped_to_350_and_official_params(self):
+        captured = {}
+
+        class FakeClient:
+            async def get(self, path, params=None):
+                captured["path"] = path
+                captured["params"] = params
+
+                class R:
+                    def raise_for_status(self):
+                        return None
+
+                    def json(self):
+                        return {"candles": []}
+
+                return R()
+
+        provider = CoinbaseProvider()
+        provider.client = FakeClient()
+        await provider.get_candles("btc-usd", "1m", limit=999)
+        self.assertEqual(captured["params"]["limit"], CANDLE_MAX_LIMIT)  # clamped
+        self.assertEqual(captured["params"]["granularity"], "ONE_MINUTE")
+        self.assertIn("start", captured["params"])
+        self.assertIn("end", captured["params"])
+        self.assertTrue(captured["path"].endswith("/market/products/BTC-USD/candles"))
+
+
+class CandleEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self._orig = main.market_provider
+
+    def tearDown(self):
+        main.market_provider = self._orig
+
+    def _client(self, provider):
+        main.market_provider = provider
+        return TestClient(create_app())
+
+    def test_endpoint_ok_with_mocked_provider(self):
+        class FakeProvider:
+            async def get_candles(self, symbol, granularity, limit=350):
+                start = _CANDLE_NOW
+                candle = Candle(start, 1.0, 2.0, 1.5, 1.8, 3.0, DataQualityStatus.VALID)
+                return [candle], DataQualityStatus.VALID
+        r = self._client(FakeProvider()).get("/api/v1/market/candles/btc-usd?granularity=1h")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["symbol"], "BTC-USD")
+        self.assertEqual(body["granularity"], "1h")
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["quality"], "VALID")
+
+    def test_endpoint_rejects_unknown_granularity(self):
+        r = TestClient(create_app()).get("/api/v1/market/candles/btc-usd?granularity=4m")
+        self.assertEqual(r.status_code, 400)
+
+    def test_endpoint_http_error_returns_503(self):
+        class FailingProvider:
+            async def get_candles(self, symbol, granularity, limit=350):
+                raise httpx.ConnectTimeout("timeout")
+        r = self._client(FailingProvider()).get("/api/v1/market/candles/btc-usd")
+        self.assertEqual(r.status_code, 503)

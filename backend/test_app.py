@@ -1647,3 +1647,168 @@ class ForexPersistenceTests(_DBBase):
                 self.assertEqual(res2.scalar(), 0)  # no Coinbase regression
         finally:
             main.massive_forex_provider = saved
+
+
+# ----------------------------- Massive mapping activation 6B-1A ---------------
+from main import (  # noqa: E402
+    EXPECTED_MASSIVE_FOREX,
+    MassiveForexProvider,
+    activate_massive_forex_mappings,
+    massive_forex_activation,
+)
+from main import _redact_secret as redact_secret  # noqa: E402
+
+
+class RedactionTests(unittest.TestCase):
+    def test_redacts_apikey_query(self):
+        out = redact_secret("GET https://api.x/y?apiKey=SECRET123&z=1")
+        self.assertIn("apiKey=REDACTED", out)
+        self.assertNotIn("SECRET123", out)
+
+    def test_no_apikey_unchanged(self):
+        self.assertEqual(redact_secret("plain text no secret"), "plain text no secret")
+
+
+class _MassiveMapBase(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._prov = main.massive_forex_provider
+        self._key = main.settings.massive_api_key
+        self._snap_p = dict(provider_symbol_map._to_provider)
+        self._snap_c = dict(provider_symbol_map._to_canonical)
+        for k in [kk for kk in list(provider_symbol_map._to_provider) if kk[0] == "massive"]:
+            del provider_symbol_map._to_provider[k]
+        for k in [kk for kk in list(provider_symbol_map._to_canonical) if kk[0] == "massive"]:
+            del provider_symbol_map._to_canonical[k]
+        massive_forex_activation.__init__()
+
+    def tearDown(self):
+        main.massive_forex_provider = self._prov
+        main.settings.massive_api_key = self._key
+        provider_symbol_map._to_provider.clear()
+        provider_symbol_map._to_provider.update(self._snap_p)
+        provider_symbol_map._to_canonical.clear()
+        provider_symbol_map._to_canonical.update(self._snap_c)
+        massive_forex_activation.__init__()
+
+
+class _FakeRef:
+    def __init__(self, tickers=None, exc=None):
+        self._t = tickers or []
+        self._exc = exc
+
+    async def list_forex_tickers(self):
+        if self._exc is not None:
+            raise self._exc
+        return list(self._t)
+
+
+class MassiveActivationTests(_MassiveMapBase):
+    async def test_no_key_no_activation(self):
+        main.settings.massive_api_key = ""
+        res = await activate_massive_forex_mappings()
+        self.assertTrue(res["attempted"])
+        self.assertFalse(res["activated"])
+        self.assertIsNone(provider_symbol_map.to_provider("massive", "EUR-USD"))
+
+    async def test_activation_registers_only_confirmed(self):
+        main.settings.massive_api_key = "DUMMY_TEST"
+        main.massive_forex_provider = _FakeRef(["C:EURUSD", "C:GBPUSD", "C:OTHER"])
+        res = await activate_massive_forex_mappings()
+        self.assertTrue(res["activated"])
+        self.assertEqual(res["confirmed_count"], 2)
+        self.assertEqual(provider_symbol_map.to_provider("massive", "EUR-USD"), "C:EURUSD")
+        self.assertEqual(provider_symbol_map.to_provider("massive", "GBP-USD"), "C:GBPUSD")
+
+    async def test_absent_not_mapped_no_deduction(self):
+        main.settings.massive_api_key = "DUMMY_TEST"
+        main.massive_forex_provider = _FakeRef(["C:EURUSD"])  # only EUR
+        await activate_massive_forex_mappings()
+        self.assertIsNone(provider_symbol_map.to_provider("massive", "USD-CHF"))
+        self.assertIsNone(provider_symbol_map.to_provider("massive", "GBP-USD"))
+
+    async def test_canonical_provider_separated(self):
+        main.settings.massive_api_key = "DUMMY_TEST"
+        main.massive_forex_provider = _FakeRef(["C:EURUSD"])
+        await activate_massive_forex_mappings()
+        self.assertNotEqual(provider_symbol_map.to_provider("massive", "EUR-USD"), "EUR-USD")
+        self.assertEqual(provider_symbol_map.to_canonical("massive", "C:EURUSD"), "EUR-USD")
+
+    async def test_xau_reported_but_not_integrated(self):
+        main.settings.massive_api_key = "DUMMY_TEST"
+        main.massive_forex_provider = _FakeRef(["C:EURUSD", "C:XAUUSD"])
+        res = await activate_massive_forex_mappings()
+        self.assertEqual(res["xau"], {"ticker": "C:XAUUSD"})
+        self.assertIsNone(provider_symbol_map.to_provider("massive", "XAU-USD"))
+
+    async def test_xau_absent_is_none(self):
+        main.settings.massive_api_key = "DUMMY_TEST"
+        main.massive_forex_provider = _FakeRef(["C:EURUSD"])
+        res = await activate_massive_forex_mappings()
+        self.assertIsNone(res["xau"])
+
+    async def test_activation_failure_is_failsafe(self):
+        main.settings.massive_api_key = "DUMMY_TEST"
+        main.massive_forex_provider = _FakeRef(exc=httpx.ConnectError("down"))
+        res = await activate_massive_forex_mappings()
+        self.assertFalse(res["activated"])
+        self.assertIsNone(provider_symbol_map.to_provider("massive", "EUR-USD"))
+
+    async def test_failure_reason_is_redacted(self):
+        main.settings.massive_api_key = "DUMMY_TEST"
+        main.massive_forex_provider = _FakeRef(exc=Exception("boom apiKey=SECRET999 x"))
+        res = await activate_massive_forex_mappings()
+        self.assertNotIn("SECRET999", res["reason"] or "")
+        self.assertIn("REDACTED", res["reason"] or "")
+
+
+class MassiveAuthSecurityTests(_MassiveMapBase):
+    async def test_header_auth_key_not_in_url(self):
+        prov = MassiveForexProvider(api_key="DUMMYKEY")
+        await prov.connect()
+        try:
+            auth = prov.client.headers.get("authorization")
+            self.assertIsNotNone(auth)
+            self.assertTrue(auth.startswith("Bearer "))
+            self.assertIn("DUMMYKEY", auth)
+            self.assertNotIn("DUMMYKEY", str(prov.rest_url))  # never in the URL
+        finally:
+            await prov.disconnect()
+
+    async def test_get_candles_params_have_no_apikey(self):
+        prov = MassiveForexProvider(api_key="DUMMYKEY")
+        captured = {}
+
+        async def fake_get(path, params=None):
+            captured["params"] = params or {}
+            return {"results": []}
+
+        prov._get = fake_get
+        main.register_massive_forex_symbol("EUR-USD", "C:EURUSD")
+        await prov.get_candles_range("EUR-USD", "1h", _FX_BASE, _FX_BASE + 3600)
+        self.assertNotIn("apiKey", captured["params"])
+        self.assertNotIn("apikey", captured["params"])
+
+
+class ForexMappingsEndpointTests(unittest.TestCase):
+    def test_mappings_endpoint_structure(self):
+        r = TestClient(create_app()).get("/api/v1/market/forex/mappings")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(len(body["mappings"]), len(EXPECTED_MASSIVE_FOREX))
+        for m_ in body["mappings"]:
+            self.assertIn(m_["status"], ("MAPPED", "NOT_MAPPED"))
+
+    def test_mappings_endpoint_no_auth_leak(self):
+        raw = TestClient(create_app()).get("/api/v1/market/forex/mappings").text.lower()
+        for bad in ("apikey", "authorization", "bearer", "massive_api_key"):
+            self.assertNotIn(bad, raw)
+
+
+class RepoKeySecurityTests(unittest.TestCase):
+    def test_main_bearer_is_fstring_only(self):
+        src = open("main.py").read()
+        for seg in src.split("Bearer ")[1:]:
+            self.assertTrue(seg.startswith("{"), "Bearer must be an f-string var in main.py")
+
+    def test_massive_key_default_empty(self):
+        self.assertEqual(main.settings.massive_api_key, "")

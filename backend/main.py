@@ -99,6 +99,10 @@ class Settings(BaseSettings):
     ticker_max_age_seconds: float = 10.0
     candle_max_age_seconds: float = 120.0
 
+    # Application-level guard rail (NOT a Coinbase limit): max provider windows
+    # (sequential REST calls) a single /history request may fan out to.
+    history_max_windows: int = 20
+
     @property
     def database_url(self) -> str:
         return (
@@ -352,6 +356,11 @@ GRANULARITIES: Dict[str, tuple] = {
     "1d": ("ONE_DAY", 86400),
 }
 CANDLE_MAX_LIMIT = 350
+# Coinbase caps a request at CANDLE_MAX_LIMIT candles. `end` inclusivity is not
+# guaranteed by the docs, so a paginated window must never request more than
+# CANDLE_MAX_LIMIT candidate starts: width = (CANDLE_MAX_LIMIT - 1) * bucket
+# keeps it <= CANDLE_MAX_LIMIT even if `end` is inclusive. Never hardcode 349.
+PROVIDER_SAFE_BUCKETS = CANDLE_MAX_LIMIT - 1
 
 
 def parse_iso8601(value: Any) -> Optional[datetime]:
@@ -465,6 +474,26 @@ class CoinbaseProvider:
         )
         # A candle is "recent enough" within ~2 buckets of its own timeframe.
         return candles_from_payload(payload, max_age_seconds=bucket_seconds * 2)
+
+    async def get_candles_range(self, symbol: str, granularity: str, start: int, end: int):
+        """Fetch candles for an EXPLICIT [start, end] window (UNIX seconds). Used by
+        the paginated history layer. Reuses the validated candles_from_payload parser.
+        Historical candles are qualified on data validity only (freshness is not a
+        meaningful axis for an explicit past range), so max_age is effectively off."""
+        if granularity not in GRANULARITIES:
+            raise ValueError(f"Unsupported granularity: {granularity}")
+        enum_value, _bucket = GRANULARITIES[granularity]
+        symbol = symbol.upper()
+        payload = await self._get(
+            f"/market/products/{symbol}/candles",
+            params={
+                "start": str(int(start)),
+                "end": str(int(end)),
+                "granularity": enum_value,
+                "limit": CANDLE_MAX_LIMIT,
+            },
+        )
+        return candles_from_payload(payload, max_age_seconds=float("inf"))
 
     async def health_check(self) -> bool:
         try:
@@ -1103,6 +1132,143 @@ market_bus = MarketBus()
 @api_router.get("/market/realtime/{symbol}")
 async def market_realtime(symbol: str) -> dict:
     return await market_store.get_realtime(symbol.upper())
+
+
+# ============================ paginated history (increment 4) =================
+# Fetch a candle history longer than one Coinbase request (max CANDLE_MAX_LIMIT)
+# by fanning out to sequential windows, then merge/dedup/sort. Robust to unknown
+# `end` inclusivity: each provider window requests at most PROVIDER_SAFE_BUCKETS
+# (= CANDLE_MAX_LIMIT - 1) buckets, so even an inclusive `end` yields <= 350
+# candidate starts; a repeated boundary candle is removed by dedup on
+# (product_id, granularity, start). The internal contract is a half-open range
+# [start, end): start < end and both aligned to the granularity. No candle is
+# ever fabricated; absences are diagnosed, never filled.
+
+
+def max_history_span(granularity: str) -> int:
+    """Max span (seconds) a single /history request may cover, from the safe
+    window width and the application guard rail. Granularity-dependent."""
+    bucket = GRANULARITIES[granularity][1]
+    return PROVIDER_SAFE_BUCKETS * bucket * settings.history_max_windows
+
+
+def plan_candle_windows(granularity: str, start: int, end: int) -> List[tuple]:
+    """Pure, deterministic window planner (no network). Windows are [w_start,
+    w_end] in UNIX seconds, each <= PROVIDER_SAFE_BUCKETS * bucket wide, stepping
+    by the same amount (1-bucket overlap at each boundary, removed later by dedup)."""
+    if granularity not in GRANULARITIES:
+        raise ValueError(f"unsupported granularity: {granularity}")
+    bucket = GRANULARITIES[granularity][1]
+    if start % bucket != 0 or end % bucket != 0:
+        raise ValueError("start and end must be aligned to the granularity (seconds)")
+    if start >= end:
+        raise ValueError("start must be strictly before end")
+    step = PROVIDER_SAFE_BUCKETS * bucket
+    windows: List[tuple] = []
+    w_start = start
+    while w_start < end:
+        w_end = min(end, w_start + step)
+        windows.append((w_start, w_end))
+        w_start += step
+    return windows
+
+
+def _missing_buckets_24_7(starts: List[int], bucket: int) -> List[Dict[str, int]]:
+    """Gap diagnostic on a 24/7 grid: within the data span, which buckets are
+    absent. Kept ABSTRACT so a market-calendar-aware version (Forex/Gold sessions,
+    weekends, holidays) can replace it later without touching the pipeline."""
+    gaps: List[Dict[str, int]] = []
+    for i in range(1, len(starts)):
+        step = starts[i] - starts[i - 1]
+        if step > bucket:
+            gaps.append({"after_start": starts[i - 1], "missing_buckets": step // bucket - 1})
+    return gaps
+
+
+async def fetch_candle_history(symbol: str, granularity: str, start: int, end: int) -> dict:
+    """Assemble a paginated candle history. Raises ValueError on invalid request
+    (unknown granularity, misaligned/reversed range, range too large)."""
+    if granularity in GRANULARITIES and end - start > max_history_span(granularity):
+        raise ValueError(
+            f"requested range too large (max {settings.history_max_windows} windows)"
+        )
+    windows = plan_candle_windows(granularity, start, end)  # validates gran/align/order
+    bucket = GRANULARITIES[granularity][1]
+
+    collected: Dict[int, Candle] = {}
+    invalid_count = 0
+    failed = 0
+    succeeded = 0
+    for w_start, w_end in windows:
+        try:
+            candles, _status = await market_provider.get_candles_range(
+                symbol, granularity, w_start, w_end
+            )
+            succeeded += 1
+        except httpx.HTTPError:
+            failed += 1
+            continue
+        for candle in candles:
+            if candle.start is None or candle.status == DataQualityStatus.INVALID:
+                invalid_count += 1
+                continue
+            key = int(candle.start.timestamp())
+            if key < start or key >= end:  # enforce internal [start, end) contract
+                continue
+            collected[key] = candle  # dedup by start (identity: product+gran+start)
+
+    starts_sorted = sorted(collected)
+    kept = [collected[k] for k in starts_sorted]
+    gaps = _missing_buckets_24_7(starts_sorted, bucket)
+
+    transport_complete = failed == 0
+    if failed > 0:
+        status = "PARTIAL"
+    elif not kept:
+        status = "EMPTY"
+    elif invalid_count > 0 or gaps:
+        status = "PARTIAL"
+    else:
+        status = "COMPLETE"
+    data_complete = status == "COMPLETE"
+
+    return {
+        "source": "coinbase",
+        "symbol": symbol.upper(),
+        "granularity": granularity,
+        "status": status,
+        "requested_range": {"start": start, "end": end},
+        "provider_windows": {
+            "planned": len(windows),
+            "succeeded": succeeded,
+            "failed": failed,
+        },
+        "first_candle_start": starts_sorted[0] if starts_sorted else None,
+        "last_candle_start": starts_sorted[-1] if starts_sorted else None,
+        "count": len(kept),
+        "invalid_candles_count": invalid_count,
+        "gaps": gaps,
+        "transport_complete": transport_complete,
+        "data_complete": data_complete,
+        "complete": data_complete,
+        "candles": [c.to_dict() for c in kept],
+    }
+
+
+@api_router.get("/market/candles/{symbol}/history")
+async def market_candles_history(
+    symbol: str, start: int, end: int, granularity: str = "1m"
+) -> dict:
+    try:
+        return await fetch_candle_history(symbol, granularity, start, end)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": str(exc)}
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": str(exc)}
+        ) from exc
 
 
 # ============================ frontend serving ============================

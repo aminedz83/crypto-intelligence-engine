@@ -26,7 +26,7 @@ from decimal import Decimal
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set
 
 import httpx
 import redis.asyncio as aioredis
@@ -1239,7 +1239,10 @@ async def fetch_candle_history(symbol: str, granularity: str, start: int, end: i
 
     starts_sorted = sorted(collected)
     kept = [collected[k] for k in starts_sorted]
-    gaps = _missing_buckets_24_7(starts_sorted, bucket)
+    # Coinbase is 24/7: route gap detection through the ALWAYS_OPEN_24_7 calendar.
+    # Always24_7Calendar.analyze_gaps delegates to _missing_buckets_24_7, so the
+    # result is byte-for-byte identical to the pre-6A behaviour (no regression).
+    gaps = _COINBASE_CALENDAR.analyze_gaps(starts_sorted, bucket).missing
 
     transport_complete = failed == 0
     if failed > 0:
@@ -1643,6 +1646,250 @@ async def market_candles_stored(
         "count": len(candles),
         "candles": candles,
     }
+
+
+# ============================ multi-asset foundation (increment 6A) ===========
+# Canonical, provider-agnostic model so Chart/Strategy/Signal/History/DB never
+# need to know Coinbase (or a future provider) specifics. 6A is a PURE abstraction:
+# no external connector, no invented market calendar/hours, no invented instrument
+# metadata. Coinbase stays functionally identical; its 24/7 behaviour is the
+# ALWAYS_OPEN_24_7 policy, and gap detection is routed through it unchanged.
+
+
+class AssetClass(str, Enum):
+    CRYPTO = "CRYPTO"
+    FOREX = "FOREX"
+    METAL = "METAL"
+    INDEX = "INDEX"
+
+
+class Capability(str, Enum):
+    TICKER_REST = "TICKER_REST"
+    TICKER_WS = "TICKER_WS"
+    CANDLES_REST = "CANDLES_REST"
+    CANDLES_WS = "CANDLES_WS"
+    HISTORY_INTRADAY = "HISTORY_INTRADAY"
+    HISTORY_DAILY = "HISTORY_DAILY"
+    VOLUME = "VOLUME"
+    BID_ASK = "BID_ASK"
+    TRADES = "TRADES"
+    ORDER_BOOK = "ORDER_BOOK"
+
+
+class VolumeSemantics(str, Enum):
+    BASE_ASSET_VOLUME = "BASE_ASSET_VOLUME"
+    QUOTE_VOLUME = "QUOTE_VOLUME"
+    TICK_VOLUME = "TICK_VOLUME"
+    CONTRACT_VOLUME = "CONTRACT_VOLUME"
+    NOT_AVAILABLE = "NOT_AVAILABLE"
+    UNKNOWN = "UNKNOWN"
+
+
+class MarketCalendarPolicy(str, Enum):
+    ALWAYS_OPEN_24_7 = "ALWAYS_OPEN_24_7"
+    NOT_CONFIGURED = "NOT_CONFIGURED"
+    # Declared intent only; NOT implemented in 6A (no invented hours). Until real
+    # official hours are added, calendar_for() maps these to NotConfigured -> UNKNOWN.
+    FOREX_WEEK = "FOREX_WEEK"
+    US_EQUITY_RTH = "US_EQUITY_RTH"
+
+
+class OpenState(str, Enum):
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    UNKNOWN = "UNKNOWN"
+
+
+class MarketAvailability(str, Enum):
+    # Orthogonal to DataQualityStatus (which is untouched). A normal market close
+    # is NOT a provider outage is NOT missing data — three distinct axes.
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+    NOT_SUPPORTED = "NOT_SUPPORTED"
+    CALENDAR_UNKNOWN = "CALENDAR_UNKNOWN"
+
+
+@dataclass(frozen=True)
+class Instrument:
+    canonical_symbol: str  # the ONLY global identity used across the app
+    asset_class: AssetClass
+    base_asset: Optional[str]
+    quote_asset: Optional[str]
+    display_name: str
+    timezone: str  # IANA market timezone (stored; no session math in 6A)
+    market_calendar: MarketCalendarPolicy
+    volume_semantics: VolumeSemantics
+    price_precision: Optional[int] = None  # None until verified (future risk calc)
+    tick_size: Optional[Decimal] = None  # None until verified (future risk calc)
+
+
+class InstrumentRegistry:
+    """Canonical instrument identities. In-memory in 6A (no Postgres table)."""
+
+    def __init__(self) -> None:
+        self._by_canonical: Dict[str, Instrument] = {}
+
+    def register(self, instrument: Instrument) -> None:
+        self._by_canonical[instrument.canonical_symbol] = instrument
+
+    def get(self, canonical_symbol: str) -> Optional[Instrument]:
+        return self._by_canonical.get(canonical_symbol)
+
+    def all(self) -> List[Instrument]:
+        return list(self._by_canonical.values())
+
+
+class ProviderSymbolMap:
+    """Bidirectional (provider, provider_symbol) <-> canonical_symbol mapping.
+    Never assumes canonical == provider symbol. Unmapped -> None (NOT_MAPPED)."""
+
+    def __init__(self) -> None:
+        self._to_provider: Dict[tuple, str] = {}
+        self._to_canonical: Dict[tuple, str] = {}
+
+    def add(self, provider: str, canonical: str, provider_symbol: str) -> None:
+        self._to_provider[(provider, canonical)] = provider_symbol
+        self._to_canonical[(provider, provider_symbol)] = canonical
+
+    def to_provider(self, provider: str, canonical: str) -> Optional[str]:
+        return self._to_provider.get((provider, canonical))
+
+    def to_canonical(self, provider: str, provider_symbol: str) -> Optional[str]:
+        return self._to_canonical.get((provider, provider_symbol))
+
+
+@dataclass
+class ProviderProfile:
+    """Explicit provider capabilities, PER asset class (a provider may offer FX
+    intraday but a metal only daily). Missing capability -> NOT_SUPPORTED, never a
+    silent fallback."""
+
+    name: str
+    capabilities_by_asset_class: Dict[AssetClass, Set[Capability]]
+    granularities_by_asset_class: Dict[AssetClass, Set[str]]
+
+    def supports(self, capability: Capability, asset_class: AssetClass) -> bool:
+        return capability in self.capabilities_by_asset_class.get(asset_class, set())
+
+    def supports_granularity(self, granularity: str, asset_class: AssetClass) -> bool:
+        return granularity in self.granularities_by_asset_class.get(asset_class, set())
+
+
+class MarketCalendar:
+    """Interface. is_market_expected_open / expected_bucket_starts / analyze_gaps.
+    Never concludes OPEN or CLOSED by assumption when not configured."""
+
+    policy: MarketCalendarPolicy = MarketCalendarPolicy.NOT_CONFIGURED
+
+    def is_market_expected_open(self, ts_unix: int) -> OpenState:
+        raise NotImplementedError
+
+    def expected_bucket_starts(self, granularity: str, start: int, end: int) -> Optional[List[int]]:
+        raise NotImplementedError
+
+    def analyze_gaps(self, starts: List[int], bucket: int) -> "GapReport":
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class GapReport:
+    status: str  # "ANALYZED" (missing meaningful) | "UNKNOWN" (no conclusion)
+    missing: List[Dict[str, int]]
+
+
+class Always24_7Calendar(MarketCalendar):
+    """Crypto 24/7. Reproduces the exact pre-6A gap logic (delegates to
+    _missing_buckets_24_7) so Coinbase behaviour is unchanged."""
+
+    policy = MarketCalendarPolicy.ALWAYS_OPEN_24_7
+
+    def is_market_expected_open(self, ts_unix: int) -> OpenState:
+        return OpenState.OPEN
+
+    def expected_bucket_starts(self, granularity: str, start: int, end: int) -> Optional[List[int]]:
+        if granularity not in GRANULARITIES:
+            return None
+        bucket = GRANULARITIES[granularity][1]
+        return list(range(start, end, bucket))
+
+    def analyze_gaps(self, starts: List[int], bucket: int) -> GapReport:
+        return GapReport("ANALYZED", _missing_buckets_24_7(starts, bucket))
+
+
+class NotConfiguredCalendar(MarketCalendar):
+    """No verified hours -> everything UNKNOWN. Never invents OPEN/CLOSED/gaps."""
+
+    policy = MarketCalendarPolicy.NOT_CONFIGURED
+
+    def is_market_expected_open(self, ts_unix: int) -> OpenState:
+        return OpenState.UNKNOWN
+
+    def expected_bucket_starts(self, granularity: str, start: int, end: int) -> Optional[List[int]]:
+        return None
+
+    def analyze_gaps(self, starts: List[int], bucket: int) -> GapReport:
+        return GapReport("UNKNOWN", [])
+
+
+_ALWAYS_24_7 = Always24_7Calendar()
+_NOT_CONFIGURED = NotConfiguredCalendar()
+_COINBASE_CALENDAR = _ALWAYS_24_7
+
+
+def calendar_for(policy: MarketCalendarPolicy) -> MarketCalendar:
+    """Only ALWAYS_OPEN_24_7 is implemented in 6A. Every other policy (including the
+    declared-but-not-implemented placeholders) resolves to NotConfigured -> UNKNOWN,
+    so no market hours are ever invented."""
+    if policy == MarketCalendarPolicy.ALWAYS_OPEN_24_7:
+        return _ALWAYS_24_7
+    return _NOT_CONFIGURED
+
+
+instrument_registry = InstrumentRegistry()
+provider_symbol_map = ProviderSymbolMap()
+
+
+def _register_coinbase_instruments() -> None:
+    """The only PROVEN real case in 6A. Coinbase crypto: 24/7, base-asset volume.
+    Unverified financial metadata (precision/tick) stays None (never invented)."""
+    for canon, base, quote, name in (
+        ("BTC-USD", "BTC", "USD", "Bitcoin / US Dollar"),
+        ("ETH-USD", "ETH", "USD", "Ethereum / US Dollar"),
+    ):
+        instrument_registry.register(
+            Instrument(
+                canonical_symbol=canon,
+                asset_class=AssetClass.CRYPTO,
+                base_asset=base,
+                quote_asset=quote,
+                display_name=name,
+                timezone="UTC",
+                market_calendar=MarketCalendarPolicy.ALWAYS_OPEN_24_7,
+                volume_semantics=VolumeSemantics.BASE_ASSET_VOLUME,
+                price_precision=None,
+                tick_size=None,
+            )
+        )
+        provider_symbol_map.add("coinbase", canon, canon)  # Coinbase symbol == canonical here
+
+
+COINBASE_PROFILE = ProviderProfile(
+    name="coinbase",
+    capabilities_by_asset_class={
+        AssetClass.CRYPTO: {
+            Capability.TICKER_REST,
+            Capability.TICKER_WS,
+            Capability.CANDLES_REST,
+            Capability.CANDLES_WS,
+            Capability.HISTORY_INTRADAY,
+            Capability.VOLUME,
+        },
+    },
+    granularities_by_asset_class={AssetClass.CRYPTO: set(GRANULARITIES)},
+)
+
+_register_coinbase_instruments()
 
 
 # ============================ frontend serving ============================

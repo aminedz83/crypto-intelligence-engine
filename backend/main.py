@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -1988,10 +1989,15 @@ class MassiveForexProvider:
 
     async def connect(self) -> None:
         if self.client is None:
+            headers = {"Accept": "application/json"}
+            if self.api_key:
+                # Header auth keeps the key OUT of the URL, so it can never leak via
+                # an httpx exception/request-URL. (Redaction below is defence in depth.)
+                headers["Authorization"] = f"Bearer {self.api_key}"
             self.client = httpx.AsyncClient(
                 base_url=self.rest_url,
                 timeout=settings.massive_request_timeout_seconds,
-                headers={"Accept": "application/json"},
+                headers=headers,
             )
 
     async def disconnect(self) -> None:
@@ -2025,9 +2031,24 @@ class MassiveForexProvider:
         end_ms = int(end) * 1000
         payload = await self._get(
             f"/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{start_ms}/{end_ms}",
-            params={"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": self.api_key},
+            params={"adjusted": "true", "sort": "asc", "limit": 50000},
         )
         return massive_aggs_to_candles(payload, max_age_seconds=float("inf"))
+
+    async def list_forex_tickers(self) -> List[str]:
+        """Fetch the REAL set of Massive forex ticker symbols (for verified mapping
+        activation). Header auth; a single page of up to 1000 (covers the majors)."""
+        payload = await self._get(
+            "/v3/reference/tickers",
+            params={"market": "fx", "active": "true", "limit": 1000},
+        )
+        results = payload.get("results")
+        out: List[str] = []
+        if isinstance(results, list):
+            for row in results:
+                if isinstance(row, dict) and isinstance(row.get("ticker"), str):
+                    out.append(row["ticker"])
+        return out
 
 
 def _register_massive_forex_instruments() -> None:
@@ -2080,6 +2101,104 @@ def register_massive_forex_symbol(canonical: str, provider_ticker: str) -> None:
     """Register a Massive forex mapping ONLY after official verification via
     /v3/reference/tickers. Never called at import (unverified -> NOT_MAPPED)."""
     provider_symbol_map.add("massive", canonical, provider_ticker)
+
+
+# Candidate provider tickers per canonical (naming convention only). A mapping is
+# activated ONLY if the exact ticker is really present in the official Massive
+# response (activate_massive_forex_mappings) -> never a deduction.
+EXPECTED_MASSIVE_FOREX: Dict[str, str] = {
+    "EUR-USD": "C:EURUSD",
+    "GBP-USD": "C:GBPUSD",
+    "USD-JPY": "C:USDJPY",
+    "USD-CHF": "C:USDCHF",
+    "AUD-USD": "C:AUDUSD",
+    "USD-CAD": "C:USDCAD",
+    "NZD-USD": "C:NZDUSD",
+    "EUR-CAD": "C:EURCAD",
+}
+MASSIVE_XAU_TICKER = "C:XAUUSD"  # only DETECTED/reported; never auto-integrated in 6B-1A
+
+_APIKEY_RE = re.compile(r"(apikey=)[^&\s]+", re.IGNORECASE)
+
+
+def _redact_secret(text: str) -> str:
+    """Mask an apiKey=... query value in any string before logging (defence in
+    depth; header auth already keeps the key out of URLs)."""
+    return _APIKEY_RE.sub(r"\1REDACTED", text)
+
+
+class ForexMappingActivation:
+    """Explicit, key-free diagnostic of the runtime mapping activation."""
+
+    def __init__(self) -> None:
+        self.attempted = False
+        self.activated = False
+        self.reason: Optional[str] = None
+        self.confirmed: Dict[str, str] = {}
+        self.xau: Optional[Dict[str, str]] = None
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "attempted": self.attempted,
+            "activated": self.activated,
+            "reason": self.reason,
+            "confirmed_count": len(self.confirmed),
+            "xau": self.xau,  # {"ticker": "C:XAUUSD"} or None (reported, NOT integrated)
+        }
+
+
+massive_forex_activation = ForexMappingActivation()
+
+
+async def activate_massive_forex_mappings() -> Dict[str, object]:
+    """Runtime activation. No MASSIVE_API_KEY -> no call, mappings stay NOT_MAPPED,
+    backend stays healthy. With a key -> query the official ticker reference and
+    register ONLY the symbols really returned. Any failure (network/401/403/429/
+    timeout/invalid) is caught: explicit diagnostic, no mapping, never a crash. The
+    key is never logged (header auth + redaction)."""
+    state = massive_forex_activation
+    state.attempted = True
+    if not settings.massive_api_key:
+        state.reason = "MASSIVE_API_KEY not set; Massive forex mappings remain NOT_MAPPED"
+        return state.to_dict()
+    try:
+        tickers = await massive_forex_provider.list_forex_tickers()
+    except Exception as exc:  # noqa: BLE001 - must never fail the whole backend
+        state.reason = _redact_secret(str(exc))[:200] or "activation failed"
+        log.warning("Massive forex mapping activation failed: %s", _redact_secret(str(exc)))
+        return state.to_dict()
+    ticker_set = set(tickers)
+    for canonical, expected in EXPECTED_MASSIVE_FOREX.items():
+        if expected in ticker_set:  # verified present in the OFFICIAL response
+            register_massive_forex_symbol(canonical, expected)
+            state.confirmed[canonical] = expected
+    if MASSIVE_XAU_TICKER in ticker_set:
+        state.xau = {"ticker": MASSIVE_XAU_TICKER}  # reported only; NOT wired to Metal
+    state.activated = True
+    state.reason = (
+        f"activated {len(state.confirmed)}/{len(EXPECTED_MASSIVE_FOREX)} forex mappings"
+    )
+    return state.to_dict()
+
+
+@api_router.get("/market/forex/mappings")
+async def market_forex_mappings() -> dict:
+    mappings = []
+    for canonical in EXPECTED_MASSIVE_FOREX:
+        provider_symbol = provider_symbol_map.to_provider("massive", canonical)
+        mappings.append(
+            {
+                "canonical": canonical,
+                "provider_symbol": provider_symbol,
+                "status": "MAPPED" if provider_symbol else "NOT_MAPPED",
+            }
+        )
+    return {
+        "provider": "massive",
+        "asset_class": "FOREX",
+        "mappings": mappings,
+        "activation": massive_forex_activation.to_dict(),
+    }
 
 
 massive_forex_provider = MassiveForexProvider()
@@ -2225,6 +2344,8 @@ async def lifespan(app: FastAPI):
         )
     await market_provider.connect()
     await massive_forex_provider.connect()
+    activation = await activate_massive_forex_mappings()
+    log.info("Massive forex mapping activation: %s", activation)
     try:
         await init_candle_schema()
         persistence_state.mark_ready()

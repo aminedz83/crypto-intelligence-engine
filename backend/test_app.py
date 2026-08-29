@@ -7,6 +7,7 @@ than skipping.
 """
 
 import asyncio
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -609,3 +610,232 @@ class CandleEndpointTests(unittest.TestCase):
                 raise httpx.ConnectTimeout("timeout")
         r = self._client(FailingProvider()).get("/api/v1/market/candles/btc-usd")
         self.assertEqual(r.status_code, 503)
+
+
+# ----------------------------- realtime WS pipeline (Phase 2) -----------------
+from main import (  # noqa: E402
+    MarketBus,
+    MarketStateStore,
+    RealtimeDatum,
+    extract_candle_data,
+    extract_ticker_data,
+    parse_ws_message,
+)
+
+_RT_NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _ticker_msg(product_id, price, seq=1, ts="2026-08-24T12:00:00Z"):
+    return json.dumps({
+        "channel": "ticker",
+        "timestamp": ts,
+        "sequence_num": seq,
+        "events": [{"type": "update", "tickers": [
+            {"type": "ticker", "product_id": product_id, "price": price}
+        ]}],
+    })
+
+
+def _candle_msg(product_id, start, close="108", seq=1):
+    return json.dumps({
+        "channel": "candles",
+        "timestamp": "2026-08-24T12:00:00Z",
+        "sequence_num": seq,
+        "events": [{"type": "update", "candles": [
+            {"product_id": product_id, "start": str(start),
+             "low": "100", "high": "110", "open": "105", "close": close, "volume": "5"}
+        ]}],
+    })
+
+
+class WsParseTests(unittest.TestCase):
+    def test_parse_valid_message(self):
+        msg = parse_ws_message(_ticker_msg("BTC-USD", "50000"))
+        self.assertIsInstance(msg, dict)
+        self.assertEqual(msg["channel"], "ticker")
+
+    def test_parse_malformed_returns_none(self):
+        self.assertIsNone(parse_ws_message("{not json"))
+
+    def test_parse_non_object_returns_none(self):
+        self.assertIsNone(parse_ws_message("[1, 2, 3]"))
+
+
+class ExtractTickerTests(unittest.TestCase):
+    def test_valid_ticker_extracted(self):
+        msg = parse_ws_message(_ticker_msg("BTC-USD", "50000", ts="2026-08-24T11:59:58Z"))
+        data = extract_ticker_data(msg, received_at=_RT_NOW, now=_RT_NOW)
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0].product_id, "BTC-USD")
+        self.assertEqual(data[0].value, 50000.0)
+        self.assertEqual(data[0].data_type, "ticker")
+        self.assertEqual(data[0].sequence_num, 1)
+
+    def test_missing_tickers_yields_nothing(self):
+        msg = {"channel": "ticker", "timestamp": "2026-08-24T12:00:00Z",
+               "sequence_num": 1, "events": [{"type": "update"}]}
+        self.assertEqual(extract_ticker_data(msg, received_at=_RT_NOW), [])
+
+    def test_invalid_price_skipped(self):
+        msg = parse_ws_message(_ticker_msg("BTC-USD", "abc"))
+        self.assertEqual(extract_ticker_data(msg, received_at=_RT_NOW, now=_RT_NOW), [])
+
+
+class ExtractCandleTests(unittest.TestCase):
+    def test_valid_candle_extracted(self):
+        start = int((_RT_NOW - _td(seconds=60)).timestamp())
+        msg = parse_ws_message(_candle_msg("BTC-USD", start))
+        data = extract_candle_data(msg, received_at=_RT_NOW, now=_RT_NOW)
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0].data_type, "candle")
+        self.assertEqual(data[0].value, 108.0)
+        self.assertIsNotNone(data[0].ohlcv)
+
+
+class SequenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_in_order(self):
+        s = MarketStateStore()
+        self.assertEqual(await s.check_sequence(100), "first")
+        self.assertEqual(await s.check_sequence(101), "ok")
+
+    async def test_gap(self):
+        s = MarketStateStore()
+        await s.check_sequence(100)
+        self.assertEqual(await s.check_sequence(102), "gap")
+
+    async def test_out_of_order(self):
+        s = MarketStateStore()
+        await s.check_sequence(102)
+        self.assertEqual(await s.check_sequence(101), "out_of_order")
+
+    async def test_duplicate(self):
+        s = MarketStateStore()
+        await s.check_sequence(102)
+        self.assertEqual(await s.check_sequence(102), "duplicate")
+
+    async def test_reset_transport_no_false_out_of_order(self):
+        s = MarketStateStore()
+        await s.check_sequence(5000)
+        await s.reset_transport()
+        self.assertEqual(await s.check_sequence(3), "first")
+
+
+class PerProductStateTests(unittest.IsolatedAsyncioTestCase):
+    def _tick(self, product_id, price, ts):
+        return RealtimeDatum("coinbase", product_id, "ticker", price, ts, _RT_NOW,
+                             DataQualityStatus.VALID, 1)
+
+    def _candle(self, product_id, price, start, seq=1):
+        return RealtimeDatum("coinbase", product_id, "candle", price, start, _RT_NOW,
+                             DataQualityStatus.VALID, seq)
+
+    async def test_btc_eth_independent(self):
+        s = MarketStateStore()
+        await s.apply_ticker(self._tick("BTC-USD", 50000.0, _RT_NOW))
+        await s.apply_ticker(self._tick("ETH-USD", 3000.0, _RT_NOW - _td(seconds=100)))
+        btc = await s.get_ticker("BTC-USD")
+        eth = await s.get_ticker("ETH-USD")
+        self.assertEqual(btc.value, 50000.0)
+        self.assertEqual(eth.value, 3000.0)
+
+    async def test_older_ticker_does_not_overwrite(self):
+        s = MarketStateStore()
+        await s.apply_ticker(self._tick("BTC-USD", 50000.0, _RT_NOW))
+        applied = await s.apply_ticker(self._tick("BTC-USD", 49000.0, _RT_NOW - _td(seconds=10)))
+        self.assertFalse(applied)
+        btc = await s.get_ticker("BTC-USD")
+        self.assertEqual(btc.value, 50000.0)
+
+    async def test_invalid_ticker_not_stored(self):
+        s = MarketStateStore()
+        bad = RealtimeDatum("coinbase", "BTC-USD", "ticker", None, _RT_NOW, _RT_NOW,
+                            DataQualityStatus.INVALID, 1)
+        self.assertFalse(await s.apply_ticker(bad))
+        self.assertIsNone(await s.get_ticker("BTC-USD"))
+
+    async def test_candle_same_start_updates_in_place(self):
+        s = MarketStateStore()
+        await s.apply_candle(self._candle("BTC-USD", 100.0, _RT_NOW, seq=1))
+        applied = await s.apply_candle(self._candle("BTC-USD", 105.0, _RT_NOW, seq=2))
+        self.assertTrue(applied)
+        cur = await s.get_candle("BTC-USD")
+        self.assertEqual(cur.value, 105.0)
+
+    async def test_older_candle_bucket_not_overwrite(self):
+        s = MarketStateStore()
+        await s.apply_candle(self._candle("BTC-USD", 105.0, _RT_NOW, seq=2))
+        older = self._candle("BTC-USD", 100.0, _RT_NOW - _td(seconds=300), seq=1)
+        self.assertFalse(await s.apply_candle(older))
+        cur = await s.get_candle("BTC-USD")
+        self.assertEqual(cur.value, 105.0)
+
+
+class RealtimeStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_realtime_missing_when_empty(self):
+        s = MarketStateStore()
+        out = await s.get_realtime("BTC-USD")
+        self.assertEqual(out["status"], "MISSING")
+
+    async def test_heartbeat_not_in_price_store(self):
+        s = MarketStateStore()
+        await s.record_heartbeat(42, _RT_NOW)
+        self.assertIsNone(await s.get_ticker("BTC-USD"))
+        h = await s.health()
+        self.assertEqual(h["heartbeat_counter"], 42)
+
+
+class MarketBusTests(unittest.IsolatedAsyncioTestCase):
+    async def test_consumer_receives_published(self):
+        bus = MarketBus()
+        seen = []
+        bus.subscribe(lambda d: seen.append(d))
+        datum = RealtimeDatum("coinbase", "BTC-USD", "ticker", 1.0, _RT_NOW, _RT_NOW,
+                              DataQualityStatus.VALID, 1)
+        await bus.publish(datum)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].product_id, "BTC-USD")
+
+
+class RealtimeHandleTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._store = main.market_store
+        self._bus = main.market_bus
+        main.market_store = MarketStateStore()
+        main.market_bus = MarketBus()
+
+    async def asyncTearDown(self):
+        main.market_store = self._store
+        main.market_bus = self._bus
+
+    async def test_handle_ticker_stores(self):
+        ts = _RT_NOW.isoformat().replace("+00:00", "Z")
+        await main.market_ws._handle(_ticker_msg("BTC-USD", "50000", ts=ts))
+        d = await main.market_store.get_ticker("BTC-USD")
+        self.assertIsNotNone(d)
+        self.assertEqual(d.value, 50000.0)
+
+    async def test_handle_unknown_channel_ignored(self):
+        raw = json.dumps({"channel": "l2_data", "sequence_num": 1, "events": []})
+        await main.market_ws._handle(raw)
+        self.assertIsNone(await main.market_store.get_ticker("BTC-USD"))
+
+    async def test_handle_malformed_no_state_change(self):
+        await main.market_ws._handle("{bad json")
+        h = await main.market_store.health()
+        self.assertEqual(h["messages"], 0)
+        self.assertIsNone(await main.market_store.get_ticker("BTC-USD"))
+
+
+class RealtimeEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self._store = main.market_store
+        main.market_store = MarketStateStore()
+        self.client = TestClient(create_app())
+
+    def tearDown(self):
+        main.market_store = self._store
+
+    def test_realtime_missing_when_no_data(self):
+        r = self.client.get("/api/v1/market/realtime/btc-usd")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "MISSING")

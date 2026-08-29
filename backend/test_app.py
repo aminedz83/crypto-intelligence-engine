@@ -1441,3 +1441,209 @@ class CandlesSchemaUnchangedTests(unittest.TestCase):
 
     def test_table_name_unchanged(self):
         self.assertEqual(candles_table.name, "candles")
+
+
+# ----------------------------- Massive Forex REST 6B-1 ------------------------
+from main import (  # noqa: E402
+    MASSIVE_FOREX_PROFILE,
+    fetch_forex_history,
+    massive_agg_to_candle,
+    massive_aggs_to_candles,
+    persist_forex_result,
+    register_massive_forex_symbol,
+)
+
+_FX_BASE = int(datetime(2026, 8, 24, 0, 0, tzinfo=timezone.utc).timestamp())
+
+
+def _agg(k, close=1.1, vol=10.0):
+    return {"t": (_FX_BASE + k * 3600) * 1000, "o": 1.1, "h": 1.2, "l": 1.0,
+            "c": close, "v": vol}
+
+
+class FakeMassiveProvider:
+    def __init__(self, ks=None, raise_exc=None, invalid_ks=None):
+        self.ks = ks if ks is not None else [0, 1, 2]
+        self.raise_exc = raise_exc
+        self.invalid_ks = set(invalid_ks or [])
+
+    async def get_candles_range(self, canonical, granularity, start, end):
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        out = []
+        for k in self.ks:
+            item = _agg(k, close=1.1 + k)
+            if k in self.invalid_ks:
+                item = {"t": (_FX_BASE + k * 3600) * 1000, "o": "x"}  # invalid OHLC
+            out.append(massive_agg_to_candle(item, float("inf")))
+        return out, DataQualityStatus.VALID
+
+
+class MassiveParsingTests(unittest.TestCase):
+    def test_agg_parsed_ms_to_utc(self):
+        c = massive_agg_to_candle(_agg(0), float("inf"))
+        self.assertNotEqual(c.status, DataQualityStatus.INVALID)
+        self.assertEqual(int(c.start.timestamp()), _FX_BASE)
+
+    def test_invalid_ohlc_is_invalid(self):
+        c = massive_agg_to_candle({"t": _FX_BASE * 1000, "o": "x", "h": "1",
+                                   "l": "1", "c": "1", "v": "1"}, float("inf"))
+        self.assertEqual(c.status, DataQualityStatus.INVALID)
+
+    def test_malformed_response_missing(self):
+        candles, status = massive_aggs_to_candles({"no": "results"}, float("inf"))
+        self.assertEqual(candles, [])
+        self.assertEqual(status, DataQualityStatus.MISSING)
+
+    def test_empty_results_missing(self):
+        candles, status = massive_aggs_to_candles({"results": []}, float("inf"))
+        self.assertEqual(status, DataQualityStatus.MISSING)
+
+
+class MassiveInstrumentTests(unittest.TestCase):
+    def test_forex_instruments_registered(self):
+        inst = instrument_registry.get("EUR-USD")
+        self.assertIsNotNone(inst)
+        self.assertEqual(inst.asset_class, AssetClass.FOREX)
+
+    def test_forex_calendar_not_configured(self):
+        self.assertEqual(instrument_registry.get("EUR-USD").market_calendar,
+                         MarketCalendarPolicy.NOT_CONFIGURED)
+
+    def test_forex_volume_semantics_unknown(self):
+        self.assertEqual(instrument_registry.get("EUR-USD").volume_semantics,
+                         VolumeSemantics.UNKNOWN)
+
+    def test_no_financial_metadata_invented(self):
+        inst = instrument_registry.get("EUR-CAD")
+        self.assertIsNone(inst.price_precision)
+        self.assertIsNone(inst.tick_size)
+
+    def test_massive_symbol_not_mapped_by_default(self):
+        # rule: no provider_symbol registered by deduction -> NOT_MAPPED
+        self.assertIsNone(provider_symbol_map.to_provider("massive", "GBP-USD"))
+
+    def test_profile_capabilities_and_granularity(self):
+        self.assertTrue(MASSIVE_FOREX_PROFILE.supports(Capability.CANDLES_REST,
+                                                       AssetClass.FOREX))
+        self.assertFalse(MASSIVE_FOREX_PROFILE.supports(Capability.ORDER_BOOK,
+                                                        AssetClass.FOREX))
+        self.assertTrue(MASSIVE_FOREX_PROFILE.supports_granularity("5m", AssetClass.FOREX))
+        self.assertFalse(MASSIVE_FOREX_PROFILE.supports_granularity("3m", AssetClass.FOREX))
+
+
+class ForexHistoryAssemblerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._saved = main.massive_forex_provider
+        self._had = provider_symbol_map.to_provider("massive", "EUR-USD")
+        register_massive_forex_symbol("EUR-USD", "C:EURUSD")
+
+    def tearDown(self):
+        main.massive_forex_provider = self._saved
+        # keep mapping registered across tests is fine (verified in-test only)
+
+    async def test_not_mapped_failsafe(self):
+        # USD-CHF has no mapping -> NOT_MAPPED, no fetch
+        main.massive_forex_provider = FakeMassiveProvider()
+        r = await fetch_forex_history("USD-CHF", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
+        self.assertEqual(r["status"], "NOT_MAPPED")
+        self.assertEqual(r["candles"], [])
+
+    async def test_ok_sorted_and_deduped(self):
+        main.massive_forex_provider = FakeMassiveProvider(ks=[2, 0, 1, 1])
+        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
+        self.assertEqual(r["status"], "OK")
+        self.assertEqual(r["count"], 3)  # deduped
+        starts = [c["start"] for c in r["candles"]]
+        self.assertEqual(starts, sorted(starts))
+
+    async def test_absence_is_not_coinbase_gap(self):
+        # hole at k=2; forex calendar NOT_CONFIGURED -> gaps UNKNOWN, never a gap
+        main.massive_forex_provider = FakeMassiveProvider(ks=[0, 1, 3])
+        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
+        self.assertEqual(r["gaps_status"], "UNKNOWN")
+        self.assertEqual(r["gaps"], [])
+        self.assertFalse(r["data_complete"])
+        self.assertEqual(r["count"], 3)  # no fabricated bar
+
+    async def test_invalid_candle_counted(self):
+        main.massive_forex_provider = FakeMassiveProvider(ks=[0, 1, 2], invalid_ks=[1])
+        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
+        self.assertEqual(r["invalid_candles_count"], 1)
+        self.assertEqual(r["count"], 2)
+
+    async def test_half_open_range_filter(self):
+        main.massive_forex_provider = FakeMassiveProvider(ks=[0, 1, 2])
+        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 2 * 3600)
+        self.assertEqual(r["count"], 2)  # k=2 (== end) excluded
+
+    async def test_volume_semantics_unknown_in_result(self):
+        main.massive_forex_provider = FakeMassiveProvider()
+        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
+        self.assertEqual(r["volume_semantics"], "UNKNOWN")
+
+    async def test_provider_timeout_unavailable(self):
+        main.massive_forex_provider = FakeMassiveProvider(raise_exc=httpx.TimeoutException("t"))
+        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
+        self.assertEqual(r["status"], "UNAVAILABLE")
+
+    async def test_http_error_unavailable(self):
+        main.massive_forex_provider = FakeMassiveProvider(raise_exc=httpx.ConnectError("x"))
+        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
+        self.assertEqual(r["status"], "UNAVAILABLE")
+
+    async def test_unsupported_granularity_raises(self):
+        main.massive_forex_provider = FakeMassiveProvider()
+        with self.assertRaises(ValueError):
+            await fetch_forex_history("EUR-USD", "3m", _FX_BASE, _FX_BASE + 5 * 3600)
+
+    async def test_start_ge_end_raises(self):
+        main.massive_forex_provider = FakeMassiveProvider()
+        with self.assertRaises(ValueError):
+            await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE)
+
+    async def test_unknown_instrument_raises(self):
+        with self.assertRaises(ValueError):
+            await fetch_forex_history("ZZZ-ZZZ", "1h", _FX_BASE, _FX_BASE + 3600)
+
+
+class ForexEndpointTests(unittest.TestCase):
+    def setUp(self):
+        register_massive_forex_symbol("EUR-USD", "C:EURUSD")
+
+    def test_forex_not_mapped_409(self):
+        # NZD-USD unmapped -> 409
+        r = TestClient(create_app()).get(
+            "/api/v1/market/forex/NZD-USD/history?granularity=1h&start=%d&end=%d"
+            % (_FX_BASE, _FX_BASE + 3600)
+        )
+        self.assertEqual(r.status_code, 409)
+
+    def test_forex_bad_granularity_400(self):
+        r = TestClient(create_app()).get(
+            "/api/v1/market/forex/EUR-USD/history?granularity=3m&start=%d&end=%d"
+            % (_FX_BASE, _FX_BASE + 3600)
+        )
+        self.assertEqual(r.status_code, 400)
+
+
+class ForexPersistenceTests(_DBBase):
+    async def test_forex_persisted_under_massive_source(self):
+        register_massive_forex_symbol("EUR-USD", "C:EURUSD")
+        saved = main.massive_forex_provider
+        main.massive_forex_provider = FakeMassiveProvider(ks=[0, 1, 2])
+        try:
+            r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
+            n = await persist_forex_result(r)
+            self.assertEqual(n, 3)
+            async with main.engine.connect() as conn:
+                res = await conn.execute(
+                    main.text("SELECT count(*) FROM candles WHERE source='massive'")
+                )
+                self.assertEqual(res.scalar(), 3)
+                res2 = await conn.execute(
+                    main.text("SELECT count(*) FROM candles WHERE source='coinbase'")
+                )
+                self.assertEqual(res2.scalar(), 0)  # no Coinbase regression
+        finally:
+            main.massive_forex_provider = saved

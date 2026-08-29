@@ -842,3 +842,214 @@ class RealtimeEndpointTests(unittest.TestCase):
         r = self.client.get("/api/v1/market/realtime/btc-usd")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["status"], "MISSING")
+
+
+# ----------------------------- paginated history (Phase 2) --------------------
+from main import (  # noqa: E402
+    PROVIDER_SAFE_BUCKETS,
+    fetch_candle_history,
+    max_history_span,
+    plan_candle_windows,
+)
+
+_H = 3600  # ONE_HOUR bucket seconds
+
+
+def _hist_candle(start_unix, close=100.0, status=DataQualityStatus.VALID):
+    dt = datetime.fromtimestamp(start_unix, tz=timezone.utc)
+    return Candle(dt, 90.0, 110.0, 95.0, close, 5.0, status)
+
+
+class FakeRangeProvider:
+    """Simulates Coinbase get_candles_range over a set of available starts.
+    `inclusive` toggles end-boundary semantics to prove robustness either way."""
+
+    def __init__(self, available, bucket=_H, inclusive=True, fail_on=None, invalid=None):
+        self.available = sorted(available)
+        self.bucket = bucket
+        self.inclusive = inclusive
+        self.fail_on = set(fail_on or [])
+        self.invalid = set(invalid or [])
+        self.calls = 0
+
+    async def get_candles_range(self, symbol, granularity, start, end):
+        self.calls += 1
+        if start in self.fail_on:
+            raise httpx.ConnectError("window failed")
+        out = []
+        for s in self.available:
+            inside = (start <= s <= end) if self.inclusive else (start <= s < end)
+            if inside:
+                st = DataQualityStatus.INVALID if s in self.invalid else DataQualityStatus.VALID
+                out.append(_hist_candle(s, status=st))
+        return out, DataQualityStatus.VALID
+
+
+class PlanWindowsTests(unittest.TestCase):
+    def test_small_range_one_window(self):
+        self.assertEqual(len(plan_candle_windows("1h", 0, 3 * _H)), 1)
+
+    def test_safe_width_one_window(self):
+        self.assertEqual(len(plan_candle_windows("1h", 0, PROVIDER_SAFE_BUCKETS * _H)), 1)
+
+    def test_350_buckets_two_windows(self):
+        self.assertEqual(len(plan_candle_windows("1h", 0, 350 * _H)), 2)
+
+    def test_multiple_windows_count(self):
+        self.assertEqual(len(plan_candle_windows("1h", 0, 700 * _H)), 3)
+
+    def test_bucket_math_per_granularity(self):
+        # 15m bucket = 900s; 350 buckets -> 2 windows
+        self.assertEqual(len(plan_candle_windows("15m", 0, 350 * 900)), 2)
+
+    def test_exact_bounds(self):
+        w = plan_candle_windows("1h", 0, 700 * _H)
+        self.assertEqual(w[0], (0, PROVIDER_SAFE_BUCKETS * _H))
+        self.assertEqual(w[1][0], PROVIDER_SAFE_BUCKETS * _H)
+
+    def test_window_never_exceeds_350_starts(self):
+        w = plan_candle_windows("1h", 0, 5000 * _H)
+        self.assertTrue(all((e - s) // _H <= 349 for s, e in w))
+
+    def test_misaligned_raises(self):
+        with self.assertRaises(ValueError):
+            plan_candle_windows("1h", 1, 3 * _H)
+
+    def test_start_ge_end_raises(self):
+        with self.assertRaises(ValueError):
+            plan_candle_windows("1h", 3 * _H, 3 * _H)
+
+    def test_unknown_granularity_raises(self):
+        with self.assertRaises(ValueError):
+            plan_candle_windows("4m", 0, 3 * _H)
+
+
+class MaxHistorySpanTests(unittest.TestCase):
+    def test_scales_with_granularity(self):
+        self.assertEqual(max_history_span("1h"), PROVIDER_SAFE_BUCKETS * _H * 20)
+        self.assertGreater(max_history_span("1d"), max_history_span("1h"))
+
+
+class HistoryAssemblerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._orig = main.market_provider
+
+    def tearDown(self):
+        main.market_provider = self._orig
+
+    async def _run(self, provider, start, end, gran="1h"):
+        main.market_provider = provider
+        return await fetch_candle_history("BTC-USD", gran, start, end)
+
+    async def test_end_inclusive_all_found_after_dedup(self):
+        avail = [i * _H for i in range(350)]
+        res = await self._run(FakeRangeProvider(avail, inclusive=True), 0, 350 * _H)
+        self.assertEqual(res["count"], 350)
+        self.assertEqual(res["status"], "COMPLETE")
+        self.assertTrue(res["data_complete"])
+
+    async def test_end_exclusive_all_found(self):
+        avail = [i * _H for i in range(350)]
+        res = await self._run(FakeRangeProvider(avail, inclusive=False), 0, 350 * _H)
+        self.assertEqual(res["count"], 350)
+
+    async def test_duplicate_boundary_single_candle(self):
+        avail = [i * _H for i in range(350)]
+        res = await self._run(FakeRangeProvider(avail, inclusive=True), 0, 350 * _H)
+        starts = [c["start"] for c in res["candles"]]
+        self.assertEqual(len(starts), len(set(starts)))
+
+    async def test_sorted_chronological(self):
+        avail = [i * _H for i in range(10)]
+        res = await self._run(FakeRangeProvider(avail), 0, 10 * _H)
+        starts = [c["start"] for c in res["candles"]]
+        self.assertEqual(starts, sorted(starts))
+
+    async def test_half_open_range_filter(self):
+        avail = [0, _H, 2 * _H]
+        res = await self._run(FakeRangeProvider(avail, inclusive=True), 0, 2 * _H)
+        # end (2*_H) excluded by [start, end)
+        self.assertEqual(res["count"], 2)
+
+    async def test_empty_is_EMPTY(self):
+        res = await self._run(FakeRangeProvider([]), 0, 10 * _H)
+        self.assertEqual(res["status"], "EMPTY")
+        self.assertEqual(res["count"], 0)
+        self.assertFalse(res["data_complete"])
+
+    async def test_gap_marks_incomplete_without_fabrication(self):
+        avail = [0, _H, 3 * _H, 4 * _H]  # missing 2*_H
+        res = await self._run(FakeRangeProvider(avail), 0, 5 * _H)
+        self.assertTrue(res["gaps"])
+        self.assertFalse(res["data_complete"])
+        self.assertEqual(res["status"], "PARTIAL")
+        self.assertEqual(res["count"], 4)  # no fabricated candle
+
+    async def test_invalid_candle_counted_and_incomplete(self):
+        avail = [0, _H, 2 * _H]
+        res = await self._run(
+            FakeRangeProvider(avail, invalid={_H}), 0, 3 * _H
+        )
+        self.assertEqual(res["invalid_candles_count"], 1)
+        self.assertFalse(res["data_complete"])
+
+    async def test_window_failure_is_partial(self):
+        avail = [i * _H for i in range(350)]
+        # second window starts at PROVIDER_SAFE_BUCKETS*_H
+        provider = FakeRangeProvider(avail, fail_on={PROVIDER_SAFE_BUCKETS * _H})
+        res = await self._run(provider, 0, 350 * _H)
+        self.assertEqual(res["status"], "PARTIAL")
+        self.assertEqual(res["provider_windows"]["failed"], 1)
+        self.assertFalse(res["transport_complete"])
+
+    async def test_complete_when_all_good(self):
+        avail = [i * _H for i in range(10)]
+        res = await self._run(FakeRangeProvider(avail), 0, 10 * _H)
+        self.assertEqual(res["status"], "COMPLETE")
+        self.assertTrue(res["transport_complete"])
+        self.assertTrue(res["data_complete"])
+
+
+class HistoryEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self._orig = main.market_provider
+
+    def tearDown(self):
+        main.market_provider = self._orig
+
+    def _client(self, provider):
+        main.market_provider = provider
+        return TestClient(create_app())
+
+    def test_history_ok(self):
+        avail = [i * _H for i in range(5)]
+        r = self._client(FakeRangeProvider(avail)).get(
+            "/api/v1/market/candles/btc-usd/history?granularity=1h&start=0&end=" + str(5 * _H)
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["count"], 5)
+
+    def test_history_misaligned_400(self):
+        r = TestClient(create_app()).get(
+            "/api/v1/market/candles/btc-usd/history?granularity=1h&start=1&end=" + str(3 * _H)
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_history_start_ge_end_400(self):
+        r = TestClient(create_app()).get(
+            "/api/v1/market/candles/btc-usd/history?granularity=1h&start=3600&end=3600"
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_history_range_too_large_400(self):
+        too_big = PROVIDER_SAFE_BUCKETS * _H * 20 + _H
+        r = TestClient(create_app()).get(
+            "/api/v1/market/candles/btc-usd/history?granularity=1h&start=0&end=" + str(too_big)
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_history_unknown_granularity_400(self):
+        r = TestClient(create_app()).get(
+            "/api/v1/market/candles/btc-usd/history?granularity=4m&start=0&end=3600"
+        )
+        self.assertEqual(r.status_code, 400)

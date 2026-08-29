@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 import httpx
 import redis.asyncio as aioredis
@@ -541,13 +541,14 @@ class MarketWsManager:
                 ) as ws:
                     self.websocket = ws
                     self.attempt = 0
+                    await market_store.reset_transport()
                     for channel, prods in list(self.subscriptions.items()):
                         await ws.send(json.dumps(self.build_subscribe(channel, sorted(prods))))
                     # Heartbeats keep sparse subscriptions open (Coinbase docs).
                     await ws.send(json.dumps({"type": "subscribe", "channel": "heartbeats"}))
                     async for raw in ws:
                         self.last_message_at = utcnow()
-                        self._handle(raw)
+                        await self._handle(raw)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -559,16 +560,30 @@ class MarketWsManager:
                 log.warning("Coinbase WS disconnected: %s - reconnecting in %.1fs", exc, delay)
                 await asyncio.sleep(delay)
 
-    def _handle(self, raw: str | bytes) -> None:  # pragma: no cover - needs a live socket
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            log.warning("Ignoring invalid JSON from Coinbase WS")
-            return
-        if isinstance(msg, dict) and msg.get("type") == "error":
-            log.error("Coinbase WS error: %s", msg)
-        # Distribution of real ticks to consumers is a later increment; nothing is
-        # fabricated here.
+    async def _handle(self, raw: str | bytes) -> None:
+        received_at = utcnow()
+        msg = parse_ws_message(raw)
+        if msg is None:
+            return  # malformed -> no state change, no fabricated data
+        channel = msg.get("channel")
+        await market_store.check_sequence(msg.get("sequence_num"))
+        if channel in WS_TICKER_TYPES:
+            for datum in extract_ticker_data(msg, received_at):
+                await market_store.apply_ticker(datum)
+                await market_bus.publish(datum)
+        elif channel == "candles":
+            for datum in extract_candle_data(msg, received_at):
+                await market_store.apply_candle(datum)
+                await market_bus.publish(datum)
+        elif channel == "heartbeats":
+            events = msg.get("events")
+            counter = None
+            if isinstance(events, list) and events and isinstance(events[0], dict):
+                counter = events[0].get("heartbeat_counter")
+            await market_store.record_heartbeat(
+                counter if isinstance(counter, int) else None, received_at
+            )
+        # unknown channel -> ignored (no fabricated data)
 
     async def health_check(self) -> Dict[str, object]:
         connected = self.websocket is not None
@@ -641,7 +656,9 @@ async def market_ws_subscribe(req: WsSubscribeRequest) -> dict:
 
 @api_router.get("/market/websocket/health")
 async def market_ws_health() -> dict:
-    return await market_ws.health_check()
+    connection = await market_ws.health_check()
+    transport = await market_store.health()
+    return {"connection": connection, "transport": transport}
 
 
 # ---- candles (Coinbase Advanced Trade, verified OpenAPI) --------------------
@@ -769,6 +786,323 @@ async def market_candles(
         "quality": status.value,
         "candles": [c.to_dict() for c in candles],
     }
+
+
+# ============================ realtime pipeline (increment 3) =================
+# Turn REAL Coinbase Advanced Trade WS messages into qualified internal data.
+# Verified envelope (docs.cdp.coinbase.com): {channel, timestamp (server send
+# time, ISO8601), sequence_num (PER-CONNECTION), events:[{type: snapshot|update,
+# ...}]}.  ticker -> events[].tickers[] (price, product_id); market/server time =
+# envelope timestamp. candles -> events[].candles[] (start, OHLCV, product_id);
+# WS candles are 5-minute buckets refreshed every second (same `start` UPDATES
+# the bucket, it is NOT a duplicate). heartbeats -> connection health only.
+#
+# Two-layer integrity: (1) per-connection sequence_num for transport gap/dup/
+# out-of-order diagnostics; (2) per-product ordering by real timestamp so an
+# older update never overwrites a newer state. No fabricated data or sequence.
+
+WS_TICKER_TYPES = {"ticker", "ticker_batch"}
+WS_CANDLE_MAX_AGE_SECONDS = 330.0  # 5-min bucket + buffer
+
+
+@dataclass(frozen=True)
+class RealtimeDatum:
+    source: str
+    product_id: str
+    data_type: str  # "ticker" | "candle"
+    value: Optional[float]  # ticker price, or candle close
+    source_timestamp: Optional[datetime]  # ticker: server send time; candle: bucket start
+    received_at: datetime
+    status: DataQualityStatus
+    sequence_num: Optional[int]
+    ohlcv: Optional[Dict[str, float]] = None  # candles only
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "source": self.source,
+            "product_id": self.product_id,
+            "data_type": self.data_type,
+            "value": self.value,
+            "source_timestamp": (
+                self.source_timestamp.isoformat() if self.source_timestamp else None
+            ),
+            "received_at": self.received_at.isoformat(),
+            "quality": self.status.value,
+            "sequence_num": self.sequence_num,
+            "ohlcv": self.ohlcv,
+        }
+
+
+def parse_ws_message(raw: Any) -> Optional[dict]:
+    """json.loads a raw WS frame -> dict envelope, or None if malformed / not a
+    JSON object. Never fabricates a message."""
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except (UnicodeDecodeError, AttributeError):
+            return None
+    if not isinstance(raw, str):
+        return None
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return msg if isinstance(msg, dict) else None
+
+
+def extract_ticker_data(
+    msg: dict, received_at: datetime, now: Optional[datetime] = None
+) -> List[RealtimeDatum]:
+    """Pure: qualified ticker data from a ticker/ticker_batch envelope. Invalid
+    entries are skipped, never fabricated."""
+    out: List[RealtimeDatum] = []
+    seq = msg.get("sequence_num")
+    seq_num = seq if isinstance(seq, int) else None
+    server_ts = parse_iso8601(msg.get("timestamp"))
+    events = msg.get("events")
+    if not isinstance(events, list):
+        return out
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        tickers = event.get("tickers")
+        if not isinstance(tickers, list):
+            continue
+        for tick in tickers:
+            if not isinstance(tick, dict):
+                continue
+            product_id = tick.get("product_id")
+            if not isinstance(product_id, str) or not product_id:
+                continue
+            price = _to_float(tick.get("price"))
+            if price is None or price <= 0:
+                continue
+            status = classify_freshness(server_ts, settings.ticker_max_age_seconds, now=now)
+            out.append(
+                RealtimeDatum(
+                    source="coinbase",
+                    product_id=product_id,
+                    data_type="ticker",
+                    value=price,
+                    source_timestamp=server_ts,
+                    received_at=received_at,
+                    status=status,
+                    sequence_num=seq_num,
+                )
+            )
+    return out
+
+
+def extract_candle_data(
+    msg: dict, received_at: datetime, now: Optional[datetime] = None
+) -> List[RealtimeDatum]:
+    """Pure: qualified candle data from a candles envelope. WS candles are 5-min
+    buckets refreshed every second; `start` identifies the bucket."""
+    out: List[RealtimeDatum] = []
+    seq = msg.get("sequence_num")
+    seq_num = seq if isinstance(seq, int) else None
+    events = msg.get("events")
+    if not isinstance(events, list):
+        return out
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        candles = event.get("candles")
+        if not isinstance(candles, list):
+            continue
+        for item in candles:
+            if not isinstance(item, dict):
+                continue
+            product_id = item.get("product_id")
+            if not isinstance(product_id, str) or not product_id:
+                continue
+            candle = candle_from_payload(item, WS_CANDLE_MAX_AGE_SECONDS, now=now)
+            ohlcv: Optional[Dict[str, float]] = None
+            value: Optional[float] = None
+            if (
+                candle.status != DataQualityStatus.INVALID
+                and candle.open is not None
+                and candle.high is not None
+                and candle.low is not None
+                and candle.close is not None
+                and candle.volume is not None
+            ):
+                value = candle.close
+                ohlcv = {
+                    "open": candle.open,
+                    "high": candle.high,
+                    "low": candle.low,
+                    "close": candle.close,
+                    "volume": candle.volume,
+                }
+            out.append(
+                RealtimeDatum(
+                    source="coinbase",
+                    product_id=product_id,
+                    data_type="candle",
+                    value=value,
+                    source_timestamp=candle.start,
+                    received_at=received_at,
+                    status=candle.status,
+                    sequence_num=seq_num,
+                    ohlcv=ohlcv,
+                )
+            )
+    return out
+
+
+class MarketBus:
+    """Fan-out of qualified realtime data to registered consumers. Future Chart /
+    Signal engines and persistence subscribe here without touching the WS manager."""
+
+    def __init__(self) -> None:
+        self._consumers: List[Callable[[RealtimeDatum], Any]] = []
+
+    def subscribe(self, consumer: Callable[[RealtimeDatum], Any]) -> None:
+        self._consumers.append(consumer)
+
+    async def publish(self, datum: RealtimeDatum) -> None:
+        for consumer in list(self._consumers):
+            result = consumer(datum)
+            if asyncio.iscoroutine(result):
+                await result
+
+
+class MarketStateStore:
+    """Single in-memory source of truth for realtime data, guarded by one lock.
+
+    Transport integrity uses the per-connection sequence_num; per-product state
+    ordering uses each datum's real timestamp. Malformed / invalid data never
+    overwrites a valid last state, and no value or sequence is fabricated."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._tickers: Dict[str, RealtimeDatum] = {}
+        self._candles: Dict[str, RealtimeDatum] = {}
+        self._last_sequence: Optional[int] = None
+        self._gaps = 0
+        self._duplicates = 0
+        self._out_of_order = 0
+        self._messages = 0
+        self._heartbeat_counter: Optional[int] = None
+        self._last_heartbeat_at: Optional[datetime] = None
+
+    async def reset_transport(self) -> None:
+        """Called on every new/reconnected socket: never compare a new socket's
+        first sequence with the previous connection's last one."""
+        async with self._lock:
+            self._last_sequence = None
+
+    async def check_sequence(self, seq: Optional[int]) -> str:
+        async with self._lock:
+            self._messages += 1
+            if not isinstance(seq, int):
+                return "unknown"
+            if self._last_sequence is None:
+                self._last_sequence = seq
+                return "first"
+            if seq == self._last_sequence + 1:
+                self._last_sequence = seq
+                return "ok"
+            if seq > self._last_sequence + 1:
+                self._gaps += seq - self._last_sequence - 1
+                self._last_sequence = seq
+                return "gap"
+            if seq == self._last_sequence:
+                self._duplicates += 1
+                return "duplicate"
+            self._out_of_order += 1
+            return "out_of_order"
+
+    async def apply_ticker(self, datum: RealtimeDatum) -> bool:
+        if datum.status in (DataQualityStatus.INVALID, DataQualityStatus.MISSING):
+            return False
+        if datum.value is None:
+            return False
+        async with self._lock:
+            prev = self._tickers.get(datum.product_id)
+            if (
+                prev is not None
+                and prev.source_timestamp is not None
+                and datum.source_timestamp is not None
+                and datum.source_timestamp < prev.source_timestamp
+            ):
+                return False  # strictly older than stored -> keep the newer state
+            self._tickers[datum.product_id] = datum
+            return True
+
+    async def apply_candle(self, datum: RealtimeDatum) -> bool:
+        if datum.status == DataQualityStatus.INVALID:
+            return False
+        async with self._lock:
+            prev = self._candles.get(datum.product_id)
+            if (
+                prev is not None
+                and prev.source_timestamp is not None
+                and datum.source_timestamp is not None
+                and datum.source_timestamp < prev.source_timestamp
+            ):
+                return False  # earlier bucket than stored -> do not overwrite
+            # same `start` is allowed: the live 5-min bucket updates in place.
+            self._candles[datum.product_id] = datum
+            return True
+
+    async def record_heartbeat(self, counter: Optional[int], at: datetime) -> None:
+        async with self._lock:
+            if isinstance(counter, int):
+                self._heartbeat_counter = counter
+            self._last_heartbeat_at = at
+
+    async def get_ticker(self, product_id: str) -> Optional[RealtimeDatum]:
+        async with self._lock:
+            return self._tickers.get(product_id)
+
+    async def get_candle(self, product_id: str) -> Optional[RealtimeDatum]:
+        async with self._lock:
+            return self._candles.get(product_id)
+
+    async def get_realtime(self, product_id: str) -> Dict[str, object]:
+        async with self._lock:
+            ticker = self._tickers.get(product_id)
+            candle = self._candles.get(product_id)
+        if ticker is None and candle is None:
+            return {
+                "product_id": product_id,
+                "status": DataQualityStatus.MISSING.value,
+                "ticker": None,
+                "candle": None,
+            }
+        return {
+            "product_id": product_id,
+            "status": DataQualityStatus.VALID.value,
+            "ticker": ticker.to_dict() if ticker else None,
+            "candle": candle.to_dict() if candle else None,
+        }
+
+    async def health(self) -> Dict[str, object]:
+        async with self._lock:
+            products = sorted(set(self._tickers) | set(self._candles))
+            return {
+                "messages": self._messages,
+                "last_sequence_num": self._last_sequence,
+                "gaps_detected": self._gaps,
+                "duplicates_detected": self._duplicates,
+                "out_of_order_detected": self._out_of_order,
+                "heartbeat_counter": self._heartbeat_counter,
+                "last_heartbeat_at": (
+                    self._last_heartbeat_at.isoformat() if self._last_heartbeat_at else None
+                ),
+                "products_tracked": products,
+            }
+
+
+market_store = MarketStateStore()
+market_bus = MarketBus()
+
+
+@api_router.get("/market/realtime/{symbol}")
+async def market_realtime(symbol: str) -> dict:
+    return await market_store.get_realtime(symbol.upper())
 
 
 # ============================ frontend serving ============================

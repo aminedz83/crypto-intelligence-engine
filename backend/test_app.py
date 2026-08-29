@@ -448,7 +448,10 @@ class MarketEndpointTests(unittest.TestCase):
         client = TestClient(create_app())
         r = client.get("/api/v1/market/websocket/health")
         self.assertEqual(r.status_code, 200)
-        self.assertIn("connected", r.json())
+        body = r.json()
+        self.assertIn("connection", body)
+        self.assertIn("transport", body)
+        self.assertIn("connected", body["connection"])
 
 
 class CoinbaseProviderConfigTests(unittest.TestCase):

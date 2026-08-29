@@ -1282,3 +1282,162 @@ class StoredEndpointTests(unittest.TestCase):
             "/api/v1/market/candles/btc-usd/stored?granularity=1h&start=3600&end=3600"
         )
         self.assertEqual(r.status_code, 400)
+
+
+# ----------------------------- multi-asset 6A --------------------------------
+from main import (  # noqa: E402
+    COINBASE_PROFILE,
+    AssetClass,
+    Capability,
+    Instrument,
+    MarketAvailability,
+    MarketCalendarPolicy,
+    OpenState,
+    ProviderProfile,
+    ProviderSymbolMap,
+    VolumeSemantics,
+    calendar_for,
+    candles_table,
+    instrument_registry,
+    provider_symbol_map,
+)
+
+
+class RegistryMappingTests(unittest.TestCase):
+    def test_coinbase_instrument_registered(self):
+        inst = instrument_registry.get("BTC-USD")
+        self.assertIsNotNone(inst)
+        self.assertEqual(inst.asset_class, AssetClass.CRYPTO)
+
+    def test_canonical_stable(self):
+        self.assertIs(instrument_registry.get("BTC-USD"), instrument_registry.get("BTC-USD"))
+
+    def test_mapping_coinbase_to_canonical(self):
+        self.assertEqual(provider_symbol_map.to_canonical("coinbase", "BTC-USD"), "BTC-USD")
+
+    def test_canonical_can_differ_from_provider_symbol(self):
+        m = ProviderSymbolMap()
+        m.add("provX", "XAU-USD", "XAU/USD")
+        self.assertEqual(m.to_canonical("provX", "XAU/USD"), "XAU-USD")
+        self.assertNotEqual(m.to_provider("provX", "XAU-USD"), "XAU-USD")
+
+    def test_two_providers_same_canonical(self):
+        m = ProviderSymbolMap()
+        m.add("a", "XAU-USD", "XAU/USD")
+        m.add("b", "XAU-USD", "XAUUSD")
+        self.assertEqual(m.to_canonical("a", "XAU/USD"), "XAU-USD")
+        self.assertEqual(m.to_canonical("b", "XAUUSD"), "XAU-USD")
+
+    def test_provider_symbol_not_global_identity(self):
+        # a raw provider symbol is NOT a canonical identity
+        self.assertIsNone(instrument_registry.get("XAUUSD"))
+
+    def test_unknown_instrument_failsafe(self):
+        self.assertIsNone(instrument_registry.get("DOES-NOT-EXIST"))
+
+    def test_unknown_provider_failsafe(self):
+        self.assertIsNone(provider_symbol_map.to_canonical("ghost", "BTC-USD"))
+
+    def test_unmapped_is_none(self):
+        self.assertIsNone(provider_symbol_map.to_provider("coinbase", "XAU-USD"))
+
+
+class AssetMetadataTests(unittest.TestCase):
+    def test_distinct_asset_classes(self):
+        self.assertEqual(
+            {AssetClass.CRYPTO, AssetClass.FOREX, AssetClass.METAL, AssetClass.INDEX},
+            set(AssetClass),
+        )
+
+    def test_no_metadata_inferred_from_symbol(self):
+        # unverified financial metadata stays None/UNKNOWN, never guessed
+        xau = Instrument("XAU-USD", AssetClass.METAL, "XAU", "USD", "Gold / USD",
+                         "UTC", MarketCalendarPolicy.NOT_CONFIGURED, VolumeSemantics.UNKNOWN)
+        self.assertIsNone(xau.price_precision)
+        self.assertIsNone(xau.tick_size)
+        self.assertEqual(xau.volume_semantics, VolumeSemantics.UNKNOWN)
+
+    def test_coinbase_volume_semantics(self):
+        self.assertEqual(
+            instrument_registry.get("BTC-USD").volume_semantics,
+            VolumeSemantics.BASE_ASSET_VOLUME,
+        )
+
+    def test_instrument_timezone_stored(self):
+        self.assertEqual(instrument_registry.get("BTC-USD").timezone, "UTC")
+
+    def test_market_availability_distinct_from_quality(self):
+        # orthogonal axes: a market close is not a data-quality value
+        self.assertNotIn(MarketAvailability.CLOSED.value,
+                         {s.value for s in [DataQualityStatus.MISSING,
+                                            DataQualityStatus.INVALID]})
+
+
+class CapabilityTests(unittest.TestCase):
+    def test_coinbase_supports_candles_rest(self):
+        self.assertTrue(COINBASE_PROFILE.supports(Capability.CANDLES_REST, AssetClass.CRYPTO))
+
+    def test_missing_capability_not_supported(self):
+        self.assertFalse(COINBASE_PROFILE.supports(Capability.ORDER_BOOK, AssetClass.CRYPTO))
+
+    def test_capabilities_per_asset_class(self):
+        prof = ProviderProfile(
+            "demo",
+            {AssetClass.FOREX: {Capability.HISTORY_INTRADAY},
+             AssetClass.METAL: {Capability.HISTORY_DAILY}},
+            {AssetClass.FOREX: {"1m"}, AssetClass.METAL: {"1d"}},
+        )
+        self.assertTrue(prof.supports(Capability.HISTORY_INTRADAY, AssetClass.FOREX))
+        self.assertFalse(prof.supports(Capability.HISTORY_INTRADAY, AssetClass.METAL))
+
+    def test_granularity_supported_or_not(self):
+        self.assertTrue(COINBASE_PROFILE.supports_granularity("1m", AssetClass.CRYPTO))
+        self.assertFalse(COINBASE_PROFILE.supports_granularity("3m", AssetClass.CRYPTO))
+
+
+class CalendarTests(unittest.TestCase):
+    def test_always_24_7_open_everywhere(self):
+        cal = calendar_for(MarketCalendarPolicy.ALWAYS_OPEN_24_7)
+        self.assertEqual(cal.is_market_expected_open(0), OpenState.OPEN)
+        self.assertEqual(cal.is_market_expected_open(10**12), OpenState.OPEN)
+
+    def test_always_24_7_expected_grid(self):
+        cal = calendar_for(MarketCalendarPolicy.ALWAYS_OPEN_24_7)
+        self.assertEqual(cal.expected_bucket_starts("1h", 0, 3 * 3600), [0, 3600, 7200])
+
+    def test_absence_during_open_is_gap(self):
+        cal = calendar_for(MarketCalendarPolicy.ALWAYS_OPEN_24_7)
+        rep = cal.analyze_gaps([0, 3600, 10800], 3600)  # missing 7200
+        self.assertEqual(rep.status, "ANALYZED")
+        self.assertTrue(rep.missing)
+
+    def test_gap_24_7_matches_legacy(self):
+        cal = calendar_for(MarketCalendarPolicy.ALWAYS_OPEN_24_7)
+        starts = [0, 3600, 10800, 14400]
+        self.assertEqual(cal.analyze_gaps(starts, 3600).missing,
+                         main._missing_buckets_24_7(starts, 3600))
+
+    def test_not_configured_never_open_or_closed(self):
+        cal = calendar_for(MarketCalendarPolicy.NOT_CONFIGURED)
+        self.assertEqual(cal.is_market_expected_open(0), OpenState.UNKNOWN)
+
+    def test_not_configured_placeholder_not_invented(self):
+        # a declared-but-not-implemented policy must NOT invent hours
+        cal = calendar_for(MarketCalendarPolicy.FOREX_WEEK)
+        self.assertEqual(cal.is_market_expected_open(0), OpenState.UNKNOWN)
+        self.assertIsNone(cal.expected_bucket_starts("1h", 0, 3600))
+
+    def test_not_configured_gaps_unknown(self):
+        cal = calendar_for(MarketCalendarPolicy.NOT_CONFIGURED)
+        rep = cal.analyze_gaps([0, 7200], 3600)  # would be a gap if 24/7, but calendar unknown
+        self.assertEqual(rep.status, "UNKNOWN")
+        self.assertEqual(rep.missing, [])
+
+
+class CandlesSchemaUnchangedTests(unittest.TestCase):
+    def test_pk_unchanged(self):
+        pk = [c.name for c in candles_table.primary_key.columns]
+        self.assertEqual(pk, ["source", "product_id", "granularity", "bucket_start"])
+
+    def test_table_name_unchanged(self):
+        self.assertEqual(candles_table.name, "candles")

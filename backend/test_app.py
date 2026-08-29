@@ -1053,3 +1053,232 @@ class HistoryEndpointTests(unittest.TestCase):
             "/api/v1/market/candles/btc-usd/history?granularity=4m&start=0&end=3600"
         )
         self.assertEqual(r.status_code, 400)
+
+
+# ----------------------------- persistence (Phase 2) --------------------------
+from main import (  # noqa: E402
+    CandleRow,
+    PersistenceState,
+    PersistenceStatus,
+    is_candle_closed,
+    persist_candles,
+    persist_history_result,
+    persistence_consumer,
+    persistence_state,
+    read_stored_candles,
+)
+
+_DB_NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _row(product="BTC-USD", gran="1h", start_unix=0, close=100.0, source="coinbase",
+         quality=DataQualityStatus.VALID, observed=_DB_NOW, origin="rest", st=None):
+    bs = datetime.fromtimestamp(start_unix, tz=timezone.utc)
+    return CandleRow(source, product, gran, bs, 90.0, 110.0, 95.0, close, 5.0,
+                     quality, origin, st, observed)
+
+
+class _DBBase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        await main.engine.dispose()  # fresh pool bound to THIS test's loop
+        await main.init_candle_schema()
+        async with main.engine.begin() as conn:
+            await conn.execute(main.text("TRUNCATE candles"))
+
+    async def asyncTearDown(self):
+        await main.engine.dispose()
+
+    async def _raw_count(self):
+        async with main.engine.connect() as conn:
+            r = await conn.execute(main.text("SELECT count(*) FROM candles"))
+            return r.scalar()
+
+
+class DBPersistenceTests(_DBBase):
+    async def test_insert_and_read(self):
+        n = await persist_candles([_row(start_unix=0, close=100.0)])
+        self.assertEqual(n, 1)
+        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["start"], 0)
+
+    async def test_upsert_same_one_row(self):
+        await persist_candles([_row(start_unix=0)])
+        await persist_candles([_row(start_unix=0)])
+        self.assertEqual(await self._raw_count(), 1)
+
+    async def test_update_newer_observation(self):
+        await persist_candles([_row(start_unix=0, close=100.0, observed=_DB_NOW)])
+        newer = _DB_NOW + timedelta(seconds=10)
+        await persist_candles([_row(start_unix=0, close=200.0, observed=newer)])
+        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
+        self.assertEqual(float(rows[0]["close"]), 200.0)
+
+    async def test_reject_older_observation(self):
+        await persist_candles([_row(start_unix=0, close=100.0, observed=_DB_NOW)])
+        older = _DB_NOW - timedelta(seconds=10)
+        await persist_candles([_row(start_unix=0, close=999.0, observed=older)])
+        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
+        self.assertEqual(float(rows[0]["close"]), 100.0)
+
+    async def test_numeric_precision_roundtrip(self):
+        await persist_candles([_row(start_unix=0, close=50000.123456)])
+        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
+        self.assertEqual(float(rows[0]["close"]), 50000.123456)
+
+    async def test_multiple_granularities(self):
+        await persist_candles([_row(gran="1h", start_unix=0)])
+        await persist_candles([_row(gran="15m", start_unix=0)])
+        self.assertEqual(await self._raw_count(), 2)
+
+    async def test_multiple_products(self):
+        await persist_candles([_row(product="BTC-USD", start_unix=0)])
+        await persist_candles([_row(product="ETH-USD", start_unix=0)])
+        self.assertEqual(len(await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)), 1)
+        self.assertEqual(len(await read_stored_candles("ETH-USD", "1h", 0, 3600, 10)), 1)
+
+    async def test_separation_by_source(self):
+        await persist_candles([_row(source="coinbase", start_unix=0)])
+        await persist_candles([_row(source="kraken", start_unix=0)])
+        self.assertEqual(await self._raw_count(), 2)  # distinct PK by source
+        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
+        self.assertEqual(len(rows), 1)  # read filters source=coinbase
+
+    async def test_batch_insert(self):
+        rows = [_row(start_unix=i * 3600) for i in range(5)]
+        n = await persist_candles(rows)
+        self.assertEqual(n, 5)
+        self.assertEqual(await self._raw_count(), 5)
+
+    async def test_transaction_rollback_atomic(self):
+        orig = main.settings.persist_batch_size
+        main.settings.persist_batch_size = 1  # force separate SQL batches in ONE tx
+        try:
+            good = _row(start_unix=0, close=100.0)
+            bad = _row(start_unix=3600, close=1e50)  # overflows NUMERIC(38,18)
+            with self.assertRaises(Exception):
+                await persist_candles([good, bad])
+        finally:
+            main.settings.persist_batch_size = orig
+        self.assertEqual(await self._raw_count(), 0)  # whole operation rolled back
+
+    async def test_invalid_not_stored(self):
+        n = await persist_candles([_row(quality=DataQualityStatus.INVALID)])
+        self.assertEqual(n, 0)
+        self.assertEqual(await self._raw_count(), 0)
+
+    async def test_invalid_does_not_replace_valid(self):
+        await persist_candles([_row(start_unix=0, close=100.0)])
+        await persist_candles([_row(start_unix=0, close=999.0, quality=DataQualityStatus.INVALID)])
+        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(float(rows[0]["close"]), 100.0)
+
+    async def test_time_closed_accepts_newer_correction(self):
+        await persist_candles([_row(start_unix=0, close=100.0, observed=_DB_NOW)])
+        newer = _DB_NOW + timedelta(seconds=10)
+        await persist_candles([_row(start_unix=0, close=200.0, observed=newer)])
+        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
+        self.assertTrue(rows[0]["is_closed"])  # 1970 bucket is time-closed
+        self.assertEqual(float(rows[0]["close"]), 200.0)  # yet correction applied
+
+    async def test_read_empty(self):
+        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
+        self.assertEqual(rows, [])
+
+    async def test_read_sorted(self):
+        await persist_candles([_row(start_unix=2 * 3600), _row(start_unix=0),
+                               _row(start_unix=3600)])
+        rows = await read_stored_candles("BTC-USD", "1h", 0, 3 * 3600, 10)
+        self.assertEqual([r["start"] for r in rows], [0, 3600, 7200])
+
+    async def test_read_filters_half_open(self):
+        await persist_candles([_row(start_unix=0), _row(start_unix=3600),
+                               _row(start_unix=7200)])
+        rows = await read_stored_candles("BTC-USD", "1h", 0, 7200, 10)
+        self.assertEqual([r["start"] for r in rows], [0, 3600])  # 7200 excluded
+
+    async def test_ws_candle_via_consumer(self):
+        orig = persistence_state.ready
+        persistence_state.ready = True
+        try:
+            start = datetime.fromtimestamp(0, tz=timezone.utc)
+            datum = main.RealtimeDatum(
+                "coinbase", "BTC-USD", "candle", 108.0, start, _DB_NOW,
+                DataQualityStatus.VALID, 1,
+                ohlcv={"open": 105.0, "high": 110.0, "low": 100.0, "close": 108.0,
+                       "volume": 5.0},
+            )
+            await persistence_consumer(datum)
+            rows = await read_stored_candles("BTC-USD", "5m", 0, 3600, 10)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(float(rows[0]["close"]), 108.0)
+        finally:
+            persistence_state.ready = orig
+
+    async def test_history_persisted(self):
+        saved = main.market_provider
+        main.market_provider = FakeRangeProvider([i * _H for i in range(5)])
+        try:
+            res = await fetch_candle_history("BTC-USD", "1h", 0, 5 * _H)
+            out = await persist_history_result(res)
+            self.assertEqual(out["persisted"], 5)
+            rows = await read_stored_candles("BTC-USD", "1h", 0, 5 * _H, 100)
+            self.assertEqual(len(rows), 5)
+        finally:
+            main.market_provider = saved
+
+
+class PersistenceStateTests(unittest.TestCase):
+    def test_init_failed_is_unavailable(self):
+        s = PersistenceState()
+        s.mark_init_failed("boom")
+        self.assertFalse(s.ready)
+        self.assertEqual(s.status, PersistenceStatus.UNAVAILABLE)
+        self.assertEqual(s.errors, 1)
+
+    def test_runtime_error_degrades_then_recovers(self):
+        s = PersistenceState()
+        s.mark_ready()
+        s.mark_runtime_error("db down")
+        self.assertEqual(s.status, PersistenceStatus.DEGRADED)
+        self.assertEqual(s.errors, 1)
+        s.mark_write_ok()  # a later success recovers
+        self.assertEqual(s.status, PersistenceStatus.READY)
+        self.assertEqual(s.errors, 1)  # counter stays cumulative
+
+    def test_is_candle_closed_time_rule(self):
+        start = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        now_open = start + timedelta(seconds=100)
+        now_closed = start + timedelta(seconds=4000)
+        self.assertFalse(is_candle_closed(start, 3600, now=now_open))
+        self.assertTrue(is_candle_closed(start, 3600, now=now_closed))
+
+
+class StoredEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self._ready = persistence_state.ready
+
+    def tearDown(self):
+        persistence_state.ready = self._ready
+
+    def test_stored_not_ready_503(self):
+        persistence_state.ready = False
+        r = TestClient(create_app()).get(
+            "/api/v1/market/candles/btc-usd/stored?granularity=1h&start=0&end=3600"
+        )
+        self.assertEqual(r.status_code, 503)
+
+    def test_stored_bad_granularity_400(self):
+        persistence_state.ready = True
+        r = TestClient(create_app()).get(
+            "/api/v1/market/candles/btc-usd/stored?granularity=4m&start=0&end=3600"
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_stored_start_ge_end_400(self):
+        persistence_state.ready = True
+        r = TestClient(create_app()).get(
+            "/api/v1/market/candles/btc-usd/stored?granularity=1h&start=3600&end=3600"
+        )
+        self.assertEqual(r.status_code, 400)

@@ -21,7 +21,8 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -35,7 +36,17 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import text
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    MetaData,
+    Numeric,
+    String,
+    Table,
+    text,
+)
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -102,6 +113,13 @@ class Settings(BaseSettings):
     # Application-level guard rail (NOT a Coinbase limit): max provider windows
     # (sequential REST calls) a single /history request may fan out to.
     history_max_windows: int = 20
+
+    # Persistence (Postgres). Batch size = technical statement size inside ONE
+    # atomic transaction (not a separate commit per batch). Margin (seconds) after
+    # a bucket's own end before we consider it time-closed (0 = fully elapsed).
+    persist_batch_size: int = 500
+    candle_finalization_margin_seconds: float = 0.0
+    db_read_max_rows: int = 1000
 
     @property
     def database_url(self) -> str:
@@ -299,7 +317,9 @@ async def liveness() -> dict:
 @health_router.get("/health")
 async def health() -> dict:
     components = [await check_database(), await check_redis()]
-    return HealthReport.from_components(components).to_dict()
+    report = HealthReport.from_components(components).to_dict()
+    report["persistence"] = persistence_state.to_dict()
+    return report
 
 
 @health_router.get("/health/ready")
@@ -1271,6 +1291,360 @@ async def market_candles_history(
         ) from exc
 
 
+# ============================ persistence (increment 5) ======================
+# Postgres = durable HISTORICAL truth (MarketStateStore stays the in-memory
+# REALTIME truth). One pipeline: WS/REST -> parse/quality -> MarketBus ->
+# PersistenceConsumer. Identity/PK = (source, product_id, granularity,
+# bucket_start). OHLCV = NUMERIC(38,18) (exact decimal, never float).
+#
+# Time semantics kept distinct:
+#   observed_at      = OUR pipeline receive/observe clock (homogeneous REST/WS) —
+#                      the ONLY field used to arbitrate freshness on upsert.
+#   source_timestamp = provider time when present (audit/diagnostic only).
+#   updated_at       = OUR DB write time (audit only; never a freshness proof).
+# is_closed = bucket time-closed by OUR clock+margin; NEVER "provider-certified
+# final", so a time-closed row may still receive a newer admissible correction.
+
+metadata = MetaData()
+
+candles_table = Table(
+    "candles",
+    metadata,
+    Column("source", String, primary_key=True),
+    Column("product_id", String, primary_key=True),
+    Column("granularity", String, primary_key=True),
+    Column("bucket_start", DateTime(timezone=True), primary_key=True),
+    Column("open", Numeric(38, 18), nullable=False),
+    Column("high", Numeric(38, 18), nullable=False),
+    Column("low", Numeric(38, 18), nullable=False),
+    Column("close", Numeric(38, 18), nullable=False),
+    Column("volume", Numeric(38, 18), nullable=False),
+    Column("quality", String, nullable=False),
+    Column("is_closed", Boolean, nullable=False),
+    Column("origin", String, nullable=False),  # "ws" | "rest"
+    Column("source_timestamp", DateTime(timezone=True), nullable=True),
+    Column("observed_at", DateTime(timezone=True), nullable=False),
+    Column("received_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+
+class PersistenceStatus(str, Enum):
+    READY = "READY"
+    DEGRADED = "DEGRADED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class PersistenceState:
+    """Explicit, observable persistence health. Never a silent false success."""
+
+    def __init__(self) -> None:
+        self.ready = False
+        self.status = PersistenceStatus.UNAVAILABLE
+        self.errors = 0
+        self.last_error: Optional[str] = None
+
+    def mark_ready(self) -> None:
+        self.ready = True
+        self.status = PersistenceStatus.READY
+
+    def mark_init_failed(self, detail: str) -> None:
+        self.ready = False
+        self.status = PersistenceStatus.UNAVAILABLE
+        self.errors += 1
+        self.last_error = detail
+
+    def mark_runtime_error(self, detail: str) -> None:
+        # Transient runtime failure after a successful init: degrade, don't reset
+        # ready=False permanently; the counter stays cumulative.
+        self.errors += 1
+        self.last_error = detail
+        if self.ready:
+            self.status = PersistenceStatus.DEGRADED
+
+    def mark_write_ok(self) -> None:
+        # Deterministic recovery: a later successful write clears a transient
+        # DEGRADED back to READY. Never clears the cumulative error counter.
+        if self.ready and self.status == PersistenceStatus.DEGRADED:
+            self.status = PersistenceStatus.READY
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "persistence_ready": self.ready,
+            "persistence_status": self.status.value,
+            "persistence_errors": self.errors,
+            "persistence_last_error": self.last_error,
+        }
+
+
+persistence_state = PersistenceState()
+
+
+def is_candle_closed(
+    bucket_start: datetime, bucket_seconds: int, now: Optional[datetime] = None
+) -> bool:
+    """True if the bucket is time-closed by OUR clock + margin. Not provider-final."""
+    reference = now or utcnow()
+    margin = settings.candle_finalization_margin_seconds
+    end = bucket_start + timedelta(seconds=bucket_seconds + margin)
+    return reference >= end
+
+
+async def init_candle_schema() -> None:
+    """Create the candles table if absent (idempotent). Raises on real DDL failure
+    so it is NEVER swallowed into a silent false success."""
+    async with engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
+
+
+@dataclass(frozen=True)
+class CandleRow:
+    source: str
+    product_id: str
+    granularity: str
+    bucket_start: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    quality: DataQualityStatus
+    origin: str  # "ws" | "rest"
+    source_timestamp: Optional[datetime]
+    observed_at: datetime
+
+
+def _bucket_seconds_for(granularity: str) -> int:
+    if granularity in GRANULARITIES:
+        return GRANULARITIES[granularity][1]
+    return 300  # WS candles are 5-minute buckets
+
+
+def candle_row_from_realtime(datum: RealtimeDatum) -> Optional[CandleRow]:
+    """Build a persistable CandleRow from a WS candle RealtimeDatum. Returns None
+    for non-candle / invalid / incomplete data (never fabricates)."""
+    if datum.data_type != "candle" or datum.status == DataQualityStatus.INVALID:
+        return None
+    if datum.source_timestamp is None or datum.ohlcv is None:
+        return None
+    o = datum.ohlcv
+    return CandleRow(
+        source=datum.source,
+        product_id=datum.product_id,
+        granularity="5m",  # Coinbase WS candles are 5-minute buckets
+        bucket_start=datum.source_timestamp,
+        open=o["open"], high=o["high"], low=o["low"], close=o["close"], volume=o["volume"],
+        quality=datum.status,
+        origin="ws",
+        source_timestamp=datum.source_timestamp,
+        observed_at=datum.received_at,
+    )
+
+
+def _row_to_values(row: CandleRow, now: datetime) -> Dict[str, object]:
+    bucket_seconds = _bucket_seconds_for(row.granularity)
+    return {
+        "source": row.source,
+        "product_id": row.product_id,
+        "granularity": row.granularity,
+        "bucket_start": row.bucket_start,
+        "open": Decimal(str(row.open)),
+        "high": Decimal(str(row.high)),
+        "low": Decimal(str(row.low)),
+        "close": Decimal(str(row.close)),
+        "volume": Decimal(str(row.volume)),
+        "quality": row.quality.value,
+        "is_closed": is_candle_closed(row.bucket_start, bucket_seconds, now=now),
+        "origin": row.origin,
+        "source_timestamp": row.source_timestamp,
+        "observed_at": row.observed_at,
+        "received_at": now,
+        "updated_at": now,
+    }
+
+
+async def persist_candles(rows: List[CandleRow]) -> int:
+    """Idempotent, ATOMIC batch upsert of candle rows. One persist_candles call =
+    ONE transaction (multiple SQL batches inside, no intermediate commit). Any
+    batch failure rolls back the WHOLE operation. Returns the number of rows sent.
+    Upsert accepts a row only if it is not strictly older than the stored one
+    (observed_at), and INVALID rows are never sent. Raises on DB error."""
+    rows = [r for r in rows if r.quality != DataQualityStatus.INVALID]
+    if not rows:
+        return 0
+    now = utcnow()
+    batch_size = max(1, settings.persist_batch_size)
+    try:
+        async with engine.begin() as conn:  # BEGIN ... COMMIT (or ROLLBACK on error)
+            for i in range(0, len(rows), batch_size):
+                chunk = rows[i:i + batch_size]
+                values = [_row_to_values(r, now) for r in chunk]
+                stmt = pg_insert(candles_table).values(values)
+                update_cols = {
+                    c: stmt.excluded[c]
+                    for c in (
+                        "open", "high", "low", "close", "volume", "quality",
+                        "is_closed", "origin", "source_timestamp", "observed_at",
+                        "updated_at",
+                    )
+                }
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["source", "product_id", "granularity", "bucket_start"],
+                    set_=update_cols,
+                    # accept only a non-older observation; never degrade with stale data
+                    where=stmt.excluded["observed_at"] >= candles_table.c.observed_at,
+                )
+                await conn.execute(stmt)
+    except Exception as exc:  # noqa: BLE001 - surface, never a false success
+        persistence_state.mark_runtime_error(str(exc))
+        raise
+    persistence_state.mark_write_ok()
+    return len(rows)
+
+
+class PersistenceConsumer:
+    """MarketBus consumer that persists WS candle events. A DB error never kills
+    the bus/WS loop: it is logged, counted, and flips persistence to DEGRADED."""
+
+    async def __call__(self, datum: RealtimeDatum) -> None:
+        if not persistence_state.ready:
+            return
+        row = candle_row_from_realtime(datum)
+        if row is None:
+            return
+        try:
+            await persist_candles([row])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Persistence consumer error: %s", exc, exc_info=True)
+
+
+persistence_consumer = PersistenceConsumer()
+
+
+async def persist_history_result(result: Dict[str, object]) -> Dict[str, object]:
+    """Persist the VALID candles of a fetch_candle_history result. Persists real
+    VALID candles even when the fetch was PARTIAL, but NEVER asserts range
+    completeness in the DB (completeness is recomputed on read)."""
+    source = str(result.get("source", "coinbase"))
+    product_id = str(result["symbol"])
+    granularity = str(result["granularity"])
+    rows = _history_dicts_to_rows(source, product_id, granularity, result.get("candles"), utcnow())
+    written = await persist_candles(rows)
+    return {
+        "persisted": written,
+        "fetch_status": result.get("status"),
+        "data_complete": result.get("data_complete"),
+    }
+
+
+def _history_dicts_to_rows(
+    source: str, product_id: str, granularity: str, raw: object, observed_at: datetime
+) -> List[CandleRow]:
+    rows: List[CandleRow] = []
+    if not isinstance(raw, list):
+        return rows
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if item.get("quality") == DataQualityStatus.INVALID.value:
+            continue
+        start = parse_iso8601(item.get("start"))
+        o = _to_float(item.get("open"))
+        h = _to_float(item.get("high"))
+        low = _to_float(item.get("low"))
+        c = _to_float(item.get("close"))
+        v = _to_float(item.get("volume"))
+        if start is None or o is None or h is None or low is None or c is None or v is None:
+            continue
+        rows.append(
+            CandleRow(
+                source=source, product_id=product_id.upper(), granularity=granularity,
+                bucket_start=start,
+                open=o, high=h, low=low, close=c, volume=v,
+                quality=DataQualityStatus.VALID, origin="rest",
+                source_timestamp=None, observed_at=observed_at,
+            )
+        )
+    return rows
+
+
+async def read_stored_candles(
+    symbol: str, granularity: str, start: int, end: int, limit: int
+) -> List[Dict[str, object]]:
+    """Read persisted candles, chronological ascending, half-open [start, end).
+    Parameterised query; raises on DB error (caller maps to 503)."""
+    bucket_seconds = _bucket_seconds_for(granularity)
+    start_dt = datetime.fromtimestamp(int(start), tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(int(end), tz=timezone.utc)
+    now = utcnow()
+    t = candles_table
+    stmt = (
+        t.select()
+        .where(t.c.source == "coinbase")
+        .where(t.c.product_id == symbol.upper())
+        .where(t.c.granularity == granularity)
+        .where(t.c.bucket_start >= start_dt)
+        .where(t.c.bucket_start < end_dt)
+        .order_by(t.c.bucket_start.asc())
+        .limit(max(1, min(int(limit), settings.db_read_max_rows)))
+    )
+    out: List[Dict[str, object]] = []
+    async with engine.connect() as conn:
+        result = await conn.execute(stmt)
+        for r in result.mappings():
+            out.append(
+                {
+                    "source": r["source"],
+                    "product_id": r["product_id"],
+                    "granularity": r["granularity"],
+                    "start": int(r["bucket_start"].timestamp()),
+                    "open": str(r["open"]),
+                    "high": str(r["high"]),
+                    "low": str(r["low"]),
+                    "close": str(r["close"]),
+                    "volume": str(r["volume"]),
+                    "quality": r["quality"],
+                    "is_closed": is_candle_closed(r["bucket_start"], bucket_seconds, now=now),
+                    "origin": r["origin"],
+                }
+            )
+    return out
+
+
+@api_router.get("/market/candles/{symbol}/stored")
+async def market_candles_stored(
+    symbol: str, start: int, end: int, granularity: str = "1m", limit: int = 1000
+) -> dict:
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+    if granularity not in GRANULARITIES:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "unsupported granularity"}
+        )
+    if start >= end:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "start must be before end"}
+        )
+    try:
+        candles = await read_stored_candles(symbol, granularity, start, end, limit)
+    except Exception as exc:  # noqa: BLE001
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": str(exc)}
+        ) from exc
+    return {
+        "source": "coinbase",
+        "symbol": symbol.upper(),
+        "granularity": granularity,
+        "status": "EMPTY" if not candles else "OK",
+        "count": len(candles),
+        "candles": candles,
+    }
+
+
 # ============================ frontend serving ============================
 def _frontend_dir(cfg: Settings) -> Path:
     """Resolve the frontend directory. FRONTEND_DIR overrides; otherwise the
@@ -1309,6 +1683,13 @@ async def lifespan(app: FastAPI):
             "live_trading_enabled=True but this build supports paper trading only."
         )
     await market_provider.connect()
+    try:
+        await init_candle_schema()
+        persistence_state.mark_ready()
+        market_bus.subscribe(persistence_consumer)
+    except Exception as exc:  # noqa: BLE001 - explicit, never a silent false success
+        persistence_state.mark_init_failed(str(exc))
+        log.error("Candle schema init failed; persistence UNAVAILABLE: %s", exc)
     try:
         yield
     finally:

@@ -121,6 +121,12 @@ class Settings(BaseSettings):
     candle_finalization_margin_seconds: float = 0.0
     db_read_max_rows: int = 1000
 
+    # Massive (ex-Polygon) Forex REST. api_key empty by default: no calls happen
+    # until an officially-verified symbol mapping is registered (never deduced).
+    massive_api_key: str = ""
+    massive_rest_url: str = "https://api.massive.com"
+    massive_request_timeout_seconds: float = 10.0
+
     @property
     def database_url(self) -> str:
         return (
@@ -1892,6 +1898,294 @@ COINBASE_PROFILE = ProviderProfile(
 _register_coinbase_instruments()
 
 
+# ============================ Massive Forex REST (increment 6B-1) =============
+# First real Multi-Asset connector: Massive (ex-Polygon) Forex REST aggregates.
+# Reuses the 6A canonical model + the existing Candle/persistence bricks (NO
+# parallel architecture). Officially verified (massive.com/docs/rest/forex):
+#   GET /v2/aggs/ticker/{forexTicker}/range/{multiplier}/{timespan}/{from}/{to}
+#   response {results:[{o,h,l,c,v,t}]} with t = Unix MILLISECONDS, bars aligned in
+#   Eastern Time; aggregates are derived from bid/ask QUOTES, not executed trades,
+#   and no bar is emitted when no quote arrives (absence != gap).
+# Rules honoured: internal time = UTC; volume semantics = UNKNOWN (never invented);
+# no invented Forex calendar (NOT_CONFIGURED -> gaps UNKNOWN); NO provider symbol
+# registered by deduction -> unverified canonical stays NOT_MAPPED.
+
+MASSIVE_FOREX_GRANULARITIES: Dict[str, tuple] = {
+    "1m": (1, "minute"),
+    "5m": (5, "minute"),
+    "15m": (15, "minute"),
+    "30m": (30, "minute"),
+    "1h": (1, "hour"),
+    "2h": (2, "hour"),
+    "4h": (4, "hour"),
+    "6h": (6, "hour"),
+    "1d": (1, "day"),
+}
+
+
+def _unix_ms_to_dt(value: Any) -> Optional[datetime]:
+    """Massive aggregate `t` is a UNIX timestamp in MILLISECONDS. Returns aware UTC,
+    or None if unparseable (never invents a timestamp)."""
+    try:
+        ms = int(value)
+    except (TypeError, ValueError):
+        return None
+    if ms <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def massive_agg_to_candle(
+    item: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> Candle:
+    """Convert one Massive forex aggregate into a qualified Candle. Pure, no network.
+    Missing/unparseable OHLCV or timestamp -> INVALID; never fabricated."""
+    if not isinstance(item, dict):
+        return Candle(None, None, None, None, None, None, DataQualityStatus.INVALID)
+    start = _unix_ms_to_dt(item.get("t"))
+    open_ = _to_float(item.get("o"))
+    high = _to_float(item.get("h"))
+    low = _to_float(item.get("l"))
+    close = _to_float(item.get("c"))
+    volume = _to_float(item.get("v"))
+    if (
+        start is None or low is None or high is None
+        or open_ is None or close is None or volume is None
+    ):
+        return Candle(start, low, high, open_, close, volume, DataQualityStatus.INVALID)
+    if low < 0 or high < 0 or open_ < 0 or close < 0 or volume < 0:
+        return Candle(start, low, high, open_, close, volume, DataQualityStatus.INVALID)
+    return Candle(start, low, high, open_, close, volume,
+                  classify_freshness(start, max_age_seconds, now=now))
+
+
+def massive_aggs_to_candles(
+    payload: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> tuple:
+    """Parse a Massive forex aggregates response into (list[Candle], status).
+    Empty/malformed -> ([], MISSING)."""
+    raw = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(raw, list) or not raw:
+        return [], DataQualityStatus.MISSING
+    candles = [massive_agg_to_candle(x, max_age_seconds, now=now) for x in raw]
+    has_valid = any(c.status != DataQualityStatus.INVALID for c in candles)
+    return candles, (DataQualityStatus.VALID if has_valid else DataQualityStatus.INVALID)
+
+
+class MassiveForexProvider:
+    """Massive Forex REST aggregates adapter. No WebSocket, no failover (6B-1).
+    Resolves the provider ticker via the verified ProviderSymbolMap only."""
+
+    SOURCE = "massive"
+
+    def __init__(self, rest_url: Optional[str] = None, api_key: Optional[str] = None) -> None:
+        self.rest_url = (rest_url or settings.massive_rest_url).rstrip("/")
+        self.api_key = api_key if api_key is not None else settings.massive_api_key
+        self.client: Optional[httpx.AsyncClient] = None
+
+    async def connect(self) -> None:
+        if self.client is None:
+            self.client = httpx.AsyncClient(
+                base_url=self.rest_url,
+                timeout=settings.massive_request_timeout_seconds,
+                headers={"Accept": "application/json"},
+            )
+
+    async def disconnect(self) -> None:
+        if self.client is not None:
+            await self.client.aclose()
+            self.client = None
+
+    async def _get(self, path: str, params: Optional[dict] = None) -> dict:
+        if self.client is None:
+            await self.connect()
+        assert self.client is not None
+        resp = await self.client.get(path, params=params)
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Massive returned a non-object JSON response")
+        return payload
+
+    async def get_candles_range(
+        self, canonical_symbol: str, granularity: str, start: int, end: int
+    ):
+        """Fetch aggregates for a canonical forex symbol over [start, end] UNIX
+        seconds. NOT_MAPPED / NOT_SUPPORTED raise ValueError (fail-safe, no fake)."""
+        ticker = provider_symbol_map.to_provider(self.SOURCE, canonical_symbol)
+        if ticker is None:
+            raise ValueError(f"NOT_MAPPED: no verified Massive symbol for {canonical_symbol}")
+        if granularity not in MASSIVE_FOREX_GRANULARITIES:
+            raise ValueError(f"NOT_SUPPORTED granularity for Massive forex: {granularity}")
+        multiplier, timespan = MASSIVE_FOREX_GRANULARITIES[granularity]
+        start_ms = int(start) * 1000
+        end_ms = int(end) * 1000
+        payload = await self._get(
+            f"/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{start_ms}/{end_ms}",
+            params={"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": self.api_key},
+        )
+        return massive_aggs_to_candles(payload, max_age_seconds=float("inf"))
+
+
+def _register_massive_forex_instruments() -> None:
+    """Register the 8 CANONICAL forex identities (ours, not provider deductions).
+    Calendar NOT_CONFIGURED (no invented hours); volume UNKNOWN; precision/tick None.
+    NO provider_symbol mapping is added here: Massive symbols stay NOT_MAPPED until
+    officially verified via /v3/reference/tickers (register_massive_forex_symbol)."""
+    pairs = (
+        ("EUR-USD", "EUR", "USD", "Euro / US Dollar"),
+        ("GBP-USD", "GBP", "USD", "British Pound / US Dollar"),
+        ("USD-JPY", "USD", "JPY", "US Dollar / Japanese Yen"),
+        ("USD-CHF", "USD", "CHF", "US Dollar / Swiss Franc"),
+        ("AUD-USD", "AUD", "USD", "Australian Dollar / US Dollar"),
+        ("USD-CAD", "USD", "CAD", "US Dollar / Canadian Dollar"),
+        ("NZD-USD", "NZD", "USD", "New Zealand Dollar / US Dollar"),
+        ("EUR-CAD", "EUR", "CAD", "Euro / Canadian Dollar"),
+    )
+    for canon, base, quote, name in pairs:
+        instrument_registry.register(
+            Instrument(
+                canonical_symbol=canon,
+                asset_class=AssetClass.FOREX,
+                base_asset=base,
+                quote_asset=quote,
+                display_name=name,
+                timezone="UTC",
+                market_calendar=MarketCalendarPolicy.NOT_CONFIGURED,
+                volume_semantics=VolumeSemantics.UNKNOWN,
+                price_precision=None,
+                tick_size=None,
+            )
+        )
+
+
+MASSIVE_FOREX_PROFILE = ProviderProfile(
+    name="massive",
+    capabilities_by_asset_class={
+        AssetClass.FOREX: {
+            Capability.CANDLES_REST,
+            Capability.HISTORY_INTRADAY,
+            Capability.HISTORY_DAILY,
+            Capability.BID_ASK,
+        },
+    },
+    granularities_by_asset_class={AssetClass.FOREX: set(MASSIVE_FOREX_GRANULARITIES)},
+)
+
+
+def register_massive_forex_symbol(canonical: str, provider_ticker: str) -> None:
+    """Register a Massive forex mapping ONLY after official verification via
+    /v3/reference/tickers. Never called at import (unverified -> NOT_MAPPED)."""
+    provider_symbol_map.add("massive", canonical, provider_ticker)
+
+
+massive_forex_provider = MassiveForexProvider()
+_register_massive_forex_instruments()
+
+
+async def fetch_forex_history(
+    canonical_symbol: str, granularity: str, start: int, end: int
+) -> dict:
+    """Assemble Massive forex history for a CANONICAL symbol. Reuses the 6A calendar
+    for gap semantics: forex is NOT_CONFIGURED -> gaps UNKNOWN, and a missing bar is
+    NEVER turned into a gap/MISSING (Massive emits no bar without a new quote)."""
+    inst = instrument_registry.get(canonical_symbol)
+    if inst is None or inst.asset_class != AssetClass.FOREX:
+        raise ValueError(f"unknown forex instrument: {canonical_symbol}")
+    provider_ticker = provider_symbol_map.to_provider("massive", canonical_symbol)
+    if provider_ticker is None:
+        return {
+            "source": "massive", "canonical_symbol": canonical_symbol, "provider_symbol": None,
+            "granularity": granularity, "status": "NOT_MAPPED",
+            "reason": "Massive symbol not officially verified/mapped",
+            "count": 0, "candles": [],
+        }
+    if granularity not in MASSIVE_FOREX_GRANULARITIES:
+        raise ValueError(f"NOT_SUPPORTED granularity for Massive forex: {granularity}")
+    if start >= end:
+        raise ValueError("start must be strictly before end")
+    bucket = GRANULARITIES[granularity][1] if granularity in GRANULARITIES else 60
+    try:
+        candles, _status = await massive_forex_provider.get_candles_range(
+            canonical_symbol, granularity, start, end
+        )
+    except httpx.HTTPError as exc:
+        return {
+            "source": "massive", "canonical_symbol": canonical_symbol,
+            "provider_symbol": provider_ticker, "granularity": granularity,
+            "status": "UNAVAILABLE", "reason": str(exc), "count": 0, "candles": [],
+        }
+    collected: Dict[int, Candle] = {}
+    invalid = 0
+    for candle in candles:
+        if candle.start is None or candle.status == DataQualityStatus.INVALID:
+            invalid += 1
+            continue
+        key = int(candle.start.timestamp())
+        if key < start or key >= end:
+            continue
+        collected[key] = candle
+    starts = sorted(collected)
+    kept = [collected[k] for k in starts]
+    # Forex calendar NOT_CONFIGURED -> gaps UNKNOWN (absence of a bar is legitimate).
+    report = calendar_for(inst.market_calendar).analyze_gaps(starts, bucket)
+    return {
+        "source": "massive",
+        "canonical_symbol": canonical_symbol,
+        "provider_symbol": provider_ticker,
+        "granularity": granularity,
+        "status": "EMPTY" if not kept else "OK",
+        "requested_range": {"start": start, "end": end},
+        "count": len(kept),
+        "invalid_candles_count": invalid,
+        "gaps_status": report.status,   # "UNKNOWN" for forex (no verified calendar)
+        "gaps": report.missing,          # [] when UNKNOWN
+        "data_complete": False,          # gap analysis unavailable -> never assert complete
+        "timezone": inst.timezone,       # UTC internal; ET bar-alignment is a provider detail
+        "volume_semantics": inst.volume_semantics.value,  # UNKNOWN (never invented)
+        "candles": [c.to_dict() for c in kept],
+    }
+
+
+async def persist_forex_result(result: Dict[str, object]) -> int:
+    """Persist a fetch_forex_history result's VALID candles under source='massive',
+    product_id=provider_symbol. Reuses the generic history->rows + persist_candles."""
+    if result.get("status") != "OK" or not result.get("provider_symbol"):
+        return 0
+    rows = _history_dicts_to_rows(
+        "massive", str(result["provider_symbol"]), str(result["granularity"]),
+        result.get("candles"), utcnow(),
+    )
+    return await persist_candles(rows)
+
+
+@api_router.get("/market/forex/{symbol}/history")
+async def market_forex_history(
+    symbol: str, start: int, end: int, granularity: str = "1h"
+) -> dict:
+    try:
+        result = await fetch_forex_history(symbol.upper(), granularity, start, end)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": str(exc)}
+        ) from exc
+    status = result.get("status")
+    if status == "NOT_MAPPED":
+        raise HTTPException(
+            status_code=409,
+            detail={"status": "NOT_MAPPED", "reason": result.get("reason")},
+        )
+    if status == "UNAVAILABLE":
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": result.get("reason")},
+        )
+    return result
+
+
 # ============================ frontend serving ============================
 def _frontend_dir(cfg: Settings) -> Path:
     """Resolve the frontend directory. FRONTEND_DIR overrides; otherwise the
@@ -1930,6 +2224,7 @@ async def lifespan(app: FastAPI):
             "live_trading_enabled=True but this build supports paper trading only."
         )
     await market_provider.connect()
+    await massive_forex_provider.connect()
     try:
         await init_candle_schema()
         persistence_state.mark_ready()
@@ -1942,6 +2237,7 @@ async def lifespan(app: FastAPI):
     finally:
         await market_ws.stop()
         await market_provider.disconnect()
+        await massive_forex_provider.disconnect()
         log.info("Shutting down %s", settings.app_name)
 
 

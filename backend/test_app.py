@@ -1860,3 +1860,167 @@ class UiEndpointCompatibilityTests(unittest.TestCase):
         r = self.client.get("/health")
         self.assertIn(r.status_code, (200, 503))
         self.assertIn("overall", r.json())
+
+
+# ----------------------------- test-feedback fixes (candles freshness + 403) --
+from main import _latest_quality  # noqa: E402
+
+_FIX_NOW = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _cndl(dt, q=DataQualityStatus.VALID):
+    return Candle(dt, 1.0, 2.0, 0.5, 1.5, 3.0, q)
+
+
+class LatestQualityTests(unittest.TestCase):
+    def test_latest_is_newest_bar(self):
+        old = _cndl(_FIX_NOW - timedelta(days=14), DataQualityStatus.STALE)
+        fresh = _cndl(_FIX_NOW, DataQualityStatus.VALID)
+        self.assertEqual(_latest_quality([old, fresh]), "VALID")
+
+    def test_latest_stale_when_newest_old(self):
+        old = _cndl(_FIX_NOW - timedelta(days=14), DataQualityStatus.STALE)
+        older = _cndl(_FIX_NOW - timedelta(days=15), DataQualityStatus.STALE)
+        self.assertEqual(_latest_quality([older, old]), "STALE")
+
+    def test_latest_missing_when_empty(self):
+        self.assertEqual(_latest_quality([]), "MISSING")
+
+
+class CandleOrderingEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self._orig = main.market_provider
+
+    def tearDown(self):
+        main.market_provider = self._orig
+
+    def _client(self, provider):
+        main.market_provider = provider
+        return TestClient(create_app())
+
+    def test_candles_sorted_ascending_and_latest_recent(self):
+        # provider returns NEWEST-FIRST (like Coinbase) + an old tail
+        newest = _cndl(_FIX_NOW, DataQualityStatus.VALID)
+        mid = _cndl(_FIX_NOW - timedelta(hours=1), DataQualityStatus.VALID)
+        old = _cndl(_FIX_NOW - timedelta(days=14), DataQualityStatus.STALE)
+
+        class FakeProvider:
+            async def get_candles(self, symbol, granularity, limit=350):
+                return [newest, mid, old], DataQualityStatus.VALID  # desc / unsorted
+
+        body = self._client(FakeProvider()).get(
+            "/api/v1/market/candles/eth-usd?granularity=1h").json()
+        starts = [c["start"] for c in body["candles"]]
+        self.assertEqual(starts, sorted(starts))                 # ascending
+        self.assertEqual(body["latest_quality"], "VALID")        # newest bar fresh
+        # the last element is the most recent, not the 14-day-old one
+        self.assertTrue(body["candles"][-1]["start"] > body["candles"][0]["start"])
+
+    def test_latest_quality_stale_when_newest_is_old(self):
+        old1 = _cndl(_FIX_NOW - timedelta(days=14), DataQualityStatus.STALE)
+        old2 = _cndl(_FIX_NOW - timedelta(days=14, hours=1), DataQualityStatus.STALE)
+
+        class FakeProvider:
+            async def get_candles(self, symbol, granularity, limit=350):
+                return [old1, old2], DataQualityStatus.VALID
+
+        body = self._client(FakeProvider()).get(
+            "/api/v1/market/candles/eth-usd?granularity=1h").json()
+        self.assertEqual(body["latest_quality"], "STALE")       # not LIVE despite HTTP 200
+
+    def test_ticker_regression_still_ok(self):
+        class FakeProvider:
+            async def get_ticker(self, symbol):
+                return main.MarketDatum("coinbase", symbol.upper(), 100.0,
+                                        _FIX_NOW, DataQualityStatus.VALID)
+        r = self._client(FakeProvider()).get("/api/v1/market/ticker/btc-usd")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["quality"], "VALID")
+
+
+def _http_status_error(code):
+    class _Resp:
+        status_code = code
+    return httpx.HTTPStatusError("boom apiKey=SECRET https://api.massive.com/x MDN mozilla",
+                                 request=None, response=_Resp())
+
+
+class MassiveErrorHandlingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._prov = main.massive_forex_provider
+        register_massive_forex_symbol("EUR-USD", "C:EURUSD")
+
+    def tearDown(self):
+        main.massive_forex_provider = self._prov
+
+    async def test_403_is_access_denied_clean(self):
+        class P:
+            async def get_candles_range(self, *a, **k):
+                raise _http_status_error(403)
+        main.massive_forex_provider = P()
+        r = await fetch_forex_history("EUR-USD", "1h", 1756512000, 1756555200)
+        self.assertEqual(r["status"], "ACCESS_DENIED")
+        self.assertEqual(r["provider_symbol"], "C:EURUSD")       # mapping kept
+        for bad in ("SECRET", "mozilla", "http", "apiKey"):
+            self.assertNotIn(bad, r["reason"])
+
+    async def test_429_is_rate_limited(self):
+        class P:
+            async def get_candles_range(self, *a, **k):
+                raise _http_status_error(429)
+        main.massive_forex_provider = P()
+        r = await fetch_forex_history("EUR-USD", "1h", 1756512000, 1756555200)
+        self.assertEqual(r["status"], "RATE_LIMITED")
+
+    async def test_network_error_unavailable_clean(self):
+        class P:
+            async def get_candles_range(self, *a, **k):
+                raise httpx.ConnectError("connect fail apiKey=SECRET https://x")
+        main.massive_forex_provider = P()
+        r = await fetch_forex_history("EUR-USD", "1h", 1756512000, 1756555200)
+        self.assertEqual(r["status"], "UNAVAILABLE")
+        self.assertNotIn("SECRET", r["reason"])
+
+
+class ForexErrorEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self._prov = main.massive_forex_provider
+        register_massive_forex_symbol("EUR-USD", "C:EURUSD")
+
+    def tearDown(self):
+        main.massive_forex_provider = self._prov
+
+    def test_endpoint_403_maps_to_403_clean(self):
+        class P:
+            async def get_candles_range(self, *a, **k):
+                raise _http_status_error(403)
+        main.massive_forex_provider = P()
+        r = TestClient(create_app()).get(
+            "/api/v1/market/forex/EUR-USD/history?granularity=1h&start=1756512000&end=1756555200")
+        self.assertEqual(r.status_code, 403)
+        raw = r.text.lower()
+        for bad in ("secret", "mozilla", "apikey", "http://", "https://"):
+            self.assertNotIn(bad, raw)
+
+
+class UiFreshnessStaticTests(unittest.TestCase):
+    def setUp(self):
+        self.html = INDEX.read_text(encoding="utf-8")
+
+    def test_candles_badge_uses_latest_quality(self):
+        self.assertIn("latest_quality", self.html)
+
+    def test_candles_sorted_before_slice(self):
+        self.assertIn("Date.parse(a.start)", self.html)
+
+    def test_forex_list_not_shown_as_live(self):
+        self.assertIn('mapped ? "MAPPED"', self.html)
+        self.assertIn("b-mapped", self.html)
+
+    def test_clean_403_message_present(self):
+        self.assertIn("accès refusé par le fournisseur (403)", self.html)
+
+    def test_no_raw_exception_rendered(self):
+        # the UI maps status codes to clean text; it never renders a raw exception
+        self.assertNotIn("str(exc)", self.html)
+        self.assertNotIn(".stack", self.html)

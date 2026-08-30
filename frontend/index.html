@@ -1,612 +1,419 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="fr">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="color-scheme" content="dark" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark light" />
   <title>Crypto Intelligence Engine</title>
-  <meta name="description" content="Real-time crypto intelligence & paper-trading terminal. Single-file build. Paper-only, real data, honest data quality." />
   <style>
-/* Crypto Intelligence Engine — core design system
-   Identity: "data-integrity terminal". Deep blue-charcoal base, tabular
-   monospace readouts, one reserved cyan accent for LIVE. Semantic status
-   colors carry meaning (never decoration). System font stacks only — no CDN,
-   no network dependency. */
-
-:root {
-  /* ---- Surfaces (deep blue-charcoal, not pure black) ---- */
-  --bg-0: #0b1017;   /* app background */
-  --bg-1: #10161f;   /* rail / topbar */
-  --bg-2: #141c27;   /* card surface */
-  --bg-3: #1b2531;   /* elevated / hover */
-  --line: #223042;   /* hairline borders */
-  --line-soft: #1a2431;
-
-  /* ---- Text ---- */
-  --fg-0: #e6edf3;   /* primary */
-  --fg-1: #aeb9c6;   /* secondary */
-  --fg-2: #6f7d8c;   /* muted / captions */
-  --fg-3: #4a5665;   /* disabled */
-
-  /* ---- Brand / LIVE accent (reserved) ---- */
-  --live: #34d6c4;
-  --live-dim: #1f7a72;
-  --brand: #6ea8fe;
-
-  /* ---- Semantic status (data quality + system) ---- */
-  --ok: #3fb968;        /* VALID / UP / ONLINE */
-  --warn: #e0a63c;      /* STALE / DEGRADED */
-  --bad: #e5544b;       /* INVALID / DOWN / OFFLINE */
-  --unknown: #7c8896;   /* UNKNOWN / not probed */
-  --conflict: #b487f0;  /* CONFLICTED */
-  --info: #5aa9e6;
-
-  /* ---- Signals (trade direction) ---- */
-  --long: #3fb968;
-  --short: #e5544b;
-
-  /* ---- Type ---- */
-  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
-
-  /* ---- Scale ---- */
-  --r-sm: 6px; --r-md: 9px; --r-lg: 13px;
-  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px;
-  --rail-w: 232px; --topbar-h: 56px;
-  --shadow: 0 1px 0 rgba(255,255,255,.02), 0 8px 24px rgba(0,0,0,.35);
-}
-
-* { box-sizing: border-box; }
-html, body { height: 100%; }
-body {
-  margin: 0;
-  background: var(--bg-0);
-  color: var(--fg-0);
-  font-family: var(--sans);
-  font-size: 14px;
-  line-height: 1.5;
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-}
-a { color: var(--brand); text-decoration: none; }
-h1, h2, h3, h4 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
-button { font-family: inherit; }
-.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
-.num { font-family: var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
-
-/* ============================ App shell ============================ */
-.app {
-  display: grid;
-  grid-template-columns: var(--rail-w) 1fr;
-  grid-template-rows: var(--topbar-h) 1fr;
-  grid-template-areas: "rail topbar" "rail main";
-  height: 100vh;
-}
-
-/* ---- Rail (left nav) ---- */
-.rail {
-  grid-area: rail;
-  background: var(--bg-1);
-  border-right: 1px solid var(--line);
-  display: flex; flex-direction: column;
-  overflow-y: auto;
-}
-.rail__brand {
-  display: flex; align-items: center; gap: var(--sp-3);
-  padding: 0 var(--sp-4); height: var(--topbar-h);
-  border-bottom: 1px solid var(--line);
-  flex: 0 0 auto;
-}
-.rail__mark {
-  width: 26px; height: 26px; border-radius: 7px;
-  background: linear-gradient(135deg, var(--live), var(--live-dim));
-  box-shadow: 0 0 0 1px rgba(52,214,196,.25) inset;
-  display: grid; place-items: center; color: #04120f; font-weight: 800;
-  font-family: var(--mono); font-size: 13px;
-}
-.rail__title { font-size: 13px; font-weight: 700; letter-spacing: .02em; }
-.rail__title small { display: block; color: var(--fg-2); font-weight: 500; font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; }
-
-.nav { padding: var(--sp-3) var(--sp-2); }
-.nav__group-label {
-  color: var(--fg-3); font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
-  padding: var(--sp-3) var(--sp-3) var(--sp-1);
-}
-.nav__item {
-  display: flex; align-items: center; gap: var(--sp-3);
-  width: 100%; border: 0; background: transparent; color: var(--fg-1);
-  padding: 8px var(--sp-3); border-radius: var(--r-sm); cursor: pointer;
-  font-size: 13px; text-align: left; transition: background .12s, color .12s;
-}
-.nav__item:hover { background: var(--bg-2); color: var(--fg-0); }
-.nav__item[aria-current="page"] { background: var(--bg-3); color: var(--fg-0); }
-.nav__item[aria-current="page"] .nav__dot { background: var(--live); box-shadow: 0 0 8px var(--live); }
-.nav__dot { width: 6px; height: 6px; border-radius: 50%; background: var(--fg-3); flex: 0 0 auto; }
-.nav__phase { margin-left: auto; font-size: 9.5px; color: var(--fg-3); font-family: var(--mono); }
-
-/* ---- Topbar ---- */
-.topbar {
-  grid-area: topbar;
-  background: var(--bg-1);
-  border-bottom: 1px solid var(--line);
-  display: flex; align-items: center; gap: var(--sp-4);
-  padding: 0 var(--sp-5);
-}
-.topbar__title { font-size: 15px; font-weight: 600; }
-.topbar__spacer { flex: 1; }
-.integrity { display: flex; align-items: center; gap: var(--sp-4); }
-.integrity__item { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--fg-1); }
-.integrity__label { color: var(--fg-2); text-transform: uppercase; letter-spacing: .06em; font-size: 10px; }
-.clock { font-size: 12px; color: var(--fg-1); }
-.live-pill {
-  display: inline-flex; align-items: center; gap: 7px;
-  padding: 4px 10px; border-radius: 999px;
-  border: 1px solid var(--line); background: var(--bg-2); font-size: 11px; color: var(--fg-1);
-}
-.live-pill__dot { width: 7px; height: 7px; border-radius: 50%; background: var(--unknown); }
-.live-pill--live .live-pill__dot { background: var(--live); box-shadow: 0 0 8px var(--live); animation: pulse 2s ease-in-out infinite; }
-.live-pill--stale .live-pill__dot { background: var(--warn); }
-.live-pill--offline .live-pill__dot { background: var(--bad); }
-
-@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
-
-/* ---- Main ---- */
-.main { grid-area: main; overflow-y: auto; padding: var(--sp-5); }
-.view { animation: viewIn .18s ease; }
-.view__head { display: flex; align-items: baseline; gap: var(--sp-3); margin-bottom: var(--sp-5); }
-.view__head h2 { font-size: 18px; }
-.view__head p { color: var(--fg-2); font-size: 12.5px; margin: 0; }
-@keyframes viewIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
-
-/* ---- Responsive ---- */
-@media (max-width: 900px) {
-  .app { grid-template-columns: 64px 1fr; }
-  .rail__title, .nav__group-label, .nav__phase { display: none; }
-  .rail__brand { justify-content: center; padding: 0; }
-  .nav__item { justify-content: center; }
-}
-@media (max-width: 620px) {
-  .integrity { display: none; }
-  .main { padding: var(--sp-4); }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  * { animation: none !important; transition: none !important; }
-}
-/* Reusable components: the data-integrity chip + freshness bar are the
-   signature elements — they appear on every panel so provenance is always
-   visible. Nothing here fabricates a value; empty/unknown states are explicit. */
-
-/* ---- Grid ---- */
-.grid { display: grid; gap: var(--sp-4); }
-.grid--kpi { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
-.grid--2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
-
-/* ---- Card ---- */
-.card {
-  background: var(--bg-2);
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
-  box-shadow: var(--shadow);
-  overflow: hidden;
-}
-.card__head {
-  display: flex; align-items: center; gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-4);
-  border-bottom: 1px solid var(--line-soft);
-}
-.card__title { font-size: 12.5px; font-weight: 600; color: var(--fg-0); }
-.card__title small { color: var(--fg-2); font-weight: 500; }
-.card__head-right { margin-left: auto; display: flex; align-items: center; gap: var(--sp-2); }
-.card__body { padding: var(--sp-4); }
-
-/* ---- KPI ---- */
-.kpi__label { color: var(--fg-2); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
-.kpi__value { font-size: 26px; margin-top: 6px; font-family: var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
-.kpi__value--unknown { color: var(--unknown); font-size: 18px; }
-.kpi__sub { margin-top: 4px; font-size: 11.5px; color: var(--fg-2); }
-
-/* ---- Status chip (data quality + system state) ---- */
-.chip {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 2px 8px; border-radius: 999px;
-  font-size: 10.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
-  border: 1px solid transparent; font-family: var(--mono);
-}
-.chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.chip--valid, .chip--up, .chip--online { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); background: color-mix(in srgb, var(--ok) 10%, transparent); }
-.chip--stale, .chip--degraded { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
-.chip--invalid, .chip--down, .chip--offline, .chip--bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 35%, transparent); background: color-mix(in srgb, var(--bad) 10%, transparent); }
-.chip--unknown, .chip--missing { color: var(--unknown); border-color: color-mix(in srgb, var(--unknown) 35%, transparent); background: color-mix(in srgb, var(--unknown) 10%, transparent); }
-.chip--conflicted { color: var(--conflict); border-color: color-mix(in srgb, var(--conflict) 35%, transparent); background: color-mix(in srgb, var(--conflict) 10%, transparent); }
-.chip--long { color: var(--long); border-color: color-mix(in srgb, var(--long) 35%, transparent); background: color-mix(in srgb, var(--long) 10%, transparent); }
-.chip--short { color: var(--short); border-color: color-mix(in srgb, var(--short) 35%, transparent); background: color-mix(in srgb, var(--short) 10%, transparent); }
-
-/* ---- Freshness bar (signature): shows data age vs its budget ---- */
-.freshness { display: inline-flex; align-items: center; gap: 6px; }
-.freshness__track { width: 46px; height: 4px; border-radius: 2px; background: var(--bg-3); overflow: hidden; }
-.freshness__fill { height: 100%; width: 0%; background: var(--ok); transition: width .3s ease, background .3s ease; }
-.freshness__fill--stale { background: var(--warn); }
-.freshness__fill--expired { background: var(--bad); }
-.freshness__age { font-size: 10px; color: var(--fg-2); font-family: var(--mono); }
-
-/* ---- Table ---- */
-.table-wrap { overflow-x: auto; }
-table.data { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-table.data th {
-  text-align: left; color: var(--fg-2); font-weight: 600; font-size: 10.5px;
-  text-transform: uppercase; letter-spacing: .06em;
-  padding: 8px var(--sp-3); border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg-2);
-}
-table.data td { padding: 9px var(--sp-3); border-bottom: 1px solid var(--line-soft); }
-table.data td.num, table.data th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
-table.data tbody tr:hover, table.data tbody tr:hover { background: var(--bg-3); }
-
-/* ---- Buttons / inputs ---- */
-.btn {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 7px 12px; border-radius: var(--r-sm); cursor: pointer;
-  background: var(--bg-3); color: var(--fg-0); border: 1px solid var(--line); font-size: 12.5px;
-  transition: background .12s, border-color .12s;
-}
-.btn:hover { background: var(--line); }
-.btn--primary { background: var(--live-dim); border-color: var(--live-dim); color: #eafffb; }
-.btn--primary:hover { background: var(--live); color: #04120f; }
-.input, .select {
-  background: var(--bg-1); border: 1px solid var(--line); color: var(--fg-0);
-  padding: 7px 10px; border-radius: var(--r-sm); font-size: 12.5px; font-family: inherit;
-}
-.field { display: flex; flex-direction: column; gap: 4px; }
-.field label { font-size: 10.5px; color: var(--fg-2); text-transform: uppercase; letter-spacing: .06em; }
-
-/* ---- Empty / not-implemented state ---- */
-.empty {
-  border: 1px dashed var(--line); border-radius: var(--r-lg);
-  padding: var(--sp-6); text-align: center; color: var(--fg-2); background: var(--bg-1);
-}
-.empty__badge {
-  display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono);
-  font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
-  color: var(--unknown); border: 1px solid color-mix(in srgb, var(--unknown) 35%, transparent);
-  padding: 4px 10px; border-radius: 999px; margin-bottom: var(--sp-3);
-}
-.empty h3 { color: var(--fg-1); font-size: 14px; margin-bottom: 6px; }
-.empty p { max-width: 520px; margin: 0 auto; font-size: 12.5px; }
-.empty code { font-family: var(--mono); color: var(--fg-1); background: var(--bg-3); padding: 1px 6px; border-radius: 4px; }
-
-/* ---- Skeleton (loading, never fake content) ---- */
-.skeleton { background: linear-gradient(90deg, var(--bg-3) 25%, var(--line) 37%, var(--bg-3) 63%); background-size: 400% 100%; animation: shimmer 1.4s ease infinite; border-radius: 4px; color: transparent; }
-@keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
-
-/* ---- Banner ---- */
-.banner {
-  display: flex; align-items: center; gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-4); border-radius: var(--r-md);
-  border: 1px solid var(--line); background: var(--bg-1); font-size: 12.5px; margin-bottom: var(--sp-4);
-}
-.banner--safe { border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
-.banner__k { font-family: var(--mono); color: var(--ok); }
-/* Dashboard-specific layout */
-.dash-grid { display: grid; grid-template-columns: 2fr 1fr; gap: var(--sp-4); }
-@media (max-width: 1000px) { .dash-grid { grid-template-columns: 1fr; } }
-.watch { display: flex; flex-direction: column; }
-.watch__row { display: grid; grid-template-columns: 1.4fr 1fr 1fr auto; align-items: center; gap: var(--sp-3); padding: 10px var(--sp-4); border-bottom: 1px solid var(--line-soft); }
-.watch__row:last-child { border-bottom: 0; }
-.watch__sym { font-weight: 600; }
-.watch__sym small { display: block; color: var(--fg-2); font-size: 10.5px; font-weight: 500; }
-/* Scanner-specific layout */
-.scanner__filters { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin-bottom: var(--sp-4); }
-.scanner__filters .field { min-width: 130px; }
-.scanner__count { color: var(--fg-2); font-size: 11.5px; margin-left: auto; align-self: flex-end; }
-
+    :root{
+      --bg:#0e1116; --panel:#171b22; --panel2:#1e232c; --line:#2a303b;
+      --text:#e8edf4; --muted:#98a2b3; --accent:#3b82f6;
+      --green:#22c55e; --amber:#f59e0b; --red:#ef4444; --grey:#6b7280; --blue:#38bdf8;
+      --radius:14px; --safe-b:env(safe-area-inset-bottom,0px);
+      --safe-t:env(safe-area-inset-top,0px);
+    }
+    *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+    html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+      font-size:16px;line-height:1.4;overflow-x:hidden}
+    body{max-width:100%;min-height:100vh;padding-bottom:calc(72px + var(--safe-b))}
+    a{color:inherit}
+    .header{position:sticky;top:0;z-index:10;background:linear-gradient(180deg,#12161c,#0e1116);
+      border-bottom:1px solid var(--line);padding:calc(10px + var(--safe-t)) 16px 10px}
+    .header__row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+    .brand{font-weight:700;font-size:17px;letter-spacing:.2px}
+    .brand small{display:block;font-weight:500;color:var(--muted);font-size:11px;letter-spacing:.3px}
+    .hdot{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);
+      background:var(--panel);border:1px solid var(--line);padding:6px 10px;border-radius:999px}
+    .dot{width:9px;height:9px;border-radius:50%;background:var(--grey);flex:0 0 auto}
+    .dot.up{background:var(--green)} .dot.deg{background:var(--amber)}
+    .dot.down{background:var(--red)} .dot.unk{background:var(--grey)}
+    .refresh{margin-top:8px;font-size:11px;color:var(--muted);display:flex;align-items:center;gap:6px}
+    .refresh .spark{width:6px;height:6px;border-radius:50%;background:var(--accent);opacity:.5}
+    main{padding:14px 14px 20px;max-width:760px;margin:0 auto}
+    .view{display:none} .view.active{display:block}
+    h2.section{font-size:13px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);
+      margin:4px 2px 10px;font-weight:600}
+    .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+      margin:0 0 12px;overflow:hidden}
+    .row{display:flex;align-items:center;justify-content:space-between;gap:12px;
+      padding:14px 16px;border-bottom:1px solid var(--line);min-height:60px}
+    .row:last-child{border-bottom:none}
+    .row.tap{cursor:pointer;transition:background .12s} .row.tap:active{background:var(--panel2)}
+    .row.disabled{opacity:.6}
+    .sym{font-weight:600;font-size:16px} .sub{color:var(--muted);font-size:12px;margin-top:2px}
+    .price{font-variant-numeric:tabular-nums;font-weight:600;font-size:16px;text-align:right}
+    .price .na{color:var(--muted);font-weight:500}
+    .badge{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.4px;
+      padding:3px 8px;border-radius:999px;border:1px solid var(--line);white-space:nowrap}
+    .b-live{color:#052e12;background:var(--green)} .b-stale{color:#3a2600;background:var(--amber)}
+    .b-invalid{color:#3a0a0a;background:var(--red)} .b-missing{color:var(--text);background:var(--panel2)}
+    .b-unknown{color:var(--text);background:var(--panel2)} .b-notmapped{color:#04212b;background:var(--blue)}
+    .b-desync{color:#3a0a0a;background:var(--red)}
+    .chip{display:inline-flex;gap:8px;flex-wrap:wrap;margin:0 0 10px}
+    .tab{flex:1;text-align:center;padding:10px;border-radius:10px;background:var(--panel);
+      border:1px solid var(--line);color:var(--muted);font-weight:600;font-size:13px;cursor:pointer}
+    .tab[aria-current="page"]{color:var(--text);background:var(--panel2);border-color:var(--accent)}
+    .tbl{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+    .tbl th,.tbl td{padding:9px 10px;text-align:right;font-size:13px;border-bottom:1px solid var(--line)}
+    .tbl th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+    .tbl th:first-child,.tbl td:first-child{text-align:left}
+    .muted{color:var(--muted)} .center{text-align:center}
+    .state{padding:22px 16px;text-align:center;color:var(--muted);font-size:14px}
+    .state strong{display:block;color:var(--text);margin-bottom:4px;font-size:15px}
+    .kv{display:flex;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line)}
+    .kv:last-child{border-bottom:none} .kv .k{color:var(--muted)} .kv .v{font-weight:600}
+    .back{display:inline-flex;align-items:center;gap:6px;color:var(--muted);background:none;border:none;
+      font-size:14px;padding:6px 2px;margin-bottom:6px;cursor:pointer}
+    .nav{position:fixed;left:0;right:0;bottom:0;z-index:20;display:flex;gap:6px;
+      background:linear-gradient(0deg,#0c0f14,#12161c);border-top:1px solid var(--line);
+      padding:8px 12px calc(8px + var(--safe-b))}
+    .nav button{flex:1;background:none;border:none;color:var(--muted);font-size:11px;font-weight:600;
+      padding:8px 4px;border-radius:10px;cursor:pointer;display:flex;flex-direction:column;
+      align-items:center;gap:4px;min-height:48px}
+    .nav button[aria-current="page"]{color:var(--text);background:var(--panel2)}
+    .nav .ic{font-size:18px;line-height:1}
+    .spin{display:inline-block;width:16px;height:16px;border:2px solid var(--line);
+      border-top-color:var(--accent);border-radius:50%;animation:sp 1s linear infinite;vertical-align:-3px}
+    @keyframes sp{to{transform:rotate(360deg)}}
+    @media (min-width:760px){ body{padding-bottom:20px}
+      .nav{position:sticky;bottom:auto;top:0;max-width:760px;margin:14px auto 0;border-radius:12px;
+        border:1px solid var(--line)} }
   </style>
 </head>
 <body>
-  <div class="app">
-    <aside class="rail">
-      <div class="rail__brand">
-        <div class="rail__mark">CIE</div>
-        <div class="rail__title">Crypto Intelligence<small>Engine · Paper</small></div>
-      </div>
-      <nav class="nav" id="nav" aria-label="Primary"></nav>
-    </aside>
-    <header class="topbar">
-      <div class="topbar__title" id="view-title">Dashboard</div>
-      <div class="topbar__spacer"></div>
-      <div class="integrity">
-        <div class="integrity__item"><span class="integrity__label">Overall</span><span class="mono" id="integrity-overall">UNKNOWN</span></div>
-        <div class="integrity__item"><span class="integrity__label">Updated</span><span class="mono" id="last-update">—</span></div>
-        <div class="integrity__item"><span class="integrity__label">UTC</span><span class="mono clock" id="clock">—</span></div>
-      </div>
-      <div class="live-pill live-pill--offline" id="live-pill"><span class="live-pill__dot"></span><span id="live-text">OFFLINE</span></div>
-    </header>
-    <main class="main" id="main"></main>
-  </div>
-  <noscript><p style="padding:24px;color:#aeb9c6">This terminal requires JavaScript to load real data from the backend.</p></noscript>
+  <header class="header">
+    <div class="header__row">
+      <div class="brand">Crypto Intelligence Engine<small>Markets · version de test</small></div>
+      <div class="hdot"><span class="dot unk" id="health-dot"></span><span id="health-label">…</span></div>
+    </div>
+    <div class="refresh"><span class="spark"></span><span>Auto-refresh: 5s (polling, pas de streaming)</span></div>
+  </header>
+
+  <main>
+    <section class="view active" id="view-markets" data-view="markets"></section>
+    <section class="view" id="view-forex" data-view="forex"></section>
+    <section class="view" id="view-system" data-view="system"></section>
+    <section class="view" id="view-detail" data-view="detail"></section>
+  </main>
+
+  <nav class="nav" id="nav"></nav>
 
   <script>
   "use strict";
-  (function () {
-    // ============================ quality ============================
-    var Quality = Object.freeze({ VALID:"VALID", STALE:"STALE", INVALID:"INVALID", MISSING:"MISSING", CONFLICTED:"CONFLICTED", UNKNOWN:"UNKNOWN" });
-    function classifyFreshness(ts, maxAgeSec, nowMs) {
-      nowMs = (nowMs == null) ? Date.now() : nowMs;
-      if (ts == null) return Quality.MISSING;
-      if (typeof ts !== "number" || Number.isNaN(ts)) return Quality.INVALID;
-      var age = (nowMs - ts) / 1000;
-      if (age < 0) return Quality.INVALID;
-      if (age <= maxAgeSec) return Quality.VALID;
-      return Quality.STALE;
-    }
+  // ---- Views registry (ids used by static tests) --------------------------
+  var VIEWS = [
+    { id:"markets", label:"Crypto", icon:"₿" },
+    { id:"forex",   label:"Forex",  icon:"$" },
+    { id:"system",  label:"Système", icon:"◔" }
+    // id:"detail" is an internal view (asset detail), not a bottom tab
+  ];
+  var DETAIL_VIEW = { id:"detail" };
 
-    // ============================ format ============================
-    var NA = "—";
-    function fmtPrice(v) {
-      if (v == null || Number.isNaN(v)) return NA;
-      var abs = Math.abs(v), dp = abs >= 1 ? 2 : abs >= 0.01 ? 4 : 8;
-      return v.toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp });
-    }
-    function fmtPct(v) { if (v == null || Number.isNaN(v)) return NA; return (v >= 0 ? "+" : "") + v.toFixed(2) + "%"; }
+  // ---- Config (NO backend URL hardcoded: same-origin relative calls) ------
+  var CRYPTO_SYMBOLS = ["BTC-USD","ETH-USD","SOL-USD","XRP-USD","LTC-USD","ADA-USD"];
+  var POLL_MS = 5000;
 
-    // ============================ net ============================
-    function resolveApiBase(override, origin) {
-      if (override) return String(override).replace(/\/$/, "");
-      if (origin) return String(origin).replace(/\/$/, "");
-      return "";
+  // ---- Tiny DOM helpers ---------------------------------------------------
+  function h(tag, attrs, kids){
+    var e = document.createElement(tag); attrs = attrs || {};
+    for (var k in attrs){
+      if (k === "class") e.className = attrs[k];
+      else if (k === "html") e.innerHTML = attrs[k];
+      else if (k.slice(0,2) === "on") e.addEventListener(k.slice(2), attrs[k]);
+      else e.setAttribute(k, attrs[k]);
     }
+    (kids||[]).forEach(function(c){
+      if (c == null) return;
+      e.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    });
+    return e;
+  }
+  function clear(node){ while(node.firstChild) node.removeChild(node.firstChild); }
+  function byId(id){ return document.getElementById(id); }
 
-    // ============================ state ============================
-    function createStore(initial) {
-      var state = Object.assign({}, initial || {}), subs = new Set();
-      return {
-        get: function (k) { return k === undefined ? state : state[k]; },
-        set: function (patch) { state = Object.assign({}, state, patch); subs.forEach(function (fn) { fn(state); }); },
-        subscribe: function (fn) { subs.add(fn); return function () { subs.delete(fn); }; }
-      };
-    }
-
-    // ============================ api ============================
-    var Result = Object.freeze({ OK:"OK", ERROR:"ERROR", NOT_IMPLEMENTED:"NOT_IMPLEMENTED" });
-    function ApiClient(opts) {
-      opts = opts || {};
-      this.base = resolveApiBase(opts.base, opts.origin);
-      this._fetch = opts.fetchImpl || (typeof fetch !== "undefined" ? fetch.bind(window) : null);
-    }
-    ApiClient.prototype._get = function (path, o) {
-      o = o || {}; var timeoutMs = o.timeoutMs || 5000, self = this;
-      if (!self._fetch) return Promise.resolve({ result: Result.ERROR, error: "no fetch", status: 0 });
-      var ctrl = new AbortController(), t = setTimeout(function () { ctrl.abort(); }, timeoutMs);
-      return self._fetch(self.base + path, { signal: ctrl.signal, headers: { Accept: "application/json" } })
-        .then(function (res) {
-          return res.json().catch(function () { return null; }).then(function (data) {
-            return { result: res.ok ? Result.OK : Result.ERROR, status: res.status, data: data };
-          });
-        })
-        .catch(function (err) { return { result: Result.ERROR, status: 0, error: String(err && err.message ? err.message : err) }; })
-        .then(function (r) { clearTimeout(t); return r; });
-    };
-    ApiClient.prototype.health = function () { return this._get("/health"); };
-    ApiClient.prototype.live = function () { return this._get("/health/live"); };
-    ApiClient.prototype.ready = function () { return this._get("/health/ready"); };
-    ApiClient.prototype.apiRoot = function () { return this._get("/api/v1/"); };
-
-    // ============================ ui helpers ============================
-    function el(tag, attrs, children) {
-      attrs = attrs || {}; var node = document.createElement(tag);
-      for (var k in attrs) { var v = attrs[k]; if (v == null) continue;
-        if (k === "class") node.className = v;
-        else if (k === "html") node.innerHTML = v;
-        else if (k.indexOf("on") === 0 && typeof v === "function") node.addEventListener(k.slice(2), v);
-        else node.setAttribute(k, v); }
-      (children == null ? [] : [].concat(children)).forEach(function (c) {
-        if (c == null) return; node.appendChild(typeof c === "string" ? document.createTextNode(c) : c); });
-      return node;
-    }
-    function chip(text, kind) { return el("span", { class: "chip chip--" + String(kind).toLowerCase() }, [text]); }
-    function card(title, sub, headRight, body) {
-      var right = el("div", { class: "card__head-right" }, [].concat(headRight || []));
-      var head = el("div", { class: "card__head" }, [ el("div", { class: "card__title" }, [title, sub ? el("small", {}, [" · " + sub]) : null]), right ]);
-      return el("div", { class: "card" }, [head, el("div", { class: "card__body" }, [].concat(body || []))]);
-    }
-    function freshnessBar(fraction, modifierClass, ageLabel) {
-      var fill = el("div", { class: "freshness__fill " + (modifierClass || "") });
-      fill.style.width = Math.round(Math.min(1, Math.max(0, fraction)) * 100) + "%";
-      return el("div", { class: "freshness" }, [ el("div", { class: "freshness__track" }, [fill]), ageLabel ? el("span", { class: "freshness__age" }, [ageLabel]) : null ]);
-    }
-    function notImplemented(engine, phase, mod) {
-      return el("div", { class: "empty" }, [
-        el("div", { class: "empty__badge" }, ["● Not implemented"]),
-        el("h3", {}, [engine + " engine"]),
-        el("p", {}, [ "This view goes live when its backend engine is built (Phase " + phase + "). No data is shown here because none exists yet — the terminal never fabricates values. Backend module: ", el("code", {}, [mod || engine.toLowerCase()]), "." ])
-      ]);
-    }
-    function viewHead(title, desc) { return el("div", { class: "view__head" }, [el("h2", {}, [title]), desc ? el("p", {}, [desc]) : null]); }
-    function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); return node; }
-
-    // ============================ views registry ============================
-    var VIEWS = [
-      { id:"dashboard",    label:"Dashboard",    group:"Overview", impl:true },
-      { id:"scanner",      label:"Scanner",      group:"Markets",  impl:false, phase:7,  module:"technical" },
-      { id:"signals",      label:"Signals",      group:"Markets",  impl:false, phase:8,  module:"strategies" },
-      { id:"positions",    label:"Positions",    group:"Trading",  impl:false, phase:10, module:"paper_trading" },
-      { id:"history",      label:"History",      group:"Trading",  impl:false, phase:10, module:"paper_trading" },
-      { id:"news",         label:"News",         group:"Intel",    impl:false, phase:4,  module:"news" },
-      { id:"macro",        label:"Macro",        group:"Intel",    impl:false, phase:5,  module:"macro" },
-      { id:"geopolitical", label:"Geopolitical", group:"Intel",    impl:false, phase:5,  module:"geopolitical" },
-      { id:"onchain",      label:"On-chain",     group:"Intel",    impl:false, phase:6,  module:"onchain" },
-      { id:"strategies",   label:"Strategies",   group:"Research", impl:false, phase:8,  module:"strategies" },
-      { id:"backtesting",  label:"Backtesting",  group:"Research", impl:false, phase:12, module:"backtesting" },
-      { id:"ai",           label:"AI Council",   group:"Research", impl:false, phase:11, module:"ai" },
-      { id:"risk",         label:"Risk",         group:"Research", impl:false, phase:9,  module:"risk" },
-      { id:"performance",  label:"Performance",  group:"Research", impl:false, phase:14, module:"performance" },
-      { id:"system",       label:"System",       group:"Ops",      impl:true },
-      { id:"settings",     label:"Settings",     group:"Ops",      impl:true }
-    ];
-    function viewById(id) { for (var i = 0; i < VIEWS.length; i++) if (VIEWS[i].id === id) return VIEWS[i]; return null; }
-    var DEFAULT_VIEW = "dashboard";
-
-    // ============================ view renderers ============================
-    var WATCH = ["BTC/USD", "ETH/USD", "SOL/USD"];
-
-    function dashSystemCard(health) {
-      var overall = "UNKNOWN", items = [];
-      if (health && health.result === Result.OK && health.data) {
-        overall = health.data.overall || "UNKNOWN";
-        items = (health.data.components || []).map(function (c) {
-          return el("div", { class: "integrity__item" }, [ el("span", { class: "integrity__label" }, [c.name]), chip(c.state, c.state) ]);
+  // ---- API client: relative, same-origin, timeout + honest error mapping --
+  function api(path){
+    var ctrl = new AbortController();
+    var to = setTimeout(function(){ ctrl.abort(); }, 8000);
+    return fetch(path, { headers:{ "Accept":"application/json" }, signal: ctrl.signal })
+      .then(function(res){
+        clearTimeout(to);
+        return res.text().then(function(txt){
+          var data = null; try { data = txt ? JSON.parse(txt) : null; } catch(e){ data = null; }
+          return { ok: res.ok, status: res.status, data: data };
         });
-      } else { items = [el("p", { class: "kpi__sub" }, ["Backend unreachable — status UNKNOWN."])]; }
-      return card("System integrity", "live probe", chip(overall, overall), el("div", { class: "grid", style: "gap:10px" }, items));
-    }
-    function watchRow(sym) {
-      return el("div", { class: "watch__row" }, [
-        el("div", { class: "watch__sym" }, [sym, el("small", {}, ["spot"])]),
-        el("div", { class: "num", style: "color:var(--fg-2)" }, [NA]),
-        freshnessBar(1, "freshness__fill--expired", "—"),
-        chip("UNKNOWN", "UNKNOWN")
-      ]);
-    }
-    function renderDashboard(ctx) {
-      var root = el("div", { class: "view" }, [
-        viewHead("Dashboard", "Real system state now; market data activates in Phase 2."),
-        el("div", { class: "banner banner--safe" }, [ el("span", { class: "banner__k" }, ["PAPER-ONLY"]), el("span", {}, ["No real orders and no withdrawals exist in this build. LIVE_TRADING_ENABLED=false."]) ])
-      ]);
-      var grid = el("div", { class: "dash-grid" });
-      var watch = card("Watchlist", WATCH.length + " assets", chip("UNKNOWN", "UNKNOWN"), el("div", { class: "watch" }, WATCH.map(watchRow)));
-      var sysHolder = el("div", {}, [card("System integrity", "loading", null, el("p", { class: "kpi__sub" }, ["Probing backend…"]))]);
-      grid.appendChild(watch); grid.appendChild(sysHolder); root.appendChild(grid);
-      ctx.api.health().then(function (h) { clear(sysHolder).appendChild(dashSystemCard(h)); });
-      return root;
-    }
-
-    function sysComponentRow(c) {
-      return el("tr", {}, [
-        el("td", {}, [c.name]), el("td", {}, [chip(c.state, c.state)]),
-        el("td", { class: "num" }, [c.latency_ms != null ? c.latency_ms + " ms" : NA]),
-        el("td", { style: "color:var(--fg-2)" }, [c.detail || NA])
-      ]);
-    }
-    function sysTable(health, live) {
-      var rows = [];
-      rows.push(el("tr", {}, [
-        el("td", {}, ["fastapi"]),
-        el("td", {}, [chip(live && live.result === Result.OK ? "UP" : "DOWN", live && live.result === Result.OK ? "UP" : "DOWN")]),
-        el("td", { class: "num" }, [NA]),
-        el("td", { style: "color:var(--fg-2)" }, [live && live.result === Result.OK ? "liveness ok" : "no liveness response"])
-      ]));
-      if (health && health.result === Result.OK && health.data) (health.data.components || []).forEach(function (c) { rows.push(sysComponentRow(c)); });
-      return el("div", { class: "table-wrap" }, [ el("table", { class: "data" }, [
-        el("thead", {}, [el("tr", {}, [ el("th", {}, ["Component"]), el("th", {}, ["State"]), el("th", { class: "num" }, ["Latency"]), el("th", {}, ["Detail"]) ])]),
-        el("tbody", {}, rows) ]) ]);
-    }
-    function renderSystem(ctx) {
-      var holder = el("div", {}, [card("Components", "live probe", null, el("p", { class: "kpi__sub" }, ["Probing…"]))]);
-      var root = el("div", { class: "view" }, [ viewHead("System", "Liveness and dependency health, probed in real time."), holder ]);
-      Promise.all([ctx.api.health(), ctx.api.live()]).then(function (r) {
-        var h = r[0], l = r[1], overall = (h && h.result === Result.OK && h.data) ? h.data.overall : "UNKNOWN";
-        clear(holder).appendChild(card("Components", "live probe", chip(overall, overall), sysTable(h, l)));
+      })
+      .catch(function(err){
+        clearTimeout(to);
+        var net = (err && err.name === "AbortError") ? "timeout" : "network";
+        return { ok:false, status:0, data:null, netError: net };
       });
-      return root;
+  }
+  // Map a non-ok response to a human message from the REAL backend reason.
+  function errorMessage(r){
+    if (r.netError === "timeout") return "Délai dépassé — réseau lent ou backend indisponible.";
+    if (r.netError === "network") return "Réseau indisponible — impossible de joindre le backend.";
+    var reason = (r.data && (r.data.reason || (r.data.detail && r.data.detail.reason))) || null;
+    switch (r.status){
+      case 400: return reason || "Requête invalide.";
+      case 401:
+      case 403: return "Accès refusé au provider.";
+      case 409: return reason || "Symbole non mappé.";
+      case 429: return "Trop de requêtes — réessayez dans un instant.";
+      case 503: return reason || "Provider temporairement indisponible.";
     }
+    if (r.status >= 500) return "Erreur serveur.";
+    return reason || ("Erreur (" + r.status + ").");
+  }
 
-    function settingsRow(label, value, chipKind) {
-      return el("div", { style: "display:flex; align-items:center; gap:10px" }, [
-        el("span", { class: "integrity__label", style: "min-width:110px" }, [label]),
-        chipKind ? chip(value, chipKind) : el("span", { class: "num" }, [value])
-      ]);
-    }
-    function renderSettings(ctx) {
-      var apiHolder = el("div", {}, [card("Service", "reading /api/v1/", null, el("p", { class: "kpi__sub" }, ["Reading…"]))]);
-      ctx.api.apiRoot().then(function (r) {
-        var ok = r.result === Result.OK && r.data;
-        var rows = el("div", { class: "grid", style: "gap:10px" }, [
-          settingsRow("Service", ok ? r.data.service : NA),
-          settingsRow("Phase", ok ? String(r.data.phase) : NA),
-          settingsRow("Status", ok ? r.data.status : "unreachable"),
-          settingsRow("Execution", "paper-only (no real orders)", "UP"),
-          settingsRow("Live trading", "disabled", "DOWN")
-        ]);
-        clear(apiHolder).appendChild(card("Service", ok ? "connected" : "unreachable", chip(ok ? "UP" : "DOWN", ok ? "UP" : "DOWN"), rows));
-      });
-      var base = (typeof localStorage !== "undefined" && localStorage.getItem("cie.apiBase")) || "";
-      var input = el("input", { class: "input", placeholder: "same origin", value: base, style: "min-width:260px" });
-      var saveBtn = el("button", { class: "btn btn--primary", onclick: function () {
-        if (typeof localStorage !== "undefined") localStorage.setItem("cie.apiBase", input.value.trim());
-        location.reload();
-      } }, ["Save & reload"]);
-      var apiBaseCard = card("API base URL", "advanced", null, el("div", { class: "field" }, [
-        el("label", {}, ["Backend base URL (blank = same origin as this page)"]),
-        el("div", { style: "display:flex; gap:8px" }, [input, saveBtn])
+  // ---- Formatting (never NaN / undefined) ---------------------------------
+  function fmtNum(v){
+    if (v === null || v === undefined || v === "" || isNaN(Number(v))) return null;
+    var n = Number(v);
+    var abs = Math.abs(n);
+    var d = abs >= 1000 ? 2 : abs >= 1 ? 4 : 6;
+    return n.toLocaleString("en-US", { minimumFractionDigits:2, maximumFractionDigits:d });
+  }
+  function priceCell(v){
+    var s = fmtNum(v);
+    return s === null ? h("span",{class:"na"},["—"]) : document.createTextNode(s);
+  }
+  // Quality (backend) -> display badge. Only real backend states are used.
+  function qualityBadge(q){
+    var map = {
+      VALID:["LIVE","b-live"], STALE:["STALE","b-stale"], INVALID:["INVALID","b-invalid"],
+      MISSING:["NO DATA","b-missing"], UNKNOWN:["UNKNOWN","b-unknown"],
+      NOT_MAPPED:["NOT MAPPED","b-notmapped"], DESYNC:["DESYNC","b-desync"]
+    };
+    var m = map[q] || ["UNKNOWN","b-unknown"];
+    return h("span",{class:"badge "+m[1]},[m[0]]);
+  }
+  function tsAgo(iso){
+    if (!iso) return "";
+    var t = Date.parse(iso); if (isNaN(t)) return "";
+    var s = Math.max(0, Math.round((Date.now()-t)/1000));
+    return s < 90 ? (s+"s") : (Math.round(s/60)+"min");
+  }
+  function loading(txt){ return h("div",{class:"state"},[h("span",{class:"spin"}),"  "+(txt||"Chargement…")]); }
+  function emptyState(title, sub){ return h("div",{class:"state"},[h("strong",{},[title]), sub||""]); }
+
+  // ---- State --------------------------------------------------------------
+  var current = "markets";
+  var detailCtx = null;   // { kind:"crypto"|"forex", symbol, canonical }
+
+  // ---- Health (header dot) ------------------------------------------------
+  function refreshHealth(){
+    return api("/health").then(function(r){
+      var dot = byId("health-dot"), lab = byId("health-label");
+      dot.className = "dot unk"; lab.textContent = "inconnu";
+      if (!r.ok || !r.data){ lab.textContent = "backend indisponible"; dot.className="dot down"; return; }
+      var overall = r.data.overall || "UNKNOWN";
+      var cls = overall==="UP"?"up":overall==="DEGRADED"?"deg":overall==="DOWN"?"down":"unk";
+      dot.className = "dot "+cls; lab.textContent = "backend " + overall.toLowerCase();
+    });
+  }
+
+  // ---- Markets (Crypto Coinbase) -----------------------------------------
+  function renderMarkets(){
+    var v = byId("view-markets"); clear(v);
+    v.appendChild(h("h2",{class:"section"},["Crypto · Coinbase (réel)"]));
+    var card = h("div",{class:"card"},[]);
+    CRYPTO_SYMBOLS.forEach(function(sym){
+      card.appendChild(h("div",{class:"row tap","data-sym":sym, onclick:function(){ openDetail("crypto",sym); }},[
+        h("div",{},[ h("div",{class:"sym"},[sym]), h("div",{class:"sub"},["Coinbase"]) ]),
+        h("div",{style:"display:flex;align-items:center;gap:10px"},[
+          h("span",{class:"price","data-price":sym},[h("span",{class:"na"},["…"])]),
+          h("span",{"data-badge":sym},[])
+        ])
       ]));
-      return el("div", { class: "view" }, [ viewHead("Settings", "Safety posture is read-only in this build."), el("div", { class: "grid grid--2" }, [apiHolder, apiBaseCard]) ]);
-    }
+    });
+    v.appendChild(card);
+    v.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:2px 4px"},
+      ["Prix et qualité fournis par le backend. Aucune valeur estimée côté interface."]));
+    refreshMarkets();
+  }
+  function refreshMarkets(){
+    CRYPTO_SYMBOLS.forEach(function(sym){
+      api("/api/v1/market/ticker/"+encodeURIComponent(sym)).then(function(r){
+        var pc = document.querySelector('[data-price="'+sym+'"]');
+        var bc = document.querySelector('[data-badge="'+sym+'"]');
+        if (!pc || !bc) return;
+        clear(pc); clear(bc);
+        if (!r.ok || !r.data){ pc.appendChild(h("span",{class:"na"},["indispo"]));
+          bc.appendChild(qualityBadge("UNKNOWN")); return; }
+        pc.appendChild(priceCell(r.data.value));
+        bc.appendChild(qualityBadge(r.data.quality));
+      });
+    });
+  }
 
-    function renderNotImplemented(v) {
-      return el("div", { class: "view" }, [
-        viewHead(v.label, "Live once the " + v.module + " engine ships (Phase " + v.phase + ")."),
-        notImplemented(v.label, v.phase, v.module)
-      ]);
-    }
-    var RENDERERS = { dashboard: renderDashboard, system: renderSystem, settings: renderSettings };
-
-    // ============================ app bootstrap ============================
-    var apiBase = (typeof localStorage !== "undefined" && localStorage.getItem("cie.apiBase")) || "";
-    var ctx = { api: new ApiClient({ base: apiBase, origin: location.origin }), store: createStore({ view: DEFAULT_VIEW, health: null }) };
-
-    function buildNav() {
-      var nav = document.getElementById("nav"); clear(nav); var currentGroup = null;
-      VIEWS.forEach(function (v) {
-        if (v.group !== currentGroup) { currentGroup = v.group; nav.appendChild(el("div", { class: "nav__group-label" }, [v.group])); }
-        nav.appendChild(el("button", { class: "nav__item", "data-view": v.id, onclick: function () { location.hash = "#/" + v.id; } }, [
-          el("span", { class: "nav__dot" }), el("span", {}, [v.label]), v.impl ? null : el("span", { class: "nav__phase" }, ["P" + v.phase])
+  // ---- Forex (Massive) ----------------------------------------------------
+  function renderForex(){
+    var v = byId("view-forex"); clear(v);
+    v.appendChild(h("h2",{class:"section"},["Forex · Massive (réel)"]));
+    v.appendChild(loading("Lecture des mappings…"));
+    api("/api/v1/market/forex/mappings").then(function(r){
+      clear(v); v.appendChild(h("h2",{class:"section"},["Forex · Massive (réel)"]));
+      if (!r.ok || !r.data){ v.appendChild(emptyState("Forex indisponible", errorMessage(r))); return; }
+      var act = r.data.activation || {};
+      var note = act.activated
+        ? (act.confirmed_count + " paire(s) mappée(s) officiellement")
+        : "Mappings non activés (clé provider absente côté serveur) — symboles NOT_MAPPED.";
+      v.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:0 4px 10px"},[note]));
+      var card = h("div",{class:"card"},[]);
+      (r.data.mappings||[]).forEach(function(m){
+        var mapped = m.status === "MAPPED";
+        card.appendChild(h("div",{class:"row "+(mapped?"tap":"disabled"),
+          onclick: mapped ? function(){ openDetail("forex", m.canonical); } : null },[
+          h("div",{},[ h("div",{class:"sym"},[m.canonical]),
+            h("div",{class:"sub"},[ mapped ? ("Massive · "+(m.provider_symbol||"")) : "Non disponible" ]) ]),
+          qualityBadge(mapped ? "VALID" : "NOT_MAPPED")
         ]));
       });
-    }
-    function setActiveNav(id) {
-      var items = document.querySelectorAll(".nav__item");
-      for (var i = 0; i < items.length; i++) {
-        if (items[i].getAttribute("data-view") === id) items[i].setAttribute("aria-current", "page");
-        else items[i].removeAttribute("aria-current");
+      v.appendChild(card);
+      if (act.xau && act.xau.ticker){
+        v.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:2px 4px"},
+          ["XAU détecté par le provider ("+act.xau.ticker+") — non intégré dans cette version."]));
       }
+    });
+  }
+
+  // ---- Detail (price + recent candles) ------------------------------------
+  function alignHour(sec){ return Math.floor(sec/3600)*3600; }
+  function openDetail(kind, symbol){
+    detailCtx = { kind:kind, symbol:symbol, canonical:symbol };
+    setView("detail");
+  }
+  function renderDetail(){
+    var v = byId("view-detail"); clear(v);
+    if (!detailCtx){ v.appendChild(emptyState("Aucun actif sélectionné","")); return; }
+    v.appendChild(h("button",{class:"back", onclick:function(){ setView(detailCtx.kind==="forex"?"forex":"markets"); }},["← Retour"]));
+    v.appendChild(h("h2",{class:"section"},[detailCtx.symbol + " · " + (detailCtx.kind==="forex"?"Forex Massive":"Crypto Coinbase")]));
+
+    if (detailCtx.kind === "crypto"){
+      var quote = h("div",{class:"card"},[ h("div",{class:"kv"},[
+        h("span",{class:"k"},["Prix"]), h("span",{class:"v","id":"d-price"},[h("span",{class:"spin"})]) ]) ]);
+      v.appendChild(quote);
     }
-    function mountView(id) {
-      var view = viewById(id) || viewById(DEFAULT_VIEW), main = document.getElementById("main");
-      document.getElementById("view-title").textContent = view.label; setActiveNav(view.id); clear(main);
-      var renderer = RENDERERS[view.id] || function () { return renderNotImplemented(view); };
-      main.appendChild(renderer(ctx));
-    }
-    function currentViewId() { var m = location.hash.match(/^#\/([a-z-]+)/); return (m && viewById(m[1])) ? m[1] : DEFAULT_VIEW; }
-    function updateTopbar(health) {
-      var pill = document.getElementById("live-pill"), overall = "UNKNOWN", cls = "live-pill--offline", text = "OFFLINE";
-      if (health && health.result === Result.OK && health.data) {
-        overall = health.data.overall;
-        if (overall === "UP") { cls = "live-pill--live"; text = "LIVE"; }
-        else if (overall === "DEGRADED") { cls = "live-pill--stale"; text = "DEGRADED"; }
-        else { cls = "live-pill--offline"; text = overall; }
-      }
-      pill.className = "live-pill " + cls;
-      document.getElementById("live-text").textContent = text;
-      document.getElementById("integrity-overall").textContent = overall;
-    }
-    function pollHealth() {
-      ctx.api.health().then(function (h) {
-        ctx.store.set({ health: h }); updateTopbar(h);
-        document.getElementById("last-update").textContent = new Date().toLocaleTimeString();
+    var histWrap = h("div",{class:"card","id":"d-hist"},[ loading("Historique réel…") ]);
+    v.appendChild(histWrap);
+    refreshDetail();
+  }
+  function refreshDetail(){
+    if (!detailCtx) return;
+    if (detailCtx.kind === "crypto"){
+      api("/api/v1/market/ticker/"+encodeURIComponent(detailCtx.symbol)).then(function(r){
+        var pe = byId("d-price"); if (!pe) return; clear(pe);
+        if (!r.ok || !r.data){ pe.appendChild(h("span",{class:"na"},["—"])); return; }
+        pe.appendChild(priceCell(r.data.value));
+        pe.appendChild(document.createTextNode("  "));
+        pe.appendChild(qualityBadge(r.data.quality));
+        if (r.data.timestamp){ pe.appendChild(h("span",{class:"sub",style:"margin-left:8px"},
+          ["il y a "+tsAgo(r.data.timestamp)])); }
       });
+      loadCandles("/api/v1/market/candles/"+encodeURIComponent(detailCtx.symbol)+"?granularity=1h");
+    } else {
+      var end = alignHour(Math.floor(Date.now()/1000));
+      var start = end - 12*3600;
+      loadCandles("/api/v1/market/forex/"+encodeURIComponent(detailCtx.canonical)+
+        "/history?granularity=1h&start="+start+"&end="+end);
     }
-    function startClock() {
-      function tick() { document.getElementById("clock").textContent = new Date().toISOString().slice(11, 19) + "Z"; }
-      tick(); setInterval(tick, 1000);
+  }
+  function loadCandles(path){
+    api(path).then(function(r){
+      var w = byId("d-hist"); if (!w) return; clear(w);
+      if (!r.ok){ w.appendChild(emptyState("Historique indisponible", errorMessage(r))); return; }
+      var d = r.data || {};
+      var candles = d.candles || [];
+      var header = h("div",{class:"kv"},[ h("span",{class:"k"},["Dernières bougies (1h)"]),
+        h("span",{class:"v"},[ qualityBadge(d.quality || (candles.length?"VALID":"MISSING")) ]) ]);
+      w.appendChild(header);
+      if (!candles.length){ w.appendChild(emptyState("Pas de données",
+        d.status==="EMPTY"?"Aucune bougie sur la période.":"")); return; }
+      var rows = candles.slice(-10).reverse().map(function(c){
+        return h("tr",{},[
+          h("td",{},[ (c.start||"").replace("T"," ").slice(0,16) ]),
+          h("td",{},[ priceCell(c.open) ]), h("td",{},[ priceCell(c.high) ]),
+          h("td",{},[ priceCell(c.low) ]), h("td",{},[ priceCell(c.close) ])
+        ]);
+      });
+      w.appendChild(h("table",{class:"tbl"},[
+        h("thead",{},[ h("tr",{},[ h("th",{},["Heure (UTC)"]), h("th",{},["O"]),
+          h("th",{},["H"]), h("th",{},["L"]), h("th",{},["C"]) ]) ]),
+        h("tbody",{}, rows)
+      ]));
+      if (d.gaps_status === "UNKNOWN"){
+        w.appendChild(h("div",{class:"muted",style:"font-size:11px;padding:8px 12px"},
+          ["Détection de trous: UNKNOWN (calendrier Forex non configuré — une barre absente n'est pas un trou)."]));
+      }
+    });
+  }
+
+  // ---- System (health) ----------------------------------------------------
+  function renderSystem(){
+    var v = byId("view-system"); clear(v);
+    v.appendChild(h("h2",{class:"section"},["Santé backend & données"]));
+    v.appendChild(loading("Lecture de /health…"));
+    api("/health").then(function(r){
+      clear(v); v.appendChild(h("h2",{class:"section"},["Santé backend & données"]));
+      if (!r.ok || !r.data){ v.appendChild(emptyState("Backend indisponible", errorMessage(r))); return; }
+      var d = r.data;
+      var card = h("div",{class:"card"},[]);
+      card.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["État global"]),
+        h("span",{class:"v"},[ d.overall || "UNKNOWN" ])]));
+      (d.components||[]).forEach(function(c){
+        card.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},[c.name]),
+          h("span",{class:"v"},[ c.state || "?" ])]));
+      });
+      if (d.persistence){
+        card.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["Persistance"]),
+          h("span",{class:"v"},[ d.persistence.persistence_status || "?" ])]));
+      }
+      v.appendChild(card);
+    });
+  }
+
+  // ---- Router / nav -------------------------------------------------------
+  function setView(id){
+    current = id;
+    var views = document.querySelectorAll(".view");
+    for (var i=0;i<views.length;i++){
+      views[i].classList.toggle("active", views[i].getAttribute("data-view")===id);
     }
-    function boot() {
-      buildNav(); startClock();
-      if (!location.hash) location.hash = "#/" + DEFAULT_VIEW;
-      mountView(currentViewId());
-      window.addEventListener("hashchange", function () { mountView(currentViewId()); });
-      pollHealth(); setInterval(pollHealth, 10000);
+    var btns = document.querySelectorAll("#nav button");
+    for (var j=0;j<btns.length;j++){
+      var on = btns[j].getAttribute("data-view")===id;
+      if (on) btns[j].setAttribute("aria-current","page"); else btns[j].removeAttribute("aria-current");
     }
-    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else boot();
-  })();
+    if (id==="markets") renderMarkets();
+    else if (id==="forex") renderForex();
+    else if (id==="system") renderSystem();
+    else if (id==="detail") renderDetail();
+  }
+  function buildNav(){
+    var nav = byId("nav"); clear(nav);
+    VIEWS.forEach(function(v){
+      nav.appendChild(h("button",{"data-view":v.id, onclick:function(){ setView(v.id); }},[
+        h("span",{class:"ic"},[v.icon]), v.label
+      ]));
+    });
+  }
+
+  // ---- Polling (provisional, every 5s; NOT websocket/streaming) -----------
+  function poll(){
+    refreshHealth();
+    if (current==="markets") refreshMarkets();
+    else if (current==="detail") refreshDetail();
+    else if (current==="system") renderSystem();
+  }
+
+  // ---- Boot ---------------------------------------------------------------
+  buildNav();
+  refreshHealth();
+  setView("markets");
+  setInterval(poll, POLL_MS);
   </script>
 </body>
 </html>

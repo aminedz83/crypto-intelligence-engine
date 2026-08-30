@@ -31,11 +31,7 @@ from main import (
 NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
 INDEX = FRONTEND / "index.html"
-VIEW_IDS = [
-    "dashboard", "scanner", "signals", "positions", "history", "news", "macro",
-    "geopolitical", "onchain", "strategies", "backtesting", "ai", "risk",
-    "performance", "system", "settings",
-]
+VIEW_IDS = ["markets", "forex", "system", "detail"]
 
 
 # ----------------------------- data quality -----------------------------
@@ -1812,3 +1808,55 @@ class RepoKeySecurityTests(unittest.TestCase):
 
     def test_massive_key_default_empty(self):
         self.assertEqual(main.settings.massive_api_key, "")
+
+
+# ----------------------------- testable UI (frontend) -------------------------
+class FrontendUiTests(unittest.TestCase):
+    def setUp(self):
+        self.html = INDEX.read_text(encoding="utf-8")
+
+    def test_no_massive_secret_in_frontend(self):
+        low = self.html.lower()
+        for bad in ("massive_api_key", "apikey=", "bearer ", "authorization"):
+            self.assertNotIn(bad, low)
+
+    def test_only_relative_api_calls(self):
+        # no hardcoded backend origin; browser talks same-origin only
+        self.assertNotIn("http://", self.html)
+        self.assertNotIn("https://", self.html)
+        self.assertIn('fetch(path', self.html)
+
+    def test_references_real_endpoints_only(self):
+        for ep in ("/health", "/api/v1/market/ticker/",
+                   "/api/v1/market/forex/mappings", "/api/v1/market/candles/"):
+            self.assertIn(ep, self.html)
+
+    def test_polling_labeled_not_streaming(self):
+        self.assertIn("Auto-refresh", self.html)
+        self.assertIn("setInterval(poll", self.html)
+
+    def test_mobile_viewport_and_safe_area(self):
+        self.assertIn("viewport-fit=cover", self.html)
+        self.assertIn("safe-area-inset", self.html)
+
+    def test_forex_not_mapped_guard_present(self):
+        # NOT_MAPPED rows must not be tappable to history (guarded by "MAPPED")
+        self.assertIn('m.status === "MAPPED"', self.html)
+
+
+class UiEndpointCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(create_app())
+
+    def test_forex_mappings_shape_for_ui(self):
+        body = self.client.get("/api/v1/market/forex/mappings").json()
+        self.assertIn("mappings", body)
+        self.assertIn("activation", body)
+        for m_ in body["mappings"]:
+            self.assertIn("canonical", m_)
+            self.assertIn("status", m_)
+
+    def test_health_shape_for_ui(self):
+        r = self.client.get("/health")
+        self.assertIn(r.status_code, (200, 503))
+        self.assertIn("overall", r.json())

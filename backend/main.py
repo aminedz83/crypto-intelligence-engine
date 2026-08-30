@@ -811,6 +811,17 @@ def candles_from_payload(
     return candles, DataQualityStatus.VALID
 
 
+def _latest_quality(candles: List[Candle]) -> str:
+    """Quality of the MOST RECENT candle actually received (freshness of the last
+    bar), or MISSING if none. A set of candles is only as 'live' as its newest bar
+    — a successful HTTP call never implies LIVE."""
+    dated = [c for c in candles if c.start is not None]
+    if not dated:
+        return DataQualityStatus.MISSING.value
+    newest = max(dated, key=lambda c: c.start.timestamp())  # type: ignore[union-attr]
+    return newest.status.value
+
+
 @api_router.get("/market/candles/{symbol}")
 async def market_candles(
     symbol: str, granularity: str = "1m", limit: int = CANDLE_MAX_LIMIT
@@ -834,13 +845,17 @@ async def market_candles(
         raise HTTPException(
             status_code=500, detail={"status": "UNKNOWN", "reason": str(exc)}
         ) from exc
+    # Coinbase returns candles newest-first; sort ascending deterministically so
+    # consumers can reliably take the most-recent slice. Undated (INVALID) go first.
+    ordered = sorted(candles, key=lambda c: c.start.timestamp() if c.start else float("-inf"))
     return {
         "source": "coinbase",
         "symbol": symbol.upper(),
         "granularity": granularity,
-        "count": len(candles),
-        "quality": status.value,
-        "candles": [c.to_dict() for c in candles],
+        "count": len(ordered),
+        "quality": status.value,               # overall (any non-invalid) — unchanged
+        "latest_quality": _latest_quality(ordered),  # freshness of the NEWEST bar
+        "candles": [c.to_dict() for c in ordered],
     }
 
 
@@ -2231,11 +2246,28 @@ async def fetch_forex_history(
         candles, _status = await massive_forex_provider.get_candles_range(
             canonical_symbol, granularity, start, end
         )
-    except httpx.HTTPError as exc:
+    except httpx.HTTPStatusError as exc:
+        # Map the provider HTTP status to a CLEAN status/reason. Never expose the
+        # raw exception, request URL, MDN link or the API key. Mapping is kept.
+        code = exc.response.status_code if exc.response is not None else 0
+        if code in (401, 403):
+            status_val, reason = "ACCESS_DENIED", f"access denied by provider ({code})"
+        elif code == 429:
+            status_val, reason = "RATE_LIMITED", "provider rate limit reached (429)"
+        else:
+            status_val, reason = "UNAVAILABLE", f"provider error ({code})"
         return {
             "source": "massive", "canonical_symbol": canonical_symbol,
             "provider_symbol": provider_ticker, "granularity": granularity,
-            "status": "UNAVAILABLE", "reason": str(exc), "count": 0, "candles": [],
+            "status": status_val, "reason": reason, "http_status": code,
+            "count": 0, "candles": [],
+        }
+    except httpx.HTTPError:
+        return {
+            "source": "massive", "canonical_symbol": canonical_symbol,
+            "provider_symbol": provider_ticker, "granularity": granularity,
+            "status": "UNAVAILABLE", "reason": "provider unreachable",
+            "count": 0, "candles": [],
         }
     collected: Dict[int, Candle] = {}
     invalid = 0
@@ -2260,6 +2292,7 @@ async def fetch_forex_history(
         "requested_range": {"start": start, "end": end},
         "count": len(kept),
         "invalid_candles_count": invalid,
+        "latest_quality": _latest_quality(kept),
         "gaps_status": report.status,   # "UNKNOWN" for forex (no verified calendar)
         "gaps": report.missing,          # [] when UNKNOWN
         "data_complete": False,          # gap analysis unavailable -> never assert complete
@@ -2296,6 +2329,16 @@ async def market_forex_history(
         raise HTTPException(
             status_code=409,
             detail={"status": "NOT_MAPPED", "reason": result.get("reason")},
+        )
+    if status == "ACCESS_DENIED":
+        raise HTTPException(
+            status_code=403,
+            detail={"status": "ACCESS_DENIED", "reason": result.get("reason")},
+        )
+    if status == "RATE_LIMITED":
+        raise HTTPException(
+            status_code=429,
+            detail={"status": "RATE_LIMITED", "reason": result.get("reason")},
         )
     if status == "UNAVAILABLE":
         raise HTTPException(

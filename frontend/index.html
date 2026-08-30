@@ -50,7 +50,7 @@
     .b-live{color:#052e12;background:var(--green)} .b-stale{color:#3a2600;background:var(--amber)}
     .b-invalid{color:#3a0a0a;background:var(--red)} .b-missing{color:var(--text);background:var(--panel2)}
     .b-unknown{color:var(--text);background:var(--panel2)} .b-notmapped{color:#04212b;background:var(--blue)}
-    .b-desync{color:#3a0a0a;background:var(--red)}
+    .b-desync{color:#3a0a0a;background:var(--red)} .b-mapped{color:#04212b;background:#67e8f9}
     .chip{display:inline-flex;gap:8px;flex-wrap:wrap;margin:0 0 10px}
     .tab{flex:1;text-align:center;padding:10px;border-radius:10px;background:var(--panel);
       border:1px solid var(--line);color:var(--muted);font-weight:600;font-size:13px;cursor:pointer}
@@ -185,7 +185,8 @@
     var map = {
       VALID:["LIVE","b-live"], STALE:["STALE","b-stale"], INVALID:["INVALID","b-invalid"],
       MISSING:["NO DATA","b-missing"], UNKNOWN:["UNKNOWN","b-unknown"],
-      NOT_MAPPED:["NOT MAPPED","b-notmapped"], DESYNC:["DESYNC","b-desync"]
+      NOT_MAPPED:["NOT MAPPED","b-notmapped"], MAPPED:["MAPPED","b-mapped"],
+      DESYNC:["DESYNC","b-desync"]
     };
     var m = map[q] || ["UNKNOWN","b-unknown"];
     return h("span",{class:"badge "+m[1]},[m[0]]);
@@ -269,7 +270,7 @@
           onclick: mapped ? function(){ openDetail("forex", m.canonical); } : null },[
           h("div",{},[ h("div",{class:"sym"},[m.canonical]),
             h("div",{class:"sub"},[ mapped ? ("Massive · "+(m.provider_symbol||"")) : "Non disponible" ]) ]),
-          qualityBadge(mapped ? "VALID" : "NOT_MAPPED")
+          qualityBadge(mapped ? "MAPPED" : "NOT_MAPPED")
         ]));
       });
       v.appendChild(card);
@@ -324,11 +325,25 @@
   function loadCandles(path){
     api(path).then(function(r){
       var w = byId("d-hist"); if (!w) return; clear(w);
-      if (!r.ok){ w.appendChild(emptyState("Historique indisponible", errorMessage(r))); return; }
+      if (!r.ok){
+        // Never show a raw httpx exception/URL: clean, per-status message only.
+        var msg;
+        if (r.status===403) msg="Données Massive indisponibles — accès refusé par le fournisseur (403).";
+        else if (r.status===409) msg="Symbole non mappé.";
+        else if (r.status===429) msg="Trop de requêtes — réessayez plus tard.";
+        else if (r.status===503) msg="Provider temporairement indisponible.";
+        else msg=errorMessage(r);
+        w.appendChild(emptyState("Historique indisponible", msg)); return;
+      }
       var d = r.data || {};
-      var candles = d.candles || [];
+      var candles = (d.candles || []).slice().sort(function(a,b){
+        return (Date.parse(a.start)||0) - (Date.parse(b.start)||0);   // chronological, deterministic
+      });
+      // Badge reflects the freshness of the NEWEST bar actually received, never
+      // just "HTTP succeeded". Prefer the backend's latest_quality.
+      var badgeQ = d.latest_quality || (candles.length ? candles[candles.length-1].quality : "MISSING");
       var header = h("div",{class:"kv"},[ h("span",{class:"k"},["Dernières bougies (1h)"]),
-        h("span",{class:"v"},[ qualityBadge(d.quality || (candles.length?"VALID":"MISSING")) ]) ]);
+        h("span",{class:"v"},[ qualityBadge(badgeQ) ]) ]);
       w.appendChild(header);
       if (!candles.length){ w.appendChild(emptyState("Pas de données",
         d.status==="EMPTY"?"Aucune bougie sur la période.":"")); return; }

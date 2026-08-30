@@ -160,7 +160,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build backend image (real build; job fails if build fails)
-        run: docker build -t crypto-intelligence-engine-backend:ci ./backend
+        run: docker build -f backend/Dockerfile -t crypto-intelligence-engine-backend:ci .
 
   # ── SECURITY (echoue si un outil manque ou trouve quelque chose) ───────────
   security:

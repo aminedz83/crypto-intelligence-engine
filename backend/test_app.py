@@ -2731,3 +2731,55 @@ def _async_return(value):
     async def _coro():
         return value
     return _coro()
+
+
+# ----------------------------- runtime fixes: quote STALE trace + mobile OHLC --
+class MetalQuoteFreshnessTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._saved = main.twelvedata_provider
+
+    def tearDown(self):
+        main.twelvedata_provider = self._saved
+
+    async def _run(self, result):
+        main.twelvedata_provider = type("P", (), {
+            "get_quote": staticmethod(lambda canon: _async_return(result))})()
+        return await fetch_metal_quote("XAU-USD")
+
+    async def test_old_provider_timestamp_is_stale_not_live(self):
+        # provider quote timestamp 144 min old + market open -> STALE (correct), never LIVE
+        old = datetime.now(timezone.utc) - timedelta(minutes=144)
+        r = await self._run(TwelveDataQuoteResult("OK", _Dec("2650"), True, old))
+        self.assertEqual(r["quality"], DataQualityStatus.STALE.value)
+        self.assertIs(r["is_market_open"], True)  # open, yet still STALE
+        self.assertGreater(r["quote_age_seconds"], 8000)  # ~8640s, transparent reason
+
+    async def test_recent_timestamp_can_be_valid(self):
+        fresh = datetime.now(timezone.utc)
+        r = await self._run(TwelveDataQuoteResult("OK", _Dec("2650"), True, fresh))
+        self.assertEqual(r["quality"], DataQualityStatus.VALID.value)
+
+    async def test_threshold_unchanged_ticker_max_age(self):
+        # freshness budget for the quote is the ticker budget (unchanged), documenting
+        # that STALE is not forced to LIVE by widening the threshold
+        self.assertEqual(main.settings.ticker_max_age_seconds, 10.0)
+
+
+class MobileOhlcTableTests(unittest.TestCase):
+    def setUp(self):
+        self.html = INDEX.read_text(encoding="utf-8")
+
+    def test_ohlc_table_has_horizontal_scroll_wrapper(self):
+        self.assertIn(".tbl-wrap", self.html)
+        self.assertIn("overflow-x:auto", self.html)
+        self.assertIn('h("div",{class:"tbl-wrap"}', self.html)
+
+    def test_table_min_width_and_nowrap(self):
+        self.assertIn("min-width:440px", self.html)
+        self.assertIn("white-space:nowrap", self.html)
+
+    def test_all_ohlc_columns_present(self):
+        # no column removed: O/H/L/C still rendered
+        for col in ('h("th",{},["O"])', 'h("th",{},["H"])',
+                    'h("th",{},["L"])', 'h("th",{},["C"])'):
+            self.assertIn(col, self.html)

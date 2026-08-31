@@ -1418,8 +1418,9 @@ class CalendarTests(unittest.TestCase):
         self.assertEqual(cal.is_market_expected_open(0), OpenState.UNKNOWN)
 
     def test_not_configured_placeholder_not_invented(self):
-        # a declared-but-not-implemented policy must NOT invent hours
-        cal = calendar_for(MarketCalendarPolicy.FOREX_WEEK)
+        # a still-declared-but-not-implemented policy must NOT invent hours
+        # (FOREX_WEEK is now implemented; US_EQUITY_RTH remains a placeholder)
+        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
         self.assertEqual(cal.is_market_expected_open(0), OpenState.UNKNOWN)
         self.assertIsNone(cal.expected_bucket_starts("1h", 0, 3600))
 

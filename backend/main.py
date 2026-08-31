@@ -23,6 +23,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from decimal import Decimal
 from enum import Enum
 from functools import lru_cache
@@ -1854,18 +1855,176 @@ class NotConfiguredCalendar(MarketCalendar):
         return GapReport("UNKNOWN", [])
 
 
+# Verified weekly Forex hours: opens Sunday 17:00 and closes Friday 17:00 in
+# America/New_York local time (DST handled by IANA -> 22:00 UTC in winter, 21:00
+# UTC in summer). NEVER a fixed UTC offset. Source: widely corroborated retail
+# spot-forex week (FOREX.com, City Index, TMGM, babypips, ...).
+FOREX_ANCHOR_TZ = "America/New_York"
+FOREX_WEEK_OPEN_HOUR = 17   # Sunday 17:00 New York
+FOREX_WEEK_CLOSE_HOUR = 17  # Friday 17:00 New York
+
+# INDICATIVE financial-center session hours (local business hours via IANA, DST
+# automatic). These are indicative CENTER hours, NOT a specific broker's hours,
+# and are NOT used to authorise/deny trading. Tokyo does not observe DST.
+FOREX_SESSIONS = (
+    ("Sydney", "Australia/Sydney", 8, 17),
+    ("Tokyo", "Asia/Tokyo", 9, 18),
+    ("London", "Europe/London", 8, 17),
+    ("New York", "America/New_York", 8, 17),
+)
+
+
+def _zone(name: str) -> Optional[ZoneInfo]:
+    """Return a ZoneInfo or None (fail-safe) if IANA data is unavailable."""
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return None
+
+
+def _forex_week_bounds(now_utc: datetime) -> Optional[Dict[str, object]]:
+    """Compute Forex weekly OPEN/CLOSED anchored on America/New_York 17:00 Sun->Fri.
+    Returns dict{is_open, weekend, next_open_utc, next_close_utc} or None if the
+    timezone database is unavailable (caller maps None -> UNKNOWN)."""
+    ny = _zone(FOREX_ANCHOR_TZ)
+    if ny is None:
+        return None
+    now_ny = now_utc.astimezone(ny)
+    # Monday=0 .. Sunday=6
+    wd = now_ny.weekday()
+
+    def at_hour(day_offset: int, hour: int) -> datetime:
+        base = (now_ny + timedelta(days=day_offset)).replace(
+            hour=hour, minute=0, second=0, microsecond=0
+        )
+        return base.astimezone(timezone.utc)
+
+    # Previous Sunday 17:00 and this Friday 17:00 in NY local terms.
+    days_since_sunday = (wd + 1) % 7  # Sunday -> 0, Monday -> 1, ... Saturday -> 6
+    sunday_open = at_hour(-days_since_sunday, FOREX_WEEK_OPEN_HOUR)
+    friday_close = at_hour(-days_since_sunday + 5, FOREX_WEEK_CLOSE_HOUR)
+    is_open = sunday_open <= now_utc < friday_close
+    weekend = not is_open
+    if is_open:
+        next_close_utc: Optional[datetime] = friday_close
+        next_open_utc: Optional[datetime] = None
+    else:
+        # Next Sunday 17:00 NY (this week's if still ahead, else next week's).
+        candidate = sunday_open if now_utc < sunday_open else at_hour(-days_since_sunday + 7,
+                                                                      FOREX_WEEK_OPEN_HOUR)
+        next_open_utc = candidate
+        next_close_utc = None
+    return {
+        "is_open": is_open,
+        "weekend": weekend,
+        "next_open_utc": next_open_utc,
+        "next_close_utc": next_close_utc,
+    }
+
+
+class ForexWeekCalendar(MarketCalendar):
+    """Forex weekly calendar: OPEN/CLOSED anchored on America/New_York 17:00 Sun->Fri
+    (DST via IANA). Gap analysis stays UNKNOWN: a missing bar is never a gap because
+    Massive emits no bar without a new quote. Holidays are NOT modelled (UNKNOWN)."""
+
+    policy = MarketCalendarPolicy.FOREX_WEEK
+
+    def is_market_expected_open(self, ts_unix: int) -> OpenState:
+        try:
+            now = datetime.fromtimestamp(int(ts_unix), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return OpenState.UNKNOWN
+        bounds = _forex_week_bounds(now)
+        if bounds is None:
+            return OpenState.UNKNOWN
+        return OpenState.OPEN if bounds["is_open"] else OpenState.CLOSED
+
+    def expected_bucket_starts(self, granularity: str, start: int, end: int) -> Optional[List[int]]:
+        return None  # never fabricate a forex grid
+
+    def analyze_gaps(self, starts: List[int], bucket: int) -> GapReport:
+        return GapReport("UNKNOWN", [])  # no-quote != gap -> no fabricated gaps
+
+
 _ALWAYS_24_7 = Always24_7Calendar()
 _NOT_CONFIGURED = NotConfiguredCalendar()
+_FOREX_WEEK = ForexWeekCalendar()
 _COINBASE_CALENDAR = _ALWAYS_24_7
 
 
 def calendar_for(policy: MarketCalendarPolicy) -> MarketCalendar:
-    """Only ALWAYS_OPEN_24_7 is implemented in 6A. Every other policy (including the
-    declared-but-not-implemented placeholders) resolves to NotConfigured -> UNKNOWN,
-    so no market hours are ever invented."""
+    """ALWAYS_OPEN_24_7 -> crypto; FOREX_WEEK -> Forex weekly (NY-anchored). Every
+    other policy resolves to NotConfigured -> UNKNOWN (no invented hours)."""
     if policy == MarketCalendarPolicy.ALWAYS_OPEN_24_7:
         return _ALWAYS_24_7
+    if policy == MarketCalendarPolicy.FOREX_WEEK:
+        return _FOREX_WEEK
     return _NOT_CONFIGURED
+
+
+def forex_active_sessions(now_utc: datetime) -> List[Dict[str, object]]:
+    """INDICATIVE financial-center sessions (local business hours via IANA). Marked
+    indicative; NOT broker hours; NOT a trading authorisation. A session is active
+    only on a local weekday within its local business hours. tz missing -> active
+    UNKNOWN (None) for that center, never fabricated."""
+    out: List[Dict[str, object]] = []
+    for name, tz_name, open_h, close_h in FOREX_SESSIONS:
+        tz = _zone(tz_name)
+        if tz is None:
+            out.append({"name": name, "tz": tz_name, "active": None, "indicative": True})
+            continue
+        local = now_utc.astimezone(tz)
+        weekday = local.weekday() < 5  # Mon-Fri local
+        active = bool(weekday and open_h <= local.hour < close_h)
+        out.append({
+            "name": name, "tz": tz_name, "active": active, "indicative": True,
+            "local_open_hour": open_h, "local_close_hour": close_h,
+        })
+    return out
+
+
+def forex_market_state(now_utc: Optional[datetime] = None) -> Dict[str, object]:
+    """Full Forex market-state payload. Market truth = OPEN/CLOSED/CLOSED_WEEKEND/
+    UNKNOWN (NY-anchored). Sessions are indicative only. Never OPEN by default;
+    unprovable fields stay null/UNKNOWN. Market state is independent from data
+    quality (OPEN != LIVE; CLOSED != provider down)."""
+    now = now_utc or utcnow()
+    bounds = _forex_week_bounds(now)
+    sessions = forex_active_sessions(now)
+    if bounds is None:
+        market_state = "UNKNOWN"
+        reason = "timezone database unavailable"
+        next_open = next_close = None
+        current = None
+    elif bounds["is_open"]:
+        market_state = "OPEN"
+        reason = "within the Forex trading week (Sun 17:00 -> Fri 17:00 New York)"
+        next_open, next_close = None, bounds["next_close_utc"]
+        active_names = [s["name"] for s in sessions if s.get("active") is True]
+        current = active_names[0] if active_names else None
+    else:
+        market_state = "CLOSED_WEEKEND"
+        reason = "weekend close (Fri 17:00 -> Sun 17:00 New York)"
+        next_open, next_close = bounds["next_open_utc"], None
+        current = None
+
+    def iso(dt: object) -> Optional[str]:
+        return dt.isoformat() if isinstance(dt, datetime) else None
+
+    return {
+        "asset_class": "FOREX",
+        "market_state": market_state,
+        "reason": reason,
+        "current_session": current,       # indicative; may be null
+        "sessions": sessions,             # indicative center hours (not broker hours)
+        "next_open": iso(next_open),
+        "next_close": iso(next_close),
+        "timezone_internal": "UTC",
+        "display_timezone": "America/Toronto",
+        "holidays": "NOT_IMPLEMENTED",    # no robust verified holiday rule yet
+        "source": "retail spot-forex week: Sun 17:00 -> Fri 17:00 America/New_York",
+        "as_of": now.isoformat(),
+    }
 
 
 instrument_registry = InstrumentRegistry()
@@ -2090,7 +2249,7 @@ def _register_massive_forex_instruments() -> None:
                 quote_asset=quote,
                 display_name=name,
                 timezone="UTC",
-                market_calendar=MarketCalendarPolicy.NOT_CONFIGURED,
+                market_calendar=MarketCalendarPolicy.FOREX_WEEK,
                 volume_semantics=VolumeSemantics.UNKNOWN,
                 price_precision=None,
                 tick_size=None,
@@ -2214,6 +2373,14 @@ async def market_forex_mappings() -> dict:
         "mappings": mappings,
         "activation": massive_forex_activation.to_dict(),
     }
+
+
+@api_router.get("/market/forex/market-state")
+async def market_forex_state() -> dict:
+    """Forex market open/closed + indicative sessions. Market state (NY-anchored
+    weekly hours) is independent from data quality: OPEN never implies LIVE, and a
+    normal CLOSED never implies a provider outage."""
+    return forex_market_state()
 
 
 massive_forex_provider = MassiveForexProvider()

@@ -2558,7 +2558,7 @@ class TwelveDataProvider:
         if self.client is None:
             await self.connect()
         assert self.client is not None
-        params: Dict[str, object] = {
+        params: Dict[str, Any] = {
             "symbol": symbol,
             "interval": TWELVEDATA_GRANULARITIES[granularity],
             "timezone": "UTC",       # intraday honours UTC (verified)

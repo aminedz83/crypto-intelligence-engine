@@ -2512,6 +2512,45 @@ def parse_twelvedata_time_series(
     return TwelveDataResult("OK", bars, None)
 
 
+@dataclass(frozen=True)
+class TwelveDataQuoteResult:
+    """Latest /quote outcome. price is an exact Decimal (never float); is_market_open
+    is a provider flag (NOT a Gold calendar, NOT a data-quality decision by itself)."""
+    status: str  # OK | NOT_MAPPED | NO_KEY | ACCESS_DENIED | RATE_LIMITED | UNAVAILABLE
+    price: Optional[Decimal]
+    is_market_open: Optional[bool]
+    timestamp_utc: Optional[datetime]
+    reason: Optional[str] = None
+
+
+def parse_twelvedata_quote(payload: Any) -> TwelveDataQuoteResult:
+    """Parse a /quote body. HTTP 200 + {status:error} is a provider error. Price from
+    `close` parsed to Decimal directly. is_market_open kept as a provider boolean."""
+    if not isinstance(payload, dict):
+        return TwelveDataQuoteResult("UNAVAILABLE", None, None, None, "malformed provider response")
+    if payload.get("status") == "error":
+        code = payload.get("code")
+        if code == 429:
+            return TwelveDataQuoteResult("RATE_LIMITED", None, None, None, "rate limited (429)")
+        if code in (401, 403):
+            return TwelveDataQuoteResult(
+                "ACCESS_DENIED", None, None, None, f"access denied by provider ({code})")
+        return TwelveDataQuoteResult("UNAVAILABLE", None, None, None, "provider error status")
+    price = _to_decimal(payload.get("close"))
+    if price is None or price < 0:
+        return TwelveDataQuoteResult("UNAVAILABLE", None, None, None, "no usable price in quote")
+    raw_open = payload.get("is_market_open")
+    is_open = raw_open if isinstance(raw_open, bool) else None
+    ts = payload.get("timestamp")
+    ts_utc: Optional[datetime] = None
+    if isinstance(ts, int) and ts > 0:
+        try:
+            ts_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            ts_utc = None
+    return TwelveDataQuoteResult("OK", price, is_open, ts_utc, None)
+
+
 class TwelveDataProvider:
     """Twelve Data REST adapter (Gold XAU/USD spot). Header auth; the key is never
     placed in the URL/query, never logged, never returned. No network without a key.
@@ -2591,6 +2630,41 @@ class TwelveDataProvider:
             return TwelveDataResult("UNAVAILABLE", [], "malformed provider response")
         # max_age off for explicit history; freshness re-derived by callers later.
         return parse_twelvedata_time_series(payload, max_age_seconds=float("inf"))
+
+    async def get_quote(self, canonical_symbol: str) -> "TwelveDataQuoteResult":
+        """Fetch the latest /quote (price + is_market_open). Price parsed to Decimal
+        (never float). Same explicit statuses as get_time_series."""
+        symbol = provider_symbol_map.to_provider(self.SOURCE, canonical_symbol)
+        if symbol is None:
+            return TwelveDataQuoteResult("NOT_MAPPED", None, None, None,
+                                         f"no verified twelvedata symbol for {canonical_symbol}")
+        if not self.api_key:
+            return TwelveDataQuoteResult("NO_KEY", None, None, None, "TWELVEDATA_API_KEY not set")
+        if self.client is None:
+            await self.connect()
+        assert self.client is not None
+        try:
+            resp = await self.client.get("/quote", params={"symbol": symbol, "timezone": "UTC"})
+        except httpx.TimeoutException:
+            return TwelveDataQuoteResult("UNAVAILABLE", None, None, None, "provider timeout")
+        except httpx.HTTPError:
+            return TwelveDataQuoteResult("UNAVAILABLE", None, None, None, "provider unreachable")
+        code = resp.status_code
+        if code in (401, 403):
+            return TwelveDataQuoteResult(
+                "ACCESS_DENIED", None, None, None, f"access denied by provider ({code})")
+        if code == 429:
+            return TwelveDataQuoteResult(
+                "RATE_LIMITED", None, None, None, "rate limited by provider (429)")
+        if code >= 500:
+            return TwelveDataQuoteResult(
+                "UNAVAILABLE", None, None, None, f"provider server error ({code})")
+        try:
+            payload = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            return TwelveDataQuoteResult(
+                "UNAVAILABLE", None, None, None, "malformed provider response")
+        return parse_twelvedata_quote(payload)
 
 
 # Officially-catalogued Twelve Data symbol for gold spot -> verified provider
@@ -2761,6 +2835,59 @@ async def market_metal_history(
             status_code=http, detail={"status": status, "reason": hist.result.get("reason")}
         )
     return hist.result
+
+
+async def fetch_metal_quote(canonical_symbol: str) -> Dict[str, object]:
+    """Latest Gold quote from Twelve Data. price is Decimal (serialised as string);
+    is_market_open is a provider flag, kept SEPARATE from data quality and from any
+    (future) Gold calendar. Quality here is the freshness of the quote timestamp."""
+    inst = instrument_registry.get(canonical_symbol)
+    if inst is None or inst.asset_class != AssetClass.METAL:
+        raise ValueError(f"unknown metal instrument: {canonical_symbol}")
+    q = await twelvedata_provider.get_quote(canonical_symbol)
+    provider_symbol = provider_symbol_map.to_provider("twelvedata", canonical_symbol)
+    base: Dict[str, object] = {
+        "source": "twelvedata",
+        "canonical_symbol": canonical_symbol,
+        "provider_symbol": provider_symbol,
+        "timezone_internal": "UTC",
+        "display_timezone": "America/Toronto",
+    }
+    if q.status != "OK":
+        base.update({"status": q.status, "reason": q.reason, "price": None,
+                     "is_market_open": None, "quality": DataQualityStatus.MISSING.value})
+        return base
+    # Quality = freshness of the quote timestamp (NOT is_market_open, NOT MAPPED).
+    quality = (
+        classify_freshness(q.timestamp_utc, settings.ticker_max_age_seconds).value
+        if q.timestamp_utc is not None else DataQualityStatus.UNKNOWN.value
+    )
+    base.update({
+        "status": "OK",
+        "price": str(q.price) if q.price is not None else None,  # Decimal -> string
+        "is_market_open": q.is_market_open,        # provider flag, informational only
+        "quote_time": q.timestamp_utc.isoformat() if q.timestamp_utc else None,
+        "quality": quality,
+        "volume_semantics": inst.volume_semantics.value,
+    })
+    return base
+
+
+@api_router.get("/market/metal/{symbol}/quote")
+async def market_metal_quote(symbol: str) -> dict:
+    try:
+        result = await fetch_metal_quote(symbol.upper())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": str(exc)}
+        ) from exc
+    status = str(result.get("status"))
+    http = _METAL_HTTP_STATUS.get(status)
+    if http is not None:
+        raise HTTPException(
+            status_code=http, detail={"status": status, "reason": result.get("reason")}
+        )
+    return result
 
 
 massive_forex_provider = MassiveForexProvider()

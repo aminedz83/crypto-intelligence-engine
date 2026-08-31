@@ -197,6 +197,25 @@
     var s = Math.max(0, Math.round((Date.now()-t)/1000));
     return s < 90 ? (s+"s") : (Math.round(s/60)+"min");
   }
+  // ---- Time display: backend stays UTC; UI shows Montreal local time. --------
+  // America/Toronto with Intl -> the seasonal DST offset is handled automatically,
+  // never hardcoded. Formatters are built once and reused.
+  var montrealFormatter = new Intl.DateTimeFormat("fr-CA", {
+    timeZone: "America/Toronto", year:"numeric", month:"2-digit", day:"2-digit",
+    hour:"2-digit", minute:"2-digit", hour12:false
+  });
+  var utcFormatter = new Intl.DateTimeFormat("fr-CA", {
+    timeZone: "UTC", year:"numeric", month:"2-digit", day:"2-digit",
+    hour:"2-digit", minute:"2-digit", hour12:false
+  });
+  function formatMontrealTime(value){
+    var d = new Date(value);
+    return isNaN(d.getTime()) ? "—" : montrealFormatter.format(d);
+  }
+  function formatUtcTime(value){
+    var d = new Date(value);
+    return isNaN(d.getTime()) ? "—" : utcFormatter.format(d) + " UTC";
+  }
   function loading(txt){ return h("div",{class:"state"},[h("span",{class:"spin"}),"  "+(txt||"Chargement…")]); }
   function emptyState(title, sub){ return h("div",{class:"state"},[h("strong",{},[title]), sub||""]); }
 
@@ -349,13 +368,16 @@
         d.status==="EMPTY"?"Aucune bougie sur la période.":"")); return; }
       var rows = candles.slice(-10).reverse().map(function(c){
         return h("tr",{},[
-          h("td",{},[ (c.start||"").replace("T"," ").slice(0,16) ]),
+          h("td",{},[
+            h("div",{},[ formatMontrealTime(c.start) ]),
+            h("div",{class:"sub",style:"font-size:10px"},[ formatUtcTime(c.start) ])
+          ]),
           h("td",{},[ priceCell(c.open) ]), h("td",{},[ priceCell(c.high) ]),
           h("td",{},[ priceCell(c.low) ]), h("td",{},[ priceCell(c.close) ])
         ]);
       });
       w.appendChild(h("table",{class:"tbl"},[
-        h("thead",{},[ h("tr",{},[ h("th",{},["Heure (UTC)"]), h("th",{},["O"]),
+        h("thead",{},[ h("tr",{},[ h("th",{},["Heure (Montréal)"]), h("th",{},["O"]),
           h("th",{},["H"]), h("th",{},["L"]), h("th",{},["C"]) ]) ]),
         h("tbody",{}, rows)
       ]));

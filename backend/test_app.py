@@ -2389,3 +2389,219 @@ class TwelveDataProviderTests(unittest.IsolatedAsyncioTestCase):
         prov.client = _TDClient(_TDResp(403, {}))
         r = await prov.get_time_series("XAU-USD", "1h")
         self.assertNotIn("DUMMYKEY", r.reason or "")
+
+
+# ----------------------------- Twelve Data XAU/USD (2/3: instrument+history+DB) -
+from main import (  # noqa: E402
+    CandleRow as _CandleRow2,
+    TwelveDataBar,
+    TwelveDataResult,
+    fetch_metal_history,
+)
+
+_XAU_BASE = int(datetime(2026, 8, 30, 0, 0, tzinfo=timezone.utc).timestamp())
+
+
+def _xau_bar(k, close="2650.5", vol="0", status=DataQualityStatus.VALID):
+    dt = datetime.fromtimestamp(_XAU_BASE + k * 3600, tz=timezone.utc)
+    v = _Dec(vol) if vol is not None else None
+    return TwelveDataBar(dt, _Dec("2650"), _Dec("2655"), _Dec("2648"), _Dec(close), v, status)
+
+
+class _FakeTD:
+    def __init__(self, result):
+        self.result = result
+
+    async def get_time_series(self, canonical, granularity, outputsize=30, start=None, end=None):
+        return self.result
+
+
+class MetalInstrumentTests(unittest.TestCase):
+    def test_xau_registered_metal(self):
+        inst = instrument_registry.get("XAU-USD")
+        self.assertIsNotNone(inst)
+        self.assertEqual(inst.asset_class, AssetClass.METAL)
+        self.assertEqual(inst.display_name, "Gold Spot")
+
+    def test_xau_calendar_not_configured(self):
+        self.assertEqual(instrument_registry.get("XAU-USD").market_calendar,
+                         MarketCalendarPolicy.NOT_CONFIGURED)
+
+    def test_xau_volume_unknown_and_metadata_none(self):
+        inst = instrument_registry.get("XAU-USD")
+        self.assertEqual(inst.volume_semantics, VolumeSemantics.UNKNOWN)
+        self.assertIsNone(inst.price_precision)
+        self.assertIsNone(inst.tick_size)
+
+    def test_mapping_present_even_though_entitlement_unknown(self):
+        # MAPPED is not an entitlement: the verified provider symbol stays mapped
+        self.assertEqual(provider_symbol_map.to_provider("twelvedata", "XAU-USD"), "XAU/USD")
+
+
+class CandleRowDecimalRegressionTests(unittest.TestCase):
+    def test_candlerow_row_to_values_exact_decimal(self):
+        row = _CandleRow2("coinbase", "BTC-USD", "1h",
+                          datetime(2026, 8, 30, 12, tzinfo=timezone.utc),
+                          _Dec("50000.12"), _Dec("50010"), _Dec("49990"),
+                          _Dec("50005.5"), _Dec("3.25"), DataQualityStatus.VALID,
+                          "rest", None, datetime(2026, 8, 30, 12, tzinfo=timezone.utc))
+        vals = main._row_to_values(row, datetime(2026, 8, 30, 12, tzinfo=timezone.utc))
+        self.assertIsInstance(vals["open"], _Dec)
+        self.assertEqual(vals["open"], _Dec("50000.12"))
+
+    def test_xau_full_precision_no_float_end_to_end(self):
+        # string -> Decimal -> CandleRow -> _row_to_values, precision preserved
+        rows = main._metal_bars_to_rows(
+            "twelvedata", "XAU/USD", "1h",
+            [_xau_bar(0, close="2650.123456789012345678")], datetime.now(timezone.utc))
+        vals = main._row_to_values(rows[0], datetime.now(timezone.utc))
+        self.assertEqual(str(vals["close"]), "2650.123456789012345678")
+
+
+class MetalHistoryAssemblerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._saved = main.twelvedata_provider
+
+    def tearDown(self):
+        main.twelvedata_provider = self._saved
+
+    async def _run(self, result, start=None, end=None, gran="1h"):
+        main.twelvedata_provider = _FakeTD(result)
+        return await fetch_metal_history("XAU-USD", gran,
+                                         start or _XAU_BASE, end or _XAU_BASE + 5 * 3600)
+
+    async def test_ok_sorted_deduped_decimal(self):
+        res = TwelveDataResult("OK", [_xau_bar(2), _xau_bar(0), _xau_bar(1), _xau_bar(1)])
+        h = await self._run(res)
+        self.assertEqual(h.result["status"], "OK")
+        self.assertEqual(h.result["count"], 3)  # deduped
+        starts = [c["start"] for c in h.result["candles"]]
+        self.assertEqual(starts, sorted(starts))
+        self.assertTrue(all(isinstance(r.close, _Dec) for r in h.rows))
+
+    async def test_absence_not_a_gap(self):
+        h = await self._run(TwelveDataResult("OK", [_xau_bar(0), _xau_bar(1), _xau_bar(3)]))
+        self.assertEqual(h.result["gaps_status"], "UNKNOWN")
+        self.assertEqual(h.result["count"], 3)  # no fabricated bar
+
+    async def test_invalid_excluded(self):
+        res = TwelveDataResult("OK", [_xau_bar(0), _xau_bar(1, status=DataQualityStatus.INVALID)])
+        h = await self._run(res)
+        self.assertEqual(h.result["invalid_candles_count"], 1)
+        self.assertEqual(h.result["count"], 1)
+
+    async def test_half_open_filter(self):
+        h = await self._run(TwelveDataResult("OK", [_xau_bar(0), _xau_bar(1), _xau_bar(2)]),
+                            start=_XAU_BASE, end=_XAU_BASE + 2 * 3600)
+        self.assertEqual(h.result["count"], 2)  # k=2 (== end) excluded
+
+    async def test_volume_semantics_unknown(self):
+        h = await self._run(TwelveDataResult("OK", [_xau_bar(0)]))
+        self.assertEqual(h.result["volume_semantics"], "UNKNOWN")
+
+    async def test_empty(self):
+        h = await self._run(TwelveDataResult("EMPTY", []))
+        self.assertEqual(h.result["status"], "EMPTY")
+        self.assertEqual(h.rows, [])
+
+    async def test_access_denied_propagated_no_rows(self):
+        denied = TwelveDataResult("ACCESS_DENIED", [], "access denied by provider (403)")
+        h = await self._run(denied)
+        self.assertEqual(h.result["status"], "ACCESS_DENIED")
+        self.assertEqual(h.rows, [])
+        self.assertNotIn("DUMMY", str(h.result.get("reason")))
+
+    async def test_no_key_propagated(self):
+        h = await self._run(TwelveDataResult("NO_KEY", [], "TWELVEDATA_API_KEY not set"))
+        self.assertEqual(h.result["status"], "NO_KEY")
+
+    async def test_unknown_instrument_raises(self):
+        main.twelvedata_provider = _FakeTD(TwelveDataResult("OK", []))
+        with self.assertRaises(ValueError):
+            await fetch_metal_history("ZZZ-ZZZ", "1h", _XAU_BASE, _XAU_BASE + 3600)
+
+    async def test_start_ge_end_raises(self):
+        main.twelvedata_provider = _FakeTD(TwelveDataResult("OK", []))
+        with self.assertRaises(ValueError):
+            await fetch_metal_history("XAU-USD", "1h", _XAU_BASE, _XAU_BASE)
+
+
+class MetalEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self._saved = main.twelvedata_provider
+        self._ready = persistence_state.ready
+        persistence_state.ready = False  # avoid DB writes in these status-mapping tests
+
+    def tearDown(self):
+        main.twelvedata_provider = self._saved
+        persistence_state.ready = self._ready
+
+    def _client(self, result):
+        main.twelvedata_provider = _FakeTD(result)
+        return TestClient(create_app())
+
+    def test_ok_200(self):
+        r = self._client(TwelveDataResult("OK", [_xau_bar(0)])).get(
+            "/api/v1/market/metal/XAU-USD/history?granularity=1h&start=%d&end=%d"
+            % (_XAU_BASE, _XAU_BASE + 5 * 3600))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["source"], "twelvedata")
+
+    def test_access_denied_403(self):
+        r = self._client(TwelveDataResult("ACCESS_DENIED", [], "x")).get(
+            "/api/v1/market/metal/XAU-USD/history?granularity=1h&start=%d&end=%d"
+            % (_XAU_BASE, _XAU_BASE + 3600))
+        self.assertEqual(r.status_code, 403)
+
+    def test_rate_limited_429(self):
+        r = self._client(TwelveDataResult("RATE_LIMITED", [], "x")).get(
+            "/api/v1/market/metal/XAU-USD/history?granularity=1h&start=%d&end=%d"
+            % (_XAU_BASE, _XAU_BASE + 3600))
+        self.assertEqual(r.status_code, 429)
+
+    def test_no_key_503(self):
+        r = self._client(TwelveDataResult("NO_KEY", [], "x")).get(
+            "/api/v1/market/metal/XAU-USD/history?granularity=1h&start=%d&end=%d"
+            % (_XAU_BASE, _XAU_BASE + 3600))
+        self.assertEqual(r.status_code, 503)
+
+    def test_6h_not_supported_409(self):
+        r = self._client(TwelveDataResult("NOT_SUPPORTED", [], "x")).get(
+            "/api/v1/market/metal/XAU-USD/history?granularity=6h&start=%d&end=%d"
+            % (_XAU_BASE, _XAU_BASE + 3600))
+        self.assertEqual(r.status_code, 409)
+
+    def test_no_secret_in_response(self):
+        denied = TwelveDataResult("ACCESS_DENIED", [], "access denied by provider (403)")
+        raw = self._client(denied).get(
+            "/api/v1/market/metal/XAU-USD/history?granularity=1h&start=%d&end=%d"
+            % (_XAU_BASE, _XAU_BASE + 3600)).text.lower()
+        for bad in ("apikey", "authorization", "bearer", "twelvedata_api_key"):
+            self.assertNotIn(bad, raw)
+
+
+class MetalPersistenceTests(_DBBase):
+    async def test_xau_persisted_source_twelvedata_exact_decimal(self):
+        saved = main.twelvedata_provider
+        main.twelvedata_provider = _FakeTD(TwelveDataResult(
+            "OK", [_xau_bar(0, close="2650.123456789012345678"), _xau_bar(1, close="2651.5")]))
+        try:
+            h = await fetch_metal_history("XAU-USD", "1h", _XAU_BASE, _XAU_BASE + 5 * 3600)
+            n = await main.persist_candles(h.rows)
+            self.assertEqual(n, 2)
+            rows = await read_stored_candles("XAU/USD", "1h", _XAU_BASE, _XAU_BASE + 5 * 3600, 100)
+            # note: read_stored_candles filters source='coinbase'; use a raw check instead
+            async with main.engine.connect() as conn:
+                res = await conn.execute(main.text(
+                    "SELECT close FROM candles WHERE source='twelvedata' "
+                    "AND product_id='XAU/USD' ORDER BY bucket_start ASC"))
+                closes = [str(r[0]) for r in res.fetchall()]
+            self.assertEqual(len(closes), 2)
+            # exact Decimal preserved through NUMERIC(38,18)
+            self.assertTrue(closes[0].startswith("2650.123456789012345678"))
+            async with main.engine.connect() as conn:
+                cnt = await conn.execute(main.text(
+                    "SELECT count(*) FROM candles WHERE source='coinbase'"))
+                self.assertEqual(cnt.scalar(), 0)  # no Coinbase regression/leak
+        finally:
+            main.twelvedata_provider = saved

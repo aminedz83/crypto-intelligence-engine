@@ -2857,7 +2857,13 @@ async def fetch_metal_quote(canonical_symbol: str) -> Dict[str, object]:
         base.update({"status": q.status, "reason": q.reason, "price": None,
                      "is_market_open": None, "quality": DataQualityStatus.MISSING.value})
         return base
-    # Quality = freshness of the quote timestamp (NOT is_market_open, NOT MAPPED).
+    # Quality = freshness of the quote's OWN provider timestamp, judged against the
+    # ticker freshness budget (ticker_max_age_seconds). It is deliberately NOT driven
+    # by is_market_open: a spot-metal /quote can be legitimately STALE while the market
+    # is open (sparse ticks and/or a delayed data plan return an old timestamp). We do
+    # NOT relax the threshold to force LIVE; STALE truthfully reflects an old timestamp.
+    # quote_age_seconds is exposed so the reason (e.g. "il y a 144 min") is transparent.
+    age = compute_age_seconds(q.timestamp_utc) if q.timestamp_utc is not None else None
     quality = (
         classify_freshness(q.timestamp_utc, settings.ticker_max_age_seconds).value
         if q.timestamp_utc is not None else DataQualityStatus.UNKNOWN.value
@@ -2867,6 +2873,7 @@ async def fetch_metal_quote(canonical_symbol: str) -> Dict[str, object]:
         "price": str(q.price) if q.price is not None else None,  # Decimal -> string
         "is_market_open": q.is_market_open,        # provider flag, informational only
         "quote_time": q.timestamp_utc.isoformat() if q.timestamp_utc else None,
+        "quote_age_seconds": age,                  # transparency for the STALE reason
         "quality": quality,
         "volume_semantics": inst.volume_semantics.value,
     })

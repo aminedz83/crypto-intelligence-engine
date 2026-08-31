@@ -94,6 +94,7 @@
   <main>
     <section class="view active" id="view-markets" data-view="markets"></section>
     <section class="view" id="view-forex" data-view="forex"></section>
+    <section class="view" id="view-metal" data-view="metal"></section>
     <section class="view" id="view-system" data-view="system"></section>
     <section class="view" id="view-detail" data-view="detail"></section>
   </main>
@@ -106,6 +107,7 @@
   var VIEWS = [
     { id:"markets", label:"Crypto", icon:"₿" },
     { id:"forex",   label:"Forex",  icon:"$" },
+    { id:"metal",   label:"Métaux", icon:"◆" },
     { id:"system",  label:"Système", icon:"◔" }
     // id:"detail" is an internal view (asset detail), not a bottom tab
   ];
@@ -353,10 +355,13 @@
   function renderDetail(){
     var v = byId("view-detail"); clear(v);
     if (!detailCtx){ v.appendChild(emptyState("Aucun actif sélectionné","")); return; }
-    v.appendChild(h("button",{class:"back", onclick:function(){ setView(detailCtx.kind==="forex"?"forex":"markets"); }},["← Retour"]));
-    v.appendChild(h("h2",{class:"section"},[detailCtx.symbol + " · " + (detailCtx.kind==="forex"?"Forex Massive":"Crypto Coinbase")]));
+    var backTo = detailCtx.kind==="forex" ? "forex" : detailCtx.kind==="metal" ? "metal" : "markets";
+    var label = detailCtx.kind==="forex" ? "Forex Massive"
+      : detailCtx.kind==="metal" ? "Gold Spot · Twelve Data" : "Crypto Coinbase";
+    v.appendChild(h("button",{class:"back", onclick:function(){ setView(backTo); }},["← Retour"]));
+    v.appendChild(h("h2",{class:"section"},[detailCtx.symbol + " · " + label]));
 
-    if (detailCtx.kind === "crypto"){
+    if (detailCtx.kind === "crypto" || detailCtx.kind === "metal"){
       var quote = h("div",{class:"card"},[ h("div",{class:"kv"},[
         h("span",{class:"k"},["Prix"]), h("span",{class:"v","id":"d-price"},[h("span",{class:"spin"})]) ]) ]);
       v.appendChild(quote);
@@ -378,6 +383,31 @@
           ["il y a "+tsAgo(r.data.timestamp)])); }
       });
       loadCandles("/api/v1/market/candles/"+encodeURIComponent(detailCtx.symbol)+"?granularity=1h");
+    } else if (detailCtx.kind === "metal"){
+      api("/api/v1/market/metal/"+encodeURIComponent(detailCtx.canonical)+"/quote").then(function(r){
+        var pe = byId("d-price"); if (!pe) return; clear(pe);
+        if (!r.ok || !r.data || r.data.price == null){
+          pe.appendChild(h("span",{class:"na"},["—"]));
+          pe.appendChild(document.createTextNode("  "));
+          pe.appendChild(qualityBadge((r.data && r.data.quality) || "UNKNOWN"));
+          return;
+        }
+        var d = r.data;
+        pe.appendChild(priceCell(d.price));   // d.price is a string (Decimal), never fabricated
+        pe.appendChild(document.createTextNode("  "));
+        pe.appendChild(qualityBadge(d.quality || "UNKNOWN"));   // quality != is_market_open
+        if (d.quote_time){ pe.appendChild(h("span",{class:"sub",style:"margin-left:8px"},
+          ["il y a "+tsAgo(d.quote_time)])); }
+        if (d.is_market_open === true || d.is_market_open === false){
+          // provider flag, informational only — NOT our calendar, NOT the data quality
+          pe.appendChild(h("div",{class:"sub"},
+            ["Marché (fournisseur) : "+(d.is_market_open ? "ouvert" : "fermé")]));
+        }
+      });
+      var mend = alignHour(Math.floor(Date.now()/1000));
+      var mstart = mend - 12*3600;
+      loadCandles("/api/v1/market/metal/"+encodeURIComponent(detailCtx.canonical)+
+        "/history?granularity=1h&start="+mstart+"&end="+mend);
     } else {
       var end = alignHour(Math.floor(Date.now()/1000));
       var start = end - 12*3600;
@@ -391,7 +421,7 @@
       if (!r.ok){
         // Never show a raw httpx exception/URL: clean, per-status message only.
         var msg;
-        if (r.status===403) msg="Données Massive indisponibles — accès refusé par le fournisseur (403).";
+        if (r.status===403) msg="Données indisponibles — accès refusé par le fournisseur (403).";
         else if (r.status===409) msg="Symbole non mappé.";
         else if (r.status===429) msg="Trop de requêtes — réessayez plus tard.";
         else if (r.status===503) msg="Provider temporairement indisponible.";
@@ -470,8 +500,24 @@
     }
     if (id==="markets") renderMarkets();
     else if (id==="forex") renderForex();
+    else if (id==="metal") renderMetal();
     else if (id==="system") renderSystem();
     else if (id==="detail") renderDetail();
+  }
+
+  // ---- Metals (Gold XAU/USD via Twelve Data) -------------------------------
+  function renderMetal(){
+    var v = byId("view-metal"); clear(v);
+    v.appendChild(h("h2",{class:"section"},["Métaux · Twelve Data (réel)"]));
+    var card = h("div",{class:"card"},[]);
+    card.appendChild(h("div",{class:"row tap", onclick:function(){ openDetail("metal","XAU-USD"); }},[
+      h("div",{},[ h("div",{class:"sym"},["XAU-USD"]),
+        h("div",{class:"sub"},["Gold Spot · Twelve Data"]) ]),
+      qualityBadge("MAPPED")
+    ]));
+    v.appendChild(card);
+    v.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:2px 4px"},
+      ["Prix/historique réels si la clé provider est configurée côté serveur ; sinon état explicite."]));
   }
   function buildNav(){
     var nav = byId("nav"); clear(nav);

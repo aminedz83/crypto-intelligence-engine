@@ -2196,3 +2196,196 @@ class ForexCalendarUiTests(unittest.TestCase):
     def test_no_hardcoded_offset_in_ui(self):
         for bad in ("UTC-4", "UTC-5", "-04:00", "-05:00", "getTimezoneOffset"):
             self.assertNotIn(bad, self.html)
+
+
+# ----------------------------- Twelve Data XAU/USD (1/3: provider REST) --------
+from decimal import Decimal as _Dec  # noqa: E402
+from main import (  # noqa: E402
+    TWELVEDATA_GRANULARITIES,
+    TwelveDataProvider,
+    parse_twelvedata_time_series,
+    twelvedata_bar_from_value,
+)
+
+
+def _td_val(dt="2026-08-30 14:30:00", o="2650.5", h="2651", low="2649", c="2650.9", v="0"):
+    return {"datetime": dt, "open": o, "high": h, "low": low, "close": c, "volume": v}
+
+
+class _TDResp:
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+class _TDClient:
+    def __init__(self, resp=None, exc=None):
+        self.resp = resp
+        self.exc = exc
+        self.calls = []
+
+    async def get(self, path, params=None):
+        self.calls.append((path, params))
+        if self.exc is not None:
+            raise self.exc
+        return self.resp
+
+
+class TwelveDataParsingTests(unittest.TestCase):
+    def test_ohlc_parsed_as_exact_decimal_no_float(self):
+        bar = twelvedata_bar_from_value(
+            _td_val(o="2650.123456789012345678"), float("inf"))
+        self.assertNotEqual(bar.status, DataQualityStatus.INVALID)
+        self.assertIsInstance(bar.open, _Dec)
+        self.assertNotIsInstance(bar.open, float)
+        # full precision preserved -> proves no intermediate float conversion
+        self.assertEqual(str(bar.open), "2650.123456789012345678")
+
+    def test_timestamp_utc_intraday(self):
+        bar = twelvedata_bar_from_value(_td_val(dt="2026-08-30 14:30:00"), float("inf"))
+        self.assertIsNotNone(bar.datetime_utc.tzinfo)
+        self.assertEqual(bar.datetime_utc.hour, 14)
+
+    def test_invalid_ohlc_is_invalid(self):
+        self.assertEqual(
+            twelvedata_bar_from_value(_td_val(o="x"), float("inf")).status,
+            DataQualityStatus.INVALID)
+
+    def test_bad_datetime_is_invalid(self):
+        self.assertEqual(
+            twelvedata_bar_from_value(_td_val(dt="nope"), float("inf")).status,
+            DataQualityStatus.INVALID)
+
+    def test_volume_optional_for_spot(self):
+        item = {"datetime": "2026-08-30 14:30:00", "open": "1", "high": "1",
+                "low": "1", "close": "1"}
+        bar = twelvedata_bar_from_value(item, float("inf"))
+        self.assertNotEqual(bar.status, DataQualityStatus.INVALID)
+        self.assertIsNone(bar.volume)
+
+    def test_negative_price_invalid(self):
+        self.assertEqual(
+            twelvedata_bar_from_value(_td_val(o="-1"), float("inf")).status,
+            DataQualityStatus.INVALID)
+
+    def test_body_status_error_429_rate_limited(self):
+        r = parse_twelvedata_time_series({"status": "error", "code": 429}, float("inf"))
+        self.assertEqual(r.status, "RATE_LIMITED")
+
+    def test_body_status_error_403_access_denied(self):
+        r = parse_twelvedata_time_series({"status": "error", "code": 403}, float("inf"))
+        self.assertEqual(r.status, "ACCESS_DENIED")
+
+    def test_body_status_error_other_unavailable(self):
+        r = parse_twelvedata_time_series({"status": "error", "code": 500}, float("inf"))
+        self.assertEqual(r.status, "UNAVAILABLE")
+
+    def test_empty_values_is_empty(self):
+        r = parse_twelvedata_time_series({"status": "ok", "values": []}, float("inf"))
+        self.assertEqual(r.status, "EMPTY")
+
+    def test_malformed_payload_unavailable(self):
+        self.assertEqual(
+            parse_twelvedata_time_series("not-a-dict", float("inf")).status, "UNAVAILABLE")
+
+
+class TwelveDataMappingTests(unittest.TestCase):
+    def test_official_mapping_xau(self):
+        self.assertEqual(provider_symbol_map.to_provider("twelvedata", "XAU-USD"), "XAU/USD")
+
+    def test_granularities_verified_only(self):
+        self.assertEqual(TWELVEDATA_GRANULARITIES["1h"], "1h")
+        self.assertIn("4h", TWELVEDATA_GRANULARITIES)
+        self.assertNotIn("6h", TWELVEDATA_GRANULARITIES)  # 6h NOT_SUPPORTED
+        self.assertNotIn("1d", TWELVEDATA_GRANULARITIES)  # 1d NOT_IMPLEMENTED here
+
+
+class TwelveDataProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_no_key_no_network(self):
+        prov = TwelveDataProvider(api_key="")
+        spy = _TDClient(_TDResp(200, {"values": []}))
+        prov.client = spy
+        r = await prov.get_time_series("XAU-USD", "1h")
+        self.assertEqual(r.status, "NO_KEY")
+        self.assertEqual(spy.calls, [])  # no request performed
+
+    async def test_not_mapped(self):
+        prov = TwelveDataProvider(api_key="DUMMY")
+        self.assertEqual((await prov.get_time_series("EUR-USD", "1h")).status, "NOT_MAPPED")
+
+    async def test_6h_not_supported(self):
+        prov = TwelveDataProvider(api_key="DUMMY")
+        self.assertEqual((await prov.get_time_series("XAU-USD", "6h")).status, "NOT_SUPPORTED")
+
+    async def test_http_403_access_denied(self):
+        prov = TwelveDataProvider(api_key="DUMMY")
+        prov.client = _TDClient(_TDResp(403, {}))
+        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "ACCESS_DENIED")
+
+    async def test_http_401_access_denied(self):
+        prov = TwelveDataProvider(api_key="DUMMY")
+        prov.client = _TDClient(_TDResp(401, {}))
+        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "ACCESS_DENIED")
+
+    async def test_http_429_rate_limited(self):
+        prov = TwelveDataProvider(api_key="DUMMY")
+        prov.client = _TDClient(_TDResp(429, {}))
+        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "RATE_LIMITED")
+
+    async def test_http_500_unavailable(self):
+        prov = TwelveDataProvider(api_key="DUMMY")
+        prov.client = _TDClient(_TDResp(500, {}))
+        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "UNAVAILABLE")
+
+    async def test_timeout_unavailable(self):
+        prov = TwelveDataProvider(api_key="DUMMY")
+        prov.client = _TDClient(exc=httpx.TimeoutException("t"))
+        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "UNAVAILABLE")
+
+    async def test_network_error_unavailable(self):
+        prov = TwelveDataProvider(api_key="DUMMY")
+        prov.client = _TDClient(exc=httpx.ConnectError("x"))
+        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "UNAVAILABLE")
+
+    async def test_body_error_on_http_200(self):
+        prov = TwelveDataProvider(api_key="DUMMY")
+        prov.client = _TDClient(_TDResp(200, {"status": "error", "code": 429}))
+        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "RATE_LIMITED")
+
+    async def test_ok_returns_bars_ascending(self):
+        prov = TwelveDataProvider(api_key="DUMMY")
+        body = {"values": [_td_val(dt="2026-08-30 14:00:00", c="2652"),
+                           _td_val(dt="2026-08-30 15:00:00", c="2653")]}
+        prov.client = _TDClient(_TDResp(200, body))
+        r = await prov.get_time_series("XAU-USD", "1h")
+        self.assertEqual(r.status, "OK")
+        self.assertEqual(len(r.bars), 2)
+
+    async def test_key_absent_from_request_params(self):
+        prov = TwelveDataProvider(api_key="DUMMYKEY")
+        fc = _TDClient(_TDResp(200, {"values": []}))
+        prov.client = fc
+        await prov.get_time_series("XAU-USD", "1h")
+        for _path, params in fc.calls:
+            self.assertNotIn("apikey", params or {})
+            self.assertNotIn("DUMMYKEY", str(params))
+
+    async def test_header_auth_key_not_in_url(self):
+        prov = TwelveDataProvider(api_key="DUMMYKEY")
+        await prov.connect()
+        try:
+            auth = prov.client.headers.get("authorization")
+            self.assertIsNotNone(auth)
+            self.assertTrue(auth.startswith("apikey "))
+            self.assertNotIn("DUMMYKEY", str(prov.rest_url))
+        finally:
+            await prov.disconnect()
+
+    async def test_error_reason_has_no_secret(self):
+        prov = TwelveDataProvider(api_key="DUMMYKEY")
+        prov.client = _TDClient(_TDResp(403, {}))
+        r = await prov.get_time_series("XAU-USD", "1h")
+        self.assertNotIn("DUMMYKEY", r.reason or "")

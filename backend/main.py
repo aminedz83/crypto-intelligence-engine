@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -128,6 +128,13 @@ class Settings(BaseSettings):
     massive_api_key: str = ""
     massive_rest_url: str = "https://api.massive.com"
     massive_request_timeout_seconds: float = 10.0
+
+    # Twelve Data REST (Gold XAU/USD spot). Key server-side only, header auth; no
+    # call is made without a key. Availability on the account's plan is determined
+    # at runtime from the provider response, never assumed.
+    twelvedata_api_key: str = ""
+    twelvedata_rest_url: str = "https://api.twelvedata.com"
+    twelvedata_request_timeout_seconds: float = 10.0
 
     @property
     def database_url(self) -> str:
@@ -753,6 +760,18 @@ def _to_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _to_decimal(value: Any) -> Optional[Decimal]:
+    """Parse a financial value (a string from the provider) into an exact Decimal.
+    Never routes through float. Returns None on missing/non-numeric/non-finite."""
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return parsed if parsed.is_finite() else None
 
 
 def _unix_seconds_to_dt(value: Any) -> Optional[datetime]:
@@ -2381,6 +2400,201 @@ async def market_forex_state() -> dict:
     weekly hours) is independent from data quality: OPEN never implies LIVE, and a
     normal CLOSED never implies a provider outage."""
     return forex_market_state()
+
+
+# ==================== Twelve Data REST — Gold XAU/USD (sub-increment 1/3) ======
+# First metal connector foundation: Twelve Data /time_series for XAU/USD (SPOT,
+# officially catalogued as "Gold Spot / Precious Metal"). This sub-increment adds
+# ONLY the REST provider + strict Decimal parsing. No METAL instrument, no public
+# endpoint, no persistence, no UI yet (later sub-increments).
+#
+# Verified officially (twelvedata.com/docs): symbol "XAU/USD"; /time_series returns
+# {values:[{datetime, open, high, low, close, volume}]} as STRINGS; intraday
+# datetime honours timezone=UTC; header auth "Authorization: apikey <key>"; errors
+# may arrive as HTTP 4xx/5xx OR as HTTP 200 with body {"status":"error","code":...}.
+# OHLC parsed strictly to Decimal (never float). Volume optional for spot metal.
+
+TWELVEDATA_REST_URL = "https://api.twelvedata.com"
+# Only officially-verified intraday intervals for this sub-increment. 6h and 1d are
+# intentionally excluded: 6h is NOT_SUPPORTED by the provider; 1d has a different
+# timezone semantic (daily ignores timezone=UTC) and is left NOT_IMPLEMENTED here.
+TWELVEDATA_GRANULARITIES: Dict[str, str] = {
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1h",
+    "2h": "2h",
+    "4h": "4h",
+}
+
+
+@dataclass(frozen=True)
+class TwelveDataBar:
+    """A parsed Twelve Data time-series bar. OHLC are exact Decimals (never float);
+    volume is Optional (spot metal may omit it)."""
+    datetime_utc: Optional[datetime]
+    open: Optional[Decimal]
+    high: Optional[Decimal]
+    low: Optional[Decimal]
+    close: Optional[Decimal]
+    volume: Optional[Decimal]
+    status: DataQualityStatus
+
+
+@dataclass(frozen=True)
+class TwelveDataResult:
+    """Explicit outcome of a Twelve Data request. status is a business state; bars
+    are only meaningful for OK. reason is a CLEAN message (no key, no raw URL)."""
+    status: str  # OK | EMPTY | NOT_MAPPED | NOT_SUPPORTED | NO_KEY |
+    #              ACCESS_DENIED | RATE_LIMITED | UNAVAILABLE
+    bars: List[TwelveDataBar]
+    reason: Optional[str] = None
+
+
+def _td_parse_dt(value: Any) -> Optional[datetime]:
+    """Parse an intraday Twelve Data `datetime` string requested with timezone=UTC.
+    Returns an aware UTC datetime, or None. Date-only (daily) is intentionally NOT
+    parsed here (daily is NOT_IMPLEMENTED in this sub-increment)."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def twelvedata_bar_from_value(
+    item: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> TwelveDataBar:
+    """Parse one time-series value into a qualified TwelveDataBar. OHLC via Decimal
+    only; missing/non-numeric/negative OHLC or timestamp -> INVALID (never faked)."""
+    if not isinstance(item, dict):
+        return TwelveDataBar(None, None, None, None, None, None, DataQualityStatus.INVALID)
+    dt = _td_parse_dt(item.get("datetime"))
+    open_ = _to_decimal(item.get("open"))
+    high = _to_decimal(item.get("high"))
+    low = _to_decimal(item.get("low"))
+    close = _to_decimal(item.get("close"))
+    volume = _to_decimal(item.get("volume"))  # optional for spot metal
+    if dt is None or open_ is None or high is None or low is None or close is None:
+        return TwelveDataBar(dt, open_, high, low, close, volume, DataQualityStatus.INVALID)
+    if open_ < 0 or high < 0 or low < 0 or close < 0 or (volume is not None and volume < 0):
+        return TwelveDataBar(dt, open_, high, low, close, volume, DataQualityStatus.INVALID)
+    status = classify_freshness(dt, max_age_seconds, now=now)
+    return TwelveDataBar(dt, open_, high, low, close, volume, status)
+
+
+def parse_twelvedata_time_series(
+    payload: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> TwelveDataResult:
+    """Parse a /time_series response body. CRITICAL: Twelve Data may return HTTP 200
+    with {"status":"error", ...}; that is a provider error, never a success."""
+    if not isinstance(payload, dict):
+        return TwelveDataResult("UNAVAILABLE", [], "malformed provider response")
+    if payload.get("status") == "error":
+        code = payload.get("code")
+        if code == 429:
+            return TwelveDataResult("RATE_LIMITED", [], "rate limited by provider (429)")
+        if code in (401, 403):
+            return TwelveDataResult("ACCESS_DENIED", [], f"access denied by provider ({code})")
+        return TwelveDataResult("UNAVAILABLE", [], "provider returned an error status")
+    values = payload.get("values")
+    if not isinstance(values, list) or not values:
+        return TwelveDataResult("EMPTY", [], None)
+    bars = [twelvedata_bar_from_value(v, max_age_seconds, now=now) for v in values]
+    return TwelveDataResult("OK", bars, None)
+
+
+class TwelveDataProvider:
+    """Twelve Data REST adapter (Gold XAU/USD spot). Header auth; the key is never
+    placed in the URL/query, never logged, never returned. No network without a key.
+    Availability on the plan is decided by the provider response, never assumed."""
+
+    SOURCE = "twelvedata"
+
+    def __init__(self, rest_url: Optional[str] = None, api_key: Optional[str] = None) -> None:
+        self.rest_url = (rest_url or settings.twelvedata_rest_url).rstrip("/")
+        self.api_key = api_key if api_key is not None else settings.twelvedata_api_key
+        self.client: Optional[httpx.AsyncClient] = None
+
+    async def connect(self) -> None:
+        if self.client is None:
+            headers = {"Accept": "application/json"}
+            if self.api_key:
+                # Header auth keeps the key OUT of the URL (no leak via exceptions).
+                headers["Authorization"] = f"apikey {self.api_key}"
+            self.client = httpx.AsyncClient(
+                base_url=self.rest_url,
+                timeout=settings.twelvedata_request_timeout_seconds,
+                headers=headers,
+            )
+
+    async def disconnect(self) -> None:
+        if self.client is not None:
+            await self.client.aclose()
+            self.client = None
+
+    async def get_time_series(
+        self, canonical_symbol: str, granularity: str, outputsize: int = 30,
+        start: Optional[str] = None, end: Optional[str] = None,
+    ) -> TwelveDataResult:
+        """Fetch XAU/USD (or any mapped twelvedata symbol) intraday bars. Returns an
+        explicit TwelveDataResult; never raises for provider/HTTP errors."""
+        symbol = provider_symbol_map.to_provider(self.SOURCE, canonical_symbol)
+        if symbol is None:
+            return TwelveDataResult(
+                "NOT_MAPPED", [], f"no verified twelvedata symbol for {canonical_symbol}"
+            )
+        if granularity not in TWELVEDATA_GRANULARITIES:
+            return TwelveDataResult(
+                "NOT_SUPPORTED", [], f"granularity {granularity} not supported (twelvedata)"
+            )
+        if not self.api_key:
+            return TwelveDataResult("NO_KEY", [], "TWELVEDATA_API_KEY not set")
+        if self.client is None:
+            await self.connect()
+        assert self.client is not None
+        params: Dict[str, object] = {
+            "symbol": symbol,
+            "interval": TWELVEDATA_GRANULARITIES[granularity],
+            "timezone": "UTC",       # intraday honours UTC (verified)
+            "order": "asc",
+            "outputsize": outputsize,
+        }
+        if start is not None:
+            params["start_date"] = start
+        if end is not None:
+            params["end_date"] = end
+        try:
+            resp = await self.client.get("/time_series", params=params)
+        except httpx.TimeoutException:
+            return TwelveDataResult("UNAVAILABLE", [], "provider timeout")
+        except httpx.HTTPError:
+            return TwelveDataResult("UNAVAILABLE", [], "provider unreachable")
+        code = resp.status_code
+        if code in (401, 403):
+            return TwelveDataResult("ACCESS_DENIED", [], f"access denied by provider ({code})")
+        if code == 429:
+            return TwelveDataResult("RATE_LIMITED", [], "rate limited by provider (429)")
+        if code >= 500:
+            return TwelveDataResult("UNAVAILABLE", [], f"provider server error ({code})")
+        try:
+            payload = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            return TwelveDataResult("UNAVAILABLE", [], "malformed provider response")
+        # max_age off for explicit history; freshness re-derived by callers later.
+        return parse_twelvedata_time_series(payload, max_age_seconds=float("inf"))
+
+
+# Officially-catalogued Twelve Data symbol for gold spot -> verified provider
+# mapping (a mapping is not an entitlement: MAPPED can coexist with NOT_ENTITLED).
+provider_symbol_map.add("twelvedata", "XAU-USD", "XAU/USD")
+
+twelvedata_provider = TwelveDataProvider()
 
 
 massive_forex_provider = MassiveForexProvider()

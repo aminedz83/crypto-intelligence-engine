@@ -31,7 +31,7 @@ from main import (
 NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
 INDEX = FRONTEND / "index.html"
-VIEW_IDS = ["markets", "forex", "system", "detail"]
+VIEW_IDS = ["markets", "forex", "metal", "system", "detail"]
 
 
 # ----------------------------- data quality -----------------------------
@@ -2604,3 +2604,130 @@ class MetalPersistenceTests(_DBBase):
                 self.assertEqual(cnt.scalar(), 0)  # no Coinbase regression/leak
         finally:
             main.twelvedata_provider = saved
+
+
+# ----------------------------- Twelve Data XAU/USD (3/3: /quote + Gold UI) -----
+from main import (  # noqa: E402
+    TwelveDataQuoteResult,
+    fetch_metal_quote,
+    parse_twelvedata_quote,
+)
+
+
+class TwelveDataQuoteTests(unittest.TestCase):
+    def test_quote_price_decimal_no_float(self):
+        q = parse_twelvedata_quote(
+            {"close": "2650.123456789012345678", "is_market_open": True,
+             "timestamp": int(datetime(2026, 8, 30, 14, tzinfo=timezone.utc).timestamp())})
+        self.assertEqual(q.status, "OK")
+        self.assertIsInstance(q.price, _Dec)
+        self.assertNotIsInstance(q.price, float)
+        self.assertEqual(str(q.price), "2650.123456789012345678")
+        self.assertIs(q.is_market_open, True)
+
+    def test_quote_body_error(self):
+        self.assertEqual(parse_twelvedata_quote({"status": "error", "code": 429}).status,
+                         "RATE_LIMITED")
+        self.assertEqual(parse_twelvedata_quote({"status": "error", "code": 403}).status,
+                         "ACCESS_DENIED")
+
+    def test_quote_bad_price_unavailable(self):
+        self.assertEqual(parse_twelvedata_quote({"close": "-1"}).status, "UNAVAILABLE")
+
+    def test_is_market_open_non_bool_becomes_none(self):
+        self.assertIsNone(parse_twelvedata_quote({"close": "2650", "is_market_open": "yes"})
+                          .is_market_open)
+
+
+class MetalQuoteAssemblerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._saved = main.twelvedata_provider
+
+    def tearDown(self):
+        main.twelvedata_provider = self._saved
+
+    async def _run(self, result):
+        main.twelvedata_provider = type("P", (), {
+            "get_quote": staticmethod(lambda canon: _async_return(result))})()
+        return await fetch_metal_quote("XAU-USD")
+
+    async def test_market_open_does_not_make_it_live(self):
+        # is_market_open=True but no quote timestamp -> quality UNKNOWN, never LIVE
+        r = await self._run(TwelveDataQuoteResult("OK", _Dec("2650"), True, None))
+        self.assertEqual(r["status"], "OK")
+        self.assertEqual(r["is_market_open"], True)
+        self.assertEqual(r["quality"], "UNKNOWN")  # not LIVE from is_market_open
+
+    async def test_price_serialised_as_string(self):
+        r = await self._run(TwelveDataQuoteResult("OK", _Dec("2650.5"), False, None))
+        self.assertEqual(r["price"], "2650.5")  # Decimal -> string
+
+    async def test_access_denied_no_price(self):
+        r = await self._run(TwelveDataQuoteResult("ACCESS_DENIED", None, None, None, "x"))
+        self.assertEqual(r["status"], "ACCESS_DENIED")
+        self.assertIsNone(r["price"])
+
+
+class MetalQuoteEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self._saved = main.twelvedata_provider
+
+    def tearDown(self):
+        main.twelvedata_provider = self._saved
+
+    def _client(self, result):
+        main.twelvedata_provider = type("P", (), {
+            "get_quote": staticmethod(lambda canon: _async_return(result))})()
+        return TestClient(create_app())
+
+    def test_quote_ok_200(self):
+        r = self._client(TwelveDataQuoteResult("OK", _Dec("2650.5"), True, None)).get(
+            "/api/v1/market/metal/XAU-USD/quote")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["price"], "2650.5")
+
+    def test_quote_access_denied_403(self):
+        r = self._client(TwelveDataQuoteResult("ACCESS_DENIED", None, None, None, "x")).get(
+            "/api/v1/market/metal/XAU-USD/quote")
+        self.assertEqual(r.status_code, 403)
+
+    def test_quote_no_secret_in_response(self):
+        raw = self._client(TwelveDataQuoteResult("OK", _Dec("2650"), True, None)).get(
+            "/api/v1/market/metal/XAU-USD/quote").text.lower()
+        for bad in ("apikey", "authorization", "bearer", "twelvedata_api_key"):
+            self.assertNotIn(bad, raw)
+
+
+class GoldUiTests(unittest.TestCase):
+    def setUp(self):
+        self.html = INDEX.read_text(encoding="utf-8")
+
+    def test_metal_view_and_labels(self):
+        self.assertIn('id:"metal"', self.html)
+        self.assertIn("XAU-USD", self.html)
+        self.assertIn("Gold Spot", self.html)
+        self.assertIn("Twelve Data", self.html)
+
+    def test_metal_endpoints_used(self):
+        self.assertIn("/api/v1/market/metal/", self.html)
+        self.assertIn("/quote", self.html)
+
+    def test_quality_independent_from_market_open(self):
+        # the badge is driven by backend quality, not is_market_open
+        self.assertIn("qualityBadge(d.quality", self.html)
+        self.assertIn("Marché (fournisseur)", self.html)  # is_market_open shown as info only
+
+    def test_no_twelvedata_secret_in_frontend(self):
+        low = self.html.lower()
+        for bad in ("twelvedata_api_key", "apikey=", "bearer "):
+            self.assertNotIn(bad, low)
+
+    def test_price_from_string_not_fabricated(self):
+        # metal price comes from backend d.price (Decimal string), guarded by null check
+        self.assertIn("r.data.price == null", self.html)
+
+
+def _async_return(value):
+    async def _coro():
+        return value
+    return _coro()

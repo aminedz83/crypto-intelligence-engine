@@ -1448,11 +1448,11 @@ class CandleRow:
     product_id: str
     granularity: str
     bucket_start: datetime
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
     quality: DataQualityStatus
     origin: str  # "ws" | "rest"
     source_timestamp: Optional[datetime]
@@ -1478,7 +1478,9 @@ def candle_row_from_realtime(datum: RealtimeDatum) -> Optional[CandleRow]:
         product_id=datum.product_id,
         granularity="5m",  # Coinbase WS candles are 5-minute buckets
         bucket_start=datum.source_timestamp,
-        open=o["open"], high=o["high"], low=o["low"], close=o["close"], volume=o["volume"],
+        open=Decimal(str(o["open"])), high=Decimal(str(o["high"])),
+        low=Decimal(str(o["low"])), close=Decimal(str(o["close"])),
+        volume=Decimal(str(o["volume"])),
         quality=datum.status,
         origin="ws",
         source_timestamp=datum.source_timestamp,
@@ -1605,7 +1607,8 @@ def _history_dicts_to_rows(
             CandleRow(
                 source=source, product_id=product_id.upper(), granularity=granularity,
                 bucket_start=start,
-                open=o, high=h, low=low, close=c, volume=v,
+                open=Decimal(str(o)), high=Decimal(str(h)), low=Decimal(str(low)),
+                close=Decimal(str(c)), volume=Decimal(str(v)),
                 quality=DataQualityStatus.VALID, origin="rest",
                 source_timestamp=None, observed_at=observed_at,
             )
@@ -2597,6 +2600,169 @@ provider_symbol_map.add("twelvedata", "XAU-USD", "XAU/USD")
 twelvedata_provider = TwelveDataProvider()
 
 
+def _register_metal_instruments() -> None:
+    """Register the canonical Gold Spot instrument. Calendar NOT_CONFIGURED (no Gold
+    calendar invented in this increment); volume UNKNOWN; precision/tick None."""
+    instrument_registry.register(
+        Instrument(
+            canonical_symbol="XAU-USD",
+            asset_class=AssetClass.METAL,
+            base_asset="XAU",
+            quote_asset="USD",
+            display_name="Gold Spot",
+            timezone="UTC",
+            market_calendar=MarketCalendarPolicy.NOT_CONFIGURED,
+            volume_semantics=VolumeSemantics.UNKNOWN,
+            price_precision=None,
+            tick_size=None,
+        )
+    )
+
+
+_register_metal_instruments()
+
+
+@dataclass(frozen=True)
+class MetalHistory:
+    """Assembled metal history: the JSON-serialisable `result` for the API, and the
+    Decimal-exact `rows` ready for persistence (never routed through float)."""
+    result: Dict[str, object]
+    rows: List[CandleRow]
+
+
+def _td_bar_dict(bar: TwelveDataBar) -> Dict[str, object]:
+    """JSON-safe view of a bar: Decimals as strings (exact), datetime as ISO UTC."""
+    def s(v: Optional[Decimal]) -> Optional[str]:
+        return str(v) if v is not None else None
+    return {
+        "start": bar.datetime_utc.isoformat() if bar.datetime_utc else None,
+        "open": s(bar.open), "high": s(bar.high), "low": s(bar.low),
+        "close": s(bar.close), "volume": s(bar.volume), "quality": bar.status.value,
+    }
+
+
+def _metal_latest_quality(
+    bars: List[TwelveDataBar], granularity: str, now: Optional[datetime] = None
+) -> str:
+    """Freshness of the MOST RECENT bar (market state is separate). MISSING if none."""
+    dts = [b.datetime_utc for b in bars if b.datetime_utc is not None]
+    if not dts:
+        return DataQualityStatus.MISSING.value
+    bucket = GRANULARITIES[granularity][1] if granularity in GRANULARITIES else 3600
+    return classify_freshness(max(dts), bucket * 2, now=now).value
+
+
+def _metal_bars_to_rows(
+    source: str, product_id: Optional[str], granularity: str, bars: List[TwelveDataBar],
+    observed_at: datetime,
+) -> List[CandleRow]:
+    """Build Decimal-exact CandleRows from parsed bars. A bar without a provider
+    volume is NOT persisted (the column is NOT NULL and we never fabricate a 0)."""
+    rows: List[CandleRow] = []
+    if product_id is None:
+        return rows
+    for b in bars:
+        if b.status == DataQualityStatus.INVALID or b.datetime_utc is None:
+            continue
+        if b.open is None or b.high is None or b.low is None or b.close is None:
+            continue
+        if b.volume is None:  # cannot persist without a volume; never fabricate one
+            continue
+        rows.append(
+            CandleRow(
+                source=source, product_id=product_id, granularity=granularity,
+                bucket_start=b.datetime_utc,
+                open=b.open, high=b.high, low=b.low, close=b.close, volume=b.volume,
+                quality=b.status, origin="rest", source_timestamp=None,
+                observed_at=observed_at,
+            )
+        )
+    return rows
+
+
+async def fetch_metal_history(
+    canonical_symbol: str, granularity: str, start: int, end: int
+) -> MetalHistory:
+    """Assemble Gold XAU/USD history from Twelve Data. [start, end) half-open, dedup
+    by timestamp, ascending, INVALID excluded. Gaps stay UNKNOWN (no Gold calendar):
+    a missing bar is never a gap. Provider/business status is surfaced explicitly."""
+    inst = instrument_registry.get(canonical_symbol)
+    if inst is None or inst.asset_class != AssetClass.METAL:
+        raise ValueError(f"unknown metal instrument: {canonical_symbol}")
+    if start >= end:
+        raise ValueError("start must be strictly before end")
+    provider_symbol = provider_symbol_map.to_provider("twelvedata", canonical_symbol)
+    start_s = datetime.fromtimestamp(int(start), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    end_s = datetime.fromtimestamp(int(end), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    tdr = await twelvedata_provider.get_time_series(
+        canonical_symbol, granularity, outputsize=5000, start=start_s, end=end_s
+    )
+    base: Dict[str, object] = {
+        "source": "twelvedata",
+        "canonical_symbol": canonical_symbol,
+        "provider_symbol": provider_symbol,
+        "granularity": granularity,
+        "requested_range": {"start": start, "end": end},
+        "timezone_internal": "UTC",
+        "display_timezone": "America/Toronto",
+        "volume_semantics": inst.volume_semantics.value,  # UNKNOWN (never invented)
+    }
+    if tdr.status != "OK":
+        base.update({"status": tdr.status, "reason": tdr.reason, "count": 0, "candles": []})
+        return MetalHistory(base, [])
+    collected: Dict[int, TwelveDataBar] = {}
+    invalid = 0
+    for bar in tdr.bars:
+        if bar.datetime_utc is None or bar.status == DataQualityStatus.INVALID:
+            invalid += 1
+            continue
+        key = int(bar.datetime_utc.timestamp())
+        if key < start or key >= end:
+            continue
+        collected[key] = bar
+    kept = [collected[k] for k in sorted(collected)]
+    rows = _metal_bars_to_rows("twelvedata", provider_symbol, granularity, kept, utcnow())
+    base.update({
+        "status": "EMPTY" if not kept else "OK",
+        "count": len(kept),
+        "invalid_candles_count": invalid,
+        "latest_quality": _metal_latest_quality(kept, granularity),
+        "gaps_status": "UNKNOWN",   # no Gold calendar -> absence is not a gap
+        "candles": [_td_bar_dict(b) for b in kept],
+    })
+    return MetalHistory(base, rows)
+
+
+_METAL_HTTP_STATUS = {
+    "NOT_MAPPED": 409, "NOT_SUPPORTED": 409, "NO_KEY": 503, "ACCESS_DENIED": 403,
+    "RATE_LIMITED": 429, "UNAVAILABLE": 503,
+}
+
+
+@api_router.get("/market/metal/{symbol}/history")
+async def market_metal_history(
+    symbol: str, start: int, end: int, granularity: str = "1h"
+) -> dict:
+    try:
+        hist = await fetch_metal_history(symbol.upper(), granularity, start, end)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": str(exc)}
+        ) from exc
+    status = str(hist.result.get("status"))
+    if status == "OK" and persistence_state.ready and hist.rows:
+        try:
+            await persist_candles(hist.rows)  # source="twelvedata"; INVALID never sent
+        except Exception as exc:  # noqa: BLE001 - a read must never fail on a write error
+            log.warning("Metal persistence error: %s", exc)
+    http = _METAL_HTTP_STATUS.get(status)
+    if http is not None:
+        raise HTTPException(
+            status_code=http, detail={"status": status, "reason": hist.result.get("reason")}
+        )
+    return hist.result
+
+
 massive_forex_provider = MassiveForexProvider()
 _register_massive_forex_instruments()
 
@@ -2768,6 +2934,7 @@ async def lifespan(app: FastAPI):
         )
     await market_provider.connect()
     await massive_forex_provider.connect()
+    await twelvedata_provider.connect()
     activation = await activate_massive_forex_mappings()
     log.info("Massive forex mapping activation: %s", activation)
     try:
@@ -2783,6 +2950,7 @@ async def lifespan(app: FastAPI):
         await market_ws.stop()
         await market_provider.disconnect()
         await massive_forex_provider.disconnect()
+        await twelvedata_provider.disconnect()
         log.info("Shutting down %s", settings.app_name)
 
 

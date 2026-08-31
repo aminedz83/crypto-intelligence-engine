@@ -2589,8 +2589,7 @@ class MetalPersistenceTests(_DBBase):
             h = await fetch_metal_history("XAU-USD", "1h", _XAU_BASE, _XAU_BASE + 5 * 3600)
             n = await main.persist_candles(h.rows)
             self.assertEqual(n, 2)
-            rows = await read_stored_candles("XAU/USD", "1h", _XAU_BASE, _XAU_BASE + 5 * 3600, 100)
-            # note: read_stored_candles filters source='coinbase'; use a raw check instead
+            # read_stored_candles filters source='coinbase'; check twelvedata rows raw
             async with main.engine.connect() as conn:
                 res = await conn.execute(main.text(
                     "SELECT close FROM candles WHERE source='twelvedata' "

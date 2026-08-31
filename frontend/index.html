@@ -273,15 +273,17 @@
   function renderForex(){
     var v = byId("view-forex"); clear(v);
     v.appendChild(h("h2",{class:"section"},["Forex · Massive (réel)"]));
-    v.appendChild(loading("Lecture des mappings…"));
+    v.appendChild(h("div",{class:"card","id":"fx-market"},[ loading("État du marché…") ]));
+    v.appendChild(h("div",{"id":"fx-mappings"},[ loading("Lecture des mappings…") ]));
+    refreshForexMarket();
     api("/api/v1/market/forex/mappings").then(function(r){
-      clear(v); v.appendChild(h("h2",{class:"section"},["Forex · Massive (réel)"]));
-      if (!r.ok || !r.data){ v.appendChild(emptyState("Forex indisponible", errorMessage(r))); return; }
+      var mv = byId("fx-mappings"); if (!mv) return; clear(mv);
+      if (!r.ok || !r.data){ mv.appendChild(emptyState("Forex indisponible", errorMessage(r))); return; }
       var act = r.data.activation || {};
       var note = act.activated
         ? (act.confirmed_count + " paire(s) mappée(s) officiellement")
         : "Mappings non activés (clé provider absente côté serveur) — symboles NOT_MAPPED.";
-      v.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:0 4px 10px"},[note]));
+      mv.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:0 4px 10px"},[note]));
       var card = h("div",{class:"card"},[]);
       (r.data.mappings||[]).forEach(function(m){
         var mapped = m.status === "MAPPED";
@@ -292,12 +294,54 @@
           qualityBadge(mapped ? "MAPPED" : "NOT_MAPPED")
         ]));
       });
-      v.appendChild(card);
+      mv.appendChild(card);
       if (act.xau && act.xau.ticker){
-        v.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:2px 4px"},
+        mv.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:2px 4px"},
           ["XAU détecté par le provider ("+act.xau.ticker+") — non intégré dans cette version."]));
       }
     });
+  }
+  function fxCountdown(iso){
+    if (!iso) return "";
+    var t = Date.parse(iso); if (isNaN(t)) return "";
+    var s = Math.max(0, Math.round((t - Date.now())/1000));
+    var hh = Math.floor(s/3600), mm = Math.floor((s%3600)/60);
+    return hh + " h " + (mm<10?"0":"") + mm;
+  }
+  function refreshForexMarket(){
+    api("/api/v1/market/forex/market-state").then(function(r){
+      var w = byId("fx-market"); if (!w) return; clear(w);
+      // Market state is independent from data quality (OPEN != LIVE).
+      var d = (r.ok && r.data) ? r.data : { market_state:"UNKNOWN" };
+      var st = d.market_state || "UNKNOWN";
+      var dot = st==="OPEN" ? "🟢" : (st==="UNKNOWN" ? "⚪" : "🔴");
+      var title = st==="OPEN" ? "Marché ouvert"
+        : st==="CLOSED_WEEKEND" ? "Marché fermé — week-end"
+        : st==="CLOSED" ? "Marché fermé" : "État du marché inconnu";
+      var lines = [ h("div",{style:"font-weight:600"},[ dot+" "+title ]) ];
+      if (st==="OPEN"){
+        if (d.current_session) lines.push(h("div",{class:"sub"},["Session : "+d.current_session+" (indicative)"]));
+        if (d.next_close) lines.push(h("div",{class:"sub"},["Ferme dans : "+fxCountdown(d.next_close)+
+          " · "+formatMontrealTime(d.next_close)]));
+      } else if (st==="CLOSED_WEEKEND" || st==="CLOSED"){
+        if (d.next_open) lines.push(h("div",{class:"sub"},["Réouverture : "+formatMontrealTime(d.next_open)+" (Montréal)"]));
+      }
+      var body = h("div",{style:"padding:12px 16px"}, lines);
+      var info = h("button",{class:"back",style:"margin:0 0 0 auto;padding:6px 12px",
+        onclick:function(){ toggleFxInfo(); }},["ⓘ Horaires"]);
+      var headRow = h("div",{style:"display:flex;align-items:center;justify-content:space-between;padding:0 4px"},
+        [ h("div",{}), info ]);
+      w.appendChild(headRow); w.appendChild(body);
+      w.appendChild(h("div",{"id":"fx-info","class":"muted","style":"display:none;padding:0 16px 14px;font-size:12px;line-height:1.5"},[
+        "Horaires du marché Forex — l'état ouvert/fermé et les sessions sont déterminés à partir du calendrier marché configuré. ",
+        "Les heures sont affichées selon le fuseau de Montréal ; le moteur conserve UTC comme référence temporelle. ",
+        "Les sessions (Sydney/Tokyo/London/New York) sont indicatives (heures locales des centres), pas les heures d'un broker."
+      ]));
+    });
+  }
+  function toggleFxInfo(){
+    var el = byId("fx-info"); if (!el) return;
+    el.style.display = el.style.display === "none" ? "block" : "none";
   }
 
   // ---- Detail (price + recent candles) ------------------------------------
@@ -444,6 +488,7 @@
     if (current==="markets") refreshMarkets();
     else if (current==="detail") refreshDetail();
     else if (current==="system") renderSystem();
+    else if (current==="forex") refreshForexMarket();
   }
 
   // ---- Boot ---------------------------------------------------------------

@@ -55,8 +55,10 @@
     .tab{flex:1;text-align:center;padding:10px;border-radius:10px;background:var(--panel);
       border:1px solid var(--line);color:var(--muted);font-weight:600;font-size:13px;cursor:pointer}
     .tab[aria-current="page"]{color:var(--text);background:var(--panel2);border-color:var(--accent)}
-    .tbl{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+    .tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}
+    .tbl{width:100%;min-width:440px;border-collapse:collapse;font-variant-numeric:tabular-nums}
     .tbl th,.tbl td{padding:9px 10px;text-align:right;font-size:13px;border-bottom:1px solid var(--line)}
+    .tbl td:not(:first-child),.tbl th:not(:first-child){white-space:nowrap}
     .tbl th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
     .tbl th:first-child,.tbl td:first-child{text-align:left}
     .muted{color:var(--muted)} .center{text-align:center}
@@ -450,11 +452,11 @@
           h("td",{},[ priceCell(c.low) ]), h("td",{},[ priceCell(c.close) ])
         ]);
       });
-      w.appendChild(h("table",{class:"tbl"},[
+      w.appendChild(h("div",{class:"tbl-wrap"},[ h("table",{class:"tbl"},[
         h("thead",{},[ h("tr",{},[ h("th",{},["Heure (Montréal)"]), h("th",{},["O"]),
           h("th",{},["H"]), h("th",{},["L"]), h("th",{},["C"]) ]) ]),
         h("tbody",{}, rows)
-      ]));
+      ]) ]));
       if (d.gaps_status === "UNKNOWN"){
         w.appendChild(h("div",{class:"muted",style:"font-size:11px;padding:8px 12px"},
           ["Détection de trous: UNKNOWN (calendrier Forex non configuré — une barre absente n'est pas un trou)."]));

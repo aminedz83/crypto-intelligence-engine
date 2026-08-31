@@ -2024,3 +2024,39 @@ class UiFreshnessStaticTests(unittest.TestCase):
         # the UI maps status codes to clean text; it never renders a raw exception
         self.assertNotIn("str(exc)", self.html)
         self.assertNotIn(".stack", self.html)
+
+
+# ----------------------------- UI: Montreal time + MAPPED != LIVE -------------
+class MontrealTimeUiTests(unittest.TestCase):
+    def setUp(self):
+        self.html = INDEX.read_text(encoding="utf-8")
+
+    def test_montreal_timezone_present(self):
+        self.assertIn("America/Toronto", self.html)
+        self.assertIn("formatMontrealTime", self.html)
+
+    def test_no_hardcoded_utc_offset(self):
+        # DST must come from Intl, never a fixed offset or manual hour math
+        for bad in ("UTC-4", "UTC-5", "-04:00", "-05:00", "getTimezoneOffset", "setHours"):
+            self.assertNotIn(bad, self.html)
+
+    def test_montreal_used_in_candle_table(self):
+        self.assertIn("formatMontrealTime(c.start)", self.html)
+        self.assertIn("Heure (Montréal)", self.html)
+
+    def test_utc_kept_as_secondary(self):
+        self.assertIn("formatUtcTime", self.html)
+
+    def test_mapped_distinct_from_live(self):
+        # forex mapped rows show MAPPED, never converted to LIVE/VALID
+        self.assertIn('qualityBadge(mapped ? "MAPPED"', self.html)
+        self.assertNotIn('qualityBadge(mapped ? "VALID"', self.html)
+        self.assertIn(".b-mapped", self.html)
+
+    def test_not_mapped_unchanged(self):
+        self.assertIn("NOT_MAPPED", self.html)
+
+    def test_crypto_live_from_backend_quality(self):
+        # crypto badge still driven by backend quality (LIVE only if VALID)
+        self.assertIn("qualityBadge(r.data.quality)", self.html)
+        self.assertIn('VALID:["LIVE"', self.html)

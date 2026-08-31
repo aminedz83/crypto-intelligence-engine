@@ -1502,9 +1502,9 @@ class MassiveInstrumentTests(unittest.TestCase):
         self.assertIsNotNone(inst)
         self.assertEqual(inst.asset_class, AssetClass.FOREX)
 
-    def test_forex_calendar_not_configured(self):
+    def test_forex_calendar_is_forex_week(self):
         self.assertEqual(instrument_registry.get("EUR-USD").market_calendar,
-                         MarketCalendarPolicy.NOT_CONFIGURED)
+                         MarketCalendarPolicy.FOREX_WEEK)
 
     def test_forex_volume_semantics_unknown(self):
         self.assertEqual(instrument_registry.get("EUR-USD").volume_semantics,
@@ -2060,3 +2060,138 @@ class MontrealTimeUiTests(unittest.TestCase):
         # crypto badge still driven by backend quality (LIVE only if VALID)
         self.assertIn("qualityBadge(r.data.quality)", self.html)
         self.assertIn('VALID:["LIVE"', self.html)
+
+
+# ----------------------------- Forex market calendar & sessions ---------------
+from datetime import datetime as _dt  # noqa: E402
+from main import (  # noqa: E402
+    ForexWeekCalendar,
+    calendar_for as _calendar_for,
+    forex_active_sessions,
+    forex_market_state,
+)
+
+
+def _utc(y, mo, d, h, mi=0):
+    return _dt(y, mo, d, h, mi, tzinfo=timezone.utc)
+
+
+class ForexCalendarTests(unittest.TestCase):
+    def test_open_midweek(self):
+        r = forex_market_state(_utc(2026, 1, 14, 12))  # Wednesday noon
+        self.assertEqual(r["market_state"], "OPEN")
+        self.assertIsNotNone(r["next_close"])
+        self.assertIsNone(r["next_open"])
+
+    def test_closed_weekend(self):
+        r = forex_market_state(_utc(2026, 1, 17, 12))  # Saturday
+        self.assertEqual(r["market_state"], "CLOSED_WEEKEND")
+        self.assertIsNotNone(r["next_open"])
+        self.assertIsNone(r["next_close"])
+
+    def test_open_boundary_winter_2200z(self):
+        # Winter (EST): opens Sunday 22:00 UTC
+        self.assertEqual(forex_market_state(_utc(2026, 1, 11, 21, 59))["market_state"],
+                         "CLOSED_WEEKEND")
+        self.assertEqual(forex_market_state(_utc(2026, 1, 11, 22, 0))["market_state"], "OPEN")
+
+    def test_open_boundary_summer_2100z(self):
+        # Summer (EDT): opens Sunday 21:00 UTC (DST auto, never a fixed offset)
+        self.assertEqual(forex_market_state(_utc(2026, 7, 12, 20, 59))["market_state"],
+                         "CLOSED_WEEKEND")
+        self.assertEqual(forex_market_state(_utc(2026, 7, 12, 21, 0))["market_state"], "OPEN")
+
+    def test_close_boundary_friday_winter(self):
+        self.assertEqual(forex_market_state(_utc(2026, 1, 16, 21, 59))["market_state"], "OPEN")
+        self.assertEqual(forex_market_state(_utc(2026, 1, 16, 22, 0))["market_state"],
+                         "CLOSED_WEEKEND")
+
+    def test_dst_transition_march(self):
+        # US DST starts 2026-03-08; the Sunday open still resolves via IANA (not a
+        # fixed offset). Just assert it computes a definitive OPEN/CLOSED, not UNKNOWN.
+        r = forex_market_state(_utc(2026, 3, 8, 21, 30))
+        self.assertIn(r["market_state"], ("OPEN", "CLOSED_WEEKEND"))
+
+    def test_utc_day_change(self):
+        # Thursday 23:30 UTC -> Friday 00:xx local NY still within the week -> OPEN
+        self.assertEqual(forex_market_state(_utc(2026, 1, 15, 23, 30))["market_state"], "OPEN")
+
+    def test_market_state_independent_from_quality(self):
+        r = forex_market_state(_utc(2026, 1, 14, 12))
+        self.assertNotIn("quality", r)  # OPEN != LIVE; no data-quality field here
+        self.assertEqual(r["timezone_internal"], "UTC")
+        self.assertEqual(r["display_timezone"], "America/Toronto")
+
+    def test_holidays_not_implemented(self):
+        self.assertEqual(forex_market_state(_utc(2026, 1, 14, 12))["holidays"], "NOT_IMPLEMENTED")
+
+    def test_sessions_marked_indicative(self):
+        sessions = forex_active_sessions(_utc(2026, 1, 14, 12))
+        self.assertEqual(len(sessions), 4)
+        self.assertTrue(all(s["indicative"] is True for s in sessions))
+
+    def test_session_active_london_midday(self):
+        # 12:00 UTC in January -> London local ~12:00 (within 08-17) -> active
+        sessions = forex_active_sessions(_utc(2026, 1, 14, 12))
+        london = next(s for s in sessions if s["name"] == "London")
+        self.assertTrue(london["active"])
+
+    def test_calendar_for_forex_week(self):
+        cal = _calendar_for(MarketCalendarPolicy.FOREX_WEEK)
+        self.assertIsInstance(cal, ForexWeekCalendar)
+
+    def test_forex_calendar_open_closed(self):
+        cal = _calendar_for(MarketCalendarPolicy.FOREX_WEEK)
+        open_ts = int(_utc(2026, 1, 14, 12).timestamp())
+        wknd_ts = int(_utc(2026, 1, 17, 12).timestamp())
+        self.assertEqual(cal.is_market_expected_open(open_ts), OpenState.OPEN)
+        self.assertEqual(cal.is_market_expected_open(wknd_ts), OpenState.CLOSED)
+
+    def test_forex_gaps_still_unknown_no_regression(self):
+        # closed market / no quote must NOT become a gap
+        cal = _calendar_for(MarketCalendarPolicy.FOREX_WEEK)
+        rep = cal.analyze_gaps([0, 7200], 3600)
+        self.assertEqual(rep.status, "UNKNOWN")
+        self.assertEqual(rep.missing, [])
+
+    def test_coinbase_24_7_unchanged(self):
+        cal = _calendar_for(MarketCalendarPolicy.ALWAYS_OPEN_24_7)
+        self.assertEqual(cal.is_market_expected_open(0), OpenState.OPEN)
+
+    def test_api_serialisation_shape(self):
+        r = forex_market_state(_utc(2026, 1, 14, 12))
+        for key in ("asset_class", "market_state", "reason", "current_session",
+                    "sessions", "next_open", "next_close", "timezone_internal",
+                    "display_timezone", "source", "as_of"):
+            self.assertIn(key, r)
+        # timestamps are ISO strings or None (JSON-serialisable), never datetime
+        for k in ("next_open", "next_close", "as_of"):
+            self.assertTrue(r[k] is None or isinstance(r[k], str))
+
+
+class ForexMarketStateEndpointTests(unittest.TestCase):
+    def test_endpoint_ok(self):
+        r = TestClient(create_app()).get("/api/v1/market/forex/market-state")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["asset_class"], "FOREX")
+        self.assertIn(body["market_state"], ("OPEN", "CLOSED", "CLOSED_WEEKEND", "UNKNOWN"))
+
+
+class ForexCalendarUiTests(unittest.TestCase):
+    def setUp(self):
+        self.html = INDEX.read_text(encoding="utf-8")
+
+    def test_market_state_endpoint_used(self):
+        self.assertIn("/api/v1/market/forex/market-state", self.html)
+
+    def test_market_hours_in_montreal(self):
+        self.assertIn("formatMontrealTime(d.next_close)", self.html)
+        self.assertIn("formatMontrealTime(d.next_open)", self.html)
+
+    def test_info_help_present(self):
+        self.assertIn("Horaires du marché Forex", self.html)
+
+    def test_no_hardcoded_offset_in_ui(self):
+        for bad in ("UTC-4", "UTC-5", "-04:00", "-05:00", "getTimezoneOffset"):
+            self.assertNotIn(bad, self.html)

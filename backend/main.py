@@ -128,6 +128,7 @@ class Settings(BaseSettings):
     massive_api_key: str = ""
     massive_rest_url: str = "https://api.massive.com"
     massive_request_timeout_seconds: float = 10.0
+    massive_forex_ws_url: str = "wss://socket.massive.com/forex"
 
     # Twelve Data REST (Gold XAU/USD spot). Key server-side only, header auth; no
     # call is made without a key. Availability on the account's plan is determined
@@ -1733,10 +1734,7 @@ class VolumeSemantics(str, Enum):
 class MarketCalendarPolicy(str, Enum):
     ALWAYS_OPEN_24_7 = "ALWAYS_OPEN_24_7"
     NOT_CONFIGURED = "NOT_CONFIGURED"
-    # Declared intent only; NOT implemented in 6A (no invented hours). Until real
-    # official hours are added, calendar_for() maps these to NotConfigured -> UNKNOWN.
     FOREX_WEEK = "FOREX_WEEK"
-    TWELVEDATA_COMMODITY_24_7 = "TWELVEDATA_COMMODITY_24_7"
     US_EQUITY_RTH = "US_EQUITY_RTH"
 
 
@@ -1878,31 +1876,6 @@ class NotConfiguredCalendar(MarketCalendar):
         return GapReport("UNKNOWN", [])
 
 
-class TwelveDataCommodity24_7Calendar(MarketCalendar):
-    """Twelve Data Commodity calendar. The provider's official Commodity market
-    specification lists trading hours as 24/7 with timezone Australia/Sydney.
-
-    OPEN/CLOSED is therefore provider-calendar truth. Gap analysis deliberately stays
-    UNKNOWN: verified trading hours do not prove that Twelve Data must emit one OHLC
-    bar for every theoretical bucket, so absence is never promoted to a data gap.
-    """
-
-    policy = MarketCalendarPolicy.TWELVEDATA_COMMODITY_24_7
-
-    def is_market_expected_open(self, ts_unix: int) -> OpenState:
-        try:
-            datetime.fromtimestamp(int(ts_unix), tz=timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return OpenState.UNKNOWN
-        return OpenState.OPEN
-
-    def expected_bucket_starts(self, granularity: str, start: int, end: int) -> Optional[List[int]]:
-        return None
-
-    def analyze_gaps(self, starts: List[int], bucket: int) -> GapReport:
-        return GapReport("UNKNOWN", [])
-
-
 # Verified weekly Forex hours: opens Sunday 17:00 and closes Friday 17:00 in
 # America/New_York local time (DST handled by IANA -> 22:00 UTC in winter, 21:00
 # UTC in summer). NEVER a fixed UTC offset. Source: widely corroborated retail
@@ -1970,6 +1943,39 @@ def _forex_week_bounds(now_utc: datetime) -> Optional[Dict[str, object]]:
     }
 
 
+class USEquityRTHCalendar(MarketCalendar):
+    """Baseline U.S. cash-index regular-hours calendar.
+
+    Massive documents most U.S. indices as updating Monday-Friday 09:30-16:00
+    America/New_York. DST is handled by IANA ZoneInfo. This class intentionally
+    does NOT fabricate holiday/early-close knowledge: it provides the documented
+    regular-hours baseline only, and gap analysis remains UNKNOWN because Massive
+    explicitly emits no aggregate when an index has no update.
+    """
+
+    policy = MarketCalendarPolicy.US_EQUITY_RTH
+    timezone_name = "America/New_York"
+
+    def is_market_expected_open(self, ts_unix: int) -> OpenState:
+        ny = _zone(self.timezone_name)
+        if ny is None:
+            return OpenState.UNKNOWN
+        try:
+            now = datetime.fromtimestamp(int(ts_unix), tz=timezone.utc).astimezone(ny)
+        except (OverflowError, OSError, ValueError):
+            return OpenState.UNKNOWN
+        if now.weekday() >= 5:
+            return OpenState.CLOSED
+        minutes = now.hour * 60 + now.minute
+        return OpenState.OPEN if 570 <= minutes < 960 else OpenState.CLOSED
+
+    def expected_bucket_starts(self, granularity: str, start: int, end: int) -> Optional[List[int]]:
+        return None  # holidays/early closes/index-specific update cadence not fabricated
+
+    def analyze_gaps(self, starts: List[int], bucket: int) -> GapReport:
+        return GapReport("UNKNOWN", [])  # no index update != missing market data
+
+
 class ForexWeekCalendar(MarketCalendar):
     """Forex weekly calendar: OPEN/CLOSED anchored on America/New_York 17:00 Sun->Fri
     (DST via IANA). Gap analysis stays UNKNOWN: a missing bar is never a gap because
@@ -1997,19 +2003,18 @@ class ForexWeekCalendar(MarketCalendar):
 _ALWAYS_24_7 = Always24_7Calendar()
 _NOT_CONFIGURED = NotConfiguredCalendar()
 _FOREX_WEEK = ForexWeekCalendar()
-_TWELVEDATA_COMMODITY_24_7 = TwelveDataCommodity24_7Calendar()
+_US_EQUITY_RTH = USEquityRTHCalendar()
 _COINBASE_CALENDAR = _ALWAYS_24_7
 
 
 def calendar_for(policy: MarketCalendarPolicy) -> MarketCalendar:
-    """ALWAYS_OPEN_24_7 -> crypto; FOREX_WEEK -> Forex weekly (NY-anchored). Every
-    other policy resolves to NotConfigured -> UNKNOWN (no invented hours)."""
+    """Resolve implemented calendar policies; unknown configuration stays UNKNOWN."""
     if policy == MarketCalendarPolicy.ALWAYS_OPEN_24_7:
         return _ALWAYS_24_7
     if policy == MarketCalendarPolicy.FOREX_WEEK:
         return _FOREX_WEEK
-    if policy == MarketCalendarPolicy.TWELVEDATA_COMMODITY_24_7:
-        return _TWELVEDATA_COMMODITY_24_7
+    if policy == MarketCalendarPolicy.US_EQUITY_RTH:
+        return _US_EQUITY_RTH
     return _NOT_CONFIGURED
 
 
@@ -2434,6 +2439,253 @@ async def market_forex_state() -> dict:
     return forex_market_state()
 
 
+
+
+# ============================ Massive Forex realtime WebSocket (V2-A) ===========
+# Official Massive protocol: wss://socket.massive.com/forex, auth action,
+# C.<PAIR> BBO quotes and CA.<PAIR> per-minute quote-derived OHLC.
+# No synthetic midpoint and no synthetic missing bars.
+@dataclass(frozen=True)
+class ForexRealtimeQuote:
+    canonical_symbol: str
+    bid: Decimal
+    ask: Decimal
+    source_timestamp: datetime
+    received_at: datetime
+    quality: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        return {"source": "massive", "canonical_symbol": self.canonical_symbol,
+                "bid": str(self.bid), "ask": str(self.ask),
+                "source_timestamp": self.source_timestamp.isoformat(),
+                "received_at": self.received_at.isoformat(), "quality": self.quality.value}
+
+
+@dataclass(frozen=True)
+class ForexRealtimeCandle:
+    canonical_symbol: str
+    start: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+    received_at: datetime
+    quality: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        return {"source": "massive", "canonical_symbol": self.canonical_symbol,
+                "granularity": "1m", "start": self.start.isoformat(),
+                "open": str(self.open), "high": str(self.high), "low": str(self.low),
+                "close": str(self.close), "volume": str(self.volume),
+                "received_at": self.received_at.isoformat(), "quality": self.quality.value}
+
+
+def _positive_decimal(value: Any) -> Optional[Decimal]:
+    try:
+        d = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return d if d > 0 and d.is_finite() else None
+
+
+def _massive_pair_to_canonical(pair: Any) -> Optional[str]:
+    if not isinstance(pair, str) or "/" not in pair:
+        return None
+    canonical = pair.replace("/", "-").upper()
+    mapped = provider_symbol_map.to_provider("massive", canonical)
+    return canonical if mapped is not None else None
+
+
+def parse_massive_forex_quote(item: Any, received_at: Optional[datetime] = None) -> Optional[ForexRealtimeQuote]:
+    if not isinstance(item, dict) or item.get("ev") != "C":
+        return None
+    canonical = _massive_pair_to_canonical(item.get("p"))
+    bid, ask = _positive_decimal(item.get("b")), _positive_decimal(item.get("a"))
+    ts = _unix_ms_to_dt(item.get("t"))
+    if canonical is None or bid is None or ask is None or ts is None or ask < bid:
+        return None
+    recv = received_at or utcnow()
+    return ForexRealtimeQuote(canonical, bid, ask, ts, recv,
+                              classify_freshness(ts, settings.ticker_max_age_seconds, now=recv))
+
+
+def parse_massive_forex_minute(item: Any, received_at: Optional[datetime] = None) -> Optional[ForexRealtimeCandle]:
+    if not isinstance(item, dict) or item.get("ev") != "CA":
+        return None
+    canonical = _massive_pair_to_canonical(item.get("pair"))
+    start = _unix_ms_to_dt(item.get("s"))
+    vals = [_positive_decimal(item.get(k)) for k in ("o", "h", "l", "c", "v")]
+    if canonical is None or start is None or any(v is None for v in vals):
+        return None
+    open_, high, low, close, volume = vals
+    assert open_ is not None and high is not None and low is not None and close is not None and volume is not None
+    if high < low or not (low <= open_ <= high) or not (low <= close <= high):
+        return None
+    recv = received_at or utcnow()
+    return ForexRealtimeCandle(canonical, start, open_, high, low, close, volume, recv,
+                               classify_freshness(start, 120.0, now=recv))
+
+
+class MassiveForexWsManager:
+    SOURCE = "massive"
+
+    def __init__(self, url: Optional[str] = None, api_key: Optional[str] = None) -> None:
+        self.url = url or settings.massive_forex_ws_url
+        self.api_key = settings.massive_api_key if api_key is None else api_key
+        self.running = False
+        self.websocket: Any = None
+        self.authenticated = False
+        self.last_message_at: Optional[datetime] = None
+        self.last_error: Optional[str] = None
+        self._task: Optional[asyncio.Task] = None
+        self.quotes: Dict[str, ForexRealtimeQuote] = {}
+        self.candles: Dict[str, ForexRealtimeCandle] = {}
+
+    def _topics(self) -> List[str]:
+        topics: List[str] = []
+        for canonical in EXPECTED_MASSIVE_FOREX:
+            if provider_symbol_map.to_provider("massive", canonical) is not None:
+                pair = canonical.replace("-", "/")
+                topics.extend((f"C.{pair}", f"CA.{pair}"))
+        return topics
+
+    async def start(self) -> None:
+        if not self.api_key:
+            raise RuntimeError("MASSIVE_API_KEY not set")
+        if websockets is None:
+            raise RuntimeError("websockets dependency is not installed")
+        if self.running:
+            return
+        if not self._topics():
+            raise RuntimeError("no verified Massive forex mappings available")
+        self.running = True
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self) -> None:
+        self.running = False
+        self.authenticated = False
+        if self.websocket is not None:
+            try:
+                await self.websocket.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.websocket = None
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def _run_loop(self) -> None:  # pragma: no cover - live provider socket
+        attempt = 0
+        while self.running:
+            try:
+                async with websockets.connect(self.url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
+                    self.websocket = ws
+                    self.authenticated = False
+                    attempt = 0
+                    await ws.send(json.dumps({"action": "auth", "params": self.api_key}))
+                    async for raw in ws:
+                        self.last_message_at = utcnow()
+                        await self._handle(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.websocket = None
+                self.authenticated = False
+                self.last_error = _redact_secret(str(exc))[:200]
+                if not self.running:
+                    break
+                attempt += 1
+                await asyncio.sleep(ws_backoff(attempt))
+
+    async def _handle(self, raw: str | bytes) -> None:
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            return
+        items = payload if isinstance(payload, list) else [payload]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("ev") == "status":
+                status_value = str(item.get("status", ""))
+                if status_value == "auth_success":
+                    self.authenticated = True
+                    topics = self._topics()
+                    if self.websocket is not None and topics:
+                        await self.websocket.send(json.dumps({"action": "subscribe", "params": ",".join(topics)}))
+                elif status_value in {"auth_failed", "error"}:
+                    self.last_error = str(item.get("message") or status_value)[:200]
+                continue
+            q = parse_massive_forex_quote(item, self.last_message_at)
+            if q is not None:
+                old = self.quotes.get(q.canonical_symbol)
+                if old is None or q.source_timestamp >= old.source_timestamp:
+                    self.quotes[q.canonical_symbol] = q
+                continue
+            c = parse_massive_forex_minute(item, self.last_message_at)
+            if c is not None:
+                oldc = self.candles.get(c.canonical_symbol)
+                if oldc is None or c.start >= oldc.start:
+                    self.candles[c.canonical_symbol] = c
+
+    def realtime(self, canonical_symbol: str) -> Dict[str, object]:
+        canonical = canonical_symbol.upper()
+        q, c = self.quotes.get(canonical), self.candles.get(canonical)
+        return {"source": "massive", "canonical_symbol": canonical,
+                "status": "OK" if (q or c) else "MISSING",
+                "transport": "WEBSOCKET" if self.authenticated else ("CONNECTING" if self.running else "STOPPED"),
+                "quote": q.to_dict() if q else None, "candle": c.to_dict() if c else None}
+
+    def health(self) -> Dict[str, object]:
+        return {"source": "massive", "running": self.running, "connected": self.websocket is not None,
+                "authenticated": self.authenticated,
+                "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
+                "last_error": self.last_error}
+
+
+massive_forex_ws = MassiveForexWsManager()
+
+
+@api_router.post("/market/forex/websocket/start")
+async def market_forex_ws_start() -> dict:
+    try:
+        await massive_forex_ws.start()
+    except RuntimeError as exc:
+        reason = str(exc)
+        code = 503 if "API_KEY" in reason else 409
+        raise HTTPException(status_code=code, detail={"status": "UNAVAILABLE", "reason": reason}) from exc
+    return {"status": "started", "source": "massive", "transport": "WEBSOCKET"}
+
+
+@api_router.post("/market/forex/websocket/stop")
+async def market_forex_ws_stop() -> dict:
+    await massive_forex_ws.stop()
+    return {"status": "stopped", "source": "massive"}
+
+
+@api_router.get("/market/forex/websocket/health")
+async def market_forex_ws_health() -> dict:
+    return massive_forex_ws.health()
+
+
+@api_router.get("/market/forex/{symbol}/realtime")
+async def market_forex_realtime(symbol: str) -> dict:
+    canonical = symbol.upper()
+    inst = instrument_registry.get(canonical)
+    if inst is None or inst.asset_class != AssetClass.FOREX:
+        raise HTTPException(status_code=404, detail={"status": "NOT_SUPPORTED", "reason": "unknown forex instrument"})
+    if provider_symbol_map.to_provider("massive", canonical) is None:
+        raise HTTPException(status_code=409, detail={"status": "NOT_MAPPED", "reason": "no verified Massive mapping"})
+    return massive_forex_ws.realtime(canonical)
+
+
 # ==================== Twelve Data REST — Gold XAU/USD (sub-increment 1/3) ======
 # First metal connector foundation: Twelve Data /time_series for XAU/USD (SPOT,
 # officially catalogued as "Gold Spot / Precious Metal"). This sub-increment adds
@@ -2704,9 +2956,8 @@ twelvedata_provider = TwelveDataProvider()
 
 
 def _register_metal_instruments() -> None:
-    """Register Gold Spot using Twelve Data's verified Commodity calendar metadata.
-    Provider trading hours are 24/7 in Australia/Sydney. Volume semantics and financial
-    precision remain UNKNOWN/None until independently verified."""
+    """Register the canonical Gold Spot instrument. Calendar NOT_CONFIGURED (no Gold
+    calendar invented in this increment); volume UNKNOWN; precision/tick None."""
     instrument_registry.register(
         Instrument(
             canonical_symbol="XAU-USD",
@@ -2714,8 +2965,8 @@ def _register_metal_instruments() -> None:
             base_asset="XAU",
             quote_asset="USD",
             display_name="Gold Spot",
-            timezone="Australia/Sydney",
-            market_calendar=MarketCalendarPolicy.TWELVEDATA_COMMODITY_24_7,
+            timezone="UTC",
+            market_calendar=MarketCalendarPolicy.NOT_CONFIGURED,
             volume_semantics=VolumeSemantics.UNKNOWN,
             price_precision=None,
             tick_size=None,
@@ -2788,8 +3039,8 @@ async def fetch_metal_history(
     canonical_symbol: str, granularity: str, start: int, end: int
 ) -> MetalHistory:
     """Assemble Gold XAU/USD history from Twelve Data. [start, end) half-open, dedup
-    by timestamp, ascending, INVALID excluded. Provider calendar is verified 24/7, but
-    gaps remain UNKNOWN because provider bar-emission semantics are not inferred."""
+    by timestamp, ascending, INVALID excluded. Gaps stay UNKNOWN (no Gold calendar):
+    a missing bar is never a gap. Provider/business status is surfaced explicitly."""
     inst = instrument_registry.get(canonical_symbol)
     if inst is None or inst.asset_class != AssetClass.METAL:
         raise ValueError(f"unknown metal instrument: {canonical_symbol}")
@@ -2811,7 +3062,6 @@ async def fetch_metal_history(
         "display_timezone": "America/Toronto",
         "market_timezone": inst.timezone,
         "market_calendar": inst.market_calendar.value,
-        "market_state": calendar_for(inst.market_calendar).is_market_expected_open(start).value,
         "volume_semantics": inst.volume_semantics.value,  # UNKNOWN (never invented)
     }
     if tdr.status != "OK":
@@ -2834,10 +3084,7 @@ async def fetch_metal_history(
         "count": len(kept),
         "invalid_candles_count": invalid,
         "latest_quality": _metal_latest_quality(kept, granularity),
-        "gaps_status": calendar_for(inst.market_calendar).analyze_gaps(
-            [int(b.datetime_utc.timestamp()) for b in kept if b.datetime_utc],
-            GRANULARITIES[granularity][1] if granularity in GRANULARITIES else 3600,
-        ).status,
+        "gaps_status": "UNKNOWN",   # no Gold calendar -> absence is not a gap
         "candles": [_td_bar_dict(b) for b in kept],
     })
     return MetalHistory(base, rows)
@@ -2874,9 +3121,9 @@ async def market_metal_history(
 
 
 async def fetch_metal_quote(canonical_symbol: str) -> Dict[str, object]:
-    """Latest Gold quote from Twelve Data. Provider is_market_open remains separate
-    from data quality; expected_market_state comes from the verified Commodity calendar.
-    Quality remains freshness of the quote's own provider timestamp."""
+    """Latest Gold quote from Twelve Data. price is Decimal (serialised as string);
+    is_market_open is a provider flag, kept SEPARATE from data quality and from any
+    (future) Gold calendar. Quality here is the freshness of the quote timestamp."""
     inst = instrument_registry.get(canonical_symbol)
     if inst is None or inst.asset_class != AssetClass.METAL:
         raise ValueError(f"unknown metal instrument: {canonical_symbol}")
@@ -2888,11 +3135,6 @@ async def fetch_metal_quote(canonical_symbol: str) -> Dict[str, object]:
         "provider_symbol": provider_symbol,
         "timezone_internal": "UTC",
         "display_timezone": "America/Toronto",
-        "market_timezone": inst.timezone,
-        "market_calendar": inst.market_calendar.value,
-        "expected_market_state": calendar_for(inst.market_calendar).is_market_expected_open(
-            int(utcnow().timestamp())
-        ).value,
     }
     if q.status != "OK":
         base.update({"status": q.status, "reason": q.reason, "price": None,
@@ -3016,7 +3258,7 @@ def parse_massive_index_aggs(
 
 
 class MassiveIndicesProvider:
-    """Massive Indices REST adapter. Same account/key as Forex (Bearer header, never
+    """Massive Indices REST adapter. Same account/key as Forex (auth header, never
     in URL/logs/response); no network without a key. OHLC decoded with
     parse_float=Decimal so index values are exact (never float)."""
 
@@ -3090,9 +3332,9 @@ class MassiveIndicesProvider:
 
 def _register_index_instruments() -> None:
     """Register the 3 canonical US cash indices. INDEX class, quote in USD points,
-    volume NOT_AVAILABLE (indices have no volume), calendar NOT_CONFIGURED (RTH is a
-    separate increment), precision/tick None. Mappings are documentation-verified ->
-    MAPPED (independent of entitlement)."""
+    volume NOT_AVAILABLE (indices have no volume), documented U.S. equity RTH baseline
+    calendar (holidays/early closes intentionally not inferred), precision/tick None.
+    Mappings are documentation-verified -> MAPPED (independent of entitlement)."""
     indices = (
         ("SPX", "I:SPX", "S&P 500"),
         ("NDX", "I:NDX", "Nasdaq-100"),
@@ -3107,7 +3349,7 @@ def _register_index_instruments() -> None:
                 quote_asset="USD",
                 display_name=name,
                 timezone="America/New_York",  # US cash index (points); internal stays UTC
-                market_calendar=MarketCalendarPolicy.NOT_CONFIGURED,
+                market_calendar=MarketCalendarPolicy.US_EQUITY_RTH,
                 volume_semantics=VolumeSemantics.NOT_AVAILABLE,
                 price_precision=None,
                 tick_size=None,
@@ -3153,6 +3395,8 @@ async def fetch_index_history(
         "requested_range": {"start": start, "end": end},
         "timezone_internal": "UTC",
         "display_timezone": "America/Toronto",
+        "market_timezone": inst.timezone,
+        "market_calendar": inst.market_calendar.value,
         "volume_semantics": inst.volume_semantics.value,  # NOT_AVAILABLE
         "persisted": False,  # D2: indices are never written to candles this increment
     }
@@ -3181,7 +3425,7 @@ async def fetch_index_history(
         "count": len(kept),
         "invalid_candles_count": invalid,
         "latest_quality": latest_quality,   # never forced LIVE; EOD data is often STALE
-        "gaps_status": "UNKNOWN",            # no RTH calendar -> absence is not a gap
+        "gaps_status": calendar_for(inst.market_calendar).analyze_gaps([], bucket).status,
         "candles": [_index_bar_dict(b) for b in kept],
     })
     return base
@@ -3391,6 +3635,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await massive_forex_ws.stop()
         await market_ws.stop()
         await market_provider.disconnect()
         await massive_forex_provider.disconnect()

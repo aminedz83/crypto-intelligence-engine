@@ -1733,8 +1733,6 @@ class VolumeSemantics(str, Enum):
 class MarketCalendarPolicy(str, Enum):
     ALWAYS_OPEN_24_7 = "ALWAYS_OPEN_24_7"
     NOT_CONFIGURED = "NOT_CONFIGURED"
-    # Declared intent only; NOT implemented in 6A (no invented hours). Until real
-    # official hours are added, calendar_for() maps these to NotConfigured -> UNKNOWN.
     FOREX_WEEK = "FOREX_WEEK"
     US_EQUITY_RTH = "US_EQUITY_RTH"
 
@@ -2009,8 +2007,7 @@ _COINBASE_CALENDAR = _ALWAYS_24_7
 
 
 def calendar_for(policy: MarketCalendarPolicy) -> MarketCalendar:
-    """ALWAYS_OPEN_24_7 -> crypto; FOREX_WEEK -> Forex weekly (NY-anchored). Every
-    other policy resolves to NotConfigured -> UNKNOWN (no invented hours)."""
+    """Resolve implemented calendar policies; unknown configuration stays UNKNOWN."""
     if policy == MarketCalendarPolicy.ALWAYS_OPEN_24_7:
         return _ALWAYS_24_7
     if policy == MarketCalendarPolicy.FOREX_WEEK:
@@ -3088,8 +3085,8 @@ class MassiveIndicesProvider:
 def _register_index_instruments() -> None:
     """Register the 3 canonical US cash indices. INDEX class, quote in USD points,
     volume NOT_AVAILABLE (indices have no volume), documented U.S. equity RTH baseline
-    calendar (holidays/early closes intentionally not inferred), precision/tick None. Mappings are documentation-verified ->
-    MAPPED (independent of entitlement)."""
+    calendar (holidays/early closes intentionally not inferred), precision/tick None.
+    Mappings are documentation-verified -> MAPPED (independent of entitlement)."""
     indices = (
         ("SPX", "I:SPX", "S&P 500"),
         ("NDX", "I:NDX", "Nasdaq-100"),

@@ -2883,7 +2883,8 @@ class IndexProviderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_not_mapped(self):
         prov = MassiveIndicesProvider(api_key="DUMMY")
-        r = await prov.get_index_aggregates("EUR-USD", "1d", _IX_BASE, _IX_BASE + 86400)
+        # BTC-USD is a Coinbase canonical, never mapped under the 'massive' provider
+        r = await prov.get_index_aggregates("BTC-USD", "1d", _IX_BASE, _IX_BASE + 86400)
         self.assertEqual(r.status, "NOT_MAPPED")
 
     async def test_not_supported_granularity(self):

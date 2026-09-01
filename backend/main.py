@@ -2497,7 +2497,9 @@ def _massive_pair_to_canonical(pair: Any) -> Optional[str]:
     return canonical if mapped is not None else None
 
 
-def parse_massive_forex_quote(item: Any, received_at: Optional[datetime] = None) -> Optional[ForexRealtimeQuote]:
+def parse_massive_forex_quote(
+    item: Any, received_at: Optional[datetime] = None
+) -> Optional[ForexRealtimeQuote]:
     if not isinstance(item, dict) or item.get("ev") != "C":
         return None
     canonical = _massive_pair_to_canonical(item.get("p"))
@@ -2510,7 +2512,9 @@ def parse_massive_forex_quote(item: Any, received_at: Optional[datetime] = None)
                               classify_freshness(ts, settings.ticker_max_age_seconds, now=recv))
 
 
-def parse_massive_forex_minute(item: Any, received_at: Optional[datetime] = None) -> Optional[ForexRealtimeCandle]:
+def parse_massive_forex_minute(
+    item: Any, received_at: Optional[datetime] = None
+) -> Optional[ForexRealtimeCandle]:
     if not isinstance(item, dict) or item.get("ev") != "CA":
         return None
     canonical = _massive_pair_to_canonical(item.get("pair"))
@@ -2519,7 +2523,13 @@ def parse_massive_forex_minute(item: Any, received_at: Optional[datetime] = None
     if canonical is None or start is None or any(v is None for v in vals):
         return None
     open_, high, low, close, volume = vals
-    assert open_ is not None and high is not None and low is not None and close is not None and volume is not None
+    assert (
+        open_ is not None
+        and high is not None
+        and low is not None
+        and close is not None
+        and volume is not None
+    )
     if high < low or not (low <= open_ <= high) or not (low <= close <= high):
         return None
     recv = received_at or utcnow()
@@ -2583,7 +2593,12 @@ class MassiveForexWsManager:
         attempt = 0
         while self.running:
             try:
-                async with websockets.connect(self.url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
+                async with websockets.connect(
+                    self.url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                ) as ws:
                     self.websocket = ws
                     self.authenticated = False
                     attempt = 0
@@ -2619,7 +2634,11 @@ class MassiveForexWsManager:
                     self.authenticated = True
                     topics = self._topics()
                     if self.websocket is not None and topics:
-                        await self.websocket.send(json.dumps({"action": "subscribe", "params": ",".join(topics)}))
+                        await self.websocket.send(
+                            json.dumps(
+                                {"action": "subscribe", "params": ",".join(topics)}
+                            )
+                        )
                 elif status_value in {"auth_failed", "error"}:
                     self.last_error = str(item.get("message") or status_value)[:200]
                 continue
@@ -2638,16 +2657,31 @@ class MassiveForexWsManager:
     def realtime(self, canonical_symbol: str) -> Dict[str, object]:
         canonical = canonical_symbol.upper()
         q, c = self.quotes.get(canonical), self.candles.get(canonical)
-        return {"source": "massive", "canonical_symbol": canonical,
-                "status": "OK" if (q or c) else "MISSING",
-                "transport": "WEBSOCKET" if self.authenticated else ("CONNECTING" if self.running else "STOPPED"),
-                "quote": q.to_dict() if q else None, "candle": c.to_dict() if c else None}
+        transport = (
+            "WEBSOCKET"
+            if self.authenticated
+            else ("CONNECTING" if self.running else "STOPPED")
+        )
+        return {
+            "source": "massive",
+            "canonical_symbol": canonical,
+            "status": "OK" if (q or c) else "MISSING",
+            "transport": transport,
+            "quote": q.to_dict() if q else None,
+            "candle": c.to_dict() if c else None,
+        }
 
     def health(self) -> Dict[str, object]:
-        return {"source": "massive", "running": self.running, "connected": self.websocket is not None,
-                "authenticated": self.authenticated,
-                "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
-                "last_error": self.last_error}
+        return {
+            "source": "massive",
+            "running": self.running,
+            "connected": self.websocket is not None,
+            "authenticated": self.authenticated,
+            "last_message_at": (
+                self.last_message_at.isoformat() if self.last_message_at else None
+            ),
+            "last_error": self.last_error,
+        }
 
 
 massive_forex_ws = MassiveForexWsManager()
@@ -2660,7 +2694,10 @@ async def market_forex_ws_start() -> dict:
     except RuntimeError as exc:
         reason = str(exc)
         code = 503 if "API_KEY" in reason else 409
-        raise HTTPException(status_code=code, detail={"status": "UNAVAILABLE", "reason": reason}) from exc
+        raise HTTPException(
+            status_code=code,
+            detail={"status": "UNAVAILABLE", "reason": reason},
+        ) from exc
     return {"status": "started", "source": "massive", "transport": "WEBSOCKET"}
 
 
@@ -2680,9 +2717,15 @@ async def market_forex_realtime(symbol: str) -> dict:
     canonical = symbol.upper()
     inst = instrument_registry.get(canonical)
     if inst is None or inst.asset_class != AssetClass.FOREX:
-        raise HTTPException(status_code=404, detail={"status": "NOT_SUPPORTED", "reason": "unknown forex instrument"})
+        raise HTTPException(
+            status_code=404,
+            detail={"status": "NOT_SUPPORTED", "reason": "unknown forex instrument"},
+        )
     if provider_symbol_map.to_provider("massive", canonical) is None:
-        raise HTTPException(status_code=409, detail={"status": "NOT_MAPPED", "reason": "no verified Massive mapping"})
+        raise HTTPException(
+            status_code=409,
+            detail={"status": "NOT_MAPPED", "reason": "no verified Massive mapping"},
+        )
     return massive_forex_ws.realtime(canonical)
 
 

@@ -29,6 +29,7 @@ from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set
+from urllib.parse import quote
 
 import httpx
 import redis.asyncio as aioredis
@@ -136,6 +137,7 @@ class Settings(BaseSettings):
     twelvedata_api_key: str = ""
     twelvedata_rest_url: str = "https://api.twelvedata.com"
     twelvedata_request_timeout_seconds: float = 10.0
+    twelvedata_ws_url: str = "wss://ws.twelvedata.com/v1/quotes/price"
 
     @property
     def database_url(self) -> str:
@@ -2997,6 +2999,242 @@ provider_symbol_map.add("twelvedata", "XAU-USD", "XAU/USD")
 
 twelvedata_provider = TwelveDataProvider()
 
+# Twelve Data WebSocket price stream for Gold Spot. Officially, /v1/quotes/price
+# emits price ticks only: it does NOT provide OHLC or bid/ask. Historical/chart
+# OHLC therefore remains sourced from the verified REST /time_series endpoint.
+TWELVEDATA_WS_PRICE_MAX_AGE_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class TwelveDataRealtimePrice:
+    canonical_symbol: str
+    provider_symbol: str
+    price: Decimal
+    source_timestamp: datetime
+    received_at: datetime
+    quality: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "source": "twelvedata",
+            "canonical_symbol": self.canonical_symbol,
+            "provider_symbol": self.provider_symbol,
+            "price": str(self.price),
+            "source_timestamp": self.source_timestamp.isoformat(),
+            "received_at": self.received_at.isoformat(),
+            "quality": self.quality.value,
+        }
+
+
+def parse_twelvedata_ws_price(
+    item: Any,
+    canonical_symbol: str,
+    received_at: Optional[datetime] = None,
+) -> Optional[TwelveDataRealtimePrice]:
+    """Parse one official Twelve Data `price` WebSocket event without synthesis."""
+    if not isinstance(item, dict) or item.get("event") != "price":
+        return None
+    provider_symbol = item.get("symbol")
+    expected = provider_symbol_map.to_provider("twelvedata", canonical_symbol)
+    if not isinstance(provider_symbol, str) or provider_symbol != expected:
+        return None
+    price = _to_decimal(item.get("price"))
+    if price is None or price <= 0:
+        return None
+    raw_ts = item.get("timestamp")
+    if not isinstance(raw_ts, (int, float)) or isinstance(raw_ts, bool) or raw_ts <= 0:
+        return None
+    try:
+        source_timestamp = datetime.fromtimestamp(float(raw_ts), tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    observed = received_at or datetime.now(timezone.utc)
+    quality = classify_freshness(
+        source_timestamp,
+        TWELVEDATA_WS_PRICE_MAX_AGE_SECONDS,
+        now=observed,
+    )
+    return TwelveDataRealtimePrice(
+        canonical_symbol=canonical_symbol,
+        provider_symbol=provider_symbol,
+        price=price,
+        source_timestamp=source_timestamp,
+        received_at=observed,
+        quality=quality,
+    )
+
+
+class TwelveDataGoldWsManager:
+    """Server-side XAU/USD price stream. API key never reaches the frontend."""
+
+    def __init__(self) -> None:
+        self.running = False
+        self.connected = False
+        self.subscribed = False
+        self.task: Optional[asyncio.Task[None]] = None
+        self.websocket: Any = None
+        self.last_price: Optional[TwelveDataRealtimePrice] = None
+        self.last_message_at: Optional[datetime] = None
+        self.last_error: Optional[str] = None
+
+    async def start(self) -> None:
+        if self.running:
+            return
+        if not settings.twelvedata_api_key:
+            raise RuntimeError("TWELVEDATA_API_KEY not set")
+        if provider_symbol_map.to_provider("twelvedata", "XAU-USD") != "XAU/USD":
+            raise RuntimeError("XAU-USD has no verified Twelve Data mapping")
+        self.running = True
+        self.last_error = None
+        self.task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        self.running = False
+        if self.websocket is not None:
+            await self.websocket.close()
+        if self.task is not None:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+        self.task = None
+        self.websocket = None
+        self.connected = False
+        self.subscribed = False
+
+    async def _run(self) -> None:
+        delay = 1.0
+        while self.running:
+            try:
+                key = quote(settings.twelvedata_api_key, safe="")
+                connect_url = f"{settings.twelvedata_ws_url}?apikey={key}"
+                async with websockets.connect(
+                    connect_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                ) as ws:
+                    self.websocket = ws
+                    self.connected = True
+                    self.subscribed = False
+                    self.last_error = None
+                    await ws.send(json.dumps({
+                        "action": "subscribe",
+                        "params": {"symbols": "XAU/USD"},
+                    }))
+                    delay = 1.0
+                    while self.running:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                        except asyncio.TimeoutError:
+                            await ws.send(json.dumps({"action": "heartbeat"}))
+                            continue
+                        self.last_message_at = datetime.now(timezone.utc)
+                        await self._handle(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - provider transport boundary
+                # Do not retain str(exc): WebSocket connection exceptions can include
+                # the URI, and the Twelve Data URI contains the server-side API key.
+                self.last_error = f"websocket {type(exc).__name__}"
+            finally:
+                self.websocket = None
+                self.connected = False
+                self.subscribed = False
+            if self.running:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2.0, 30.0)
+
+    async def _handle(self, raw: Any) -> None:
+        try:
+            item = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if not isinstance(item, dict):
+            return
+        if item.get("event") == "subscribe-status":
+            status_value = str(item.get("status") or "").lower()
+            if status_value in {"ok", "success"}:
+                self.subscribed = True
+            elif status_value in {"error", "failed"}:
+                self.last_error = "subscription rejected by provider"
+            return
+        parsed = parse_twelvedata_ws_price(item, "XAU-USD")
+        if parsed is not None:
+            self.last_price = parsed
+
+    def realtime(self) -> Dict[str, object]:
+        transport = "STOPPED"
+        if self.running:
+            transport = "WEBSOCKET" if self.connected else "CONNECTING"
+        return {
+            "source": "twelvedata",
+            "canonical_symbol": "XAU-USD",
+            "status": "OK" if self.last_price is not None else "MISSING",
+            "transport": transport,
+            "subscribed": self.subscribed,
+            "price": self.last_price.to_dict() if self.last_price else None,
+            "ohlc_transport": "REST",
+            "last_error": self.last_error,
+        }
+
+    def health(self) -> Dict[str, object]:
+        return {
+            "source": "twelvedata",
+            "running": self.running,
+            "connected": self.connected,
+            "subscribed": self.subscribed,
+            "last_message_at": (
+                self.last_message_at.isoformat() if self.last_message_at else None
+            ),
+            "last_error": self.last_error,
+        }
+
+
+twelvedata_gold_ws = TwelveDataGoldWsManager()
+
+
+@api_router.post("/market/metal/websocket/start")
+async def market_metal_ws_start() -> dict:
+    try:
+        await twelvedata_gold_ws.start()
+    except RuntimeError as exc:
+        reason = str(exc)
+        code = 503 if "API_KEY" in reason else 409
+        raise HTTPException(
+            status_code=code,
+            detail={"status": "UNAVAILABLE", "reason": reason},
+        ) from exc
+    return {
+        "status": "started",
+        "source": "twelvedata",
+        "transport": "WEBSOCKET_PRICE_ONLY",
+        "ohlc_transport": "REST",
+    }
+
+
+@api_router.post("/market/metal/websocket/stop")
+async def market_metal_ws_stop() -> dict:
+    await twelvedata_gold_ws.stop()
+    return {"status": "stopped", "source": "twelvedata"}
+
+
+@api_router.get("/market/metal/websocket/health")
+async def market_metal_ws_health() -> dict:
+    return twelvedata_gold_ws.health()
+
+
+@api_router.get("/market/metal/{symbol}/realtime")
+async def market_metal_realtime(symbol: str) -> dict:
+    canonical = canonical_symbol(symbol)
+    if canonical != "XAU-USD":
+        raise HTTPException(
+            status_code=404,
+            detail={"status": "NOT_SUPPORTED", "reason": "unknown metal instrument"},
+        )
+    return twelvedata_gold_ws.realtime()
+
 
 def _register_metal_instruments() -> None:
     """Register the canonical Gold Spot instrument. Calendar NOT_CONFIGURED (no Gold
@@ -3678,6 +3916,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await twelvedata_gold_ws.stop()
         await massive_forex_ws.stop()
         await market_ws.stop()
         await market_provider.disconnect()

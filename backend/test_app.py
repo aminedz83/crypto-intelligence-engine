@@ -3583,3 +3583,46 @@ class TestChartEngineV7Displacement(unittest.TestCase):
 
     def test_displacement_methodology_warns_backtest_required(self):
         self.assertIn("Seuils à valider par backtest/OOS", self.html)
+
+
+class TestChartEngineV8FVG(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_fvg_detector_present(self):
+        self.assertIn("function detectFairValueGaps", self.html)
+
+    def test_bullish_fvg_is_strict_three_candle_gap(self):
+        self.assertIn('if(cLow>aHigh){type="BULLISH"', self.html)
+
+    def test_bearish_fvg_is_strict_three_candle_gap(self):
+        self.assertIn('else if(cHigh<aLow){type="BEARISH"', self.html)
+
+    def test_fvg_equality_does_not_count(self):
+        self.assertNotIn("cLow>=aHigh", self.html)
+        self.assertNotIn("cHigh<=aLow", self.html)
+
+    def test_fvg_excludes_latest_potentially_open_candle(self):
+        self.assertIn("i<Math.max(0,cs.length-1)", self.html)
+
+    def test_fvg_followup_uses_only_closed_candles(self):
+        self.assertIn("j<Math.max(0,cs.length-1)", self.html)
+
+    def test_bullish_fvg_mitigation_is_tracked(self):
+        self.assertIn('if(l<=lower){state="MITIGATED"', self.html)
+
+    def test_bearish_fvg_mitigation_is_tracked(self):
+        self.assertIn('if(h>=upper){state="MITIGATED"', self.html)
+
+    def test_partial_mitigation_state_is_present(self):
+        self.assertIn('state="PARTIALLY_MITIGATED"', self.html)
+
+    def test_fvg_displacement_link_is_explicit(self):
+        self.assertIn("displacementConfirmed:Boolean(dispByIndex[i-1])", self.html)
+
+    def test_fvg_ui_is_active(self):
+        self.assertIn("FVG ACTIF", self.html)
+
+    def test_fvg_methodology_says_not_entry_signal(self):
+        self.assertIn("un FVG isolé n’est pas un signal d’entrée", self.html)

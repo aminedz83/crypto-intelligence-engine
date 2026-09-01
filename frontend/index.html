@@ -432,6 +432,10 @@ body{padding-bottom:calc(102px + var(--safe-b))!important}
 @media(max-width:430px){.pipeline{grid-template-columns:1fr 1fr}.form-grid,.info-grid,.help-grid{grid-template-columns:1fr}}
 </style>
 
+
+<style id="chart-engine-v1-real">
+.chart-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.chart-head .filter-row{margin:0;flex:1}.chart-controls{display:flex;gap:4px;flex:none}.chart-controls button{width:29px;height:29px;border:1px solid #26364d;border-radius:8px;background:#081220;color:#b7c4d8;font-size:14px}.chart-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:#8392a8;font-size:7px}.real-chart{height:310px;position:relative;border:1px solid #1f3047;border-radius:11px;background:#050c16;overflow:hidden}.real-chart-svg{display:block;width:100%;height:100%;touch-action:none}.chart-grid{stroke:#24344a;stroke-width:1;opacity:.65}.chart-axis,.chart-time{fill:#8290a5;font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.candle-up{stroke:#20e878;fill:#20e878;stroke-width:1.5}.candle-down{stroke:#ff5573;fill:#ff5573;stroke-width:1.5}.cross-line{stroke:#9eabc0;stroke-width:1;stroke-dasharray:4 4;opacity:.7}.cross-dot{fill:#e6edf8}.chart-tip{position:absolute;left:8px;top:8px;max-width:calc(100% - 16px);padding:6px 8px;border:1px solid #344760;border-radius:7px;background:rgba(4,10,19,.94);color:#d9e2ef;font-size:7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;opacity:0;pointer-events:none;white-space:normal}.chart-tip.show{opacity:1}@media(max-width:430px){.real-chart{height:260px}.chart-head{align-items:flex-start;flex-direction:column}.chart-controls{align-self:flex-end}.chart-axis,.chart-time{font-size:13px}}
+</style>
 </head>
 <body>
 <header class="header">
@@ -758,36 +762,49 @@ function renderSettings(){
   ])));
 }
 
-function renderChartShell(){
-  var v=byId("view-detail");
-  if(!v || byId("future-chart-shell")) return;
-  var shell=h("div",{class:"section-stack",id:"future-chart-shell"},[
-    modCard("Chart Engine","NOT IMPLEMENTED",h("div",{class:"section-stack"},[
-      h("div",{class:"filter-row"},[
-        h("button",{class:"filter-chip active"},["1m"]),h("button",{class:"filter-chip"},["5m"]),
-        h("button",{class:"filter-chip"},["15m"]),h("button",{class:"filter-chip"},["1h"]),
-        h("button",{class:"filter-chip"},["4h"]),h("button",{class:"filter-chip"},["1D"])
-      ]),
-      h("div",{class:"empty-chart"},[h("div",{class:"chart-center"},[h("div",{},[
-        h("strong",{},["Graphique chandeliers interactif à venir"]),
-        h("span",{},["OHLC réel · zoom/pan · crosshair · historique · multi-timeframes"])
-      ])])])
-    ])),
-    modCard("Overlays Market Intelligence","NOT IMPLEMENTED",h("div",{class:"badge-row"},[
-      h("span",{class:"badge-soft"},["BOS"]),h("span",{class:"badge-soft"},["CHoCH/MSS"]),
-      h("span",{class:"badge-soft"},["Liquidity Sweep"]),h("span",{class:"badge-soft"},["Order Block"]),
-      h("span",{class:"badge-soft"},["FVG"]),h("span",{class:"badge-soft"},["Supply/Demand"]),
-      h("span",{class:"badge-soft"},["Entry"]),h("span",{class:"badge-soft"},["SL"]),h("span",{class:"badge-soft"},["TP"])
-    ])),
-    modCard("Inspector","NOT IMPLEMENTED",h("div",{class:"info-grid"},[
-      h("div",{class:"journal-card"},[h("h4",{},["Bougie sélectionnée"]),h("p",{},["OHLC, source timestamp, received timestamp, qualité."])]),
-      h("div",{class:"journal-card"},[h("h4",{},["Objet sélectionné"]),h("p",{},["Type, création, confirmations, invalidation, état."])]),
-      h("div",{class:"journal-card"},[h("h4",{},["Session"]),h("p",{},["État marché et session indicative."])]),
-      h("div",{class:"journal-card"},[h("h4",{},["Decision context"]),h("p",{},["Ce que le moteur savait à cet instant."])])
-    ]))
-  ]);
-  v.appendChild(shell)
+var chartState={tf:"1h",candles:[],visible:60,offset:0,status:"IDLE",source:"",quality:"UNKNOWN"};
+const CHART_BUCKETS={"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600,"2h":7200,"4h":14400,"6h":21600,"1d":86400};
+function chartTimeframes(kind){return kind==="metal"?["1m","5m","15m","30m","1h","2h","4h"]:["1m","5m","15m","30m","1h","2h","4h","6h","1d"]}
+function chartPath(kind,symbol,tf){
+  if(kind==="crypto")return "/api/v1/market/candles/"+encodeURIComponent(symbol)+"?granularity="+encodeURIComponent(tf)+"&limit=300";
+  var bucket=CHART_BUCKETS[tf]||3600, end=Math.floor(Date.now()/1000/bucket)*bucket, start=end-bucket*300;
+  if(kind==="metal")return "/api/v1/market/metal/"+encodeURIComponent(symbol)+"/history?granularity="+tf+"&start="+start+"&end="+end;
+  if(kind==="index")return "/api/v1/market/index/"+encodeURIComponent(symbol)+"/history?granularity="+tf+"&start="+start+"&end="+end;
+  return "/api/v1/market/forex/"+encodeURIComponent(symbol)+"/history?granularity="+tf+"&start="+start+"&end="+end;
 }
+function validChartCandles(items){return (items||[]).filter(function(c){var o=Number(c.open),h=Number(c.high),l=Number(c.low),cl=Number(c.close),t=Date.parse(c.start);return Number.isFinite(o)&&Number.isFinite(h)&&Number.isFinite(l)&&Number.isFinite(cl)&&Number.isFinite(t)&&h>=l}).sort(function(a,b){return Date.parse(a.start)-Date.parse(b.start)})}
+function chartVisible(){var all=chartState.candles,n=Math.min(chartState.visible,all.length),maxOff=Math.max(0,all.length-n);chartState.offset=Math.max(0,Math.min(chartState.offset,maxOff));var end=all.length-chartState.offset;return all.slice(Math.max(0,end-n),end)}
+function svgEl(name,attrs){var e=document.createElementNS("http://www.w3.org/2000/svg",name);Object.keys(attrs||{}).forEach(function(k){e.setAttribute(k,String(attrs[k]))});return e}
+function drawRealChart(){
+  var host=byId("real-chart");if(!host)return;clear(host);
+  if(chartState.status==="LOADING"){host.appendChild(loading("Chargement des bougies réelles…"));return}
+  if(chartState.status!=="OK"){host.appendChild(emptyState("Graphique indisponible",chartState.status==="EMPTY"?"Aucune bougie retournée par le fournisseur.":chartState.status));return}
+  var cs=chartVisible();if(!cs.length){host.appendChild(emptyState("Pas de données","Aucune bougie exploitable."));return}
+  var W=900,H=430,L=12,R=76,T=18,B=42,pw=W-L-R,ph=H-T-B;
+  var lows=cs.map(function(c){return Number(c.low)}), highs=cs.map(function(c){return Number(c.high)}),lo=Math.min.apply(null,lows),hi=Math.max.apply(null,highs),span=hi-lo||Math.max(Math.abs(hi)*.001,1);lo-=span*.06;hi+=span*.06;span=hi-lo;
+  var svg=svgEl("svg",{viewBox:"0 0 "+W+" "+H,preserveAspectRatio:"none",role:"img","aria-label":"Graphique chandeliers OHLC réel"});svg.classList.add("real-chart-svg");
+  for(var g=0;g<=4;g++){var y=T+ph*g/4;svg.appendChild(svgEl("line",{x1:L,y1:y,x2:L+pw,y2:y,class:"chart-grid"}));var tx=svgEl("text",{x:L+pw+8,y:y+4,class:"chart-axis"});tx.textContent=(hi-span*g/4).toLocaleString(undefined,{maximumFractionDigits:6});svg.appendChild(tx)}
+  var step=pw/cs.length,body=Math.max(2,Math.min(11,step*.62));function yv(v){return T+(hi-v)/span*ph}
+  cs.forEach(function(c,i){var o=Number(c.open),h=Number(c.high),l=Number(c.low),cl=Number(c.close),x=L+step*(i+.5),up=cl>=o,klass=up?"candle-up":"candle-down";svg.appendChild(svgEl("line",{x1:x,y1:yv(h),x2:x,y2:yv(l),class:klass}));var top=Math.min(yv(o),yv(cl)),bh=Math.max(1.5,Math.abs(yv(o)-yv(cl)));svg.appendChild(svgEl("rect",{x:x-body/2,y:top,width:body,height:bh,rx:.5,class:klass}));if(i===0||i===Math.floor(cs.length/2)||i===cs.length-1){var tt=svgEl("text",{x:x,y:H-13,class:"chart-time","text-anchor":i===0?"start":i===cs.length-1?"end":"middle"});tt.textContent=new Intl.DateTimeFormat("fr-CA",{timeZone:"America/Toronto",month:"short",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}).format(new Date(c.start));svg.appendChild(tt)}});
+  var cross=svgEl("g",{class:"chart-cross",visibility:"hidden"}),vl=svgEl("line",{y1:T,y2:T+ph,class:"cross-line"}),hl=svgEl("line",{x1:L,x2:L+pw,class:"cross-line"}),dot=svgEl("circle",{r:3,class:"cross-dot"});cross.appendChild(vl);cross.appendChild(hl);cross.appendChild(dot);svg.appendChild(cross);
+  var tip=h("div",{class:"chart-tip",id:"chart-tip"},[]);host.appendChild(svg);host.appendChild(tip);
+  function point(ev){var r=svg.getBoundingClientRect(),x=(ev.clientX-r.left)/r.width*W,y=(ev.clientY-r.top)/r.height*H;if(x<L||x>L+pw||y<T||y>T+ph){cross.setAttribute("visibility","hidden");tip.classList.remove("show");return}var idx=Math.max(0,Math.min(cs.length-1,Math.floor((x-L)/step))),c=cs[idx],cx=L+step*(idx+.5),cy=yv(Number(c.close));vl.setAttribute("x1",cx);vl.setAttribute("x2",cx);hl.setAttribute("y1",cy);hl.setAttribute("y2",cy);dot.setAttribute("cx",cx);dot.setAttribute("cy",cy);cross.setAttribute("visibility","visible");tip.classList.add("show");tip.textContent=formatMontrealTime(c.start)+"  O "+c.open+"  H "+c.high+"  L "+c.low+"  C "+c.close+"  · "+(c.quality||"UNKNOWN")}
+  svg.addEventListener("pointermove",point);svg.addEventListener("pointerleave",function(){cross.setAttribute("visibility","hidden");tip.classList.remove("show")});
+}
+function loadRealChart(){if(!detailCtx)return;chartState.status="LOADING";drawRealChart();api(chartPath(detailCtx.kind,detailCtx.canonical||detailCtx.symbol,chartState.tf)).then(function(r){if(!byId("real-chart"))return;if(!r.ok){chartState.candles=[];chartState.status=errorMessage(r);drawRealChart();return}var d=r.data||{},cs=validChartCandles(d.candles);chartState.candles=cs;chartState.offset=0;chartState.source=d.source||"backend";chartState.quality=d.latest_quality||(cs.length?cs[cs.length-1].quality:"MISSING");chartState.status=cs.length?"OK":"EMPTY";var q=byId("chart-quality");if(q){clear(q);q.appendChild(qualityBadge(chartState.quality))}var n=byId("chart-count");if(n)n.textContent=String(cs.length)+" bougies";drawRealChart()})}
+function chartSetTf(tf){if(!detailCtx||chartTimeframes(detailCtx.kind).indexOf(tf)<0)return;chartState.tf=tf;chartState.offset=0;document.querySelectorAll("#chart-tfs .filter-chip").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-tf")===tf)});loadRealChart()}
+function chartZoom(delta){chartState.visible=Math.max(15,Math.min(180,chartState.visible+delta));chartState.offset=0;drawRealChart()}
+function chartPan(delta){var n=Math.min(chartState.visible,chartState.candles.length),maxOff=Math.max(0,chartState.candles.length-n);chartState.offset=Math.max(0,Math.min(maxOff,chartState.offset+delta));drawRealChart()}
+function renderChartShell(){
+  var v=byId("view-detail");if(!v||byId("future-chart-shell")||!detailCtx)return;var tfs=chartTimeframes(detailCtx.kind);if(tfs.indexOf(chartState.tf)<0)chartState.tf="1h";
+  var tfrow=h("div",{class:"filter-row",id:"chart-tfs"},[]);tfs.forEach(function(tf){tfrow.appendChild(h("button",{class:"filter-chip "+(tf===chartState.tf?"active":""),"data-tf":tf,onclick:function(){chartSetTf(tf)}},[tf.toUpperCase()]))});
+  var controls=h("div",{class:"chart-controls"},[h("button",{onclick:function(){chartPan(12)},title:"Historique plus ancien"},["←"]),h("button",{onclick:function(){chartZoom(15)},title:"Dézoomer"},["−"]),h("button",{onclick:function(){chartZoom(-15)},title:"Zoomer"},["+"]),h("button",{onclick:function(){chartPan(-12)},title:"Historique plus récent"},["→"])]);
+  var shell=h("div",{class:"section-stack",id:"future-chart-shell"},[
+    modCard("Chart Engine · OHLC réel","REAL DATA",h("div",{class:"section-stack"},[h("div",{class:"chart-head"},[tfrow,controls]),h("div",{class:"chart-meta"},[h("span",{},["Source backend · aucune bougie synthétique"]),h("span",{id:"chart-count"},["0 bougie"]),h("span",{id:"chart-quality"},[qualityBadge("UNKNOWN")])]),h("div",{class:"real-chart",id:"real-chart"},[loading("Chargement des bougies réelles…")])])),
+    modCard("Overlays Market Intelligence","NOT IMPLEMENTED",h("div",{class:"badge-row"},[h("span",{class:"badge-soft"},["BOS"]),h("span",{class:"badge-soft"},["CHoCH/MSS"]),h("span",{class:"badge-soft"},["Liquidity Sweep"]),h("span",{class:"badge-soft"},["Order Block"]),h("span",{class:"badge-soft"},["FVG"]),h("span",{class:"badge-soft"},["Supply/Demand"])]))
+  ]);v.appendChild(shell);loadRealChart()
+}
+
 
 var BOTTOM=[
  {id:"dashboard",label:"Accueil",icon:"⌂"},

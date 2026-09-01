@@ -3058,3 +3058,38 @@ class IndexUiTests(unittest.TestCase):
         # tickers; we use the official cash indices SPX/NDX/US30 -> I:SPX/I:NDX/I:DJI)
         for bad in ("SPY", "QQQ", "DIA", "ES=F", "NQ=F", "YM=F", "/ES", "/NQ", "/YM"):
             self.assertNotIn(bad, self.html)
+
+
+class ChartEngineV1UiTests(unittest.TestCase):
+    """Static contract: chart V1 consumes backend OHLC only; no demo series."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_real_chart_label_present(self):
+        self.assertIn("Chart Engine · OHLC réel", self.html)
+        self.assertIn("REAL DATA", self.html)
+
+    def test_chart_uses_existing_real_endpoints(self):
+        self.assertIn('/api/v1/market/candles/', self.html)
+        self.assertIn('/api/v1/market/forex/', self.html)
+        self.assertIn('/api/v1/market/metal/', self.html)
+        self.assertIn('/api/v1/market/index/', self.html)
+
+    def test_chart_has_no_synthetic_candle_fallback(self):
+        self.assertIn("aucune bougie synthétique", self.html)
+        self.assertNotIn("Math.random()", self.html)
+
+    def test_chart_supports_real_ohlc_fields(self):
+        for field in ("c.open", "c.high", "c.low", "c.close", "c.start"):
+            self.assertIn(field, self.html)
+
+    def test_chart_has_zoom_pan_controls(self):
+        self.assertIn("chartZoom", self.html)
+        self.assertIn("chartPan", self.html)
+        self.assertIn("chart-cross", self.html)
+
+    def test_provider_errors_remain_explicit(self):
+        self.assertIn("errorMessage(r)", self.html)
+        self.assertIn("Graphique indisponible", self.html)

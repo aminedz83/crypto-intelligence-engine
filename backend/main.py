@@ -130,6 +130,8 @@ class Settings(BaseSettings):
     massive_rest_url: str = "https://api.massive.com"
     massive_request_timeout_seconds: float = 10.0
     massive_forex_ws_url: str = "wss://socket.massive.com/forex"
+    # Massive Indices Starter WebSocket documented as 15-minute delayed. Never label LIVE.
+    massive_indices_ws_url: str = "wss://delayed.massive.com/indices"
 
     # Twelve Data REST (Gold XAU/USD spot). Key server-side only, header auth; no
     # call is made without a key. Availability on the account's plan is determined
@@ -3712,6 +3714,279 @@ async def fetch_index_history(
     return base
 
 
+
+
+@dataclass(frozen=True)
+class IndexRealtimeValue:
+    canonical_symbol: str
+    value: Decimal
+    source_timestamp: datetime
+    received_at: datetime
+    quality: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "canonical_symbol": self.canonical_symbol,
+            "value": str(self.value),
+            "source_timestamp": self.source_timestamp.isoformat(),
+            "received_at": self.received_at.isoformat(),
+            "quality": self.quality.value,
+        }
+
+
+@dataclass(frozen=True)
+class IndexRealtimeCandle:
+    canonical_symbol: str
+    start: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    received_at: datetime
+    quality: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "canonical_symbol": self.canonical_symbol,
+            "granularity": "1m",
+            "start": self.start.isoformat(),
+            "open": str(self.open),
+            "high": str(self.high),
+            "low": str(self.low),
+            "close": str(self.close),
+            "received_at": self.received_at.isoformat(),
+            "quality": self.quality.value,
+        }
+
+
+def _massive_index_to_canonical(provider_symbol: Any) -> Optional[str]:
+    if not isinstance(provider_symbol, str):
+        return None
+    for canonical in ("SPX", "NDX", "US30"):
+        if provider_symbol_map.to_provider("massive", canonical) == provider_symbol:
+            return canonical
+    return None
+
+
+def parse_massive_index_value(
+    item: Any, received_at: Optional[datetime] = None
+) -> Optional[IndexRealtimeValue]:
+    if not isinstance(item, dict) or item.get("ev") != "V":
+        return None
+    canonical = _massive_index_to_canonical(item.get("T"))
+    value = _positive_decimal(item.get("val"))
+    ts = _unix_ms_to_dt(item.get("t"))
+    if canonical is None or value is None or ts is None:
+        return None
+    recv = received_at or utcnow()
+    quality = classify_freshness(ts, 16 * 60.0, now=recv)
+    return IndexRealtimeValue(canonical, value, ts, recv, quality)
+
+
+def parse_massive_index_minute(
+    item: Any, received_at: Optional[datetime] = None
+) -> Optional[IndexRealtimeCandle]:
+    if not isinstance(item, dict) or item.get("ev") != "AM":
+        return None
+    canonical = _massive_index_to_canonical(item.get("sym"))
+    start = _unix_ms_to_dt(item.get("s"))
+    vals = [_positive_decimal(item.get(k)) for k in ("o", "h", "l", "c")]
+    if canonical is None or start is None or any(v is None for v in vals):
+        return None
+    open_, high, low, close = vals
+    assert open_ is not None and high is not None and low is not None and close is not None
+    if high < low or not (low <= open_ <= high) or not (low <= close <= high):
+        return None
+    recv = received_at or utcnow()
+    quality = classify_freshness(start, 17 * 60.0, now=recv)
+    return IndexRealtimeCandle(canonical, start, open_, high, low, close, recv, quality)
+
+
+class MassiveIndicesWsManager:
+    SOURCE = "massive"
+    FEED_RECENCY = "15_MIN_DELAYED"
+
+    def __init__(self, url: Optional[str] = None, api_key: Optional[str] = None) -> None:
+        self.url = url or settings.massive_indices_ws_url
+        self.api_key = settings.massive_api_key if api_key is None else api_key
+        self.running = False
+        self.websocket: Any = None
+        self.authenticated = False
+        self.last_message_at: Optional[datetime] = None
+        self.last_error: Optional[str] = None
+        self._task: Optional[asyncio.Task] = None
+        self.values: Dict[str, IndexRealtimeValue] = {}
+        self.candles: Dict[str, IndexRealtimeCandle] = {}
+
+    def _topics(self) -> List[str]:
+        tickers = [
+            provider_symbol_map.to_provider("massive", canonical)
+            for canonical in ("SPX", "NDX", "US30")
+        ]
+        verified = [ticker for ticker in tickers if ticker is not None]
+        return [f"{channel}.{ticker}" for ticker in verified for channel in ("V", "AM")]
+
+    async def start(self) -> None:
+        if not self.api_key:
+            raise RuntimeError("MASSIVE_API_KEY not set")
+        if websockets is None:
+            raise RuntimeError("websockets dependency is not installed")
+        if self.running:
+            return
+        if not self._topics():
+            raise RuntimeError("no verified Massive index mappings available")
+        self.running = True
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self) -> None:
+        self.running = False
+        self.authenticated = False
+        if self.websocket is not None:
+            try:
+                await self.websocket.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.websocket = None
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def _run_loop(self) -> None:  # pragma: no cover - live provider socket
+        attempt = 0
+        while self.running:
+            try:
+                async with websockets.connect(
+                    self.url, ping_interval=20, ping_timeout=20, close_timeout=5
+                ) as ws:
+                    self.websocket = ws
+                    self.authenticated = False
+                    attempt = 0
+                    await ws.send(json.dumps({"action": "auth", "params": self.api_key}))
+                    async for raw in ws:
+                        self.last_message_at = utcnow()
+                        await self._handle(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.websocket = None
+                self.authenticated = False
+                self.last_error = _redact_secret(str(exc))[:200]
+                if not self.running:
+                    break
+                attempt += 1
+                await asyncio.sleep(ws_backoff(attempt))
+
+    async def _handle(self, raw: str | bytes) -> None:
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            return
+        items = payload if isinstance(payload, list) else [payload]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("ev") == "status":
+                status_value = str(item.get("status", ""))
+                if status_value == "auth_success":
+                    self.authenticated = True
+                    if self.websocket is not None:
+                        await self.websocket.send(
+                            json.dumps({"action": "subscribe", "params": ",".join(self._topics())})
+                        )
+                elif status_value in {"auth_failed", "error"}:
+                    self.last_error = str(item.get("message") or status_value)[:200]
+                continue
+            value = parse_massive_index_value(item, self.last_message_at)
+            if value is not None:
+                old = self.values.get(value.canonical_symbol)
+                if old is None or value.source_timestamp >= old.source_timestamp:
+                    self.values[value.canonical_symbol] = value
+                continue
+            candle = parse_massive_index_minute(item, self.last_message_at)
+            if candle is not None:
+                oldc = self.candles.get(candle.canonical_symbol)
+                if oldc is None or candle.start >= oldc.start:
+                    self.candles[candle.canonical_symbol] = candle
+
+    def realtime(self, canonical_symbol: str) -> Dict[str, object]:
+        canonical = canonical_symbol.upper()
+        value = self.values.get(canonical)
+        candle = self.candles.get(canonical)
+        transport = (
+            "WEBSOCKET" if self.authenticated else ("CONNECTING" if self.running else "STOPPED")
+        )
+        return {
+            "source": "massive",
+            "canonical_symbol": canonical,
+            "status": "OK" if (value or candle) else "MISSING",
+            "transport": transport,
+            "feed_recency": self.FEED_RECENCY,
+            "value": value.to_dict() if value else None,
+            "candle": candle.to_dict() if candle else None,
+        }
+
+    def health(self) -> Dict[str, object]:
+        return {
+            "source": "massive",
+            "running": self.running,
+            "connected": self.websocket is not None,
+            "authenticated": self.authenticated,
+            "feed_recency": self.FEED_RECENCY,
+            "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
+            "last_error": self.last_error,
+        }
+
+
+massive_indices_ws = MassiveIndicesWsManager()
+
+
+@api_router.post("/market/index/websocket/start")
+async def market_index_ws_start() -> dict:
+    try:
+        await massive_indices_ws.start()
+    except RuntimeError as exc:
+        reason = str(exc)
+        code = 503 if "API_KEY" in reason else 409
+        raise HTTPException(
+            status_code=code, detail={"status": "UNAVAILABLE", "reason": reason}
+        ) from exc
+    return {
+        "status": "started",
+        "source": "massive",
+        "transport": "WEBSOCKET",
+        "feed_recency": massive_indices_ws.FEED_RECENCY,
+    }
+
+
+@api_router.post("/market/index/websocket/stop")
+async def market_index_ws_stop() -> dict:
+    await massive_indices_ws.stop()
+    return {"status": "stopped", "source": "massive"}
+
+
+@api_router.get("/market/index/websocket/health")
+async def market_index_ws_health() -> dict:
+    return massive_indices_ws.health()
+
+
+@api_router.get("/market/index/{symbol}/realtime")
+async def market_index_realtime(symbol: str) -> dict:
+    canonical = symbol.upper()
+    inst = instrument_registry.get(canonical)
+    if inst is None or inst.asset_class != AssetClass.INDEX:
+        raise HTTPException(
+            status_code=404,
+            detail={"status": "NOT_MAPPED", "reason": "unknown index instrument"},
+        )
+    return massive_indices_ws.realtime(canonical)
+
+
 @api_router.get("/market/index/{symbol}/history")
 async def market_index_history(
     symbol: str, start: int, end: int, granularity: str = "1d"
@@ -3916,6 +4191,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await massive_indices_ws.stop()
         await twelvedata_gold_ws.stop()
         await massive_forex_ws.stop()
         await market_ws.stop()

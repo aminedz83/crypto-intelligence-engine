@@ -31,7 +31,7 @@ from main import (
 NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
 INDEX = FRONTEND / "index.html"
-VIEW_IDS = ["markets", "forex", "metal", "system", "detail"]
+VIEW_IDS = ["markets", "forex", "metal", "index", "system", "detail"]
 
 
 # ----------------------------- data quality -----------------------------
@@ -2783,3 +2783,250 @@ class MobileOhlcTableTests(unittest.TestCase):
         for col in ('h("th",{},["O"])', 'h("th",{},["H"])',
                     'h("th",{},["L"])', 'h("th",{},["C"])'):
             self.assertIn(col, self.html)
+
+
+# ----------------------------- Massive US cash indices REST -------------------
+import json as _json  # noqa: E402
+from main import (  # noqa: E402
+    MassiveIndexResult,
+    MassiveIndicesProvider,
+    fetch_index_history,
+    index_bar_from_agg,
+    parse_massive_index_aggs,
+)
+
+_IX_BASE = 1755000000  # some UNIX seconds anchor
+
+
+def _ix_agg(k, close="100.5"):
+    return {"o": "100", "h": "101", "l": "99", "c": close, "t": (_IX_BASE + k * 86400) * 1000}
+
+
+class _IXResp:
+    def __init__(self, status_code, text):
+        self.status_code = status_code
+        self.text = text
+
+
+class _IXClient:
+    def __init__(self, resp=None, exc=None):
+        self.resp = resp
+        self.exc = exc
+        self.calls = []
+
+    async def get(self, path, params=None):
+        self.calls.append((path, params))
+        if self.exc is not None:
+            raise self.exc
+        return self.resp
+
+
+class IndexInstrumentTests(unittest.TestCase):
+    def test_three_cash_indices_registered(self):
+        for c, name in (("SPX", "S&P 500"), ("NDX", "Nasdaq-100"),
+                        ("US30", "Dow Jones Industrial Average")):
+            inst = instrument_registry.get(c)
+            self.assertIsNotNone(inst)
+            self.assertEqual(inst.asset_class, AssetClass.INDEX)
+            self.assertEqual(inst.display_name, name)
+
+    def test_official_mappings_cash_not_etf_or_future(self):
+        self.assertEqual(provider_symbol_map.to_provider("massive", "SPX"), "I:SPX")
+        self.assertEqual(provider_symbol_map.to_provider("massive", "NDX"), "I:NDX")
+        self.assertEqual(provider_symbol_map.to_provider("massive", "US30"), "I:DJI")
+
+    def test_volume_not_available_and_metadata_none(self):
+        inst = instrument_registry.get("SPX")
+        self.assertEqual(inst.volume_semantics, VolumeSemantics.NOT_AVAILABLE)
+        self.assertIsNone(inst.price_precision)
+        self.assertIsNone(inst.tick_size)
+
+    def test_calendar_not_configured(self):
+        self.assertEqual(instrument_registry.get("SPX").market_calendar,
+                         MarketCalendarPolicy.NOT_CONFIGURED)
+
+
+class IndexParsingTests(unittest.TestCase):
+    def test_decimal_exact_via_parse_float(self):
+        body = _json.loads('{"results":[{"o":3985.67,"h":3990.12,"l":3980.0,"c":3987.5,'
+                           '"t":1755000000000}]}', parse_float=_Dec)
+        r = parse_massive_index_aggs(body, float("inf"))
+        self.assertEqual(r.status, "OK")
+        self.assertIsInstance(r.bars[0].open, _Dec)
+        self.assertNotIsInstance(r.bars[0].open, float)
+        self.assertEqual(str(r.bars[0].open), "3985.67")
+
+    def test_no_volume_on_index_bar(self):
+        bar = index_bar_from_agg(_ix_agg(0), float("inf"))
+        self.assertFalse(hasattr(bar, "volume"))
+
+    def test_invalid_ohlc(self):
+        self.assertEqual(
+            index_bar_from_agg({"o": "x", "h": "1", "l": "1", "c": "1", "t": 1755000000000},
+                              float("inf")).status, DataQualityStatus.INVALID)
+
+    def test_empty_results(self):
+        self.assertEqual(parse_massive_index_aggs({"results": []}, float("inf")).status, "EMPTY")
+
+    def test_malformed(self):
+        self.assertEqual(parse_massive_index_aggs("x", float("inf")).status, "UNAVAILABLE")
+
+
+class IndexProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_no_key_no_network(self):
+        prov = MassiveIndicesProvider(api_key="")
+        spy = _IXClient(_IXResp(200, "{}"))
+        prov.client = spy
+        r = await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 86400)
+        self.assertEqual(r.status, "NO_KEY")
+        self.assertEqual(spy.calls, [])
+
+    async def test_not_mapped(self):
+        prov = MassiveIndicesProvider(api_key="DUMMY")
+        r = await prov.get_index_aggregates("EUR-USD", "1d", _IX_BASE, _IX_BASE + 86400)
+        self.assertEqual(r.status, "NOT_MAPPED")
+
+    async def test_not_supported_granularity(self):
+        prov = MassiveIndicesProvider(api_key="DUMMY")
+        r = await prov.get_index_aggregates("SPX", "3m", _IX_BASE, _IX_BASE + 86400)
+        self.assertEqual(r.status, "NOT_SUPPORTED")
+
+    async def test_403_access_denied(self):
+        prov = MassiveIndicesProvider(api_key="DUMMY")
+        prov.client = _IXClient(_IXResp(403, "{}"))
+        r = await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 86400)
+        self.assertEqual(r.status, "ACCESS_DENIED")
+
+    async def test_429_rate_limited(self):
+        prov = MassiveIndicesProvider(api_key="DUMMY")
+        prov.client = _IXClient(_IXResp(429, "{}"))
+        r = await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 86400)
+        self.assertEqual(r.status, "RATE_LIMITED")
+
+    async def test_500_unavailable(self):
+        prov = MassiveIndicesProvider(api_key="DUMMY")
+        prov.client = _IXClient(_IXResp(500, "{}"))
+        r = await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 86400)
+        self.assertEqual(r.status, "UNAVAILABLE")
+
+    async def test_timeout_unavailable(self):
+        prov = MassiveIndicesProvider(api_key="DUMMY")
+        prov.client = _IXClient(exc=httpx.TimeoutException("t"))
+        r = await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 86400)
+        self.assertEqual(r.status, "UNAVAILABLE")
+
+    async def test_ok_bars_decimal(self):
+        prov = MassiveIndicesProvider(api_key="DUMMY")
+        prov.client = _IXClient(_IXResp(200, _json.dumps({"results": [_ix_agg(0), _ix_agg(1)]})))
+        r = await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 5 * 86400)
+        self.assertEqual(r.status, "OK")
+        self.assertEqual(len(r.bars), 2)
+
+    async def test_key_absent_from_params(self):
+        prov = MassiveIndicesProvider(api_key="DUMMYKEY")
+        fc = _IXClient(_IXResp(200, "{}"))
+        prov.client = fc
+        await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 86400)
+        for _p, params in fc.calls:
+            self.assertNotIn("apikey", params or {})
+            self.assertNotIn("DUMMYKEY", str(params))
+
+
+class IndexHistoryAssemblerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._saved = main.massive_indices_provider
+
+    def tearDown(self):
+        main.massive_indices_provider = self._saved
+
+    def _prov(self, result):
+        return type("P", (), {
+            "get_index_aggregates": staticmethod(
+                lambda canon, gran, start, end: _async_return(result))})()
+
+    async def test_ok_sorted_no_persist_no_volume(self):
+        main.massive_indices_provider = self._prov(MassiveIndexResult(
+            "OK", [index_bar_from_agg(_ix_agg(2), float("inf")),
+                   index_bar_from_agg(_ix_agg(0), float("inf")),
+                   index_bar_from_agg(_ix_agg(3), float("inf"))]))
+        h = await fetch_index_history("SPX", "1d", _IX_BASE, _IX_BASE + 5 * 86400)
+        self.assertEqual(h["status"], "OK")
+        self.assertEqual(h["count"], 3)
+        self.assertEqual(h["gaps_status"], "UNKNOWN")   # absence != gap
+        self.assertIs(h["persisted"], False)            # D2: never persisted
+        self.assertEqual(h["volume_semantics"], "NOT_AVAILABLE")
+        self.assertTrue(all("volume" not in c for c in h["candles"]))
+        starts = [c["start"] for c in h["candles"]]
+        self.assertEqual(starts, sorted(starts))
+
+    async def test_access_denied_propagated(self):
+        main.massive_indices_provider = self._prov(
+            MassiveIndexResult("ACCESS_DENIED", [], "access denied by provider (403)"))
+        h = await fetch_index_history("SPX", "1d", _IX_BASE, _IX_BASE + 5 * 86400)
+        self.assertEqual(h["status"], "ACCESS_DENIED")
+        self.assertEqual(h["count"], 0)
+
+    async def test_empty(self):
+        main.massive_indices_provider = self._prov(MassiveIndexResult("EMPTY", []))
+        h = await fetch_index_history("SPX", "1d", _IX_BASE, _IX_BASE + 5 * 86400)
+        self.assertEqual(h["status"], "EMPTY")
+
+    async def test_unknown_index_raises(self):
+        main.massive_indices_provider = self._prov(MassiveIndexResult("OK", []))
+        with self.assertRaises(ValueError):
+            await fetch_index_history("ZZZ", "1d", _IX_BASE, _IX_BASE + 86400)
+
+
+class IndexEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self._saved = main.massive_indices_provider
+
+    def tearDown(self):
+        main.massive_indices_provider = self._saved
+
+    def _client(self, result):
+        main.massive_indices_provider = type("P", (), {
+            "get_index_aggregates": staticmethod(
+                lambda canon, gran, start, end: _async_return(result))})()
+        return TestClient(create_app())
+
+    def test_ok_200(self):
+        r = self._client(MassiveIndexResult(
+            "OK", [index_bar_from_agg(_ix_agg(0), float("inf"))])).get(
+            "/api/v1/market/index/SPX/history?granularity=1d&start=%d&end=%d"
+            % (_IX_BASE, _IX_BASE + 5 * 86400))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["source"], "massive")
+
+    def test_access_denied_403(self):
+        r = self._client(MassiveIndexResult("ACCESS_DENIED", [], "x")).get(
+            "/api/v1/market/index/SPX/history?granularity=1d&start=%d&end=%d"
+            % (_IX_BASE, _IX_BASE + 86400))
+        self.assertEqual(r.status_code, 403)
+
+    def test_no_secret_in_response(self):
+        raw = self._client(MassiveIndexResult("ACCESS_DENIED", [], "x")).get(
+            "/api/v1/market/index/SPX/history?granularity=1d&start=%d&end=%d"
+            % (_IX_BASE, _IX_BASE + 86400)).text.lower()
+        for bad in ("apikey", "authorization", "bearer", "massive_api_key"):
+            self.assertNotIn(bad, raw)
+
+
+class IndexUiTests(unittest.TestCase):
+    def setUp(self):
+        self.html = INDEX.read_text(encoding="utf-8")
+
+    def test_index_view_and_labels(self):
+        self.assertIn('id:"index"', self.html)
+        self.assertIn("SPX", self.html)
+        self.assertIn("NDX", self.html)
+        self.assertIn("US30", self.html)
+
+    def test_index_endpoint_used(self):
+        self.assertIn("/api/v1/market/index/", self.html)
+
+    def test_no_fallback_to_etf_or_futures(self):
+        # ETF proxies and index futures must never appear (case-sensitive uppercase
+        # tickers; we use the official cash indices SPX/NDX/US30 -> I:SPX/I:NDX/I:DJI)
+        for bad in ("SPY", "QQQ", "DIA", "ES=F", "NQ=F", "YM=F", "/ES", "/NQ", "/YM"):
+            self.assertNotIn(bad, self.html)

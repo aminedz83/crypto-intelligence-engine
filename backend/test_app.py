@@ -3123,3 +3123,36 @@ class ChartEngineV2SwingUiTests(unittest.TestCase):
     def test_no_synthetic_or_random_swing_fallback(self):
         self.assertIn("Aucun swing futur/repainté", self.html)
         self.assertNotIn("Math.random()", self.html)
+
+
+class ChartEngineV3StructureUiTests(unittest.TestCase):
+    """Static contract: HH/HL/LH/LL derive only from confirmed swings."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_structure_classifier_present(self):
+        self.assertIn("classifyConfirmedStructure", self.html)
+        self.assertIn("HH/HL/LH/LL ACTIF", self.html)
+
+    def test_high_structure_compares_only_previous_high(self):
+        self.assertIn('if(s.price>prevHigh)label="HH"', self.html)
+        self.assertIn('else if(s.price<prevHigh)label="LH"', self.html)
+
+    def test_low_structure_compares_only_previous_low(self):
+        self.assertIn('if(s.price>prevLow)label="HL"', self.html)
+        self.assertIn('else if(s.price<prevLow)label="LL"', self.html)
+
+    def test_equal_swing_is_not_forced_into_structure(self):
+        self.assertIn("var label=null", self.html)
+        self.assertNotIn('else label="HH"', self.html)
+        self.assertNotIn('else label="LL"', self.html)
+
+    def test_structure_is_built_from_confirmed_swings(self):
+        self.assertIn("classifyConfirmedStructure(swings)", self.html)
+        self.assertIn("Structure comparée uniquement entre swings confirmés", self.html)
+
+    def test_structure_labels_are_drawn_without_random_fallback(self):
+        self.assertIn('lab.textContent=s.structure||(isHigh?"SH":"SL")', self.html)
+        self.assertNotIn("Math.random()", self.html)

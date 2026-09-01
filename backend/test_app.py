@@ -3678,3 +3678,51 @@ class TestChartEngineV9OrderBlocks(unittest.TestCase):
     def test_order_block_ui_and_methodology_are_present(self):
         self.assertIn("ORDER BLOCK ACTIF", self.html)
         self.assertIn("pas comme obligations ni comme signal d’entrée", self.html)
+
+
+class TestChartEngineV10OrderBlockRetestQuality(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_order_block_width_is_explicit(self):
+        self.assertIn("width=high-low", self.html)
+
+    def test_order_block_tracks_deepest_retest_fraction(self):
+        self.assertIn("deepestRetestFraction=0", self.html)
+
+    def test_retest_penetration_is_clamped_zero_to_one(self):
+        self.assertIn("Math.max(0,Math.min(1,penetration/width))", self.html)
+
+    def test_bullish_retest_penetration_uses_zone_from_high_down(self):
+        self.assertIn("high-Math.max(l,low)", self.html)
+
+    def test_bearish_retest_penetration_uses_zone_from_low_up(self):
+        self.assertIn("Math.min(h,high)-low", self.html)
+
+    def test_first_retest_timestamp_is_retained(self):
+        self.assertIn("if(mitigatedAt===null)mitigatedAt=k", self.html)
+
+    def test_invalidation_stops_followup(self):
+        self.assertIn('state="INVALIDATED";invalidatedAt=k;break', self.html)
+
+    def test_evidence_count_has_two_required_components(self):
+        self.assertIn("var evidenceCount=2+", self.html)
+
+    def test_quality_core_tier_is_explicit(self):
+        self.assertIn('"CORE"', self.html)
+
+    def test_quality_confirmed_tier_is_explicit(self):
+        self.assertIn('"CONFIRMED"', self.html)
+
+    def test_quality_confluent_tier_is_explicit(self):
+        self.assertIn('"CONFLUENT"', self.html)
+
+    def test_invalidated_order_block_quality_is_invalid(self):
+        self.assertIn('if(state==="INVALIDATED")qualityTier="INVALID"', self.html)
+
+    def test_quality_methodology_disclaims_profit_probability(self):
+        self.assertIn("pas une probabilité de gain", self.html)
+
+    def test_order_block_retest_quality_ui_is_active(self):
+        self.assertIn("OB RETEST / QUALITY ACTIF", self.html)

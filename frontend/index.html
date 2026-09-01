@@ -1,587 +1,834 @@
 <!DOCTYPE html>
 <html lang="fr">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="color-scheme" content="dark light" />
-  <title>Crypto Intelligence Engine</title>
-  <style>
-    :root{
-      --bg:#0e1116; --panel:#171b22; --panel2:#1e232c; --line:#2a303b;
-      --text:#e8edf4; --muted:#98a2b3; --accent:#3b82f6;
-      --green:#22c55e; --amber:#f59e0b; --red:#ef4444; --grey:#6b7280; --blue:#38bdf8;
-      --radius:14px; --safe-b:env(safe-area-inset-bottom,0px);
-      --safe-t:env(safe-area-inset-top,0px);
-    }
-    *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-    html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
-      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-      font-size:16px;line-height:1.4;overflow-x:hidden}
-    body{max-width:100%;min-height:100vh;padding-bottom:calc(72px + var(--safe-b))}
-    a{color:inherit}
-    .header{position:sticky;top:0;z-index:10;background:linear-gradient(180deg,#12161c,#0e1116);
-      border-bottom:1px solid var(--line);padding:calc(10px + var(--safe-t)) 16px 10px}
-    .header__row{display:flex;align-items:center;justify-content:space-between;gap:10px}
-    .brand{font-weight:700;font-size:17px;letter-spacing:.2px}
-    .brand small{display:block;font-weight:500;color:var(--muted);font-size:11px;letter-spacing:.3px}
-    .hdot{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);
-      background:var(--panel);border:1px solid var(--line);padding:6px 10px;border-radius:999px}
-    .dot{width:9px;height:9px;border-radius:50%;background:var(--grey);flex:0 0 auto}
-    .dot.up{background:var(--green)} .dot.deg{background:var(--amber)}
-    .dot.down{background:var(--red)} .dot.unk{background:var(--grey)}
-    .refresh{margin-top:8px;font-size:11px;color:var(--muted);display:flex;align-items:center;gap:6px}
-    .refresh .spark{width:6px;height:6px;border-radius:50%;background:var(--accent);opacity:.5}
-    main{padding:14px 14px 20px;max-width:760px;margin:0 auto}
-    .view{display:none} .view.active{display:block}
-    h2.section{font-size:13px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);
-      margin:4px 2px 10px;font-weight:600}
-    .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
-      margin:0 0 12px;overflow:hidden}
-    .row{display:flex;align-items:center;justify-content:space-between;gap:12px;
-      padding:14px 16px;border-bottom:1px solid var(--line);min-height:60px}
-    .row:last-child{border-bottom:none}
-    .row.tap{cursor:pointer;transition:background .12s} .row.tap:active{background:var(--panel2)}
-    .row.disabled{opacity:.6}
-    .sym{font-weight:600;font-size:16px} .sub{color:var(--muted);font-size:12px;margin-top:2px}
-    .price{font-variant-numeric:tabular-nums;font-weight:600;font-size:16px;text-align:right}
-    .price .na{color:var(--muted);font-weight:500}
-    .badge{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.4px;
-      padding:3px 8px;border-radius:999px;border:1px solid var(--line);white-space:nowrap}
-    .b-live{color:#052e12;background:var(--green)} .b-stale{color:#3a2600;background:var(--amber)}
-    .b-invalid{color:#3a0a0a;background:var(--red)} .b-missing{color:var(--text);background:var(--panel2)}
-    .b-unknown{color:var(--text);background:var(--panel2)} .b-notmapped{color:#04212b;background:var(--blue)}
-    .b-desync{color:#3a0a0a;background:var(--red)} .b-mapped{color:#04212b;background:#67e8f9}
-    .chip{display:inline-flex;gap:8px;flex-wrap:wrap;margin:0 0 10px}
-    .tab{flex:1;text-align:center;padding:10px;border-radius:10px;background:var(--panel);
-      border:1px solid var(--line);color:var(--muted);font-weight:600;font-size:13px;cursor:pointer}
-    .tab[aria-current="page"]{color:var(--text);background:var(--panel2);border-color:var(--accent)}
-    .tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}
-    .tbl{width:100%;min-width:440px;border-collapse:collapse;font-variant-numeric:tabular-nums}
-    .tbl th,.tbl td{padding:9px 10px;text-align:right;font-size:13px;border-bottom:1px solid var(--line)}
-    .tbl td:not(:first-child),.tbl th:not(:first-child){white-space:nowrap}
-    .tbl th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
-    .tbl th:first-child,.tbl td:first-child{text-align:left}
-    .muted{color:var(--muted)} .center{text-align:center}
-    .state{padding:22px 16px;text-align:center;color:var(--muted);font-size:14px}
-    .state strong{display:block;color:var(--text);margin-bottom:4px;font-size:15px}
-    .kv{display:flex;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line)}
-    .kv:last-child{border-bottom:none} .kv .k{color:var(--muted)} .kv .v{font-weight:600}
-    .back{display:inline-flex;align-items:center;gap:6px;color:var(--muted);background:none;border:none;
-      font-size:14px;padding:6px 2px;margin-bottom:6px;cursor:pointer}
-    .nav{position:fixed;left:0;right:0;bottom:0;z-index:20;display:flex;gap:6px;
-      background:linear-gradient(0deg,#0c0f14,#12161c);border-top:1px solid var(--line);
-      padding:8px 12px calc(8px + var(--safe-b))}
-    .nav button{flex:1;background:none;border:none;color:var(--muted);font-size:11px;font-weight:600;
-      padding:8px 4px;border-radius:10px;cursor:pointer;display:flex;flex-direction:column;
-      align-items:center;gap:4px;min-height:48px}
-    .nav button[aria-current="page"]{color:var(--text);background:var(--panel2)}
-    .nav .ic{font-size:18px;line-height:1}
-    .spin{display:inline-block;width:16px;height:16px;border:2px solid var(--line);
-      border-top-color:var(--accent);border-radius:50%;animation:sp 1s linear infinite;vertical-align:-3px}
-    @keyframes sp{to{transform:rotate(360deg)}}
-    @media (min-width:760px){ body{padding-bottom:20px}
-      .nav{position:sticky;bottom:auto;top:0;max-width:760px;margin:14px auto 0;border-radius:12px;
-        border:1px solid var(--line)} }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Crypto Intelligence Engine</title>
+<style>
+:root{
+  --bg:#020610;--bg2:#040a14;--card:#07111d;--card2:#091525;--line:#1d2b3e;
+  --text:#f8fbff;--muted:#8f9bae;--muted2:#647188;--purple:#9a63ff;--green:#28ef62;
+  --red:#ff4e5f;--blue:#12b8ff;--orange:#ff9b08;--cyan:#51e7ff;
+  --safe-t:env(safe-area-inset-top,0px);--safe-b:env(safe-area-inset-bottom,0px)
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;min-height:100%;background:
+ radial-gradient(circle at 70% -10%,rgba(38,62,120,.18),transparent 32%),
+ linear-gradient(180deg,#01050d 0%,#040915 55%,#020610 100%);
+ color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
+body{padding-bottom:calc(84px + var(--safe-b));overflow-x:hidden}
+button{font:inherit;color:inherit}
+
+/* HEADER */
+.header{position:sticky;top:0;z-index:80;background:rgba(2,6,16,.94);backdrop-filter:blur(20px);
+ border-bottom:1px solid rgba(39,56,82,.75);padding:calc(11px + var(--safe-t)) 12px 9px}
+.header-row{max-width:1180px;margin:auto;display:grid;grid-template-columns:34px 1fr auto 30px;align-items:center;gap:9px}
+.hamb,.bell{width:30px;height:30px;border:0;background:none;padding:0;font-size:22px;display:grid;place-items:center;color:#e7edf7}
+.brandline{min-width:0;display:flex;align-items:center;gap:8px}
+.logo{width:34px;height:34px;border-radius:11px;background:linear-gradient(145deg,#f8fbff,#b5c0ff 54%,#8b55ff);
+ display:grid;place-items:center;color:#060911;font-size:19px;font-weight:950;box-shadow:0 0 22px rgba(139,85,255,.26)}
+.brand{font-weight:800;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand small{display:block;font-size:9px;color:#9aa6b8;font-weight:500;margin-top:1px}
+.health{display:flex;align-items:center;gap:6px;border:1px solid #2a394e;border-radius:999px;background:#07101c;padding:7px 9px;
+ font-size:9.5px;color:#dce4f0;white-space:nowrap}
+.dot{width:8px;height:8px;border-radius:50%;background:#67758a}.dot.up{background:var(--green);box-shadow:0 0 9px var(--green)}
+.dot.deg{background:#ffb020}.dot.down{background:var(--red)}
+
+/* TOP TABS */
+.market-tabs-wrap{position:sticky;top:64px;z-index:70;background:rgba(2,6,16,.96);backdrop-filter:blur(18px);
+ border-bottom:1px solid #17253a;padding:5px 8px}
+.market-tabs{max-width:1180px;margin:auto;display:grid;grid-template-columns:1.22fr repeat(4,1fr);gap:3px;min-width:620px}
+.market-tabs-scroll{overflow-x:auto;scrollbar-width:none}.market-tabs-scroll::-webkit-scrollbar{display:none}
+.mtab{border:1px solid transparent;background:transparent;color:#d5dce7;border-radius:10px;padding:9px 8px;font-size:11px;font-weight:650;
+ display:flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap}
+.mtab .ico{font-size:16px}.mtab.active{border-color:#7443e0;color:#c49cff;background:linear-gradient(180deg,#2f1e632d,#1a123b27)}
+.mtab.crypto .ico{color:#f7931a}.mtab.forex .ico{color:#44e36c}.mtab.metals .ico{color:#ffb30e}.mtab.indices .ico{color:#22baff}
+
+/* COMMON */
+main{max-width:1180px;margin:auto;padding:11px 10px 20px}
+.view{display:none}.view.active{display:block;animation:fade .14s ease}@keyframes fade{from{opacity:.55}to{opacity:1}}
+.card{background:linear-gradient(180deg,rgba(7,17,29,.98),rgba(4,11,20,.99));border:1px solid #203149;border-radius:14px;
+ box-shadow:0 12px 34px rgba(0,0,0,.28);overflow:hidden}
+.section{font-size:11px;color:#aeb8c8;text-transform:uppercase;letter-spacing:.72px;margin:3px 2px 8px}
+.muted{color:var(--muted)}.sub{font-size:9.5px;color:var(--muted);margin-top:2px}
+.badge{display:inline-flex;align-items:center;border:1px solid #42516a;border-radius:6px;padding:2px 5px;font-size:7.5px;font-weight:800;letter-spacing:.55px}
+.b-live{color:#40ff75;border-color:#1b8c3e;background:#10391e7a}.b-stale{color:#ffc85c;border-color:#8a641e}.b-invalid,.b-desync{color:#ff7b86;border-color:#84343d}
+.b-missing,.b-unknown{color:#c0cad8}.b-mapped,.b-notmapped{color:#5ce7ff;border-color:#2b7483}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid #263750;border-top-color:#32cfff;border-radius:50%;animation:sp 1s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}
+.state{padding:22px;text-align:center;color:#8d9ab0;font-size:11px}.state strong{display:block;color:white;font-size:13px;margin-bottom:4px}
+
+/* DASHBOARD KPI row — four across, like reference */
+.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-bottom:9px}
+.kpi{min-height:116px;padding:11px 10px;position:relative}
+.klabel{font-size:8px;letter-spacing:.35px;color:#d2d8e3;text-transform:uppercase;white-space:nowrap}
+.kvalue{font-size:18px;font-weight:800;margin-top:8px}.kvalue.green{color:var(--green)}
+.kfooter{position:absolute;left:10px;right:10px;bottom:9px;color:#9aa6b8;font-size:8px;line-height:1.35}
+.sparkline{position:absolute;left:9px;right:9px;bottom:22px;height:26px;opacity:.9}
+.sparkline svg{width:100%;height:100%}
+.info{width:17px;height:17px;border:1px solid #59677c;border-radius:50%;display:grid;place-items:center;font-size:9px;color:#a9b5c6}
+
+/* MARKET HOURS */
+.hours{margin-bottom:10px;padding:12px}
+.hours-title{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:800;margin-bottom:10px}
+.hours-grid{display:grid;grid-template-columns:.78fr 1.22fr;gap:12px;align-items:stretch}
+.market-open{font-size:17px;font-weight:800;color:var(--green);display:flex;gap:6px;align-items:center}.market-open .orb{width:16px;height:16px;border-radius:50%;background:linear-gradient(#48ff7b,#159f3f);box-shadow:0 0 13px #21dc5940}
+.market-status{font-size:10px;color:#d4dbe7;margin-top:7px}.indic{font-size:7px;background:#302353;color:#c5a2ff;border-radius:4px;padding:2px 4px;margin-left:4px}
+.closebox{border:1px solid #21334c;border-radius:10px;background:#030a14;margin-top:10px;padding:8px 9px}.closebox .t1{font-size:9px;color:#d2d9e5}.closebox .t2{font-size:16px;font-weight:800;margin-top:3px}.closebox .t2 .green{color:var(--green)}
+.localtime{margin-top:11px;display:flex;gap:7px;align-items:flex-start;color:#a5b0c1;font-size:8.5px}.localtime b{display:block;color:#dce3ef;font-size:9.5px;margin-top:1px}
+
+/* World map approximation with CSS dots — decorative only */
+.mapbox{position:relative;min-height:166px;border-left:1px solid #1e3047;padding-left:9px;overflow:hidden}
+.world{position:absolute;inset:4px 3px 22px 12px;opacity:.55}
+.world svg{width:100%;height:100%}
+.scard{position:absolute;border:1px solid #7444e0;background:#07101de8;border-radius:8px;padding:6px 8px;text-align:center;font-size:8px;min-width:78px}
+.scard b{display:block;font-size:9px;margin-bottom:2px}.scard.sydney{left:7%;top:58%}.scard.london{left:44%;top:13%;border-color:#22d95b}.scard.ny{right:3%;top:57%;border-color:#168eea}
+.scard.london span{color:#41f278}.timeline{position:absolute;left:12px;right:4px;bottom:4px;border-top:1px solid #24354d;display:flex;justify-content:space-between;padding-top:4px;font-size:7px;color:#8c98aa}
+
+/* Favorites table */
+.fav{margin-bottom:10px}.favhead{display:flex;align-items:center;justify-content:space-between;padding:10px 11px 7px}.favhead b{font-size:13px}.favhead span{font-size:9px;color:#b78cff}
+.favcols{display:grid;grid-template-columns:1.55fr .85fr .85fr .65fr .82fr 12px;gap:5px;padding:0 11px 6px;color:#9ba6b7;font-size:7.5px}
+.frow{display:grid;grid-template-columns:1.55fr .85fr .85fr .65fr .82fr 12px;gap:5px;align-items:center;padding:8px 11px;border-top:1px solid #1d2a3f;min-height:54px}
+.asset{display:flex;align-items:center;gap:7px;min-width:0}.star{color:#ffad0a;font-size:13px}.coin{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;font-weight:900;font-size:12px;flex:0 0 auto}
+.coin.btc{background:#f7931a}.coin.eth{background:#5c68f1}.coin.sol{background:#0c1520;color:#5ef3d6;border:1px solid #1c2b40}.coin.gold{background:#d79b00}.coin.idx{background:#17395f}
+.sym{font-size:10.5px;font-weight:800;white-space:nowrap}.aname{font-size:7.5px;color:#9ba6b8;margin-top:2px;white-space:nowrap}
+.fprice{font-size:9.5px;font-weight:750;text-align:right}.fsmall{font-size:7px;color:#8e9aae;margin-top:1px;text-align:right}
+.change{font-size:9.5px;text-align:right;color:#8190a6}.quality{text-align:center}.mini{height:25px}.mini svg{width:100%;height:100%}.chev{font-size:17px;color:#eef3fb;text-align:right}
+
+/* Action cards */
+.actions{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.action{min-height:103px;padding:11px 5px;text-align:center;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.action .aico{font-size:26px;margin-bottom:6px}.action b{font-size:10.5px}.action span{font-size:8px;margin-top:3px}.blue{color:var(--blue)}.purple{color:#d56cff}.green{color:var(--green)}.orange{color:var(--orange)}
+
+/* Other market views */
+.listcard{margin-bottom:10px}.row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 13px;border-bottom:1px solid #1d2a3f;min-height:60px}.row:last-child{border:0}.row.tap{cursor:pointer}
+.price{font-size:12px;font-weight:750;text-align:right}.na{color:#7c899d}.right{display:flex;align-items:center;gap:7px}.back{border:1px solid #253750;background:#081321;color:#b7c2d4;border-radius:9px;padding:7px 9px;margin-bottom:8px}
+.kv{display:flex;justify-content:space-between;padding:12px;border-bottom:1px solid #1d2a3f}.kv .k{color:#8d9ab0}.tbl-wrap{overflow:auto}.tbl{width:100%;min-width:440px;border-collapse:collapse;white-space:nowrap}.tbl th,.tbl td{padding:9px;text-align:right;border-bottom:1px solid #1d2a3f;font-size:10px}.tbl th:first-child,.tbl td:first-child{text-align:left}.tbl th{font-size:8px;color:#8290a5}
+
+/* BOTTOM NAV */
+.nav{position:fixed;left:5px;right:5px;bottom:5px;z-index:90;display:flex;background:rgba(6,14,27,.97);backdrop-filter:blur(18px);border:1px solid #203149;border-radius:22px;padding:6px 4px calc(6px + var(--safe-b));box-shadow:0 16px 48px #0009}
+.nav button{flex:1;border:0;background:none;color:#7c899e;min-height:51px;border-radius:13px;font-size:8px;font-weight:650;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px}
+.nav .ic{font-size:18px}.nav button[aria-current=page]{color:#bb8fff}.nav button[aria-current=page] .ic{filter:drop-shadow(0 0 5px #8755ff)}
+.note{font-size:8px;color:#607086;text-align:center;margin:8px 0 2px}
+
+/* Make reference-like proportions even on narrower phones */
+@media(max-width:430px){
+  .header-row{grid-template-columns:28px 1fr auto 26px;gap:6px}.hamb,.bell{font-size:18px}.logo{width:30px;height:30px}.brand{font-size:13px}.health{padding:6px 7px;font-size:8.5px}
+  .market-tabs-wrap{top:59px}.market-tabs{min-width:560px}.mtab{font-size:10px;padding:8px 7px}
+  main{padding:9px 7px 18px}.kpis{gap:4px}.kpi{padding:9px 6px;min-height:103px}.klabel{font-size:6.8px}.kvalue{font-size:15px}.kfooter{left:6px;right:6px;font-size:6.8px}
+  .hours{padding:10px}.hours-grid{grid-template-columns:.9fr 1.1fr;gap:7px}.hours-title{font-size:11px}.market-open{font-size:14px}.mapbox{min-height:145px}.scard{min-width:63px;padding:5px 4px;font-size:6.7px}.scard b{font-size:8px}
+  .favcols,.frow{grid-template-columns:1.58fr .85fr .72fr .58fr .7fr 10px;padding-left:8px;padding-right:8px;gap:3px}.coin{width:24px;height:24px}.sym{font-size:9px}.aname{font-size:6.5px}
+  .fprice,.change{font-size:8px}.actions{gap:4px}.action{min-height:91px}.action .aico{font-size:22px}.action b{font-size:9px}.action span{font-size:7px}
+}
+@media(min-width:760px){body{padding-bottom:28px}.nav{position:sticky;max-width:760px;margin:14px auto 0}.brand{font-size:18px}.market-tabs-wrap{top:68px}}
+</style>
+
+<style id="v4-reference-tuning">
+/* === V4: proportions calées sur la maquette officielle === */
+body{padding-bottom:calc(78px + var(--safe-b))}
+.header{padding:calc(8px + var(--safe-t)) 9px 7px}
+.header-row{grid-template-columns:27px minmax(0,1fr) auto 25px;gap:6px}
+.hamb,.bell{width:25px;height:25px;font-size:18px}
+.logo{width:29px;height:29px;border-radius:9px;font-size:16px}
+.brand{font-size:13px}.brand small{font-size:8px}
+.health{font-size:8px;padding:5px 7px}.health .dot{width:7px;height:7px}
+
+.market-tabs-wrap{top:54px;padding:4px 6px}
+.market-tabs{min-width:0!important;grid-template-columns:1.18fr repeat(4,.82fr);gap:2px}
+.mtab{font-size:9px;padding:7px 3px;gap:4px;border-radius:8px}
+.mtab .ico{font-size:14px}
+
+main{padding:8px 7px 14px}
+.kpis{grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-bottom:7px}
+.kpi{min-height:92px;padding:8px 7px;border-radius:12px}
+.klabel{font-size:6.4px;letter-spacing:.2px;overflow:hidden;text-overflow:ellipsis}
+.kvalue{font-size:14px;margin-top:6px}
+.kfooter{left:7px;right:7px;bottom:7px;font-size:6.3px;line-height:1.25}
+
+.hours{padding:9px;margin-bottom:7px;border-radius:13px}
+.hours-title{font-size:10px;margin-bottom:7px}
+.hours-grid{grid-template-columns:.76fr 1.24fr;gap:7px}
+.market-open{font-size:13px}.market-open .orb{width:13px;height:13px}
+.market-status{font-size:7.5px;margin-top:5px}
+.closebox{margin-top:7px;padding:6px 7px;border-radius:8px}
+.closebox .t1{font-size:6.8px}.closebox .t2{font-size:11.5px;margin-top:2px}
+.localtime{margin-top:7px;font-size:6.5px;gap:4px}.localtime b{font-size:7.5px}
+.mapbox{min-height:116px;padding-left:6px}
+.world{inset:1px 1px 16px 7px}
+.scard{min-width:52px;padding:4px 3px;border-radius:6px;font-size:5.8px}
+.scard b{font-size:6.8px;margin-bottom:1px}
+.scard.sydney{left:5%;top:58%}.scard.london{left:43%;top:11%}.scard.ny{right:1%;top:57%}
+.timeline{left:7px;right:1px;bottom:1px;padding-top:2px;font-size:5.5px}
+
+.fav{margin-bottom:7px;border-radius:13px}
+.favhead{padding:8px 9px 5px}.favhead b{font-size:10px}.favhead span{font-size:7px}
+.favcols,.frow{grid-template-columns:1.52fr .78fr .74fr .58fr .74fr 8px;gap:2px;padding-left:7px;padding-right:7px}
+.favcols{padding-bottom:4px;font-size:5.8px}
+.frow{min-height:43px;padding-top:6px;padding-bottom:6px}
+.asset{gap:5px}.star{font-size:10px}.coin{width:21px;height:21px;font-size:9px}
+.sym{font-size:7.8px}.aname{font-size:5.6px;margin-top:1px}
+.fprice,.change{font-size:7.1px}.fsmall{font-size:5.5px}.badge{font-size:5.7px;padding:2px 4px;border-radius:5px}
+.mini{height:18px}.chev{font-size:13px}
+
+.actions{grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-bottom:3px}
+.action{min-height:73px;padding:7px 3px;border-radius:12px}
+.action .aico{font-size:18px;margin-bottom:3px}.action b{font-size:7.8px}.action span{font-size:6px;margin-top:2px}
+.note{font-size:6px;margin:4px 0 0}
+
+.nav{left:4px;right:4px;bottom:4px;border-radius:18px;padding:4px 3px calc(4px + var(--safe-b))}
+.nav button{min-height:43px;border-radius:10px;font-size:6.8px;gap:2px}
+.nav .ic{font-size:14px}
+
+@media (min-width:431px) and (max-width:759px){
+ .header-row{max-width:720px}.market-tabs{max-width:720px;margin:auto}
+ main{max-width:720px}
+}
+@media(max-width:360px){
+ .brand{font-size:11.5px}.health{font-size:7px}
+ .mtab{font-size:8px}.mtab .ico{font-size:12px}
+ .kpi{min-height:88px}.kvalue{font-size:12px}
+ .hours-grid{grid-template-columns:.82fr 1.18fr}
+ .favcols,.frow{grid-template-columns:1.55fr .72fr .67fr .55fr .65fr 7px}
+}
+</style>
+
+
+<style id="v5-exact-reference-tuning">
+/* V5 — visual geometry follows the approved reference image much more strictly */
+body{padding-bottom:calc(88px + var(--safe-b))}
+.header{padding:calc(11px + var(--safe-t)) 10px 10px}
+.header-row{grid-template-columns:30px minmax(0,1fr) auto 28px;gap:8px}
+.hamb,.bell{width:28px;height:28px;font-size:20px}
+.logo{width:33px;height:33px;border-radius:10px;font-size:18px}
+.brand{font-size:14.5px}.brand small{font-size:8.7px;margin-top:2px}
+.health{font-size:8.7px;padding:6px 8px}
+.market-tabs-wrap{top:62px;padding:4px 7px}
+.market-tabs{grid-template-columns:1.2fr repeat(4,.9fr)}
+.mtab{padding:8px 4px;font-size:9.8px}.mtab .ico{font-size:15px}
+main{padding:9px 8px 16px}
+.kpis{gap:7px;margin-bottom:9px}
+.kpi{min-height:112px;padding:10px 8px;border-radius:13px}
+.klabel{font-size:7.2px}.kvalue{font-size:16px;margin-top:8px}.kfooter{font-size:6.9px;bottom:9px}
+.hours{padding:12px 11px;margin-bottom:9px}
+.hours-title{font-size:11.5px;margin-bottom:10px}
+.hours-grid{grid-template-columns:.76fr 1.24fr;gap:10px}
+.market-open{font-size:15px}.market-open .orb{width:15px;height:15px}
+.market-status{font-size:8.3px;margin-top:6px}
+.closebox{margin-top:9px;padding:8px}.closebox .t1{font-size:7.6px}.closebox .t2{font-size:13px}
+.localtime{margin-top:10px;font-size:7.3px}.localtime b{font-size:8.5px}
+.mapbox{min-height:154px;padding-left:9px;border-left-color:#273a53}
+.world{inset:-4px -2px 18px 8px;opacity:1}
+.scard{min-width:65px;padding:5px 5px;font-size:6.7px;background:rgba(4,12,23,.94);box-shadow:0 0 13px rgba(113,70,255,.15)}
+.scard b{font-size:8px}.scard.sydney{left:4%;top:57%}.scard.london{left:42%;top:12%;box-shadow:0 0 15px rgba(39,239,98,.16)}.scard.ny{right:1%;top:57%;box-shadow:0 0 15px rgba(18,184,255,.15)}
+.timeline{left:9px;bottom:1px;font-size:6px}
+.fav{margin-bottom:9px}.favhead{padding:10px 10px 7px}.favhead b{font-size:11px}.favhead span{font-size:7.8px}
+.favcols,.frow{grid-template-columns:1.52fr .82fr .78fr .62fr .78fr 9px;gap:3px;padding-left:9px;padding-right:9px}
+.favcols{font-size:6.2px;padding-bottom:5px}
+.frow{min-height:51px;padding-top:7px;padding-bottom:7px}
+.star{font-size:12px}.coin{width:26px;height:26px;font-size:10px}.sym{font-size:9px}.aname{font-size:6.2px}
+.fprice,.change{font-size:8px}.badge{font-size:6px}.mini{height:22px}
+.actions{gap:7px}.action{min-height:91px;padding:9px 4px}.action .aico{font-size:23px}.action b{font-size:9px}.action span{font-size:6.8px}
+.nav{left:3px;right:3px;bottom:3px;border-radius:21px;padding:6px 4px calc(6px + var(--safe-b))}
+.nav button{min-height:50px;font-size:7.5px}.nav .ic{font-size:17px}
+@media(max-width:390px){
+ .brand{font-size:13px}.market-tabs-wrap{top:60px}.mtab{font-size:9px}
+ .kpi{min-height:105px}.kvalue{font-size:14px}
+ .hours-grid{grid-template-columns:.78fr 1.22fr}.mapbox{min-height:145px}
+ .favcols,.frow{grid-template-columns:1.55fr .76fr .72fr .58fr .7fr 8px}
+}
+</style>
+
+
+<style id="v6-real-world-map">
+.world{inset:-8px -6px 14px 4px!important;opacity:1!important}
+.world svg{width:100%;height:100%;display:block}
+.mapbox{min-height:158px!important}
+.scard.sydney{left:4%!important;top:59%!important}
+.scard.london{left:43%!important;top:14%!important}
+.scard.ny{right:1%!important;top:58%!important}
+</style>
+
+
+<style id="v7-action-cards">
+/* V7 — bloc Scanner / Signaux / Graphiques / Paper Trading fidèle à la maquette */
+.actions{
+  display:grid!important;
+  grid-template-columns:repeat(4,minmax(0,1fr))!important;
+  gap:8px!important;
+  margin:10px 0 18px!important;
+}
+.action{
+  min-height:132px!important;
+  padding:15px 5px 13px!important;
+  border-radius:15px!important;
+  justify-content:center!important;
+  border-color:#26364b!important;
+  background:linear-gradient(180deg,#07111e 0%,#050c16 100%)!important;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.015),0 10px 25px rgba(0,0,0,.18)!important;
+}
+.action .aico{
+  font-size:39px!important;
+  line-height:1!important;
+  margin-bottom:12px!important;
+  font-weight:400!important;
+}
+.action b{
+  font-size:13px!important;
+  line-height:1.15!important;
+  font-weight:700!important;
+  color:#f7f9ff!important;
+  white-space:nowrap;
+}
+.action span{
+  font-size:10px!important;
+  line-height:1.2!important;
+  margin-top:7px!important;
+}
+.action:nth-child(1) .aico{
+  color:#18c5ff!important;
+  text-shadow:0 0 14px rgba(18,197,255,.42);
+}
+.action:nth-child(2) .aico{
+  color:#d266ff!important;
+  text-shadow:0 0 14px rgba(210,102,255,.42);
+}
+.action:nth-child(3) .aico{
+  color:#32ef64!important;
+  text-shadow:0 0 14px rgba(50,239,100,.38);
+}
+.action:nth-child(4) .aico{
+  color:#ff9808!important;
+  text-shadow:0 0 14px rgba(255,152,8,.38);
+}
+.action:nth-child(1) span{color:#19bfff!important}
+.action:nth-child(2) span{color:#d267ff!important}
+.action:nth-child(3) span{color:#35eb62!important}
+.action:nth-child(4) span{color:#ff9b08!important}
+.note{margin-bottom:8px!important}
+body{padding-bottom:calc(102px + var(--safe-b))!important}
+@media(max-width:430px){
+ .actions{gap:6px!important;margin-top:9px!important;margin-bottom:20px!important}
+ .action{min-height:116px!important;padding:12px 3px 11px!important}
+ .action .aico{font-size:33px!important;margin-bottom:10px!important}
+ .action b{font-size:11px!important}
+ .action span{font-size:8.5px!important;margin-top:6px!important}
+}
+@media(max-width:360px){
+ .actions{gap:4px!important}
+ .action{min-height:106px!important}
+ .action .aico{font-size:29px!important}
+ .action b{font-size:9.5px!important}
+ .action span{font-size:7.5px!important}
+}
+</style>
+
+
+<style id="v8-svg-icons">
+.action .aico{width:54px!important;height:54px!important;display:grid!important;place-items:center!important;margin-bottom:11px!important;font-size:0!important}
+.action .aico svg{width:100%;height:100%;display:block;overflow:visible}
+.action:nth-child(1) .aico{filter:drop-shadow(0 0 7px rgba(24,197,255,.35))}
+.action:nth-child(2) .aico{filter:drop-shadow(0 0 7px rgba(210,102,255,.35))}
+.action:nth-child(3) .aico{filter:drop-shadow(0 0 7px rgba(50,239,100,.32))}
+.action:nth-child(4) .aico{filter:drop-shadow(0 0 7px rgba(255,152,8,.32))}
+@media(max-width:430px){.action .aico{width:47px!important;height:47px!important;margin-bottom:9px!important}}
+@media(max-width:360px){.action .aico{width:42px!important;height:42px!important}}
+</style>
+
+
+<style id="v9-reference-icons">
+.mtab .ico,.nav .ic{display:inline-grid;place-items:center;flex:0 0 auto}
+.mtab .ico svg{width:20px;height:20px;display:block}
+.mtab.active .ico{filter:drop-shadow(0 0 5px currentColor)}
+.nav .ic svg{width:27px;height:27px;display:block}
+.nav button.active .ic{filter:drop-shadow(0 0 5px #8d55ff)}
+.action .aico svg{width:100%;height:100%;display:block}
+</style>
+
+
+<style id="v10-official-asset-logos">
+.coin.official-logo{padding:0!important;background:transparent!important;border:none!important;overflow:hidden!important}
+.coin.official-logo svg{display:block;width:100%;height:100%}
+</style>
+
+
+<style id="v11-full-ui-shell">
+.app-section{display:none}.app-section.active{display:block}
+.page-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:2px 0 12px}
+.page-head h1{font-size:18px;line-height:1.15;margin:0;font-weight:800}
+.page-head p{margin:4px 0 0;color:#8f9bae;font-size:10px}
+.page-chip{border:1px solid #2a3a51;border-radius:999px;padding:5px 8px;font-size:8px;color:#aab6c8;background:#081220;white-space:nowrap}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.module{padding:12px}
+.module-title{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:9px}
+.module-title b{font-size:11px}
+.module-title small{font-size:7px;color:#8c99ad}
+.placeholder{border:1px dashed #2b3b52;border-radius:10px;padding:18px 10px;text-align:center;color:#738097;font-size:9px;background:#050c16}
+.placeholder strong{display:block;color:#d9e0eb;font-size:10px;margin-bottom:3px}
+.status-pill{display:inline-flex;align-items:center;border:1px solid #3a4659;border-radius:999px;padding:3px 6px;font-size:7px;font-weight:800;letter-spacing:.5px;color:#b8c2d0}
+.status-pill.future{color:#c2a2ff;border-color:#60498d;background:#23163d}
+.status-pill.unavail{color:#ffc86a;border-color:#76591d;background:#2a1e08}
+.status-pill.ready{color:#55f681;border-color:#208444;background:#0d301a}
+.tool-card{padding:12px;min-height:92px;display:flex;flex-direction:column;justify-content:space-between}
+.tool-card .tool-name{font-size:11px;font-weight:750}
+.tool-card .tool-desc{font-size:8px;color:#8f9bae;line-height:1.35;margin-top:4px}
+.tool-card .tool-foot{display:flex;justify-content:space-between;align-items:center;margin-top:10px}
+.empty-chart{height:230px;position:relative;overflow:hidden}
+.empty-chart:before{content:"";position:absolute;inset:0;background:
+ linear-gradient(to bottom,transparent 24%,rgba(80,104,140,.14) 25%,transparent 26%,transparent 49%,rgba(80,104,140,.14) 50%,transparent 51%,transparent 74%,rgba(80,104,140,.14) 75%,transparent 76%),
+ linear-gradient(to right,transparent 19%,rgba(80,104,140,.10) 20%,transparent 21%,transparent 39%,rgba(80,104,140,.10) 40%,transparent 41%,transparent 59%,rgba(80,104,140,.10) 60%,transparent 61%,transparent 79%,rgba(80,104,140,.10) 80%,transparent 81%)}
+.empty-chart .chart-center{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:20px}
+.empty-chart .chart-center strong{font-size:12px}.empty-chart .chart-center span{display:block;color:#8694a8;font-size:8px;margin-top:4px}
+.filter-row{display:flex;gap:6px;overflow:auto;scrollbar-width:none;margin-bottom:9px}.filter-row::-webkit-scrollbar{display:none}
+.filter-chip{border:1px solid #26364d;background:#081220;color:#9eabbf;border-radius:999px;padding:6px 9px;font-size:8px;white-space:nowrap}
+.filter-chip.active{border-color:#7443e0;color:#c6a1ff;background:#241544}
+.timeline-list{display:flex;flex-direction:column;gap:6px}
+.timeline-item{display:grid;grid-template-columns:8px 1fr auto;gap:8px;align-items:start;padding:9px;border:1px solid #1f2d42;border-radius:10px;background:#06101c}
+.timeline-dot{width:8px;height:8px;border-radius:50%;background:#3f4d63;margin-top:3px}
+.timeline-item b{font-size:9px}.timeline-item p{margin:2px 0 0;color:#8794a8;font-size:7px}
+.metric-strip{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.metric-mini{padding:9px;border:1px solid #1f3047;border-radius:9px;background:#06101c}
+.metric-mini span{display:block;color:#8794a8;font-size:6.5px}.metric-mini b{display:block;font-size:11px;margin-top:3px}
+.setting-row{display:flex;align-items:center;justify-content:space-between;padding:11px 0;border-bottom:1px solid #1b293e}
+.setting-row:last-child{border-bottom:0}.setting-row b{font-size:9px}.setting-row small{display:block;color:#8794a8;font-size:7px;margin-top:2px}
+.switch-off{width:34px;height:19px;border-radius:999px;background:#172235;border:1px solid #2c3b51;position:relative}
+.switch-off:after{content:"";position:absolute;width:13px;height:13px;border-radius:50%;background:#6f7e93;left:2px;top:2px}
+@media(max-width:430px){
+ .grid-3{grid-template-columns:1fr 1fr}.grid-2{grid-template-columns:1fr}
+ .page-head h1{font-size:16px}.empty-chart{height:205px}
+ .metric-strip{grid-template-columns:1fr 1fr}
+}
+</style>
+
+
+<style id="v12-hyper-full">
+.subtabs{display:flex;gap:6px;overflow:auto;scrollbar-width:none;margin:8px 0 10px}.subtabs::-webkit-scrollbar{display:none}
+.subtab{border:1px solid #23334a;background:#07111d;color:#98a6b8;border-radius:8px;padding:7px 10px;font-size:8px;white-space:nowrap}
+.subtab.active{background:#241641;border-color:#7147c7;color:#dbc6ff}
+.section-stack{display:flex;flex-direction:column;gap:8px}
+.compact-table{width:100%;border-collapse:collapse;font-size:8px}
+.compact-table th,.compact-table td{padding:8px 6px;border-bottom:1px solid #17263a;text-align:left}
+.compact-table th{color:#738198;font-size:7px;font-weight:700}
+.compact-table td{color:#d7dfeb}
+.kv{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid #17263a;font-size:8px}.kv:last-child{border-bottom:0}
+.kv span{color:#8492a6}.kv b{color:#dce4ee;text-align:right}
+.scorebar{height:7px;border-radius:999px;background:#101d2e;overflow:hidden}.scorebar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#6f4eff,#2ad78f)}
+.pipeline{display:grid;grid-template-columns:repeat(4,1fr);gap:5px}
+.pipe{padding:8px;border:1px solid #22334b;border-radius:8px;background:#07111d;text-align:center;font-size:7px;color:#8492a6}
+.pipe b{display:block;color:#dce4ee;font-size:8px;margin-bottom:3px}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}.field{padding:9px;border:1px solid #22344d;border-radius:9px;background:#07111d}
+.field label{display:block;color:#7e8ca1;font-size:7px;margin-bottom:4px}.field .value{font-size:9px;color:#dce4ee}
+.btnline{display:flex;gap:6px;flex-wrap:wrap}.btn-lite{padding:7px 9px;border-radius:8px;border:1px solid #2a3d59;background:#0a1624;color:#b7c3d2;font-size:8px}
+.btn-lite.primary{border-color:#6f4de0;background:#241642;color:#d8c1ff}
+.btn-lite.danger{border-color:#68353a;background:#2b1116;color:#ff9ea7}
+.info-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:7px}
+.badge-row{display:flex;gap:5px;flex-wrap:wrap}
+.badge-soft{font-size:7px;border-radius:999px;padding:4px 6px;border:1px solid #2a3d57;background:#091522;color:#9fb0c4}
+.replay-box{border:1px solid #24354c;border-radius:10px;padding:10px;background:#06101b}
+.replay-row{display:grid;grid-template-columns:95px 1fr;gap:8px;padding:6px 0;border-bottom:1px solid #18283b;font-size:8px}.replay-row:last-child{border-bottom:0}
+.replay-row span{color:#7f8da2}.replay-row b{color:#dbe4ee}
+.journal-card{padding:10px;border:1px solid #203149;border-radius:10px;background:#06101b}
+.journal-card h4{font-size:9px;margin:0 0 5px}.journal-card p{font-size:7px;color:#8997aa;margin:0}
+.help-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:7px}
+.help-card{padding:10px;border:1px solid #21324a;border-radius:10px;background:#06101b}.help-card b{font-size:8px}.help-card p{font-size:7px;color:#8391a5;line-height:1.35}
+@media(max-width:430px){.pipeline{grid-template-columns:1fr 1fr}.form-grid,.info-grid,.help-grid{grid-template-columns:1fr}}
+</style>
+
 </head>
 <body>
-  <header class="header">
-    <div class="header__row">
-      <div class="brand">Crypto Intelligence Engine<small>Markets · version de test</small></div>
-      <div class="hdot"><span class="dot unk" id="health-dot"></span><span id="health-label">…</span></div>
-    </div>
-    <div class="refresh"><span class="spark"></span><span>Auto-refresh: 5s (polling, pas de streaming)</span></div>
-  </header>
+<header class="header">
+ <div class="header-row">
+  <button class="hamb" aria-label="Menu">☰</button>
+  <div class="brandline"><div class="logo">↗</div><div class="brand">Crypto Intelligence Engine<small>Markets · version de test</small></div></div>
+  <div class="health"><span class="dot" id="health-dot"></span><span id="health-label">…</span></div>
+  <button class="bell" aria-label="Notifications">♧</button>
+ </div>
+ <div style="font-size:8px;color:#74839a;padding:2px 14px 5px">Auto-refresh · 5s (polling, pas de streaming)</div>
+</header>
+<div class="market-tabs-wrap"><div class="market-tabs-scroll"><div class="market-tabs">
+ <button class="mtab active" data-mtab="dashboard" onclick="setView('dashboard')"><span class="ico">⌂</span>Vue d'ensemble</button>
+ <button class="mtab crypto" data-mtab="markets" onclick="setView('markets')"><span class="ico">₿</span>Crypto</button>
+ <button class="mtab forex" data-mtab="forex" onclick="setView('forex')"><span class="ico">$</span>Forex</button>
+ <button class="mtab metals" data-mtab="metal" onclick="setView('metal')"><span class="ico">▰</span>Métaux</button>
+ <button class="mtab indices" data-mtab="index" onclick="setView('index')"><span class="ico">▥</span>Indices</button>
+</div></div></div>
+<main>
+ <section class="view active" id="view-dashboard" data-view="dashboard"></section>
+ <section class="view" id="view-markets" data-view="markets"></section>
+ <section class="view" id="view-forex" data-view="forex"></section>
+ <section class="view" id="view-metal" data-view="metal"></section>
+ <section class="view" id="view-index" data-view="index"></section>
+ <section class="view" id="view-system" data-view="system"></section>
+ <section class="view" id="view-detail" data-view="detail"></section>
 
-  <main>
-    <section class="view active" id="view-markets" data-view="markets"></section>
-    <section class="view" id="view-forex" data-view="forex"></section>
-    <section class="view" id="view-metal" data-view="metal"></section>
-    <section class="view" id="view-index" data-view="index"></section>
-    <section class="view" id="view-system" data-view="system"></section>
-    <section class="view" id="view-detail" data-view="detail"></section>
-  </main>
+<section class="view" id="view-signals" data-view="signals"></section>
+<section class="view" id="view-trading" data-view="trading"></section>
+<section class="view" id="view-strategies" data-view="strategies"></section>
+<section class="view" id="view-intelligence" data-view="intelligence"></section>
+<section class="view" id="view-settings" data-view="settings"></section>
 
-  <nav class="nav" id="nav"></nav>
+</main>
+<nav class="nav" id="nav"></nav>
+<script>
+"use strict";
+var POLL_MS=5000;
+const REAL_ASSET_VIEWS=[{id:"metal"},{id:"index"}];
+var CRYPTO_SYMBOLS=["BTC-USD","ETH-USD","SOL-USD","XRP-USD","LTC-USD","ADA-USD"];
+var current="dashboard",detailCtx=null;
 
-  <script>
-  "use strict";
-  // ---- Views registry (ids used by static tests) --------------------------
-  var VIEWS = [
-    { id:"markets", label:"Crypto", icon:"₿" },
-    { id:"forex",   label:"Forex",  icon:"$" },
-    { id:"metal",   label:"Métaux", icon:"◆" },
-    { id:"index",   label:"Indices", icon:"▤" },
-    { id:"system",  label:"Système", icon:"◔" }
-    // id:"detail" is an internal view (asset detail), not a bottom tab
-  ];
-  var DETAIL_VIEW = { id:"detail" };
+const ICONS={"overview": "<svg viewBox=\"0 0 32 32\"><path d=\"M5 15.5 16 6l11 9.5V27h-8v-7h-6v7H5z\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" stroke-linejoin=\"round\"/></svg>", "crypto": "<svg viewBox=\"0 0 32 32\"><circle cx=\"16\" cy=\"16\" r=\"13\" fill=\"currentColor\"/><path d=\"M14 7v18m4-18v3m0 12v3M11 11h7c5 0 5 6 0 6h-7m0 0h8c5 0 5 7 0 7h-8\" fill=\"none\" stroke=\"#07101d\" stroke-width=\"2.2\" stroke-linecap=\"round\"/></svg>", "forex": "<svg viewBox=\"0 0 32 32\"><path d=\"M19.5 7.5c-1.2-1.1-2.8-1.7-4.5-1.7-3.4 0-6 1.9-6 4.7 0 6.8 12.5 2.8 12.5 9.4 0 3.2-2.8 5.3-6.4 5.3-2.2 0-4.3-.8-5.7-2.3M15.2 3v26\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.7\" stroke-linecap=\"round\"/></svg>", "metal": "<svg viewBox=\"0 0 36 32\"><path d=\"M3 23h12l3-9H7zM18 23h15l-4-11H22zM11 12h12l-3-8h-6z\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.4\" stroke-linejoin=\"round\"/></svg>", "indices": "<svg viewBox=\"0 0 32 32\"><path d=\"M6 27V15h5v12M14 27V8h5v19M22 27V4h5v23\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.3\" stroke-linejoin=\"round\"/></svg>", "scanner": "<svg viewBox=\"0 0 64 64\"><circle cx=\"30\" cy=\"32\" r=\"23\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"4\"/><circle cx=\"30\" cy=\"32\" r=\"12\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"4\"/><circle cx=\"30\" cy=\"32\" r=\"4\" fill=\"currentColor\"/><path d=\"M30 32 48 14M42 13h7v7\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"4\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>", "signals": "<svg viewBox=\"0 0 64 64\"><circle cx=\"29\" cy=\"32\" r=\"22\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"4\"/><circle cx=\"29\" cy=\"32\" r=\"11\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"4\"/><circle cx=\"29\" cy=\"32\" r=\"4\" fill=\"currentColor\"/><path d=\"M29 32 47 14M41 13h7v7M51 33v13m-6-6.5h12\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"4\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>", "charts": "<svg viewBox=\"0 0 64 64\"><g fill=\"none\" stroke=\"currentColor\" stroke-width=\"3.5\"><path d=\"M16 7v50M32 5v54M48 10v47\"/><rect x=\"11\" y=\"20\" width=\"10\" height=\"23\" rx=\"1\"/><rect x=\"27\" y=\"16\" width=\"10\" height=\"28\" rx=\"1\"/><rect x=\"43\" y=\"22\" width=\"10\" height=\"20\" rx=\"1\"/></g></svg>", "paper": "<svg viewBox=\"0 0 64 64\"><g fill=\"none\" stroke=\"currentColor\" stroke-width=\"3.8\" stroke-linejoin=\"round\"><rect x=\"8\" y=\"20\" width=\"48\" height=\"32\" rx=\"5\"/><path d=\"M21 20v-5c0-3 2-5 5-5h12c3 0 5 2 5 5v5M8 31h48\"/><rect x=\"27\" y=\"28\" width=\"10\" height=\"7\" rx=\"1\"/></g></svg>", "home": "<svg viewBox=\"0 0 32 32\"><path d=\"M4 15 16 5l12 10v13h-8v-8h-8v8H4z\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.4\" stroke-linejoin=\"round\"/></svg>", "markets": "<svg viewBox=\"0 0 32 32\"><path d=\"M5 27V17h4v10M14 27V8h4v19M23 27V13h4v14\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.3\"/></svg>", "trading": "<svg viewBox=\"0 0 32 32\"><circle cx=\"16\" cy=\"16\" r=\"11\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.2\"/><path d=\"M16 5v11h11M16 16 9 25\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.2\" stroke-linejoin=\"round\"/></svg>", "strategies": "<svg viewBox=\"0 0 36 32\"><path d=\"M2 19h7l4-11 7 19 5-14 4 6h5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>", "settings": "<svg viewBox=\"0 0 32 32\"><path d=\"m13 4 1-2h4l1 2 3 1 2-1 3 3-1 2 1 3 2 1v4l-2 1-1 3 1 2-3 3-2-1-3 1-1 2h-4l-1-2-3-1-2 1-3-3 1-2-1-3-2-1v-4l2-1 1-3-1-2 3-3 2 1z\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\"/><circle cx=\"16\" cy=\"15\" r=\"5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/></svg>"};
+function iconSvg(name){return ICONS[name]||''}
+const ASSET_LOGOS={"BTC": "<svg viewBox=\"0 0 48 48\" aria-hidden=\"true\"><circle cx=\"24\" cy=\"24\" r=\"23\" fill=\"#F7931A\"/><path d=\"M31.4 20.2c.5-3.4-2.1-5.2-5.7-6.4l1.2-4.7-2.9-.7-1.1 4.6-2.3-.5 1.2-4.6-2.9-.7-1.2 4.7-1.8-.4-4-.9-.8 3.1s2.1.5 2.1.5c1.2.3 1.4 1.1 1.3 1.8l-1.3 5.3.3.1-.3-.1-1.9 7.4c-.1.4-.5 1-1.3.8 0 0-2.1-.5-2.1-.5l-1.4 3.4 3.8 1 2.1.5-1.2 4.8 2.9.7 1.2-4.7 2.3.6-1.2 4.7 2.9.7 1.2-4.8c5 .9 8.8.5 10.4-4 1.3-3.6-.1-5.7-2.7-7.1 1.9-.4 3.4-1.7 3.8-4.4zm-6.8 9.6c-.9 3.6-7 1.7-9 1.2l1.6-6.4c2 .5 8.3 1.5 7.4 5.2zm.9-9.7c-.8 3.3-5.9 1.6-7.6 1.2l1.5-5.8c1.7.4 6.9 1.2 6.1 4.6z\" fill=\"#fff\"/></svg>", "ETH": "<svg viewBox=\"0 0 48 48\" aria-hidden=\"true\"><circle cx=\"24\" cy=\"24\" r=\"23\" fill=\"#627EEA\"/><path d=\"M24 7v12.6l10.6 4.7L24 7z\" fill=\"#fff\" fill-opacity=\".62\"/><path d=\"M24 7 13.4 24.3 24 19.6V7z\" fill=\"#fff\"/><path d=\"m24 32.5 10.6-6.1L24 41V32.5z\" fill=\"#fff\" fill-opacity=\".62\"/><path d=\"M24 41 13.4 26.4 24 32.5V41z\" fill=\"#fff\"/><path d=\"m24 30.5 10.6-6.2L24 19.6v10.9z\" fill=\"#fff\" fill-opacity=\".28\"/><path d=\"m13.4 24.3 10.6 6.2V19.6l-10.6 4.7z\" fill=\"#fff\" fill-opacity=\".82\"/></svg>", "SOL": "<svg viewBox=\"0 0 48 48\" aria-hidden=\"true\"><circle cx=\"24\" cy=\"24\" r=\"23\" fill=\"#050A0F\"/><defs><linearGradient id=\"solg\" x1=\"10\" y1=\"38\" x2=\"38\" y2=\"10\"><stop stop-color=\"#9945FF\"/><stop offset=\".5\" stop-color=\"#14F195\"/><stop offset=\"1\" stop-color=\"#00D1FF\"/></linearGradient></defs><path d=\"M14 12h23l-5 5H9l5-5zm-5 13h23l5-5H14l-5 5zm5 3h23l-5 5H9l5-5z\" fill=\"url(#solg)\"/></svg>", "XRP": "<svg viewBox=\"0 0 48 48\" aria-hidden=\"true\"><circle cx=\"24\" cy=\"24\" r=\"23\" fill=\"#111820\"/><path d=\"M12 13h6.2c1.7 0 3.3.7 4.5 1.9L24 16.2l1.3-1.3c1.2-1.2 2.8-1.9 4.5-1.9H36l-8.9 8.9a4.4 4.4 0 0 1-6.2 0L12 13zm24 22h-6.2c-1.7 0-3.3-.7-4.5-1.9L24 31.8l-1.3 1.3a6.3 6.3 0 0 1-4.5 1.9H12l8.9-8.9a4.4 4.4 0 0 1 6.2 0L36 35z\" fill=\"#fff\"/></svg>", "LTC": "<svg viewBox=\"0 0 48 48\" aria-hidden=\"true\"><circle cx=\"24\" cy=\"24\" r=\"23\" fill=\"#345D9D\"/><path d=\"m27 9-4.2 15.7-5.1 1.9-1.1 4 5-1.8-2 7.2h16l1.2-4.5h-9.6l1.5-5.5 5-1.8 1.1-4-5 1.8L33.3 9H27z\" fill=\"#fff\"/></svg>", "ADA": "<svg viewBox=\"0 0 48 48\" aria-hidden=\"true\"><circle cx=\"24\" cy=\"24\" r=\"23\" fill=\"#0033AD\"/><g fill=\"#fff\"><circle cx=\"24\" cy=\"24\" r=\"3\"/><circle cx=\"24\" cy=\"13\" r=\"1.8\"/><circle cx=\"24\" cy=\"35\" r=\"1.8\"/><circle cx=\"13\" cy=\"24\" r=\"1.8\"/><circle cx=\"35\" cy=\"24\" r=\"1.8\"/><circle cx=\"16.2\" cy=\"16.2\" r=\"1.5\"/><circle cx=\"31.8\" cy=\"16.2\" r=\"1.5\"/><circle cx=\"16.2\" cy=\"31.8\" r=\"1.5\"/><circle cx=\"31.8\" cy=\"31.8\" r=\"1.5\"/><circle cx=\"9.5\" cy=\"18.5\" r=\"1\"/><circle cx=\"38.5\" cy=\"18.5\" r=\"1\"/><circle cx=\"9.5\" cy=\"29.5\" r=\"1\"/><circle cx=\"38.5\" cy=\"29.5\" r=\"1\"/><circle cx=\"18.5\" cy=\"9.5\" r=\"1\"/><circle cx=\"29.5\" cy=\"9.5\" r=\"1\"/><circle cx=\"18.5\" cy=\"38.5\" r=\"1\"/><circle cx=\"29.5\" cy=\"38.5\" r=\"1\"/></g></svg>", "XAU": "<svg viewBox=\"0 0 48 48\" aria-hidden=\"true\"><circle cx=\"24\" cy=\"24\" r=\"23\" fill=\"#E8A900\"/><path d=\"M10 29h12l3-8H13l-3 8zm16 0h13l-3-8H29l-3 8zm-9-10h14l-3-8h-8l-3 8z\" fill=\"#fff\"/></svg>", "US30": "<svg viewBox=\"0 0 48 48\" aria-hidden=\"true\"><defs><clipPath id=\"usc\"><circle cx=\"24\" cy=\"24\" r=\"23\"/></clipPath></defs><g clip-path=\"url(#usc)\"><rect width=\"48\" height=\"48\" fill=\"#fff\"/><path d=\"M0 4h48v4H0zm0 8h48v4H0zm0 8h48v4H0zm0 8h48v4H0zm0 8h48v4H0zm0 8h48v4H0z\" fill=\"#D82935\"/><rect width=\"24\" height=\"26\" fill=\"#21468B\"/><g fill=\"#fff\" font-size=\"4\"><text x=\"3\" y=\"6\">★ ★ ★</text><text x=\"3\" y=\"12\"> ★ ★ ★</text><text x=\"3\" y=\"18\">★ ★ ★</text><text x=\"3\" y=\"24\"> ★ ★ ★</text></g></g></svg>"};
+function assetLogo(name){return ASSET_LOGOS[name]||''}
+function h(tag,attrs,kids){var e=document.createElement(tag);attrs=attrs||{};for(var k in attrs){if(k==="class")e.className=attrs[k];else if(k==="html")e.innerHTML=attrs[k];else if(k.slice(0,2)==="on"&&typeof attrs[k]==="function")e.addEventListener(k.slice(2),attrs[k]);else if(attrs[k]!==null)e.setAttribute(k,attrs[k]);}(kids||[]).forEach(function(c){if(c==null)return;e.appendChild(typeof c==="string"?document.createTextNode(c):c)});return e}
+function clear(n){while(n&&n.firstChild)n.removeChild(n.firstChild)}function byId(id){return document.getElementById(id)}
+function api(path){var ctrl=new AbortController(),to=setTimeout(function(){ctrl.abort()},8000);return fetch(path,{headers:{"Accept":"application/json"},signal:ctrl.signal}).then(function(res){clearTimeout(to);return res.text().then(function(txt){var data=null;try{data=txt?JSON.parse(txt):null}catch(e){}return{ok:res.ok,status:res.status,data:data}})}).catch(function(err){clearTimeout(to);return{ok:false,status:0,data:null,netError:err&&err.name==="AbortError"?"timeout":"network"}})}
+function errorMessage(r){if(r.netError==="timeout")return"Délai dépassé.";if(r.netError==="network")return"Backend inaccessible depuis cet aperçu.";var reason=(r.data&&(r.data.reason||(r.data.detail&&r.data.detail.reason)))||null;if(r.status===403)return"Accès refusé au provider.";if(r.status===429)return"Trop de requêtes.";if(r.status===503)return reason||"Provider indisponible.";return reason||("Erreur ("+r.status+").")}
+function fmtNum(v){if(v===null||v===undefined||v===""||isNaN(Number(v)))return null;var n=Number(v),a=Math.abs(n),d=a>=1000?2:a>=1?4:6;return n.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:d})}
+function priceCell(v){var s=fmtNum(v);return s===null?h("span",{class:"na"},["—"]):document.createTextNode(s)}
+function qualityBadge(q){var map={VALID:["LIVE","b-live"],STALE:["STALE","b-stale"],INVALID:["INVALID","b-invalid"],MISSING:["NO DATA","b-missing"],UNKNOWN:["UNKNOWN","b-unknown"],NOT_MAPPED:["NOT MAPPED","b-notmapped"],MAPPED:["MAPPED","b-mapped"],DESYNC:["DESYNC","b-desync"]};var m=map[q]||["UNKNOWN","b-unknown"];return h("span",{class:"badge "+m[1]},[m[0]])}
+var montrealFormatter=new Intl.DateTimeFormat("fr-CA",{timeZone:"America/Toronto",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false});
+var utcFormatter=new Intl.DateTimeFormat("fr-CA",{timeZone:"UTC",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false});
+function formatMontrealTime(v){var d=new Date(v);return isNaN(d.getTime())?"—":montrealFormatter.format(d)}
+function formatUtcTime(v){var d=new Date(v);return isNaN(d.getTime())?"—":utcFormatter.format(d)+" UTC"}
+function fxCountdown(iso){if(!iso)return"";var t=Date.parse(iso);if(isNaN(t))return"";var s=Math.max(0,Math.round((t-Date.now())/1000)),d=Math.floor(s/86400),hh=Math.floor((s%86400)/3600),mm=Math.floor((s%3600)/60);return(d?d+" j ":"")+(hh?hh+" h ":"")+mm+" min"}
+function loading(t){return h("div",{class:"state"},[h("span",{class:"spin"})," "+(t||"Chargement…")])}
+function emptyState(t,s){return h("div",{class:"state"},[h("strong",{},[t]),s||""])}
 
-  // ---- Config (NO backend URL hardcoded: same-origin relative calls) ------
-  var CRYPTO_SYMBOLS = ["BTC-USD","ETH-USD","SOL-USD","XRP-USD","LTC-USD","ADA-USD"];
-  var POLL_MS = 5000;
+function refreshHealth(){return api("/health").then(function(r){var dot=byId("health-dot"),lab=byId("health-label");dot.className="dot";if(!r.ok||!r.data){dot.className="dot down";lab.textContent="backend indisponible";return}var o=r.data.overall||"UNKNOWN";dot.className="dot "+(o==="UP"?"up":o==="DEGRADED"?"deg":o==="DOWN"?"down":"");lab.textContent="backend "+o.toLowerCase()})}
 
-  // ---- Tiny DOM helpers ---------------------------------------------------
-  function h(tag, attrs, kids){
-    var e = document.createElement(tag); attrs = attrs || {};
-    for (var k in attrs){
-      if (k === "class") e.className = attrs[k];
-      else if (k === "html") e.innerHTML = attrs[k];
-      else if (k.slice(0,2) === "on") e.addEventListener(k.slice(2), attrs[k]);
-      else e.setAttribute(k, attrs[k]);
-    }
-    (kids||[]).forEach(function(c){
-      if (c == null) return;
-      e.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-    });
-    return e;
-  }
-  function clear(node){ while(node.firstChild) node.removeChild(node.firstChild); }
-  function byId(id){ return document.getElementById(id); }
+function iconFor(sym){var cls=sym==="BTC-USD"?"btc":sym==="ETH-USD"?"eth":sym==="SOL-USD"?"sol":sym==="XAU-USD"?"gold":"idx";var tx=sym==="BTC-USD"?"₿":sym==="ETH-USD"?"◆":sym==="SOL-USD"?"S":sym==="XAU-USD"?"Au":"I";return h("span",{class:"coin "+cls},[tx])}
+function miniPlaceholder(){return h("div",{class:"mini",html:'<svg viewBox="0 0 100 30" preserveAspectRatio="none"><path d="M0 18 L15 18 L30 18 L45 18 L60 18 L75 18 L100 18" fill="none" stroke="#314057" stroke-width="1.3" stroke-dasharray="3 4"/></svg>'})}
+function favRow(sym,name,kind){
+ var p="fav-p-"+sym,b="fav-b-"+sym;
+ return h("div",{class:"frow",onclick:function(){openDetail(kind,sym)}},[
+  h("div",{class:"asset"},[h("span",{class:"star"},["★"]),iconFor(sym),h("div",{},[h("div",{class:"sym"},[sym]),h("div",{class:"aname"},[name])])]),
+  h("div",{},[h("div",{class:"fprice",id:p},["…"]),h("div",{class:"fsmall"},[" "])]),
+  h("div",{class:"change"},["—"]),
+  h("div",{class:"quality",id:b},[]),
+  miniPlaceholder(),h("div",{class:"chev"},["›"])
+ ])
+}
+function kpi(label,value,foot,cls){return h("div",{class:"card kpi"},[h("div",{class:"klabel"},[label]),h("div",{class:"kvalue "+(cls||"")},[value]),h("div",{class:"kfooter"},[foot])])}
 
-  // ---- API client: relative, same-origin, timeout + honest error mapping --
-  function api(path){
-    var ctrl = new AbortController();
-    var to = setTimeout(function(){ ctrl.abort(); }, 8000);
-    return fetch(path, { headers:{ "Accept":"application/json" }, signal: ctrl.signal })
-      .then(function(res){
-        clearTimeout(to);
-        return res.text().then(function(txt){
-          var data = null; try { data = txt ? JSON.parse(txt) : null; } catch(e){ data = null; }
-          return { ok: res.ok, status: res.status, data: data };
-        });
-      })
-      .catch(function(err){
-        clearTimeout(to);
-        var net = (err && err.name === "AbortError") ? "timeout" : "network";
-        return { ok:false, status:0, data:null, netError: net };
-      });
-  }
-  // Map a non-ok response to a human message from the REAL backend reason.
-  function errorMessage(r){
-    if (r.netError === "timeout") return "Délai dépassé — réseau lent ou backend indisponible.";
-    if (r.netError === "network") return "Réseau indisponible — impossible de joindre le backend.";
-    var reason = (r.data && (r.data.reason || (r.data.detail && r.data.detail.reason))) || null;
-    switch (r.status){
-      case 400: return reason || "Requête invalide.";
-      case 401:
-      case 403: return "Accès refusé au provider.";
-      case 409: return reason || "Symbole non mappé.";
-      case 429: return "Trop de requêtes — réessayez dans un instant.";
-      case 503: return reason || "Provider temporairement indisponible.";
-    }
-    if (r.status >= 500) return "Erreur serveur.";
-    return reason || ("Erreur (" + r.status + ").");
-  }
+function renderDashboard(){
+ var v=byId("view-dashboard");clear(v);
+ v.appendChild(h("div",{class:"kpis"},[
+  kpi("Marché","…","Crypto · Forex · Métaux · Indices","green"),
+  kpi("Signaux actifs","—","NOT IMPLEMENTED"),
+  kpi("Capital virtuel","—","NOT IMPLEMENTED"),
+  kpi("Exposition","—","NOT IMPLEMENTED")
+ ]));
+ v.appendChild(h("div",{class:"card hours",id:"dash-hours"},[loading("État du marché…")]));
+ var fav=h("div",{class:"card fav"},[
+  h("div",{class:"favhead"},[h("b",{},["MARCHÉS FAVORIS"]),h("span",{},["Voir tout"])]),
+  h("div",{class:"favcols"},[h("span",{},["Actif"]),h("span",{},["Prix"]),h("span",{},["Variation 24h"]),h("span",{},["Qualité"]),h("span",{},["Mini graphique"]),h("span",{},[""])])
+ ]);
+ fav.appendChild(favRow("BTC-USD","Bitcoin","crypto"));fav.appendChild(favRow("ETH-USD","Ethereum","crypto"));fav.appendChild(favRow("SOL-USD","Solana","crypto"));fav.appendChild(favRow("XAU-USD","Gold Spot","metal"));fav.appendChild(favRow("US30","Dow Jones 30","index"));v.appendChild(fav);
+ v.appendChild(h("div",{class:"actions"},[
+  h("div",{class:"card action",onclick:function(){setView("intelligence")}},[h("div",{class:"aico blue",html:iconSvg("scanner")},[]),h("b",{},["Scanner"]),h("span",{class:"blue"},["Opportunités"])]),
+  h("div",{class:"card action",onclick:function(){setView("signals")}},[h("div",{class:"aico purple",html:iconSvg("signals")},[]),h("b",{},["Signaux"]),h("span",{class:"purple"},["À venir"])]),
+  h("div",{class:"card action",onclick:function(){if(detailCtx){setView("detail")}else{setView("markets")}}},[h("div",{class:"aico green",html:iconSvg("charts")},[]),h("b",{},["Graphiques"]),h("span",{class:"green"},["À venir"])]),
+  h("div",{class:"card action",onclick:function(){setView("trading")}},[h("div",{class:"aico orange",html:iconSvg("paper")},[]),h("b",{},["Paper Trading"]),h("span",{class:"orange"},["À venir"])])
+ ]));
+ v.appendChild(h("div",{class:"note"},["Les champs non implémentés restent vides : aucune donnée inventée."]));
+ refreshDashboard()
+}
 
-  // ---- Formatting (never NaN / undefined) ---------------------------------
-  function fmtNum(v){
-    if (v === null || v === undefined || v === "" || isNaN(Number(v))) return null;
-    var n = Number(v);
-    var abs = Math.abs(n);
-    var d = abs >= 1000 ? 2 : abs >= 1 ? 4 : 6;
-    return n.toLocaleString("en-US", { minimumFractionDigits:2, maximumFractionDigits:d });
-  }
-  function priceCell(v){
-    var s = fmtNum(v);
-    return s === null ? h("span",{class:"na"},["—"]) : document.createTextNode(s);
-  }
-  // Quality (backend) -> display badge. Only real backend states are used.
-  function qualityBadge(q){
-    var map = {
-      VALID:["LIVE","b-live"], STALE:["STALE","b-stale"], INVALID:["INVALID","b-invalid"],
-      MISSING:["NO DATA","b-missing"], UNKNOWN:["UNKNOWN","b-unknown"],
-      NOT_MAPPED:["NOT MAPPED","b-notmapped"], MAPPED:["MAPPED","b-mapped"],
-      DESYNC:["DESYNC","b-desync"]
-    };
-    var m = map[q] || ["UNKNOWN","b-unknown"];
-    return h("span",{class:"badge "+m[1]},[m[0]]);
-  }
-  function tsAgo(iso){
-    if (!iso) return "";
-    var t = Date.parse(iso); if (isNaN(t)) return "";
-    var s = Math.max(0, Math.round((Date.now()-t)/1000));
-    return s < 90 ? (s+"s") : (Math.round(s/60)+"min");
-  }
-  // ---- Time display: backend stays UTC; UI shows Montreal local time. --------
-  // America/Toronto with Intl -> the seasonal DST offset is handled automatically,
-  // never hardcoded. Formatters are built once and reused.
-  var montrealFormatter = new Intl.DateTimeFormat("fr-CA", {
-    timeZone: "America/Toronto", year:"numeric", month:"2-digit", day:"2-digit",
-    hour:"2-digit", minute:"2-digit", hour12:false
+function worldSvg(){ return '<svg viewBox="0 0 560 230" preserveAspectRatio="xMidYMid meet" aria-hidden="true"><defs><pattern id="realDotsPurple" width="5" height="5" patternUnits="userSpaceOnUse"><circle cx="1.5" cy="1.5" r=".8" fill="#7456ff"/></pattern><pattern id="realDotsBlue" width="5" height="5" patternUnits="userSpaceOnUse"><circle cx="1.5" cy="1.5" r=".8" fill="#138eea"/></pattern><pattern id="realDotsGreen" width="5" height="5" patternUnits="userSpaceOnUse"><circle cx="1.5" cy="1.5" r=".8" fill="#16bc50"/></pattern><filter id="realGlowPurple"><feGaussianBlur stdDeviation="1.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter><filter id="realGlowBlue"><feGaussianBlur stdDeviation="1.1" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter><filter id="realGlowGreen"><feGaussianBlur stdDeviation="1.1" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><g opacity=".96"><path d="M 0.0,21.4 L 7.4,23.6 L 9.4,26.0 L 8.4,24.6 L 9.9,24.5 L 13.0,24.7 L 16.1,26.1 L 14.7,26.9 L 13.3,26.6 L 13.9,27.2 L 10.9,26.8 L 12.3,27.1 L 10.6,28.3 L 12.1,28.9 L 10.7,29.2 L 9.9,29.0 L 7.1,28.3 L 5.5,27.0 L 2.4,27.2 L 2.4,25.7 L 1.0,25.8 L 1.1,27.1 L 0.0,27.8 L 0.0,21.4 Z M 153.9,120.2 L 155.7,119.3 L 156.3,120.0 L 154.8,121.2 L 155.6,122.4 L 154.9,122.8 L 153.9,121.7 L 153.2,122.0 L 152.8,121.2 L 151.3,121.0 L 150.3,120.3 L 148.2,118.3 L 147.3,117.8 L 148.0,118.6 L 146.7,118.4 L 146.7,117.0 L 143.6,113.5 L 144.0,112.7 L 142.0,112.9 L 138.0,111.8 L 133.3,108.2 L 129.8,109.0 L 122.8,106.3 L 121.4,105.2 L 119.0,104.6 L 115.9,101.8 L 116.3,100.9 L 116.4,99.5 L 115.2,97.1 L 112.0,94.2 L 109.8,92.5 L 110.3,91.5 L 108.1,89.9 L 108.1,88.9 L 107.2,88.8 L 105.5,87.1 L 104.1,83.4 L 101.2,82.3 L 101.8,85.4 L 104.5,88.0 L 104.7,89.1 L 106.6,91.1 L 107.8,94.7 L 109.2,95.2 L 109.7,96.6 L 108.9,97.1 L 108.4,96.0 L 105.5,93.9 L 105.4,91.9 L 104.0,90.4 L 103.2,90.8 L 101.1,89.1 L 102.7,89.3 L 102.6,88.0 L 100.0,85.8 L 97.3,80.1 L 95.6,78.8 L 92.3,77.9 L 92.3,77.0 L 89.6,73.6 L 89.5,72.6 L 90.2,73.2 L 89.8,72.2 L 88.6,72.3 L 87.5,70.8 L 86.5,68.3 L 87.0,66.6 L 86.2,64.3 L 87.1,58.8 L 88.0,58.7 L 87.0,58.7 L 87.4,57.5 L 86.0,55.2 L 89.0,55.6 L 88.4,56.9 L 89.3,56.0 L 88.8,57.4 L 89.9,56.7 L 89.5,54.6 L 88.4,54.2 L 88.4,53.1 L 87.2,53.4 L 87.8,53.1 L 87.3,52.3 L 86.7,53.0 L 85.9,52.6 L 86.6,51.7 L 85.4,52.0 L 85.8,51.0 L 85.4,51.9 L 84.5,51.9 L 83.5,51.5 L 84.7,50.9 L 83.7,51.4 L 81.6,50.9 L 83.0,50.6 L 81.2,50.7 L 82.3,50.4 L 81.2,50.4 L 82.1,49.8 L 81.4,50.2 L 82.4,48.2 L 81.1,49.0 L 80.2,48.8 L 81.2,48.1 L 79.4,46.7 L 80.7,46.8 L 79.7,46.7 L 79.8,46.0 L 78.8,47.0 L 77.6,46.1 L 78.5,45.6 L 77.0,45.4 L 77.8,45.5 L 77.1,44.9 L 78.3,44.4 L 77.5,44.2 L 77.9,42.8 L 77.6,43.8 L 76.4,44.7 L 76.7,43.1 L 76.2,42.5 L 74.4,43.4 L 75.5,42.3 L 72.2,40.8 L 73.0,40.5 L 72.1,39.9 L 73.3,40.3 L 72.2,39.8 L 71.5,39.3 L 72.0,38.5 L 71.3,39.1 L 70.3,38.8 L 69.5,37.0 L 69.9,39.0 L 68.6,38.8 L 68.2,37.7 L 66.8,37.7 L 68.4,38.8 L 67.4,39.1 L 62.4,36.9 L 63.0,36.2 L 63.3,36.9 L 64.0,36.5 L 63.0,36.0 L 61.7,36.6 L 60.0,35.9 L 55.6,36.1 L 54.6,35.4 L 53.0,35.4 L 51.9,35.0 L 52.8,34.8 L 51.7,34.7 L 52.4,34.3 L 50.7,34.7 L 50.0,34.8 L 50.2,34.0 L 48.7,34.9 L 49.9,35.4 L 49.1,36.2 L 47.6,35.9 L 47.1,36.7 L 44.0,37.5 L 45.2,36.5 L 43.8,36.5 L 44.5,35.0 L 46.1,34.4 L 48.3,34.8 L 46.5,34.2 L 48.0,33.7 L 45.8,33.9 L 40.2,37.2 L 41.6,38.0 L 40.1,39.2 L 37.9,39.8 L 31.7,43.4 L 29.2,43.8 L 28.1,44.2 L 27.0,43.9 L 25.9,44.7 L 28.3,42.9 L 30.7,43.1 L 30.6,42.2 L 35.2,40.3 L 34.9,38.8 L 36.0,37.7 L 33.9,38.4 L 33.4,37.6 L 32.8,38.8 L 30.6,37.7 L 27.8,38.4 L 28.7,37.6 L 27.7,35.9 L 24.7,36.4 L 24.1,35.2 L 25.8,34.9 L 23.1,34.6 L 21.6,33.7 L 24.2,30.9 L 26.0,31.2 L 27.5,30.3 L 29.3,30.4 L 30.0,29.8 L 28.7,28.9 L 29.9,28.4 L 28.4,28.2 L 26.8,29.0 L 26.2,28.5 L 21.4,28.6 L 20.3,27.7 L 21.7,27.5 L 18.5,26.8 L 24.3,25.3 L 25.3,26.2 L 29.4,26.1 L 27.3,24.7 L 28.6,25.6 L 30.8,25.5 L 28.8,25.4 L 28.5,24.6 L 25.4,24.5 L 24.6,23.6 L 20.5,22.4 L 21.4,21.6 L 25.0,21.4 L 28.1,19.2 L 30.9,18.7 L 31.6,18.4 L 34.5,18.3 L 36.6,17.4 L 38.0,17.8 L 37.3,18.5 L 38.8,17.9 L 40.2,18.5 L 43.1,18.3 L 44.8,19.1 L 57.2,19.5 L 69.5,21.9 L 68.4,21.0 L 70.8,20.2 L 71.2,20.9 L 73.1,20.8 L 78.3,19.3 L 76.4,20.9 L 81.7,19.5 L 80.8,18.8 L 84.8,20.8 L 86.3,19.4 L 86.5,20.8 L 90.4,20.0 L 97.9,21.6 L 101.1,21.6 L 102.8,22.3 L 100.7,22.7 L 106.0,23.5 L 108.8,23.0 L 112.1,24.2 L 111.2,24.5 L 113.2,25.7 L 112.4,24.7 L 113.5,24.9 L 112.0,23.4 L 115.5,22.0 L 112.7,22.7 L 110.7,22.6 L 114.8,21.4 L 116.7,22.7 L 119.2,22.7 L 121.0,23.6 L 126.2,23.5 L 126.7,22.8 L 128.6,23.8 L 127.5,23.1 L 126.5,22.3 L 128.6,22.2 L 130.1,22.5 L 130.8,22.5 L 130.0,23.9 L 131.7,24.4 L 131.5,22.9 L 134.6,22.0 L 134.1,21.3 L 132.8,21.8 L 133.4,20.8 L 134.8,20.7 L 130.4,19.9 L 131.0,18.5 L 129.7,18.4 L 133.0,16.4 L 137.7,19.4 L 136.3,19.3 L 135.5,20.2 L 139.5,20.6 L 137.8,20.8 L 139.6,22.7 L 141.0,21.0 L 142.8,21.5 L 143.9,24.5 L 145.4,24.1 L 146.8,21.8 L 148.2,21.8 L 146.9,19.9 L 151.6,20.2 L 150.5,20.5 L 153.5,21.0 L 152.4,21.6 L 153.6,21.9 L 151.4,22.3 L 153.7,23.9 L 150.3,25.7 L 149.5,24.8 L 147.5,24.8 L 149.6,26.0 L 145.0,25.4 L 146.4,26.0 L 144.1,27.4 L 140.3,26.3 L 138.6,26.4 L 144.8,27.7 L 142.9,29.3 L 140.0,29.3 L 139.0,30.5 L 134.1,29.2 L 136.5,30.0 L 137.3,30.1 L 139.0,31.0 L 137.8,31.6 L 136.3,31.5 L 137.1,31.9 L 134.3,32.9 L 132.6,35.3 L 132.3,37.7 L 133.4,38.8 L 135.1,38.2 L 136.2,40.5 L 135.6,41.2 L 138.8,40.5 L 147.5,44.0 L 151.9,44.1 L 151.9,47.7 L 154.7,49.8 L 155.9,50.7 L 156.6,49.8 L 157.3,50.6 L 157.0,49.7 L 158.0,48.9 L 157.1,45.7 L 155.9,45.0 L 159.2,43.9 L 161.0,42.1 L 160.2,39.4 L 157.7,38.3 L 159.9,36.1 L 159.4,34.8 L 158.3,34.9 L 159.5,33.6 L 158.4,32.4 L 159.6,31.9 L 164.1,32.7 L 165.4,32.1 L 167.6,33.6 L 168.7,33.5 L 168.6,34.2 L 171.3,34.8 L 171.9,34.4 L 171.7,36.0 L 169.8,36.1 L 171.6,36.2 L 171.5,37.3 L 172.3,37.3 L 171.8,38.1 L 170.7,38.2 L 173.7,38.1 L 173.2,39.4 L 174.2,38.5 L 174.7,39.4 L 176.7,38.0 L 177.4,39.0 L 177.2,38.1 L 178.4,37.7 L 177.7,37.3 L 178.9,37.2 L 178.1,36.6 L 179.1,35.5 L 179.9,35.7 L 181.4,37.5 L 180.4,37.8 L 181.8,37.7 L 181.1,38.9 L 182.7,38.6 L 181.4,39.5 L 182.9,39.1 L 183.7,40.0 L 182.7,40.3 L 184.5,40.9 L 184.1,41.7 L 182.7,41.5 L 184.1,41.8 L 183.2,41.9 L 184.2,42.3 L 185.7,43.0 L 185.6,44.4 L 187.0,43.8 L 186.8,44.8 L 187.9,44.0 L 188.3,44.6 L 189.9,44.5 L 190.8,45.0 L 187.3,45.9 L 189.2,45.6 L 185.5,47.2 L 189.5,45.6 L 191.1,46.1 L 190.8,46.9 L 192.1,46.3 L 193.2,47.1 L 192.6,47.9 L 193.3,48.3 L 192.0,48.3 L 193.5,48.6 L 192.5,48.5 L 193.4,49.1 L 191.4,50.2 L 188.7,50.5 L 186.8,52.1 L 176.6,52.1 L 175.2,53.7 L 171.1,55.4 L 171.3,56.2 L 169.3,57.8 L 173.9,54.8 L 177.1,53.9 L 179.5,54.0 L 180.0,55.2 L 178.5,55.8 L 176.1,55.9 L 177.6,56.0 L 179.2,56.2 L 178.2,57.4 L 179.2,57.4 L 179.3,58.6 L 181.6,59.6 L 183.7,59.3 L 185.2,60.3 L 181.0,61.2 L 180.0,61.5 L 178.2,63.3 L 177.1,62.8 L 177.2,61.6 L 179.7,60.2 L 180.3,60.8 L 181.4,60.2 L 179.0,60.2 L 179.9,59.3 L 176.6,60.7 L 175.5,60.4 L 175.9,61.1 L 174.1,61.9 L 172.9,61.9 L 172.3,62.5 L 171.4,62.3 L 170.7,62.9 L 169.5,65.1 L 170.6,66.2 L 169.3,66.6 L 165.5,67.3 L 164.4,68.2 L 164.7,69.4 L 163.5,70.7 L 162.5,69.4 L 163.3,71.6 L 161.9,73.7 L 162.3,72.3 L 161.2,70.9 L 162.0,69.8 L 160.8,70.2 L 161.3,72.2 L 159.9,71.2 L 161.4,72.5 L 160.3,72.3 L 161.3,73.0 L 160.5,73.1 L 161.1,73.8 L 160.2,73.5 L 161.8,74.1 L 162.5,75.9 L 161.8,74.4 L 162.1,75.5 L 160.6,75.7 L 161.7,75.6 L 162.2,76.2 L 161.5,76.7 L 160.2,76.4 L 161.1,76.8 L 160.3,77.2 L 161.3,77.4 L 157.5,79.2 L 154.6,81.7 L 153.1,83.4 L 155.5,90.7 L 154.7,93.7 L 153.9,93.5 L 152.9,92.1 L 152.4,90.4 L 151.4,89.6 L 151.8,88.8 L 151.5,87.3 L 149.8,85.6 L 149.0,85.2 L 147.2,86.0 L 146.9,84.9 L 145.4,84.8 L 144.4,84.9 L 143.1,85.1 L 143.1,84.2 L 142.9,84.9 L 139.4,85.1 L 141.2,85.6 L 140.5,86.1 L 141.6,86.8 L 140.9,87.2 L 140.4,86.3 L 139.8,86.8 L 138.7,86.9 L 137.2,85.7 L 136.4,86.2 L 134.0,85.9 L 132.6,86.5 L 130.3,87.9 L 129.6,87.5 L 128.8,88.4 L 128.5,89.8 L 128.9,92.1 L 128.3,93.6 L 127.8,94.4 L 127.7,97.6 L 127.9,98.5 L 130.9,104.0 L 131.9,104.0 L 133.1,105.0 L 136.4,104.0 L 137.6,104.4 L 138.9,102.9 L 139.6,100.1 L 142.9,99.2 L 145.0,99.7 L 143.5,102.4 L 143.4,104.8 L 143.0,103.7 L 142.5,104.5 L 142.8,106.9 L 141.7,108.6 L 142.9,109.0 L 147.7,108.4 L 150.3,109.7 L 150.6,111.2 L 149.5,116.2 L 152.1,119.9 L 153.9,120.2 Z M 165.9,221.8 L 166.6,221.0 L 165.4,221.5 L 165.3,220.2 L 166.4,220.3 L 167.3,219.8 L 166.2,219.4 L 167.1,219.8 L 165.9,219.4 L 166.2,220.2 L 165.8,219.5 L 165.0,219.5 L 165.4,218.7 L 164.5,218.4 L 165.9,218.0 L 164.8,218.3 L 164.9,217.5 L 163.8,217.2 L 165.1,217.4 L 164.4,216.3 L 165.4,216.4 L 164.8,215.5 L 164.3,214.6 L 165.1,214.2 L 163.9,213.6 L 165.8,214.0 L 165.4,213.4 L 163.8,213.1 L 165.0,212.8 L 164.1,212.7 L 165.0,212.3 L 164.6,211.5 L 163.6,211.6 L 162.5,211.5 L 163.6,210.9 L 163.2,210.1 L 164.2,210.4 L 165.1,210.5 L 166.2,209.7 L 165.6,209.0 L 167.1,207.9 L 166.0,207.3 L 166.8,206.7 L 166.3,206.1 L 166.7,204.6 L 167.5,204.0 L 166.6,203.6 L 167.6,202.7 L 166.5,202.9 L 165.3,203.3 L 165.0,202.1 L 166.1,199.5 L 165.4,196.0 L 166.2,195.7 L 168.6,190.0 L 168.4,185.0 L 169.1,183.9 L 168.7,182.2 L 170.4,176.4 L 170.1,173.3 L 171.0,169.9 L 170.9,167.6 L 170.6,165.0 L 168.8,163.1 L 163.1,160.0 L 161.9,158.8 L 161.2,157.6 L 161.5,156.7 L 159.2,153.3 L 157.1,148.2 L 155.6,145.8 L 153.8,144.5 L 153.6,141.7 L 155.5,140.3 L 156.0,139.0 L 155.2,139.2 L 154.2,138.5 L 154.1,136.4 L 155.1,135.8 L 155.6,134.4 L 155.4,133.4 L 157.2,133.0 L 157.1,132.0 L 157.8,131.8 L 157.8,130.7 L 159.0,130.3 L 160.0,128.7 L 159.4,127.8 L 159.8,123.9 L 158.0,121.7 L 158.6,120.9 L 157.0,119.9 L 155.7,119.3 L 157.2,119.0 L 158.9,119.7 L 160.6,121.7 L 160.3,120.7 L 162.4,119.2 L 162.2,118.0 L 162.9,117.0 L 163.6,116.5 L 164.5,116.6 L 166.0,116.2 L 168.5,114.2 L 169.4,114.9 L 168.1,115.7 L 168.7,117.1 L 167.8,118.6 L 168.5,119.8 L 169.4,119.4 L 168.6,117.0 L 170.9,115.7 L 171.1,114.7 L 171.7,115.9 L 173.6,116.3 L 174.0,117.5 L 177.0,117.2 L 178.8,118.2 L 181.0,117.5 L 180.0,117.2 L 183.8,117.1 L 182.2,117.7 L 183.0,118.6 L 184.1,118.4 L 185.3,119.2 L 185.3,120.6 L 186.3,120.5 L 188.2,121.6 L 189.0,122.7 L 188.7,124.2 L 189.2,123.4 L 191.1,125.1 L 195.7,125.0 L 198.7,126.6 L 199.6,128.0 L 201.0,131.3 L 202.3,131.9 L 202.0,132.7 L 200.2,134.8 L 199.6,136.3 L 199.1,137.0 L 198.0,137.3 L 198.8,137.5 L 200.9,136.2 L 201.4,137.9 L 203.3,137.6 L 202.7,139.1 L 204.3,137.0 L 205.2,137.3 L 205.3,135.8 L 206.3,136.1 L 207.9,136.5 L 208.9,137.1 L 209.6,137.8 L 210.3,137.0 L 210.8,138.1 L 210.0,138.7 L 211.0,138.6 L 210.4,139.0 L 210.3,140.2 L 212.5,138.5 L 214.3,139.4 L 217.7,139.4 L 220.2,140.8 L 222.2,142.9 L 224.6,143.1 L 225.2,143.7 L 225.9,146.5 L 225.6,148.4 L 220.8,155.5 L 220.2,156.1 L 219.8,155.4 L 219.1,163.8 L 218.2,164.9 L 218.1,166.9 L 216.1,170.0 L 216.2,170.9 L 214.7,171.7 L 214.6,172.5 L 213.0,172.5 L 212.2,172.6 L 210.9,172.4 L 209.4,173.9 L 207.9,174.0 L 206.0,175.3 L 205.0,176.6 L 204.2,176.4 L 204.1,177.9 L 204.6,179.3 L 204.1,181.6 L 202.7,182.9 L 201.0,185.9 L 199.0,187.6 L 201.3,184.8 L 200.2,184.0 L 198.7,186.9 L 198.2,189.0 L 195.8,191.7 L 192.6,192.1 L 190.0,191.4 L 189.1,190.4 L 189.1,189.0 L 188.9,191.3 L 191.0,192.7 L 190.7,193.8 L 191.8,194.4 L 191.8,195.3 L 190.5,197.3 L 189.0,198.0 L 184.9,198.8 L 183.0,198.4 L 183.5,199.4 L 183.0,201.9 L 180.8,202.3 L 178.9,201.6 L 178.8,203.8 L 179.7,204.4 L 180.8,203.8 L 181.1,204.7 L 180.3,205.2 L 179.8,204.6 L 178.9,204.8 L 180.0,205.3 L 178.4,206.4 L 178.1,208.5 L 175.9,209.1 L 174.8,210.4 L 176.1,211.9 L 177.7,212.3 L 177.7,213.4 L 174.9,215.3 L 174.4,216.9 L 173.1,216.5 L 173.7,217.1 L 172.0,218.7 L 172.7,219.4 L 171.8,219.5 L 172.7,219.5 L 173.7,220.7 L 172.3,220.5 L 169.7,221.4 L 169.1,223.3 L 167.2,222.4 L 168.2,222.2 L 169.0,222.0 L 168.7,221.1 L 166.6,221.1 L 166.5,221.9 L 165.9,221.8 Z M 210.5,36.2 L 210.8,35.3 L 209.7,35.9 L 210.6,35.0 L 209.7,35.5 L 208.5,35.2 L 209.4,34.5 L 208.1,34.9 L 209.7,34.2 L 205.9,34.8 L 205.5,34.0 L 203.6,33.9 L 204.9,33.6 L 203.4,33.6 L 204.4,33.5 L 203.5,33.4 L 204.0,32.7 L 202.7,32.9 L 203.3,32.4 L 201.7,32.1 L 202.7,31.1 L 201.7,31.6 L 202.1,30.9 L 200.5,30.7 L 202.0,30.6 L 200.3,30.5 L 201.4,30.1 L 199.8,30.1 L 200.8,29.7 L 199.7,29.5 L 202.1,29.4 L 199.5,29.3 L 201.9,28.9 L 200.8,28.6 L 202.8,29.0 L 200.7,27.6 L 201.2,28.4 L 199.1,29.3 L 198.9,28.4 L 200.3,27.9 L 198.8,28.3 L 199.2,27.4 L 198.2,27.4 L 201.5,26.8 L 200.3,26.6 L 198.3,27.3 L 197.2,26.7 L 199.5,26.2 L 196.8,26.2 L 201.7,24.9 L 200.7,24.7 L 196.5,26.1 L 197.4,25.7 L 196.6,25.4 L 198.5,25.4 L 196.8,25.2 L 198.7,24.9 L 196.2,24.4 L 200.0,24.1 L 196.3,24.0 L 201.8,23.2 L 198.7,23.3 L 199.7,23.0 L 196.5,23.9 L 197.2,22.9 L 199.0,23.1 L 197.0,22.7 L 201.7,23.1 L 200.0,22.7 L 201.0,22.2 L 196.8,22.5 L 198.7,21.9 L 201.2,22.2 L 200.5,21.1 L 201.6,21.5 L 202.3,21.1 L 200.4,21.0 L 201.8,19.6 L 198.6,19.6 L 195.0,18.6 L 197.7,18.5 L 201.3,19.2 L 199.2,18.0 L 200.8,18.0 L 198.8,17.9 L 199.9,17.6 L 198.3,17.8 L 200.1,17.3 L 197.5,17.4 L 199.6,16.9 L 197.1,16.9 L 196.7,15.8 L 196.1,17.3 L 193.1,16.9 L 195.4,16.0 L 194.1,16.5 L 194.9,15.8 L 193.5,15.7 L 195.6,15.6 L 193.4,14.7 L 192.8,12.7 L 190.9,13.0 L 192.7,12.2 L 185.3,9.6 L 181.4,9.2 L 178.2,9.8 L 175.6,9.4 L 176.6,10.0 L 173.4,9.7 L 171.7,9.2 L 174.3,8.7 L 169.0,8.1 L 176.8,8.0 L 172.5,7.8 L 177.1,7.8 L 172.2,7.4 L 166.3,6.3 L 172.6,4.9 L 177.3,4.7 L 180.7,3.0 L 175.8,3.2 L 175.1,2.7 L 180.3,1.5 L 181.8,2.1 L 181.3,1.3 L 183.9,1.6 L 183.8,0.4 L 187.0,0.2 L 191.0,1.1 L 186.6,0.0 L 194.4,0.0 L 196.4,0.0 L 201.7,0.7 L 200.7,0.0 L 206.3,0.0 L 209.5,0.4 L 227.8,0.0 L 226.7,0.3 L 239.3,0.0 L 236.7,1.0 L 243.5,0.0 L 241.5,2.4 L 247.2,0.7 L 251.4,0.9 L 253.9,0.1 L 260.0,0.4 L 257.0,1.8 L 246.9,2.3 L 254.9,2.4 L 247.9,3.1 L 252.6,3.3 L 246.0,6.3 L 245.8,7.1 L 247.5,6.5 L 250.2,7.0 L 247.2,7.3 L 251.4,7.7 L 251.6,8.5 L 244.6,8.7 L 246.0,9.5 L 249.2,9.6 L 246.0,9.9 L 249.9,10.3 L 249.5,11.3 L 245.0,10.6 L 248.0,11.2 L 245.1,11.2 L 247.9,11.4 L 247.2,12.1 L 250.5,12.3 L 249.4,12.8 L 245.6,12.2 L 245.0,13.1 L 246.0,13.7 L 248.4,13.4 L 245.2,14.4 L 242.5,13.7 L 245.4,13.8 L 242.4,13.5 L 239.9,13.2 L 241.6,14.0 L 239.6,14.4 L 237.5,14.0 L 239.0,14.4 L 236.9,14.6 L 241.0,14.7 L 237.3,15.1 L 238.6,15.6 L 240.7,15.1 L 241.8,15.6 L 239.0,15.8 L 240.7,15.8 L 241.7,15.7 L 244.9,16.6 L 244.0,17.0 L 245.9,16.9 L 244.9,17.3 L 246.2,17.3 L 245.3,18.0 L 246.6,18.9 L 245.1,19.0 L 243.6,19.0 L 241.7,17.5 L 235.9,16.4 L 237.5,16.9 L 235.7,17.2 L 240.4,17.6 L 238.3,18.2 L 236.5,17.8 L 234.5,19.0 L 238.7,18.9 L 235.5,19.5 L 237.4,19.8 L 240.7,19.0 L 245.6,19.6 L 239.0,21.9 L 234.2,22.6 L 233.3,22.3 L 230.8,22.9 L 229.3,21.9 L 230.1,23.1 L 228.3,23.5 L 225.9,25.8 L 224.2,25.6 L 222.4,26.5 L 221.2,26.5 L 222.2,25.8 L 221.1,25.6 L 220.6,26.9 L 217.9,27.0 L 217.4,28.0 L 216.0,27.7 L 217.2,29.0 L 215.3,29.2 L 216.9,29.4 L 215.4,29.8 L 216.6,30.3 L 215.3,30.4 L 216.0,30.7 L 214.8,30.5 L 215.7,31.1 L 214.5,30.8 L 215.0,31.5 L 212.9,31.6 L 214.4,32.2 L 213.1,32.0 L 214.5,32.9 L 213.3,33.3 L 214.3,33.4 L 213.0,33.5 L 214.0,33.7 L 212.7,34.0 L 213.7,34.4 L 212.1,34.3 L 213.6,34.4 L 212.3,34.8 L 213.3,35.2 L 211.2,35.2 L 212.9,36.0 L 211.4,35.6 L 210.5,36.2 Z M 177.3,32.9 L 168.6,31.0 L 167.8,30.5 L 169.2,30.2 L 167.0,29.8 L 166.0,28.5 L 163.9,28.1 L 164.2,28.9 L 158.6,28.9 L 159.6,27.2 L 162.1,27.5 L 165.7,27.2 L 164.2,26.0 L 166.3,25.1 L 167.9,25.2 L 166.4,25.0 L 167.8,24.2 L 165.4,21.9 L 164.5,22.1 L 162.6,21.3 L 160.8,21.9 L 162.4,21.0 L 161.5,20.3 L 159.9,20.3 L 157.1,18.6 L 156.2,19.1 L 157.4,19.9 L 152.9,19.5 L 154.1,20.2 L 150.8,19.2 L 152.8,19.9 L 146.5,19.7 L 145.6,18.8 L 143.3,19.3 L 141.9,18.9 L 140.7,17.9 L 147.8,17.7 L 148.6,17.0 L 146.2,16.4 L 147.4,16.0 L 149.1,16.4 L 146.7,14.9 L 149.4,15.2 L 146.9,14.7 L 149.8,14.8 L 147.8,14.2 L 153.1,13.6 L 155.2,15.2 L 154.1,16.6 L 155.9,15.6 L 159.1,16.8 L 157.3,16.0 L 160.2,16.2 L 157.8,15.7 L 159.3,15.2 L 163.1,15.6 L 161.2,16.7 L 164.6,16.3 L 162.8,16.9 L 163.9,17.0 L 163.3,17.8 L 165.5,16.8 L 165.1,18.0 L 167.1,17.0 L 169.3,17.6 L 167.1,18.7 L 170.2,18.0 L 168.0,19.0 L 169.3,18.8 L 168.7,19.7 L 171.3,18.3 L 170.2,19.0 L 172.0,18.4 L 173.8,18.9 L 170.8,19.7 L 173.2,19.4 L 171.1,20.3 L 174.0,19.2 L 175.4,19.8 L 171.0,20.5 L 175.4,20.6 L 176.2,21.1 L 172.6,20.8 L 174.1,21.0 L 172.6,21.4 L 173.9,21.1 L 174.6,21.7 L 172.0,21.7 L 176.3,22.3 L 174.4,22.6 L 175.7,22.5 L 176.2,23.1 L 177.4,22.9 L 178.4,23.7 L 179.3,23.0 L 178.5,23.6 L 179.6,23.3 L 180.5,24.1 L 179.2,24.0 L 180.5,24.2 L 179.3,24.6 L 181.2,24.3 L 180.7,25.0 L 182.2,24.7 L 183.5,24.6 L 184.7,25.2 L 183.2,25.3 L 184.3,25.8 L 182.2,25.7 L 183.6,26.3 L 182.1,26.0 L 182.5,27.0 L 181.2,26.4 L 181.2,28.1 L 178.1,26.7 L 179.9,25.7 L 177.5,26.4 L 178.1,25.7 L 177.4,26.1 L 176.2,25.3 L 174.3,25.2 L 175.6,26.3 L 173.7,26.2 L 173.9,27.2 L 175.3,26.8 L 176.2,28.4 L 177.8,28.2 L 178.8,28.9 L 177.8,29.1 L 179.5,29.6 L 179.6,30.8 L 178.4,29.9 L 179.0,31.8 L 174.4,30.0 L 172.7,30.0 L 177.3,32.9 Z M 103.4,21.4 L 98.8,20.7 L 97.4,19.6 L 106.6,19.2 L 102.9,18.5 L 96.9,18.7 L 95.9,18.0 L 101.1,17.2 L 96.1,17.4 L 96.8,17.0 L 94.7,16.8 L 95.7,15.6 L 101.9,14.2 L 101.9,15.5 L 104.6,14.8 L 107.0,15.2 L 105.7,16.0 L 107.3,16.0 L 109.3,15.7 L 107.8,14.8 L 109.0,14.8 L 112.4,17.1 L 111.6,14.5 L 113.9,14.3 L 116.2,15.1 L 117.5,18.0 L 122.9,19.4 L 123.0,20.3 L 122.2,19.8 L 120.4,20.5 L 119.0,20.2 L 119.5,21.2 L 120.9,20.5 L 121.7,21.3 L 116.5,21.5 L 114.2,20.5 L 110.4,21.8 L 103.9,22.2 L 103.4,21.4 Z M 183.0,0.0 L 177.6,0.6 L 172.2,0.5 L 176.4,0.8 L 171.1,1.5 L 179.5,1.0 L 171.9,2.7 L 169.9,2.4 L 170.9,3.0 L 167.4,2.9 L 170.4,3.1 L 168.8,3.7 L 164.5,3.5 L 166.1,4.1 L 158.6,4.4 L 164.2,4.9 L 157.3,4.8 L 164.0,5.6 L 160.8,5.7 L 163.3,6.0 L 160.4,6.2 L 162.0,6.6 L 158.4,6.6 L 157.5,7.7 L 152.5,7.1 L 152.8,7.9 L 158.7,8.2 L 158.1,9.1 L 153.9,9.6 L 151.3,8.5 L 152.0,9.2 L 150.3,8.6 L 148.8,8.8 L 147.4,9.4 L 145.3,8.8 L 143.8,8.8 L 142.5,8.6 L 140.5,8.9 L 145.3,7.9 L 142.8,6.8 L 148.6,7.7 L 152.0,6.4 L 148.1,7.4 L 148.4,5.6 L 147.1,6.4 L 143.9,6.4 L 144.9,5.4 L 147.7,5.1 L 151.9,5.6 L 150.5,5.2 L 153.2,4.8 L 148.2,4.9 L 150.3,4.8 L 145.4,2.8 L 149.7,2.9 L 154.6,4.0 L 150.6,2.7 L 161.1,1.8 L 157.2,1.8 L 160.5,0.9 L 154.1,2.2 L 150.7,2.4 L 152.9,1.9 L 150.6,1.9 L 146.1,2.4 L 147.0,2.0 L 152.0,1.4 L 143.9,2.3 L 140.9,1.8 L 148.3,1.2 L 140.5,1.6 L 144.3,0.8 L 139.4,1.0 L 140.8,0.6 L 137.1,0.6 L 141.5,0.0 L 145.9,0.0 L 148.6,0.2 L 147.2,0.0 L 183.0,0.0 Z M 194.1,57.5 L 192.9,57.6 L 194.9,56.4 L 192.7,56.7 L 193.2,55.9 L 191.6,56.6 L 189.3,56.2 L 188.0,56.6 L 189.4,55.0 L 187.8,55.1 L 189.1,54.0 L 189.9,54.3 L 189.4,53.6 L 190.2,53.5 L 190.7,51.4 L 193.0,49.9 L 193.7,50.3 L 192.8,50.3 L 191.5,53.3 L 192.6,52.3 L 193.7,52.6 L 192.7,53.5 L 194.2,53.3 L 193.8,54.1 L 195.3,53.3 L 196.8,53.7 L 195.7,55.2 L 197.6,55.0 L 196.1,55.5 L 196.7,56.6 L 197.7,55.6 L 197.1,56.6 L 197.9,56.2 L 197.3,58.1 L 196.7,57.1 L 195.7,57.8 L 196.3,56.8 L 195.9,56.1 L 194.1,57.5 Z M 163.3,102.0 L 159.1,102.1 L 160.0,101.3 L 158.4,100.6 L 157.5,99.2 L 152.7,98.3 L 152.7,97.5 L 151.3,97.4 L 149.3,98.7 L 147.9,98.8 L 148.9,98.6 L 149.3,97.4 L 153.8,96.6 L 155.9,97.1 L 160.4,99.7 L 162.2,100.0 L 164.7,101.5 L 163.3,102.0 Z M 169.3,105.1 L 168.9,105.8 L 167.9,104.8 L 165.1,105.1 L 164.1,104.4 L 167.4,104.3 L 166.7,103.4 L 165.7,102.4 L 166.7,101.9 L 171.2,102.4 L 172.4,103.0 L 171.7,103.4 L 173.7,104.1 L 173.2,104.8 L 170.1,104.4 L 169.3,105.1 Z M 92.8,16.4 L 92.4,17.3 L 88.5,17.9 L 85.7,16.5 L 84.0,16.5 L 87.5,13.5 L 86.0,12.6 L 91.1,12.2 L 94.7,13.1 L 97.0,12.7 L 100.6,13.9 L 92.8,16.4 Z M 136.6,11.5 L 135.2,9.3 L 131.6,9.5 L 129.4,8.2 L 134.3,8.4 L 134.5,9.2 L 138.5,8.8 L 137.7,9.1 L 141.3,9.5 L 137.5,9.4 L 139.7,9.8 L 138.1,10.2 L 140.1,9.8 L 141.7,10.8 L 145.4,10.9 L 153.1,10.2 L 156.2,10.7 L 155.0,11.5 L 156.6,11.7 L 152.8,12.4 L 150.1,11.7 L 143.6,12.4 L 142.3,11.7 L 140.0,12.3 L 136.6,11.5 Z M 176.2,225.1 L 168.1,224.5 L 169.8,224.0 L 170.9,224.4 L 169.7,223.6 L 171.5,224.4 L 172.7,224.2 L 171.0,223.5 L 172.2,222.5 L 170.4,222.4 L 170.5,221.4 L 173.0,221.1 L 174.6,223.2 L 178.7,224.5 L 176.2,225.1 Z M 154.0,30.5 L 151.7,30.1 L 150.9,29.3 L 147.4,31.0 L 146.7,30.0 L 144.4,30.3 L 145.9,29.4 L 146.9,26.4 L 147.9,27.6 L 148.5,27.1 L 152.7,28.7 L 152.5,29.6 L 154.1,29.4 L 155.3,29.9 L 154.0,30.5 Z M 100.2,11.5 L 97.0,11.1 L 101.1,10.4 L 97.7,10.5 L 101.4,10.0 L 98.4,10.0 L 101.7,9.6 L 99.7,9.4 L 101.3,9.0 L 107.0,10.7 L 110.6,10.7 L 108.2,9.3 L 110.3,8.5 L 112.0,10.2 L 113.8,10.4 L 114.2,9.7 L 116.0,10.1 L 115.1,11.4 L 110.8,11.4 L 105.2,12.4 L 102.0,12.0 L 107.3,11.0 L 102.8,11.4 L 100.2,11.5 Z M 133.5,4.9 L 139.5,4.5 L 132.0,4.5 L 133.3,3.7 L 129.7,3.5 L 133.2,3.3 L 129.7,2.7 L 134.1,2.4 L 131.4,1.9 L 134.6,1.0 L 142.6,3.2 L 143.7,2.6 L 144.0,4.1 L 146.7,3.9 L 148.0,4.5 L 143.7,5.5 L 142.9,4.9 L 141.8,6.3 L 140.1,5.6 L 140.8,6.3 L 136.8,6.2 L 135.4,5.8 L 137.4,5.6 L 133.5,4.9 Z M 201.0,136.0 L 201.7,134.9 L 204.7,135.2 L 204.0,137.1 L 202.5,137.7 L 201.3,137.6 L 201.0,136.5 L 201.0,136.0 Z M 147.8,17.6 L 144.7,17.7 L 140.0,17.3 L 141.3,14.5 L 145.4,13.4 L 148.0,13.6 L 145.8,15.3 L 146.1,16.5 L 147.8,17.6 Z M 129.1,16.8 L 127.3,17.0 L 125.7,17.5 L 120.3,15.3 L 121.0,14.6 L 124.2,15.1 L 124.8,14.4 L 121.9,14.0 L 123.8,14.1 L 123.1,13.4 L 129.2,13.6 L 126.8,14.8 L 129.9,15.2 L 129.1,16.8 Z M 84.5,54.2 L 82.3,52.3 L 81.0,52.4 L 81.8,51.6 L 80.8,51.8 L 80.2,51.3 L 84.9,52.0 L 88.3,55.1 L 85.4,54.7 L 85.8,53.8 L 84.5,54.2 Z M 132.2,16.5 L 131.8,13.2 L 139.7,13.3 L 136.7,15.2 L 133.3,15.2 L 134.6,15.7 L 132.2,16.5 Z M 124.4,11.5 L 123.2,10.9 L 125.0,10.4 L 120.0,10.5 L 123.0,10.2 L 121.5,9.1 L 124.6,10.1 L 122.9,9.0 L 125.9,9.2 L 126.8,8.7 L 128.7,10.8 L 127.6,11.5 L 124.4,11.5 Z M 98.0,7.5 L 100.6,7.7 L 97.9,9.4 L 96.7,8.5 L 93.7,10.1 L 92.0,9.5 L 89.3,10.0 L 94.6,7.7 L 98.0,7.5 Z M 126.0,21.5 L 127.6,19.9 L 132.0,21.6 L 129.8,22.3 L 126.0,21.5 Z M 126.0,6.7 L 120.1,5.9 L 117.5,6.1 L 119.3,5.4 L 116.7,5.3 L 116.0,4.4 L 123.9,5.2 L 126.0,6.7 Z M 155.3,14.8 L 154.3,13.5 L 159.6,13.9 L 161.7,15.0 L 156.6,15.2 L 155.3,14.8 Z M 186.9,59.1 L 184.7,59.9 L 184.2,59.1 L 186.0,57.4 L 186.0,58.7 L 184.9,59.6 L 186.2,58.6 L 186.9,59.1 Z" fill="url(#realDotsPurple)" filter="url(#realGlowPurple)"/><path d="M 329.7,82.9 L 330.2,83.4 L 330.6,85.5 L 330.8,87.1 L 332.2,89.0 L 334.7,94.4 L 335.7,95.4 L 335.5,97.0 L 337.4,98.5 L 338.1,100.1 L 338.2,103.7 L 340.0,105.0 L 341.8,109.9 L 342.5,110.2 L 344.1,110.7 L 347.4,114.2 L 347.5,115.0 L 346.2,115.8 L 347.1,115.6 L 349.3,117.7 L 351.3,116.9 L 352.2,117.2 L 353.8,116.3 L 356.9,116.1 L 359.0,115.0 L 359.8,115.3 L 359.4,117.6 L 359.1,119.2 L 354.6,127.4 L 351.6,130.7 L 347.8,133.5 L 344.3,137.9 L 343.4,137.9 L 342.5,139.2 L 341.0,142.4 L 340.3,144.7 L 341.5,146.2 L 341.0,147.6 L 341.8,151.2 L 343.2,152.3 L 342.7,153.3 L 343.2,155.7 L 343.5,159.1 L 342.0,161.7 L 337.3,164.1 L 336.5,165.7 L 334.3,167.3 L 333.9,168.5 L 335.3,171.1 L 335.2,174.3 L 330.6,177.4 L 331.1,177.9 L 330.4,181.6 L 328.6,183.1 L 326.7,186.1 L 322.0,189.9 L 318.6,190.9 L 315.1,190.5 L 311.1,191.9 L 309.2,190.7 L 307.8,188.6 L 308.5,188.2 L 308.3,186.8 L 303.2,178.0 L 302.6,171.7 L 298.4,164.3 L 298.3,160.7 L 299.5,156.8 L 301.2,154.8 L 301.6,152.8 L 300.2,149.6 L 300.8,148.5 L 299.1,144.8 L 298.2,142.0 L 295.0,138.7 L 293.5,135.8 L 294.5,134.1 L 295.5,134.4 L 294.5,133.9 L 295.1,132.9 L 295.5,129.7 L 294.8,128.5 L 293.7,126.9 L 292.8,126.6 L 291.4,127.4 L 290.5,127.0 L 289.3,127.6 L 288.3,126.2 L 288.8,125.6 L 288.1,125.6 L 286.9,124.3 L 285.3,124.2 L 285.9,123.8 L 282.1,124.6 L 280.0,125.5 L 276.9,126.9 L 273.8,126.1 L 270.5,126.5 L 268.4,127.6 L 266.4,126.8 L 262.5,123.6 L 260.5,122.6 L 259.3,120.9 L 259.3,119.4 L 258.9,118.6 L 257.5,117.9 L 257.1,116.5 L 256.3,116.6 L 256.6,115.6 L 255.9,115.3 L 256.8,115.0 L 255.2,115.4 L 254.6,114.8 L 253.9,114.3 L 254.8,114.0 L 253.9,114.1 L 254.0,112.6 L 255.8,112.5 L 254.3,112.8 L 254.3,111.9 L 252.7,110.5 L 254.2,108.9 L 255.0,105.6 L 254.3,102.9 L 254.8,101.5 L 253.7,99.9 L 253.6,98.9 L 255.6,95.3 L 256.8,94.2 L 257.5,91.7 L 258.8,90.9 L 259.9,88.8 L 262.1,88.2 L 264.1,86.6 L 265.0,85.3 L 264.7,83.1 L 265.6,81.2 L 269.4,78.8 L 270.8,75.9 L 271.5,75.7 L 272.7,76.9 L 275.4,76.5 L 277.0,77.1 L 278.5,76.0 L 280.0,75.8 L 281.7,74.8 L 286.1,74.1 L 288.3,74.5 L 290.0,73.8 L 292.3,74.2 L 295.2,73.4 L 296.2,74.4 L 297.2,73.8 L 296.3,75.3 L 297.4,76.9 L 295.6,78.5 L 299.1,80.8 L 300.8,80.7 L 303.7,81.5 L 304.5,83.1 L 307.8,83.9 L 309.5,85.0 L 311.2,84.0 L 311.3,81.8 L 313.8,80.6 L 315.9,81.1 L 316.3,81.9 L 318.9,82.2 L 319.2,82.9 L 322.0,83.1 L 325.2,84.1 L 328.3,82.8 L 329.7,82.9 Z M 350.0,176.6 L 348.5,175.8 L 347.2,171.4 L 347.7,169.7 L 349.2,167.6 L 348.3,163.5 L 349.1,161.3 L 351.8,160.5 L 353.0,159.7 L 353.8,158.8 L 354.3,158.1 L 354.5,157.0 L 355.9,156.7 L 355.8,155.2 L 356.6,154.4 L 357.7,156.1 L 358.5,160.1 L 358.0,161.0 L 357.6,160.1 L 357.5,162.4 L 356.9,163.0 L 356.9,164.6 L 353.3,175.8 L 350.0,176.6 Z" fill="url(#realDotsGreen)" filter="url(#realGlowGreen)"/><path d="M 560.0,27.8 L 559.3,28.3 L 552.4,28.4 L 554.0,28.4 L 556.1,28.4 L 557.3,29.3 L 559.4,31.7 L 558.7,32.4 L 555.5,32.0 L 549.9,33.3 L 545.3,35.4 L 544.9,36.3 L 543.3,35.1 L 539.8,35.5 L 538.7,36.5 L 538.6,35.4 L 536.4,36.5 L 535.9,36.0 L 534.5,36.1 L 531.8,39.5 L 534.1,39.9 L 533.1,40.5 L 534.1,42.4 L 532.1,42.6 L 532.2,44.8 L 528.9,45.7 L 529.0,47.5 L 526.4,47.6 L 526.6,48.8 L 523.7,51.2 L 522.0,44.1 L 522.6,41.6 L 524.0,39.8 L 526.3,39.5 L 531.9,35.5 L 534.8,34.8 L 535.3,32.4 L 537.1,32.1 L 536.1,31.7 L 534.0,32.0 L 534.1,33.4 L 532.6,33.4 L 529.2,35.2 L 529.6,34.4 L 528.6,34.6 L 529.5,32.9 L 523.7,33.6 L 519.9,36.4 L 521.1,37.0 L 515.4,38.1 L 516.9,37.4 L 512.5,36.5 L 511.7,37.4 L 507.9,37.0 L 507.2,37.6 L 501.6,37.5 L 495.0,42.0 L 490.4,44.5 L 491.2,45.1 L 492.9,44.9 L 492.8,46.4 L 494.3,45.5 L 493.6,46.8 L 495.6,46.0 L 497.4,45.5 L 500.0,47.2 L 498.8,47.4 L 500.2,49.0 L 498.5,51.4 L 498.4,54.3 L 494.8,58.8 L 490.2,63.2 L 487.0,64.6 L 485.0,63.5 L 484.1,64.8 L 483.3,64.6 L 481.8,66.1 L 481.8,67.6 L 478.3,69.4 L 478.1,70.3 L 479.7,71.2 L 481.3,73.8 L 481.6,75.5 L 480.8,77.1 L 480.0,76.9 L 479.8,77.6 L 478.7,77.2 L 478.1,78.1 L 476.8,78.4 L 476.4,77.0 L 477.4,75.3 L 476.8,74.5 L 476.8,72.7 L 475.4,72.2 L 474.4,72.4 L 474.4,71.3 L 475.4,71.2 L 474.6,70.8 L 475.3,69.5 L 472.3,69.1 L 468.4,71.1 L 469.7,70.0 L 468.6,70.0 L 470.2,68.2 L 469.6,67.3 L 468.2,67.6 L 465.1,70.3 L 463.1,70.5 L 463.1,71.6 L 464.9,71.9 L 465.4,73.7 L 467.8,72.6 L 470.9,73.3 L 470.6,74.1 L 469.7,73.9 L 467.9,74.5 L 467.8,75.4 L 466.9,75.2 L 465.4,77.2 L 467.1,78.4 L 468.0,81.1 L 469.6,82.6 L 466.8,82.2 L 467.9,82.4 L 469.6,83.9 L 466.9,85.1 L 468.6,84.9 L 470.0,85.6 L 468.9,86.3 L 469.8,86.1 L 468.9,86.8 L 468.8,87.6 L 469.2,88.3 L 467.6,88.5 L 466.9,91.0 L 466.0,90.7 L 466.6,91.4 L 465.9,91.9 L 466.1,93.1 L 464.9,93.2 L 464.6,94.4 L 463.2,94.5 L 462.9,95.8 L 461.2,96.2 L 461.2,97.0 L 459.8,97.5 L 458.7,97.7 L 457.7,97.7 L 456.4,96.7 L 456.6,98.3 L 455.7,97.7 L 455.6,98.8 L 454.8,98.6 L 453.7,98.9 L 451.8,99.9 L 451.6,101.5 L 450.6,100.3 L 451.1,99.4 L 449.8,99.5 L 448.9,98.7 L 447.7,99.4 L 447.0,100.2 L 445.8,100.2 L 445.8,101.4 L 444.8,102.0 L 444.3,103.7 L 446.6,107.0 L 448.5,108.2 L 449.5,109.7 L 450.3,113.9 L 449.6,116.1 L 446.8,117.7 L 446.0,117.3 L 446.1,118.2 L 445.2,118.0 L 445.7,119.0 L 444.6,118.3 L 445.2,119.3 L 443.8,120.3 L 443.0,120.3 L 443.5,118.3 L 441.6,117.1 L 441.1,116.4 L 440.4,116.9 L 439.7,114.7 L 438.3,113.8 L 436.9,113.9 L 437.1,112.5 L 435.5,112.8 L 435.6,114.7 L 434.2,117.7 L 434.3,119.5 L 435.3,119.5 L 436.2,123.0 L 438.0,123.5 L 440.5,125.9 L 441.0,127.3 L 440.9,130.1 L 442.2,132.5 L 441.0,132.6 L 437.6,130.0 L 436.4,127.6 L 435.7,123.9 L 433.5,120.9 L 433.6,117.8 L 433.2,117.2 L 433.8,115.5 L 433.6,113.7 L 432.8,111.8 L 432.1,110.3 L 432.0,107.5 L 430.7,105.9 L 430.7,107.1 L 430.0,107.6 L 428.9,108.0 L 428.5,108.9 L 428.0,108.2 L 427.2,108.3 L 427.2,105.9 L 426.4,102.9 L 426.1,103.8 L 425.4,102.9 L 426.3,102.9 L 425.8,102.0 L 424.7,101.6 L 422.3,97.3 L 421.1,97.3 L 421.3,98.3 L 420.8,97.6 L 420.3,98.9 L 419.8,97.9 L 419.7,98.9 L 418.8,99.0 L 417.9,98.4 L 417.3,99.3 L 416.9,98.2 L 416.6,99.1 L 415.2,99.7 L 415.4,100.7 L 414.4,101.9 L 412.3,102.9 L 410.9,104.6 L 408.0,106.7 L 408.0,107.5 L 406.4,107.9 L 405.9,108.9 L 404.9,109.0 L 404.5,109.9 L 405.0,112.9 L 404.1,115.5 L 404.3,117.8 L 403.3,117.9 L 402.7,119.1 L 401.7,119.9 L 401.4,121.0 L 400.6,121.5 L 399.1,120.1 L 398.0,116.4 L 394.3,108.3 L 393.0,102.1 L 393.4,100.6 L 392.9,99.7 L 393.4,99.1 L 392.8,98.6 L 393.4,98.1 L 392.5,98.1 L 392.2,99.9 L 390.2,100.7 L 387.2,98.1 L 389.2,97.7 L 389.6,97.0 L 387.6,97.2 L 386.4,96.1 L 387.0,95.5 L 386.2,96.0 L 385.0,95.4 L 384.7,94.0 L 383.7,93.9 L 383.4,92.6 L 376.1,93.6 L 369.2,92.4 L 368.2,90.0 L 365.2,91.2 L 363.6,90.8 L 361.6,89.3 L 360.0,88.8 L 357.9,85.1 L 357.1,85.4 L 356.1,84.8 L 354.6,85.3 L 355.0,86.2 L 354.2,86.5 L 356.0,89.4 L 358.0,91.0 L 357.8,92.0 L 359.0,94.1 L 359.3,92.0 L 360.2,92.1 L 359.8,94.8 L 361.1,95.4 L 361.8,95.0 L 364.1,95.1 L 367.9,91.4 L 367.5,92.6 L 368.1,94.5 L 368.9,95.4 L 371.4,96.1 L 373.0,98.2 L 371.0,101.2 L 370.0,101.5 L 370.0,103.5 L 368.4,103.9 L 367.7,105.3 L 366.2,105.4 L 365.6,106.8 L 361.6,107.7 L 361.2,109.1 L 356.8,110.7 L 355.8,111.6 L 351.0,112.8 L 350.1,113.8 L 347.6,113.9 L 346.3,109.7 L 346.4,107.2 L 343.5,102.3 L 341.0,100.1 L 340.9,97.9 L 339.8,95.6 L 338.2,94.7 L 337.9,93.3 L 334.8,88.6 L 333.8,88.6 L 334.4,86.2 L 333.3,89.2 L 330.7,85.5 L 330.3,83.5 L 333.3,83.2 L 336.0,78.0 L 335.6,76.3 L 336.2,74.2 L 335.0,74.7 L 333.9,74.3 L 332.8,75.2 L 331.0,75.5 L 328.5,74.2 L 327.7,74.2 L 327.3,75.2 L 326.2,75.4 L 324.3,74.1 L 322.6,74.5 L 324.1,73.8 L 322.4,74.0 L 323.0,73.5 L 322.0,72.8 L 320.8,71.8 L 322.3,71.6 L 321.6,71.2 L 321.9,69.7 L 320.6,69.9 L 321.6,68.3 L 325.1,68.4 L 326.6,67.8 L 325.5,67.7 L 328.6,67.2 L 331.9,65.7 L 334.5,65.6 L 336.6,67.0 L 339.7,67.5 L 342.5,67.5 L 344.4,66.7 L 345.0,66.0 L 344.5,64.5 L 336.9,60.5 L 338.4,60.2 L 339.5,58.7 L 338.6,58.0 L 340.0,58.1 L 341.1,57.1 L 335.9,58.1 L 334.4,59.0 L 334.7,58.3 L 333.6,59.3 L 334.4,60.2 L 335.2,60.3 L 334.2,58.9 L 335.2,60.3 L 337.0,60.2 L 332.9,61.8 L 331.9,61.5 L 331.6,60.1 L 330.5,60.2 L 332.4,59.4 L 329.4,58.7 L 330.5,58.3 L 329.8,57.7 L 327.8,58.2 L 327.4,59.0 L 326.2,59.8 L 326.9,59.3 L 326.3,59.8 L 326.1,61.0 L 325.1,61.3 L 324.5,63.3 L 322.5,65.1 L 325.1,67.4 L 322.8,67.4 L 320.7,68.9 L 321.7,67.9 L 319.1,67.3 L 316.9,67.8 L 318.0,68.7 L 316.9,68.4 L 317.3,69.1 L 315.7,68.0 L 316.3,70.3 L 315.0,70.9 L 317.5,72.0 L 317.4,72.9 L 316.6,72.2 L 315.8,72.5 L 316.6,73.2 L 315.3,73.0 L 316.1,74.9 L 315.2,74.2 L 314.4,73.9 L 312.8,72.5 L 315.6,72.4 L 312.8,71.7 L 312.2,70.9 L 310.0,68.3 L 310.5,66.0 L 309.2,64.9 L 306.5,64.1 L 307.6,64.3 L 306.3,63.4 L 304.8,63.2 L 302.6,60.3 L 301.6,61.2 L 301.1,59.5 L 298.9,60.2 L 299.3,62.1 L 301.2,63.2 L 303.0,65.6 L 305.1,65.9 L 304.8,66.6 L 308.8,68.8 L 307.8,68.5 L 306.3,68.3 L 305.6,69.4 L 306.8,70.6 L 305.8,71.0 L 305.0,72.4 L 305.2,70.9 L 304.4,69.0 L 297.3,65.1 L 295.8,62.5 L 293.6,61.7 L 289.6,64.0 L 286.4,63.1 L 285.2,63.6 L 284.6,64.3 L 285.0,65.9 L 281.5,67.3 L 280.0,69.1 L 279.6,70.4 L 280.4,71.1 L 279.2,71.7 L 278.9,72.9 L 277.7,73.1 L 276.7,74.4 L 273.1,74.4 L 271.3,75.6 L 269.3,73.4 L 266.0,73.9 L 266.2,71.7 L 266.1,70.6 L 265.2,71.0 L 266.3,68.8 L 266.6,65.1 L 265.5,64.0 L 268.0,62.8 L 269.0,63.3 L 277.5,63.4 L 278.3,59.9 L 278.3,58.6 L 277.2,58.3 L 276.3,56.7 L 273.2,56.2 L 272.8,55.4 L 275.2,54.4 L 275.8,55.0 L 277.9,54.8 L 277.0,53.0 L 280.0,53.7 L 282.6,52.3 L 282.5,51.1 L 286.6,50.4 L 285.3,50.1 L 287.2,49.8 L 286.2,49.3 L 287.4,47.7 L 288.2,48.8 L 289.1,48.3 L 288.3,47.5 L 289.1,47.0 L 291.6,47.3 L 291.0,46.7 L 292.4,46.5 L 293.2,47.0 L 293.5,46.2 L 295.3,46.8 L 293.3,45.5 L 293.4,44.6 L 293.4,40.9 L 296.6,39.9 L 295.7,41.5 L 297.1,42.0 L 294.9,43.2 L 294.7,44.6 L 295.8,45.5 L 297.3,45.4 L 296.9,46.1 L 300.3,45.3 L 302.7,46.7 L 307.9,44.6 L 309.2,45.4 L 310.9,44.9 L 310.1,45.6 L 311.8,44.9 L 310.9,45.0 L 312.0,44.2 L 312.8,43.2 L 311.9,44.4 L 313.1,44.4 L 312.6,41.9 L 313.8,40.1 L 315.2,39.8 L 316.8,41.1 L 317.9,40.7 L 318.2,38.9 L 316.9,38.9 L 316.6,37.4 L 320.0,36.7 L 323.4,37.1 L 327.2,36.2 L 324.5,35.6 L 315.6,36.5 L 315.9,35.5 L 315.0,35.8 L 313.3,35.2 L 313.9,33.7 L 312.9,31.5 L 319.7,27.9 L 318.3,26.5 L 315.2,26.4 L 313.8,26.7 L 313.8,27.6 L 313.0,27.4 L 313.6,28.8 L 312.2,29.9 L 308.2,31.6 L 307.5,31.2 L 306.7,35.0 L 308.0,35.1 L 309.7,36.6 L 308.1,37.1 L 309.1,37.3 L 307.9,38.1 L 307.5,37.5 L 305.2,38.4 L 306.4,38.6 L 305.5,38.6 L 306.0,40.3 L 304.7,42.6 L 302.8,42.4 L 302.1,43.7 L 299.9,43.7 L 299.4,42.2 L 300.1,41.8 L 298.2,39.9 L 298.5,38.9 L 298.0,39.5 L 298.2,38.7 L 297.4,38.9 L 296.7,36.3 L 296.2,37.7 L 294.8,37.6 L 292.8,39.2 L 291.0,39.5 L 288.8,38.5 L 288.7,37.7 L 289.8,38.0 L 290.3,36.9 L 288.8,37.4 L 288.1,36.9 L 291.1,35.3 L 288.6,36.3 L 289.0,35.5 L 288.0,35.5 L 289.0,34.9 L 288.2,35.3 L 287.8,34.4 L 290.3,34.2 L 291.1,34.7 L 292.0,34.1 L 290.5,33.8 L 288.1,34.3 L 288.8,33.9 L 287.7,33.8 L 289.1,33.8 L 287.8,33.5 L 290.6,33.1 L 288.1,33.0 L 289.8,32.8 L 291.2,32.7 L 289.7,31.9 L 292.7,31.7 L 290.9,31.3 L 293.3,31.8 L 292.3,31.2 L 293.5,31.5 L 293.2,30.6 L 295.1,30.2 L 297.1,30.5 L 297.7,29.4 L 296.2,30.3 L 294.8,30.2 L 297.0,28.6 L 298.4,28.8 L 297.7,28.4 L 298.9,28.0 L 297.6,28.1 L 300.2,27.4 L 298.7,27.6 L 299.7,26.4 L 300.5,26.6 L 299.7,26.2 L 302.0,25.8 L 300.2,26.0 L 301.8,25.0 L 301.0,24.7 L 304.1,24.5 L 302.3,24.2 L 304.7,23.7 L 303.1,23.2 L 304.7,23.2 L 303.8,22.9 L 304.9,22.6 L 305.7,23.3 L 305.3,22.4 L 307.9,22.3 L 305.6,22.2 L 307.5,21.9 L 308.2,20.6 L 310.4,21.0 L 309.5,20.3 L 310.7,20.0 L 311.6,19.7 L 311.0,20.9 L 313.0,19.7 L 314.4,20.1 L 313.5,19.2 L 316.5,19.7 L 318.3,18.1 L 320.3,18.3 L 319.1,19.6 L 321.5,18.1 L 321.2,19.1 L 322.1,19.0 L 323.0,17.9 L 324.4,18.1 L 323.3,19.0 L 325.1,18.3 L 328.3,19.1 L 327.0,19.6 L 324.4,19.4 L 325.9,20.3 L 327.1,19.9 L 328.6,20.4 L 329.9,19.8 L 331.5,20.2 L 329.9,20.1 L 332.1,20.7 L 331.4,21.5 L 332.2,20.9 L 334.9,20.9 L 341.9,22.8 L 344.4,24.5 L 340.8,26.1 L 329.6,24.4 L 332.4,25.6 L 331.3,25.9 L 334.2,26.5 L 333.3,27.3 L 334.1,28.7 L 338.2,29.9 L 339.2,29.1 L 336.8,28.4 L 337.3,27.7 L 339.7,28.2 L 342.9,28.7 L 341.8,27.2 L 343.4,26.3 L 345.7,25.4 L 348.6,26.3 L 348.8,22.6 L 347.3,21.9 L 352.4,22.8 L 349.9,23.9 L 351.6,24.9 L 354.0,24.8 L 354.4,23.7 L 356.3,23.7 L 355.6,23.1 L 361.2,22.1 L 363.8,21.4 L 364.9,21.4 L 363.4,21.7 L 362.8,22.7 L 365.3,22.8 L 366.1,22.1 L 369.1,22.1 L 371.8,21.4 L 373.0,22.4 L 375.2,21.7 L 373.6,20.4 L 374.6,19.9 L 383.0,21.2 L 381.9,21.1 L 386.2,22.8 L 387.7,21.5 L 385.9,20.5 L 383.9,20.5 L 383.8,17.9 L 386.3,17.1 L 387.9,14.9 L 391.4,14.9 L 393.4,15.3 L 391.7,17.3 L 393.3,18.3 L 392.8,21.4 L 394.5,22.3 L 391.6,24.8 L 387.5,25.3 L 392.2,26.0 L 396.3,23.5 L 396.1,21.7 L 399.1,21.4 L 399.9,23.4 L 402.6,23.9 L 400.5,23.4 L 401.6,22.6 L 400.8,21.5 L 398.1,20.9 L 394.7,21.1 L 395.6,18.7 L 393.6,17.4 L 396.7,16.1 L 396.4,15.1 L 398.4,17.8 L 402.1,18.2 L 398.2,16.6 L 401.3,16.7 L 400.5,16.1 L 402.0,15.8 L 406.7,16.9 L 409.5,16.9 L 407.6,18.8 L 408.9,18.1 L 408.2,19.4 L 410.1,20.2 L 410.2,17.0 L 405.8,15.7 L 405.2,13.9 L 415.7,13.4 L 413.6,11.7 L 415.3,12.2 L 415.3,11.3 L 426.4,10.0 L 424.4,10.1 L 425.1,9.7 L 429.5,9.7 L 428.9,10.1 L 433.7,9.4 L 435.3,9.8 L 433.8,9.1 L 437.3,9.1 L 437.7,8.1 L 442.0,7.0 L 445.4,7.6 L 442.0,8.1 L 447.3,8.4 L 445.7,9.0 L 452.8,8.6 L 457.2,10.1 L 454.8,10.1 L 456.7,11.2 L 446.5,13.7 L 444.1,15.2 L 445.4,14.5 L 452.7,13.7 L 450.6,13.7 L 451.1,13.1 L 453.6,13.1 L 454.7,13.7 L 455.5,13.2 L 456.6,14.5 L 460.0,13.6 L 464.9,13.9 L 464.2,14.4 L 466.4,14.9 L 471.1,15.0 L 473.6,13.5 L 476.4,14.4 L 480.4,14.5 L 481.4,15.4 L 479.8,15.6 L 481.5,16.1 L 479.6,16.3 L 483.8,18.6 L 486.5,16.5 L 488.2,17.4 L 491.6,17.0 L 494.5,17.9 L 494.8,17.1 L 498.0,17.4 L 496.7,16.5 L 498.1,16.0 L 496.4,16.0 L 499.8,15.5 L 499.2,15.0 L 508.5,15.8 L 504.4,16.0 L 508.6,15.9 L 507.1,16.7 L 506.3,16.0 L 506.1,17.2 L 508.8,15.9 L 510.8,15.9 L 513.4,16.5 L 511.5,16.9 L 517.3,18.4 L 522.5,17.9 L 527.2,18.3 L 530.6,21.1 L 532.5,20.3 L 539.6,20.6 L 541.0,20.1 L 541.8,21.0 L 545.2,21.7 L 546.3,21.3 L 544.7,20.4 L 545.3,19.5 L 549.5,20.1 L 553.9,19.9 L 560.0,21.4 L 560.0,27.8 Z M 458.9,141.3 L 458.2,140.2 L 456.8,140.4 L 455.8,139.5 L 454.1,140.6 L 453.8,139.3 L 451.5,139.6 L 451.0,136.5 L 450.2,136.8 L 449.9,135.8 L 450.0,134.7 L 449.4,134.2 L 449.4,132.8 L 450.6,131.3 L 452.9,132.5 L 453.3,130.3 L 455.8,129.5 L 457.3,127.2 L 459.5,126.7 L 459.5,125.8 L 460.2,125.5 L 461.6,123.2 L 461.7,124.0 L 462.2,123.2 L 463.1,124.2 L 462.9,125.0 L 464.1,125.1 L 465.5,125.9 L 463.7,126.7 L 464.4,127.6 L 462.6,127.9 L 463.2,128.7 L 462.0,128.8 L 463.7,130.9 L 463.3,131.7 L 465.1,133.1 L 464.1,133.4 L 463.4,132.9 L 462.7,134.6 L 463.0,136.0 L 461.8,136.8 L 460.7,137.7 L 461.4,138.3 L 460.9,139.6 L 458.9,141.3 Z M 441.8,143.5 L 438.0,140.0 L 436.1,136.1 L 434.2,134.3 L 433.7,131.9 L 432.1,131.0 L 430.7,128.6 L 428.6,127.1 L 428.1,125.5 L 431.7,126.1 L 432.9,127.4 L 435.2,129.5 L 437.0,131.7 L 437.2,130.9 L 439.3,133.4 L 440.1,133.5 L 439.7,134.3 L 440.7,133.8 L 441.4,134.3 L 440.7,135.9 L 442.3,136.4 L 442.5,138.0 L 442.9,139.0 L 444.3,138.6 L 445.0,140.0 L 444.5,144.4 L 443.8,143.7 L 442.6,143.8 L 441.8,143.5 Z M 491.6,79.3 L 490.1,79.1 L 490.5,77.7 L 488.7,77.6 L 486.2,78.7 L 485.5,79.1 L 483.6,79.0 L 487.0,76.2 L 491.7,76.1 L 492.7,73.3 L 493.6,73.1 L 492.9,73.8 L 493.6,74.3 L 496.9,72.0 L 497.9,69.5 L 497.6,68.0 L 498.3,66.9 L 499.5,67.6 L 499.1,66.7 L 500.1,66.6 L 501.0,69.7 L 500.2,71.8 L 499.2,72.0 L 499.3,73.9 L 498.6,75.1 L 499.1,76.1 L 497.6,77.4 L 498.0,76.3 L 497.3,77.0 L 496.5,76.8 L 496.0,77.9 L 495.8,77.0 L 495.0,77.9 L 493.1,77.9 L 492.7,77.1 L 493.0,78.4 L 491.6,79.3 Z M 280.0,51.3 L 274.6,51.4 L 274.3,52.2 L 271.1,52.5 L 273.4,50.6 L 275.2,50.6 L 276.3,49.6 L 274.7,50.3 L 271.7,49.5 L 273.9,48.4 L 272.6,48.0 L 273.5,47.3 L 275.8,47.1 L 275.6,45.6 L 274.3,45.2 L 275.3,44.4 L 272.4,44.6 L 272.4,42.8 L 271.0,43.9 L 272.2,41.5 L 270.3,41.5 L 271.6,40.9 L 271.0,39.7 L 272.1,39.7 L 272.2,38.4 L 275.3,38.4 L 273.1,40.3 L 277.2,40.1 L 276.1,41.8 L 274.7,42.1 L 276.0,42.3 L 274.0,42.5 L 276.7,42.9 L 278.1,45.0 L 279.9,45.8 L 278.8,46.5 L 279.7,46.6 L 280.0,47.8 L 282.0,47.8 L 282.7,48.5 L 281.5,50.0 L 280.4,50.2 L 282.2,50.3 L 280.0,51.3 Z M 465.9,142.9 L 465.9,140.6 L 465.0,140.6 L 464.7,139.3 L 465.7,137.8 L 465.6,136.6 L 466.2,135.8 L 466.1,134.7 L 466.7,133.5 L 467.6,133.5 L 468.1,132.5 L 472.8,133.3 L 474.7,131.9 L 473.4,134.1 L 467.1,134.0 L 466.8,135.8 L 467.7,137.0 L 469.2,136.0 L 472.0,136.0 L 469.3,137.9 L 470.5,139.9 L 470.1,140.6 L 471.2,142.0 L 470.0,142.1 L 469.1,142.6 L 469.2,141.4 L 468.1,140.6 L 468.4,139.2 L 467.0,139.6 L 467.4,144.0 L 465.8,143.9 L 465.9,142.9 Z M 472.9,113.4 L 471.8,113.3 L 470.6,111.8 L 470.7,113.1 L 469.4,111.8 L 468.7,112.4 L 467.6,112.0 L 468.2,110.7 L 467.4,111.0 L 466.8,110.4 L 466.3,108.5 L 467.3,108.2 L 467.6,104.2 L 470.3,104.5 L 470.0,105.5 L 470.5,107.0 L 468.8,109.5 L 469.2,111.1 L 470.1,111.9 L 471.0,111.2 L 471.5,112.2 L 472.4,111.8 L 472.5,113.3 L 473.0,114.1 L 472.9,113.4 Z M 253.6,29.9 L 250.9,30.6 L 247.3,29.7 L 244.7,29.9 L 246.8,28.9 L 242.6,28.1 L 246.1,27.9 L 244.8,27.6 L 246.3,27.2 L 241.8,27.1 L 243.0,27.1 L 243.8,26.8 L 243.5,26.0 L 245.1,26.6 L 244.0,25.6 L 246.8,26.3 L 247.2,27.7 L 248.2,26.1 L 249.8,26.8 L 250.8,26.0 L 251.9,26.9 L 251.6,26.0 L 254.2,26.1 L 254.8,25.4 L 256.0,26.0 L 257.4,25.7 L 256.4,26.1 L 259.0,27.8 L 257.9,27.9 L 258.7,28.1 L 256.7,29.2 L 253.6,29.9 Z M 474.4,125.1 L 473.0,124.2 L 473.3,122.6 L 472.4,121.9 L 472.0,122.6 L 470.8,121.9 L 470.0,123.4 L 470.1,121.6 L 471.9,120.4 L 472.6,120.9 L 472.4,121.6 L 473.5,120.6 L 474.1,119.9 L 475.3,120.0 L 475.1,118.6 L 476.3,119.4 L 476.1,120.6 L 476.9,122.7 L 476.2,123.4 L 476.3,124.4 L 475.5,122.7 L 475.0,123.7 L 475.5,124.9 L 475.0,125.6 L 474.9,124.7 L 474.4,125.1 Z M 267.6,49.5 L 264.8,50.2 L 265.1,49.5 L 263.8,49.5 L 264.8,49.0 L 263.9,48.9 L 266.5,48.2 L 264.5,48.4 L 266.2,47.3 L 264.2,47.0 L 265.1,46.3 L 264.3,45.6 L 266.7,45.7 L 267.4,44.9 L 266.3,44.9 L 267.6,44.0 L 268.5,43.7 L 269.2,44.0 L 270.4,44.0 L 271.6,45.2 L 270.0,46.0 L 270.2,48.9 L 267.6,49.5 Z M 502.8,65.7 L 500.4,64.6 L 499.3,65.2 L 498.5,64.7 L 499.6,66.0 L 497.8,66.4 L 497.5,64.7 L 498.6,64.1 L 500.0,63.5 L 500.8,59.9 L 503.6,62.3 L 505.2,62.5 L 506.1,61.9 L 505.9,63.5 L 506.8,63.4 L 504.0,64.2 L 502.8,65.7 Z M 500.9,59.2 L 501.3,50.7 L 500.3,48.7 L 500.5,47.0 L 502.1,46.5 L 501.3,45.5 L 502.8,50.1 L 505.2,54.8 L 504.1,53.8 L 502.4,54.0 L 501.7,56.2 L 503.4,58.5 L 501.7,58.0 L 500.9,59.2 Z M 404.8,124.9 L 404.0,121.2 L 404.5,118.9 L 406.6,120.8 L 407.4,123.2 L 406.5,124.5 L 404.8,124.9 Z M 370.6,13.1 L 369.4,12.8 L 370.0,13.5 L 368.0,13.3 L 369.6,13.7 L 367.7,13.6 L 368.2,14.4 L 364.1,14.2 L 366.9,13.7 L 363.5,13.5 L 365.6,12.9 L 367.7,13.1 L 365.8,12.8 L 368.6,12.0 L 367.1,11.2 L 375.1,9.4 L 380.8,9.3 L 386.7,8.3 L 386.4,9.5 L 375.4,11.0 L 372.0,12.5 L 370.6,12.3 L 370.6,13.1 Z M 304.0,8.2 L 301.6,7.4 L 305.0,7.5 L 302.9,7.1 L 306.4,6.7 L 301.7,7.0 L 301.2,6.5 L 307.1,5.9 L 305.8,5.4 L 304.0,5.8 L 300.2,6.2 L 296.6,4.0 L 301.5,3.5 L 299.2,4.0 L 301.8,4.5 L 302.9,3.6 L 305.7,5.1 L 305.3,3.2 L 307.5,4.3 L 308.4,3.9 L 313.5,5.3 L 309.6,5.9 L 306.4,8.9 L 304.0,8.2 Z M 483.3,83.8 L 483.5,82.6 L 483.1,83.5 L 482.4,83.1 L 483.3,81.1 L 482.9,80.0 L 482.8,81.0 L 481.8,81.2 L 481.7,80.3 L 483.7,79.1 L 485.5,80.6 L 484.3,83.2 L 483.3,83.8 Z M 468.0,98.6 L 466.7,96.8 L 466.9,95.9 L 469.1,93.1 L 469.8,93.6 L 468.0,98.6 Z M 449.6,104.6 L 449.0,103.1 L 450.0,102.0 L 452.6,101.8 L 451.8,104.1 L 450.4,104.9 L 449.6,104.6 Z M 364.0,18.5 L 363.2,17.2 L 360.7,17.3 L 360.0,16.7 L 363.5,15.4 L 361.5,15.3 L 363.4,15.0 L 362.7,14.5 L 365.3,14.4 L 367.9,14.5 L 365.7,15.5 L 365.8,16.6 L 369.6,18.5 L 364.0,18.5 Z M 303.3,74.4 L 299.7,73.0 L 299.4,72.3 L 304.3,71.8 L 303.3,74.4 Z M 293.1,70.6 L 292.7,67.5 L 294.4,66.9 L 295.3,68.1 L 295.0,70.2 L 293.1,70.6 Z M 494.7,11.8 L 493.1,10.5 L 495.9,9.5 L 498.7,10.5 L 499.9,9.6 L 506.2,10.7 L 503.1,11.4 L 501.5,10.3 L 503.4,11.7 L 494.7,11.8 Z M 486.9,80.5 L 486.0,79.7 L 486.8,78.6 L 488.3,78.2 L 489.4,78.5 L 488.7,80.1 L 487.8,79.6 L 486.9,80.5 Z M 479.1,135.2 L 479.8,136.2 L 478.6,135.1 L 478.2,133.0 L 479.0,131.1 L 479.1,132.6 L 478.5,133.2 L 480.2,132.1 L 480.2,133.0 L 479.4,133.4 L 480.5,134.4 L 479.0,134.0 L 479.1,135.2 Z M 479.1,139.8 L 480.7,139.3 L 482.7,139.6 L 483.5,141.1 L 482.1,140.2 L 479.8,140.4 L 479.4,139.7 L 479.0,140.6 L 479.1,139.8 Z M 429.3,5.0 L 424.5,4.0 L 431.9,3.0 L 433.7,3.2 L 435.7,3.6 L 435.6,5.1 L 429.3,5.0 Z M 322.0,3.4 L 316.8,4.6 L 311.3,4.2 L 313.8,3.6 L 309.2,3.8 L 307.6,3.1 L 310.4,3.1 L 314.6,3.3 L 315.5,2.5 L 315.9,3.1 L 318.6,2.7 L 322.0,3.4 Z M 474.5,116.1 L 473.3,114.0 L 474.7,114.0 L 475.2,114.7 L 475.6,116.6 L 474.5,116.1 Z M 446.0,139.6 L 444.8,139.3 L 444.5,138.2 L 443.5,138.1 L 443.9,137.4 L 445.0,137.3 L 445.3,138.7 L 446.2,138.9 L 446.0,139.6 Z M 463.6,120.1 L 462.3,121.0 L 465.5,117.5 L 465.5,116.7 L 465.9,116.0 L 466.2,117.4 L 464.7,118.4 L 463.6,120.1 Z M 436.1,6.6 L 439.4,4.2 L 439.4,5.2 L 441.6,4.6 L 444.1,5.8 L 436.1,6.6 Z" fill="url(#realDotsBlue)" filter="url(#realGlowBlue)"/><path d="M 507.5,198.3 L 506.1,198.0 L 505.0,197.7 L 505.7,197.4 L 503.3,198.6 L 498.7,197.2 L 497.4,195.8 L 497.2,194.1 L 496.1,193.1 L 494.8,193.2 L 495.5,191.9 L 494.8,190.8 L 494.3,192.4 L 492.9,192.7 L 493.8,192.1 L 493.8,190.8 L 494.6,189.8 L 494.3,188.0 L 494.3,188.9 L 491.5,191.4 L 491.5,192.2 L 490.2,191.5 L 489.5,189.2 L 488.5,188.8 L 484.0,186.4 L 475.9,187.8 L 473.3,189.0 L 472.2,190.5 L 466.5,190.5 L 463.5,192.4 L 461.4,192.3 L 459.1,191.2 L 458.9,189.8 L 460.0,189.4 L 460.3,187.2 L 459.0,184.8 L 458.7,182.5 L 456.0,177.7 L 457.1,178.4 L 456.6,176.6 L 456.9,177.8 L 457.7,177.9 L 456.4,174.8 L 457.3,170.6 L 457.8,171.7 L 458.3,170.6 L 461.7,168.4 L 462.6,168.8 L 465.3,167.5 L 468.4,166.8 L 470.4,164.5 L 470.0,163.1 L 471.2,161.6 L 472.2,163.7 L 472.2,162.7 L 472.2,161.3 L 473.5,161.9 L 474.4,161.6 L 473.5,161.6 L 474.1,160.7 L 473.9,159.8 L 474.8,160.3 L 474.2,159.6 L 475.2,159.6 L 474.7,158.9 L 475.4,158.1 L 475.9,158.8 L 476.0,157.6 L 476.8,157.6 L 478.2,157.6 L 479.5,158.9 L 479.1,160.2 L 479.4,159.5 L 480.8,159.2 L 481.6,159.7 L 482.2,158.9 L 481.2,158.3 L 481.9,156.9 L 482.7,156.7 L 482.8,155.5 L 483.7,155.5 L 484.2,154.5 L 486.5,154.7 L 486.5,153.8 L 485.0,153.3 L 487.7,154.2 L 488.7,154.7 L 489.6,154.3 L 490.3,154.9 L 491.4,154.4 L 491.6,155.2 L 492.4,154.2 L 493.1,155.0 L 492.3,155.7 L 492.3,156.5 L 491.4,156.5 L 490.6,159.3 L 492.6,160.9 L 496.3,162.5 L 497.2,163.5 L 498.7,163.7 L 500.4,159.4 L 500.1,157.5 L 500.9,155.4 L 501.0,154.4 L 501.1,152.7 L 501.7,152.3 L 503.3,155.8 L 503.6,158.4 L 504.8,158.0 L 506.1,159.3 L 506.2,161.7 L 507.0,162.5 L 507.5,165.7 L 511.4,168.0 L 512.8,171.8 L 513.4,171.1 L 514.3,171.9 L 514.6,173.3 L 516.1,174.2 L 518.3,177.3 L 518.0,179.6 L 519.0,181.8 L 518.1,185.7 L 517.0,187.6 L 515.2,189.8 L 514.3,192.0 L 513.6,193.4 L 513.3,196.3 L 509.7,196.9 L 507.5,198.3 Z M 513.3,151.3 L 514.7,151.5 L 513.6,152.3 L 512.9,151.7 L 509.8,151.3 L 507.3,148.0 L 505.3,147.5 L 504.6,146.9 L 503.4,146.9 L 503.9,147.8 L 503.1,147.7 L 501.2,148.1 L 503.1,149.1 L 501.9,150.1 L 501.2,149.6 L 499.5,149.9 L 497.8,147.9 L 496.2,148.3 L 496.4,147.2 L 495.7,146.6 L 496.6,146.4 L 495.5,146.1 L 495.3,145.1 L 495.2,144.0 L 490.3,142.0 L 489.4,141.5 L 488.4,141.1 L 487.9,140.4 L 488.1,139.5 L 487.6,141.1 L 486.7,141.4 L 486.6,140.1 L 485.3,139.3 L 486.5,139.3 L 487.2,138.7 L 487.9,139.2 L 488.4,138.1 L 485.8,138.5 L 485.3,137.1 L 483.7,137.1 L 484.1,136.1 L 486.0,135.3 L 488.4,135.9 L 488.7,138.6 L 489.2,139.4 L 490.2,140.3 L 491.2,139.8 L 492.2,138.4 L 493.4,138.2 L 494.5,137.1 L 504.8,141.0 L 506.8,142.7 L 506.7,143.7 L 509.6,144.8 L 510.0,145.6 L 508.6,145.8 L 508.9,147.0 L 510.4,148.0 L 511.2,149.6 L 512.2,149.5 L 512.1,150.3 L 513.4,150.5 L 513.3,151.3 Z M 544.4,210.7 L 542.9,211.4 L 540.8,210.6 L 539.3,210.6 L 539.5,209.2 L 541.9,207.0 L 543.2,207.0 L 545.6,205.5 L 547.8,201.8 L 549.1,201.3 L 549.4,202.6 L 551.2,202.1 L 550.5,202.5 L 551.1,203.3 L 548.8,205.6 L 548.6,206.4 L 549.2,206.8 L 547.9,206.8 L 547.0,206.2 L 547.9,206.8 L 546.5,207.0 L 545.6,210.1 L 544.4,210.7 Z M 457.3,148.8 L 452.2,148.2 L 449.3,147.2 L 447.8,147.4 L 445.5,146.8 L 443.7,145.8 L 444.6,145.4 L 444.9,144.4 L 448.5,145.0 L 449.5,146.0 L 451.7,146.1 L 452.7,145.3 L 455.1,146.0 L 456.0,147.4 L 458.0,147.5 L 458.3,149.1 L 457.3,148.8 Z M 552.1,202.1 L 552.3,200.3 L 550.3,199.2 L 551.6,198.5 L 552.2,196.8 L 551.5,195.6 L 550.9,194.6 L 550.5,193.9 L 548.6,191.3 L 549.5,192.2 L 550.8,192.8 L 551.2,193.6 L 552.0,194.5 L 551.7,195.3 L 553.1,195.9 L 553.0,194.7 L 553.8,196.6 L 555.6,197.2 L 556.9,196.4 L 557.7,196.6 L 556.9,199.0 L 555.4,199.1 L 553.7,202.5 L 552.6,203.1 L 551.6,202.6 L 552.1,202.1 Z M 507.1,205.9 L 506.0,204.7 L 505.2,202.8 L 505.1,201.5 L 508.1,202.5 L 510.3,201.7 L 510.8,204.0 L 510.2,205.7 L 509.0,204.9 L 508.5,206.4 L 507.1,205.9 Z M 515.0,144.6 L 512.7,145.1 L 510.7,143.9 L 513.1,143.8 L 513.5,142.9 L 513.5,143.8 L 514.7,143.7 L 516.0,142.7 L 515.7,141.6 L 516.7,141.5 L 516.4,142.9 L 515.0,144.6 Z M 472.9,151.6 L 472.0,151.7 L 472.4,150.5 L 474.6,148.9 L 478.0,148.5 L 472.9,151.6 Z M 539.8,171.4 L 536.6,169.8 L 535.1,167.7 L 539.8,171.4 Z M 462.0,149.7 L 461.6,148.9 L 464.0,148.9 L 463.1,148.2 L 465.4,148.9 L 462.0,149.7 Z M 471.3,148.4 L 469.2,149.4 L 466.4,149.1 L 467.3,148.2 L 469.0,148.9 L 470.4,148.8 L 471.1,148.0 L 471.3,148.4 Z M 466.7,151.2 L 465.0,150.3 L 466.6,150.0 L 468.0,151.2 L 467.4,151.7 L 466.7,151.2 Z" fill="url(#realDotsBlue)" filter="url(#realGlowBlue)"/></g></svg>' }
+function refreshDashboard(){
+ api("/api/v1/market/forex/market-state").then(function(r){
+  var w=byId("dash-hours");if(!w)return;clear(w);var d=(r.ok&&r.data)?r.data:{market_state:"UNKNOWN"},st=d.market_state||"UNKNOWN";
+  var open=st==="OPEN",title=open?"Marché ouvert":st==="CLOSED_WEEKEND"?"Marché fermé — week-end":st==="CLOSED"?"Marché fermé":"État inconnu";
+  var left=[h("div",{class:"market-open"},[h("span",{class:"orb"}),title])];
+  if(d.current_session)left.push(h("div",{class:"market-status"},["Session actuelle : "+d.current_session,h("span",{class:"indic"},["Indicative"])]));
+  if(d.next_close)left.push(h("div",{class:"closebox"},[h("div",{class:"t1"},["Ferme "+formatMontrealTime(d.next_close)+" (Montréal)"]),h("div",{class:"t2"},["dans ",h("span",{class:"green"},[fxCountdown(d.next_close)])])]));
+  if(d.next_open&&!open)left.push(h("div",{class:"closebox"},[h("div",{class:"t1"},["Réouverture"]),h("div",{class:"t2"},[formatMontrealTime(d.next_open)])]));
+  left.push(h("div",{class:"localtime"},["◷",h("div",{},["Heure locale (Montréal)",h("b",{},[formatMontrealTime(new Date())])])]));
+  var map=h("div",{class:"mapbox"},[
+   h("div",{class:"world",html:worldSvg()}),
+   h("div",{class:"scard sydney"},[h("b",{},["Sydney"]),h("span",{},["Indicative"])]),
+   h("div",{class:"scard london"},[h("b",{},["Londres"]),h("span",{},["Indicative"])]),
+   h("div",{class:"scard ny"},[h("b",{},["New York"]),h("span",{},["Indicative"])]),
+   h("div",{class:"timeline"},[h("span",{},["00:00"]),h("span",{},["06:00"]),h("span",{},["12:00"]),h("span",{},["18:00"]),h("span",{},["24:00"])])
+  ]);
+  w.appendChild(h("div",{class:"hours-title"},["HORAIRES DU MARCHÉ",h("span",{class:"info"},["i"])]));
+  w.appendChild(h("div",{class:"hours-grid"},[h("div",{},left),map]))
+ });
+ [["BTC-USD","crypto"],["ETH-USD","crypto"],["SOL-USD","crypto"]].forEach(function(it){
+  api("/api/v1/market/ticker/"+encodeURIComponent(it[0])).then(function(r){var p=byId("fav-p-"+it[0]),b=byId("fav-b-"+it[0]);if(!p||!b)return;clear(p);clear(b);if(!r.ok||!r.data){p.textContent="—";b.appendChild(qualityBadge("UNKNOWN"));return}p.textContent=fmtNum(r.data.value)||"—";b.appendChild(qualityBadge(r.data.quality))})
+ });
+ api("/api/v1/market/metal/XAU-USD/quote").then(function(r){var p=byId("fav-p-XAU-USD"),b=byId("fav-b-XAU-USD");if(!p||!b)return;clear(p);clear(b);if(!r.ok||!r.data||r.data.price == null){p.textContent="—";b.appendChild(qualityBadge((r.data&&r.data.quality)||"UNKNOWN"));return}p.textContent=fmtNum(r.data.price)||"—";b.appendChild(qualityBadge(r.data.quality||"UNKNOWN"))});
+ var up=byId("fav-p-US30"),ub=byId("fav-b-US30");if(up&&ub){up.textContent="—";clear(ub);ub.appendChild(qualityBadge("MAPPED"))}
+}
+
+/* Existing market views */
+function renderMarkets(){var v=byId("view-markets");clear(v);v.appendChild(h("h2",{class:"section"},["Crypto · Coinbase · données réelles"]));var c=h("div",{class:"card listcard"},[]);CRYPTO_SYMBOLS.forEach(function(sym){c.appendChild(h("div",{class:"row tap",onclick:function(){openDetail("crypto",sym)}},[h("div",{class:"asset"},[iconFor(sym),h("div",{},[h("div",{class:"sym"},[sym]),h("div",{class:"aname"},["Coinbase"])])]),h("div",{class:"right"},[h("span",{class:"price","data-price":sym},["…"]),h("span",{"data-badge":sym},[])])]))});v.appendChild(c);refreshMarkets()}
+function refreshMarkets(){CRYPTO_SYMBOLS.forEach(function(sym){api("/api/v1/market/ticker/"+encodeURIComponent(sym)).then(function(r){var p=document.querySelector('[data-price="'+sym+'"]'),b=document.querySelector('[data-badge="'+sym+'"]');if(!p||!b)return;clear(p);clear(b);if(!r.ok||!r.data){p.textContent="—";b.appendChild(qualityBadge("UNKNOWN"));return}p.appendChild(priceCell(r.data.value));b.appendChild(qualityBadge(r.data.quality))})})}
+
+function renderForex(){var v=byId("view-forex");clear(v);v.appendChild(h("h2",{class:"section"},["Forex · Massive · données réelles"]));v.appendChild(h("div",{class:"card",id:"fx-state"},[loading("État du marché…")]));v.appendChild(h("div",{id:"fx-map"},[loading("Mappings…")]));refreshForexMarket();api("/api/v1/market/forex/mappings").then(function(r){var w=byId("fx-map");clear(w);if(!r.ok||!r.data){w.appendChild(emptyState("Forex indisponible",errorMessage(r)));return}var c=h("div",{class:"card listcard"},[]);(r.data.mappings||[]).forEach(function(m){var mapped=m.status === "MAPPED";c.appendChild(h("div",{class:"row "+(mapped?"tap":""),onclick:mapped?function(){openDetail("forex",m.canonical)}:null},[h("div",{},[h("div",{class:"sym"},[m.canonical]),h("div",{class:"sub"},[mapped?"Massive · "+(m.provider_symbol||""):"Non disponible"])]),qualityBadge(mapped?"MAPPED":"NOT_MAPPED")]))});w.appendChild(c)})}
+function refreshForexMarket(){api("/api/v1/market/forex/market-state").then(function(r){var w=byId("fx-state");if(!w)return;clear(w);var d=(r.ok&&r.data)?r.data:{market_state:"UNKNOWN"},st=d.market_state||"UNKNOWN";w.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["État du marché"]),h("span",{},[st])]));if(d.current_session)w.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["Session indicative"]),h("span",{},[d.current_session])]))})}
+
+function renderMetal(){var v=byId("view-metal");clear(v);v.appendChild(h("h2",{class:"section"},["Métaux · Twelve Data · données réelles"]));var c=h("div",{class:"card listcard"},[]);c.appendChild(h("div",{class:"row tap",onclick:function(){openDetail("metal","XAU-USD")}},[h("div",{class:"asset"},[iconFor("XAU-USD"),h("div",{},[h("div",{class:"sym"},["XAU-USD"]),h("div",{class:"aname"},["Gold Spot · Twelve Data"])])]),qualityBadge("MAPPED")]));v.appendChild(c)}
+function renderIndex(){var v=byId("view-index");clear(v);v.appendChild(h("h2",{class:"section"},["Indices US cash · Massive · données réelles"]));var c=h("div",{class:"card listcard"},[]);[["SPX","S&P 500"],["NDX","Nasdaq-100"],["US30","Dow Jones 30"]].forEach(function(it){c.appendChild(h("div",{class:"row tap",onclick:function(){openDetail("index",it[0])}},[h("div",{class:"asset"},[iconFor("US30"),h("div",{},[h("div",{class:"sym"},[it[0]]),h("div",{class:"aname"},[it[1]+" · indice cash"])])]),qualityBadge("MAPPED")]))});v.appendChild(c)}
+function renderSystem(){var v=byId("view-system");clear(v);v.appendChild(h("h2",{class:"section"},["Santé backend & données"]));v.appendChild(loading("Lecture de /health…"));api("/health").then(function(r){clear(v);v.appendChild(h("h2",{class:"section"},["Santé backend & données"]));if(!r.ok||!r.data){v.appendChild(emptyState("Backend indisponible",errorMessage(r)));return}var c=h("div",{class:"card"},[]);c.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["État global"]),h("span",{},[r.data.overall||"UNKNOWN"])]));(r.data.components||[]).forEach(function(x){c.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},[x.name]),h("span",{},[x.state||"?"])]))});v.appendChild(c)})}
+
+function openDetail(kind,symbol){detailCtx={kind:kind,symbol:symbol,canonical:symbol};setView("detail")}
+function renderDetail(){var v=byId("view-detail");clear(v);if(!detailCtx){v.appendChild(emptyState("Aucun actif",""));return}var back=detailCtx.kind==="forex"?"forex":detailCtx.kind==="metal"?"metal":detailCtx.kind==="index"?"index":"markets";v.appendChild(h("button",{class:"back",onclick:function(){setView(back)}},["← Retour"]));v.appendChild(h("h2",{class:"section"},[detailCtx.symbol]));if(detailCtx.kind==="crypto"||detailCtx.kind==="metal")v.appendChild(h("div",{class:"card"},[h("div",{class:"kv"},[h("span",{class:"k"},["Prix"]),h("span",{id:"d-price"},[h("span",{class:"spin"})])]),h("div",{class:"kv"},[h("span",{class:"k"},["Marché (fournisseur)"]),h("span",{id:"d-market-provider"},["UNKNOWN"])])]));v.appendChild(h("div",{class:"card",id:"d-hist"},[loading("Historique réel…")]));refreshDetail()}
+function refreshDetail(){if(!detailCtx)return;if(detailCtx.kind==="crypto"){api("/api/v1/market/ticker/"+encodeURIComponent(detailCtx.symbol)).then(function(r){var p=byId("d-price");if(!p)return;clear(p);if(!r.ok||!r.data){p.textContent="—";return}p.appendChild(priceCell(r.data.value));p.appendChild(document.createTextNode(" "));p.appendChild(qualityBadge(r.data.quality))});loadCandles("/api/v1/market/candles/"+encodeURIComponent(detailCtx.symbol)+"?granularity=1h")}else if(detailCtx.kind==="metal"){api("/api/v1/market/metal/"+encodeURIComponent(detailCtx.canonical)+"/quote").then(function(r){var p=byId("d-price");if(!p)return;clear(p);var d=r.data;if(!r.ok||!d||d.price == null){p.textContent="—";return}p.appendChild(priceCell(d.price));p.appendChild(document.createTextNode(" "));p.appendChild(qualityBadge(d.quality||"UNKNOWN"));var ms=byId("d-market-provider");if(ms){ms.textContent=d.is_market_open===true?"OUVERT":d.is_market_open===false?"FERMÉ":"UNKNOWN"}});var e=Math.floor(Date.now()/1000/3600)*3600;loadCandles("/api/v1/market/metal/"+encodeURIComponent(detailCtx.canonical)+"/history?granularity=1h&start="+(e-43200)+"&end="+e)}else if(detailCtx.kind==="index"){var e2=Math.floor(Date.now()/1000);loadCandles("/api/v1/market/index/"+encodeURIComponent(detailCtx.canonical)+"/history?granularity=1d&start="+(e2-2592000)+"&end="+e2)}else{var e3=Math.floor(Date.now()/1000/3600)*3600;loadCandles("/api/v1/market/forex/"+encodeURIComponent(detailCtx.canonical)+"/history?granularity=1h&start="+(e3-43200)+"&end="+e3)}}
+function loadCandles(path){api(path).then(function(r){var w=byId("d-hist");if(!w)return;clear(w);if(!r.ok){w.appendChild(emptyState("Historique indisponible",errorMessage(r)));return}var d=r.data||{},cs=(d.candles||[]).slice().sort(function(a,b){return(Date.parse(a.start)||0)-(Date.parse(b.start)||0)});w.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["Dernières bougies"]),qualityBadge(d.latest_quality||(cs.length?cs[cs.length-1].quality:"MISSING"))]));if(!cs.length){w.appendChild(emptyState("Pas de données",""));return}var rows=cs.slice(-10).reverse().map(function(c){return h("tr",{},[h("td",{},[formatMontrealTime(c.start)]),h("td",{},[priceCell(c.open)]),h("td",{},[priceCell(c.high)]),h("td",{},[priceCell(c.low)]),h("td",{},[priceCell(c.close)])])});w.appendChild(h("div",{class:"tbl-wrap"},[h("table",{class:"tbl"},[h("thead",{},[h("tr",{},[h("th",{},["Heure"]),h("th",{},["O"]),h("th",{},["H"]),h("th",{},["L"]),h("th",{},["C"])])]),h("tbody",{},rows)])]))})}
+
+
+function pageHead(title,sub,badge){
+  return h("div",{class:"page-head"},[
+    h("div",{},[h("h1",{},[title]),h("p",{},[sub])]),
+    h("span",{class:"page-chip"},[badge||"UI READY"])
+  ])
+}
+function modCard(title,status,content){
+  return h("div",{class:"card module"},[
+    h("div",{class:"module-title"},[
+      h("b",{},[title]),
+      h("span",{class:"status-pill "+(status==="READY"?"ready":status==="UNAVAILABLE"?"unavail":"future")},[status])
+    ]),
+    content
+  ])
+}
+function placeholder(title,sub){
+  return h("div",{class:"placeholder"},[h("strong",{},[title]),sub||""])
+}
+
+function renderSignals(){
+  var v=byId("view-signals");clear(v);
+  v.appendChild(pageHead("Signaux","Setups structurés, cycle de validation, raisons d'entrée et d'invalidation.","UI HYPER FULL"));
+  v.appendChild(h("div",{class:"subtabs"},[
+    h("button",{class:"subtab active"},["Actifs"]),h("button",{class:"subtab"},["Watchlist"]),
+    h("button",{class:"subtab"},["Historique"]),h("button",{class:"subtab"},["Alertes"]),h("button",{class:"subtab"},["Explications"])
+  ]));
+  v.appendChild(modCard("Signal Engine","NOT IMPLEMENTED",h("div",{class:"section-stack"},[
+    placeholder("Aucun signal réel disponible","Le moteur backend n'est pas encore branché. Aucun LONG/SHORT fictif n'est généré."),
+    h("div",{class:"pipeline"},[
+      h("div",{class:"pipe"},[h("b",{},["1. CONTEXTE"]),"Régime + HTF"]),
+      h("div",{class:"pipe"},[h("b",{},["2. LIQUIDITÉ"]),"Niveaux + sweep"]),
+      h("div",{class:"pipe"},[h("b",{},["3. STRUCTURE"]),"BOS / CHoCH / MSS"]),
+      h("div",{class:"pipe"},[h("b",{},["4. ENTRÉE"]),"Retest + revalidation"])
+    ])
+  ])));
+  v.appendChild(modCard("Fiche signal","NOT IMPLEMENTED",h("div",{class:"info-grid"},[
+    h("div",{class:"journal-card"},[h("h4",{},["Direction & actif"]),h("p",{},["LONG / SHORT / WAIT, actif, timeframe, session."])]),
+    h("div",{class:"journal-card"},[h("h4",{},["Entry / SL / TP"]),h("p",{},["Zone d'entrée, invalidation structurelle, objectifs de liquidité."])]),
+    h("div",{class:"journal-card"},[h("h4",{},["Confirmations"]),h("p",{},["Sweep, displacement, BOS/CHoCH/MSS, OB, FVG, retest."])]),
+    h("div",{class:"journal-card"},[h("h4",{},["Qualité des données"]),h("p",{},["Source, freshness, sync, état du marché, limitations."])])
+  ])));
+  v.appendChild(modCard("Historique des décisions","NOT IMPLEMENTED",
+    placeholder("Historique indisponible","Chaque signal futur conservera timestamp, stratégie/version, régime, confirmations et résultat.")));
+}
+
+function renderTrading(){
+  var v=byId("view-trading");clear(v);
+  v.appendChild(pageHead("Trading","Paper Trading complet, gestion du risque, journal et Decision Replay.","PAPER ONLY"));
+  v.appendChild(h("div",{class:"subtabs"},[
+    h("button",{class:"subtab active"},["Compte"]),h("button",{class:"subtab"},["Positions"]),
+    h("button",{class:"subtab"},["Historique"]),h("button",{class:"subtab"},["Calculateur"]),
+    h("button",{class:"subtab"},["Replay"]),h("button",{class:"subtab"},["Journal"])
+  ]));
+  v.appendChild(h("div",{class:"metric-strip"},[
+    h("div",{class:"metric-mini"},[h("span",{},["Capital virtuel"]),h("b",{},["—"])]),
+    h("div",{class:"metric-mini"},[h("span",{},["P&L réalisé"]),h("b",{},["—"])]),
+    h("div",{class:"metric-mini"},[h("span",{},["P&L latent"]),h("b",{},["—"])]),
+    h("div",{class:"metric-mini"},[h("span",{},["Drawdown"]),h("b",{},["—"])])
+  ]));
+  v.appendChild(modCard("Ordre Paper Trading","NOT IMPLEMENTED",h("div",{class:"form-grid"},[
+    h("div",{class:"field"},[h("label",{},["Actif"]),h("div",{class:"value"},["—"])]),
+    h("div",{class:"field"},[h("label",{},["Sens"]),h("div",{class:"value"},["—"])]),
+    h("div",{class:"field"},[h("label",{},["Montant du trade"]),h("div",{class:"value"},["—"])]),
+    h("div",{class:"field"},[h("label",{},["Risque maximum"]),h("div",{class:"value"},["—"])]),
+    h("div",{class:"field"},[h("label",{},["Stop Loss"]),h("div",{class:"value"},["—"])]),
+    h("div",{class:"field"},[h("label",{},["Take Profit"]),h("div",{class:"value"},["—"])])
+  ])));
+  v.appendChild(modCard("Positions ouvertes","NOT IMPLEMENTED",
+    placeholder("Aucune position","P&L, frais, slippage, exposition, SL/TP et état de synchronisation apparaîtront ici.")));
+  v.appendChild(modCard("Calculateur risque / taille","NOT IMPLEMENTED",h("div",{class:"section-stack"},[
+    h("div",{class:"kv"},[h("span",{},["Taille calculée"]),h("b",{},["—"])]),
+    h("div",{class:"kv"},[h("span",{},["Risque en $"]),h("b",{},["—"])]),
+    h("div",{class:"kv"},[h("span",{},["Risque en %"]),h("b",{},["—"])]),
+    h("div",{class:"kv"},[h("span",{},["RR projeté"]),h("b",{},["—"])]),
+    h("div",{class:"placeholder"},[h("strong",{},["LOT INDISPONIBLE si métadonnées broker manquantes"]),"Aucun lot ne sera deviné."])
+  ])));
+  v.appendChild(modCard("Decision Replay","NOT IMPLEMENTED",h("div",{class:"replay-box"},[
+    h("div",{class:"replay-row"},[h("span",{},["Timestamp"]),h("b",{},["—"])]),
+    h("div",{class:"replay-row"},[h("span",{},["État des données"]),h("b",{},["—"])]),
+    h("div",{class:"replay-row"},[h("span",{},["Structure connue"]),h("b",{},["—"])]),
+    h("div",{class:"replay-row"},[h("span",{},["Décision"]),h("b",{},["—"])]),
+    h("div",{class:"replay-row"},[h("span",{},["Pourquoi"]),h("b",{},["—"])])
+  ])));
+}
+
+function renderStrategies(){
+  var v=byId("view-strategies");clear(v);
+  v.appendChild(pageHead("Stratégies","Bibliothèque, versions, validation, performances et Adaptive Edge.","UI HYPER FULL"));
+  v.appendChild(h("div",{class:"subtabs"},[
+    h("button",{class:"subtab active"},["Bibliothèque"]),h("button",{class:"subtab"},["Backtests"]),
+    h("button",{class:"subtab"},["OOS"]),h("button",{class:"subtab"},["Performances"]),
+    h("button",{class:"subtab"},["Adaptive Edge"]),h("button",{class:"subtab"},["Versions"])
+  ]));
+  var g=h("div",{class:"grid-2"},[]);
+  [
+    ["SMC Liquidity Sweep + Structure Reversal","Sweep → displacement → structure → OB/FVG → retest."],
+    ["Value-Area Order Flow Reversal","Value, absorption, delta/CVD, trapped participants."],
+    ["POC Retest","POC + contexte + confirmation, jamais POC seul."],
+    ["Top-Down Swing Structure","Weekly/Daily/H4 avec trigger H1 optionnel."],
+    ["Fair Value 3-Touch / Reclaim","Range, sweep/reclaim et structure."],
+    ["Auction Market / LVN Scalping","LVN/HVN/POC + order flow quand disponible."]
+  ].forEach(function(x){
+    g.appendChild(h("div",{class:"card tool-card"},[
+      h("div",{},[h("div",{class:"tool-name"},[x[0]]),h("div",{class:"tool-desc"},[x[1]])]),
+      h("div",{class:"tool-foot"},[h("span",{class:"status-pill future"},["CANDIDATE"]),h("span",{class:"info"},["i"])])
+    ]))
   });
-  var utcFormatter = new Intl.DateTimeFormat("fr-CA", {
-    timeZone: "UTC", year:"numeric", month:"2-digit", day:"2-digit",
-    hour:"2-digit", minute:"2-digit", hour12:false
+  v.appendChild(g);
+  v.appendChild(modCard("Performance Matrix","NOT IMPLEMENTED",h("div",{class:"section-stack"},[
+    h("table",{class:"compact-table"},[
+      h("thead",{},[h("tr",{},[h("th",{},["Actif"]),h("th",{},["Stratégie"]),h("th",{},["TF"]),h("th",{},["Session"]),h("th",{},["Régime"]),h("th",{},["PF"]),h("th",{},["Expectancy"])])]),
+      h("tbody",{},[h("tr",{},[h("td",{},["—"]),h("td",{},["—"]),h("td",{},["—"]),h("td",{},["—"]),h("td",{},["—"]),h("td",{},["—"]),h("td",{},["—"])])])
+    ])
+  ])));
+  v.appendChild(modCard("Validation & Robustesse","NOT IMPLEMENTED",h("div",{class:"info-grid"},[
+    h("div",{class:"journal-card"},[h("h4",{},["Backtest"]),h("p",{},["Échantillon d'entraînement, frais/slippage, métriques."])]),
+    h("div",{class:"journal-card"},[h("h4",{},["Out-of-sample"]),h("p",{},["Validation hors échantillon avant activation."])]),
+    h("div",{class:"journal-card"},[h("h4",{},["Robustesse"]),h("p",{},["Sensibilité aux paramètres, périodes et régimes."])]),
+    h("div",{class:"journal-card"},[h("h4",{},["Versioning"]),h("p",{},["Chaque décision garde stratégie + version exacte."])])
+  ])));
+}
+
+function renderIntelligence(){
+  var v=byId("view-intelligence");clear(v);
+  v.appendChild(pageHead("Intelligence","Contexte, structure, liquidité, zones, sessions et données alternatives.","UI HYPER FULL"));
+  v.appendChild(h("div",{class:"subtabs"},[
+    h("button",{class:"subtab active"},["Régime"]),h("button",{class:"subtab"},["Structure"]),
+    h("button",{class:"subtab"},["Liquidité"]),h("button",{class:"subtab"},["Zones"]),
+    h("button",{class:"subtab"},["Sessions"]),h("button",{class:"subtab"},["News/Macro"])
+  ]));
+  var g=h("div",{class:"grid-2"},[]);
+  [
+    ["Market Regime","Trend / range, volatilité, expansion / compression, risk-on/off."],
+    ["Market Structure","HH/HL, LH/LL, BOS, CHoCH/MSS avec timestamps."],
+    ["Liquidity Map","Daily/weekly highs-lows, equal highs/lows, sweeps, stop runs."],
+    ["Order Blocks","Bullish/Bearish, qualité, fraîcheur, retest, mitigation, invalidation."],
+    ["Fair Value Gaps","Création, remplissage, mitigation, invalidation."],
+    ["Supply & Demand","Zones + fraîcheur + retests + displacement."],
+    ["Session Intelligence","Sydney/Tokyo/London/New York indicatif + calendars."],
+    ["News / Macro","Événements, sentiment et contexte sans inventer de données."]
+  ].forEach(function(x){
+    g.appendChild(h("div",{class:"card tool-card"},[
+      h("div",{},[h("div",{class:"tool-name"},[x[0]]),h("div",{class:"tool-desc"},[x[1]])]),
+      h("div",{class:"tool-foot"},[h("span",{class:"status-pill future"},["NOT IMPLEMENTED"]),h("span",{class:"info"},["i"])])
+    ]))
   });
-  function formatMontrealTime(value){
-    var d = new Date(value);
-    return isNaN(d.getTime()) ? "—" : montrealFormatter.format(d);
-  }
-  function formatUtcTime(value){
-    var d = new Date(value);
-    return isNaN(d.getTime()) ? "—" : utcFormatter.format(d) + " UTC";
-  }
-  function loading(txt){ return h("div",{class:"state"},[h("span",{class:"spin"}),"  "+(txt||"Chargement…")]); }
-  function emptyState(title, sub){ return h("div",{class:"state"},[h("strong",{},[title]), sub||""]); }
+  v.appendChild(g);
+  v.appendChild(modCard("Qualité & synchronisation","NOT IMPLEMENTED",h("div",{class:"section-stack"},[
+    h("div",{class:"kv"},[h("span",{},["Freshness"]),h("b",{},["—"])]),
+    h("div",{class:"kv"},[h("span",{},["Messages hors ordre"]),h("b",{},["—"])]),
+    h("div",{class:"kv"},[h("span",{},["Gaps"]),h("b",{},["—"])]),
+    h("div",{class:"kv"},[h("span",{},["Conflits sources"]),h("b",{},["—"])]),
+    h("div",{class:"kv"},[h("span",{},["État marché"]),h("b",{},["—"])])
+  ])));
+}
 
-  // ---- State --------------------------------------------------------------
-  var current = "markets";
-  var detailCtx = null;   // { kind:"crypto"|"forex", symbol, canonical }
+function renderSettings(){
+  var v=byId("view-settings");clear(v);
+  v.appendChild(pageHead("Réglages","Configuration de l'interface, data layer, risque, alertes et sécurité.","UI HYPER FULL"));
+  v.appendChild(h("div",{class:"subtabs"},[
+    h("button",{class:"subtab active"},["Interface"]),h("button",{class:"subtab"},["Données"]),
+    h("button",{class:"subtab"},["Risque"]),h("button",{class:"subtab"},["Alertes"]),
+    h("button",{class:"subtab"},["Trading"]),h("button",{class:"subtab"},["Sécurité"])
+  ]));
+  v.appendChild(modCard("Interface","READY",h("div",{},[
+    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Fuseau d'affichage"]),h("small",{},["America/Toronto · Montréal"])]),h("span",{class:"status-pill ready"},["ACTIF"])]),
+    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Design premium"]),h("small",{},["Référence UI officielle"])]),h("span",{class:"status-pill ready"},["ACTIF"])]),
+    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Aide contextuelle ⓘ"]),h("small",{},["Définitions intégrées aux concepts trading."])]),h("span",{class:"status-pill future"},["À VENIR"])])
+  ])));
+  v.appendChild(modCard("Data Layer","NOT IMPLEMENTED",h("div",{},[
+    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Coinbase"]),h("small",{},["Crypto réel · backend existant"])]),h("span",{class:"status-pill ready"},["BACKEND"])]),
+    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Massive"]),h("small",{},["Forex / indices selon mapping & entitlement"])]),h("span",{class:"status-pill future"},["CONNECTEUR"])]),
+    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Twelve Data"]),h("small",{},["XAU/USD réel · backend existant"])]),h("span",{class:"status-pill ready"},["BACKEND"])])
+  ])));
+  v.appendChild(modCard("Trading & sécurité","NOT IMPLEMENTED",h("div",{},[
+    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Live trading"]),h("small",{},["Doit rester désactivé pendant la phase actuelle."])]),h("div",{class:"switch-off"})]),
+    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Kill switch"]),h("small",{},["Future protection globale d'exécution."])]),h("span",{class:"status-pill future"},["À VENIR"])]),
+    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Limites risque / exposition"]),h("small",{},["Max risque, positions, spread, slippage, sessions."])]),h("span",{class:"status-pill future"},["À VENIR"])])
+  ])));
+}
 
-  // ---- Health (header dot) ------------------------------------------------
-  function refreshHealth(){
-    return api("/health").then(function(r){
-      var dot = byId("health-dot"), lab = byId("health-label");
-      dot.className = "dot unk"; lab.textContent = "inconnu";
-      if (!r.ok || !r.data){ lab.textContent = "backend indisponible"; dot.className="dot down"; return; }
-      var overall = r.data.overall || "UNKNOWN";
-      var cls = overall==="UP"?"up":overall==="DEGRADED"?"deg":overall==="DOWN"?"down":"unk";
-      dot.className = "dot "+cls; lab.textContent = "backend " + overall.toLowerCase();
-    });
-  }
+function renderChartShell(){
+  var v=byId("view-detail");
+  if(!v || byId("future-chart-shell")) return;
+  var shell=h("div",{class:"section-stack",id:"future-chart-shell"},[
+    modCard("Chart Engine","NOT IMPLEMENTED",h("div",{class:"section-stack"},[
+      h("div",{class:"filter-row"},[
+        h("button",{class:"filter-chip active"},["1m"]),h("button",{class:"filter-chip"},["5m"]),
+        h("button",{class:"filter-chip"},["15m"]),h("button",{class:"filter-chip"},["1h"]),
+        h("button",{class:"filter-chip"},["4h"]),h("button",{class:"filter-chip"},["1D"])
+      ]),
+      h("div",{class:"empty-chart"},[h("div",{class:"chart-center"},[h("div",{},[
+        h("strong",{},["Graphique chandeliers interactif à venir"]),
+        h("span",{},["OHLC réel · zoom/pan · crosshair · historique · multi-timeframes"])
+      ])])])
+    ])),
+    modCard("Overlays Market Intelligence","NOT IMPLEMENTED",h("div",{class:"badge-row"},[
+      h("span",{class:"badge-soft"},["BOS"]),h("span",{class:"badge-soft"},["CHoCH/MSS"]),
+      h("span",{class:"badge-soft"},["Liquidity Sweep"]),h("span",{class:"badge-soft"},["Order Block"]),
+      h("span",{class:"badge-soft"},["FVG"]),h("span",{class:"badge-soft"},["Supply/Demand"]),
+      h("span",{class:"badge-soft"},["Entry"]),h("span",{class:"badge-soft"},["SL"]),h("span",{class:"badge-soft"},["TP"])
+    ])),
+    modCard("Inspector","NOT IMPLEMENTED",h("div",{class:"info-grid"},[
+      h("div",{class:"journal-card"},[h("h4",{},["Bougie sélectionnée"]),h("p",{},["OHLC, source timestamp, received timestamp, qualité."])]),
+      h("div",{class:"journal-card"},[h("h4",{},["Objet sélectionné"]),h("p",{},["Type, création, confirmations, invalidation, état."])]),
+      h("div",{class:"journal-card"},[h("h4",{},["Session"]),h("p",{},["État marché et session indicative."])]),
+      h("div",{class:"journal-card"},[h("h4",{},["Decision context"]),h("p",{},["Ce que le moteur savait à cet instant."])])
+    ]))
+  ]);
+  v.appendChild(shell)
+}
 
-  // ---- Markets (Crypto Coinbase) -----------------------------------------
-  function renderMarkets(){
-    var v = byId("view-markets"); clear(v);
-    v.appendChild(h("h2",{class:"section"},["Crypto · Coinbase (réel)"]));
-    var card = h("div",{class:"card"},[]);
-    CRYPTO_SYMBOLS.forEach(function(sym){
-      card.appendChild(h("div",{class:"row tap","data-sym":sym, onclick:function(){ openDetail("crypto",sym); }},[
-        h("div",{},[ h("div",{class:"sym"},[sym]), h("div",{class:"sub"},["Coinbase"]) ]),
-        h("div",{style:"display:flex;align-items:center;gap:10px"},[
-          h("span",{class:"price","data-price":sym},[h("span",{class:"na"},["…"])]),
-          h("span",{"data-badge":sym},[])
-        ])
-      ]));
-    });
-    v.appendChild(card);
-    v.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:2px 4px"},
-      ["Prix et qualité fournis par le backend. Aucune valeur estimée côté interface."]));
-    refreshMarkets();
-  }
-  function refreshMarkets(){
-    CRYPTO_SYMBOLS.forEach(function(sym){
-      api("/api/v1/market/ticker/"+encodeURIComponent(sym)).then(function(r){
-        var pc = document.querySelector('[data-price="'+sym+'"]');
-        var bc = document.querySelector('[data-badge="'+sym+'"]');
-        if (!pc || !bc) return;
-        clear(pc); clear(bc);
-        if (!r.ok || !r.data){ pc.appendChild(h("span",{class:"na"},["indispo"]));
-          bc.appendChild(qualityBadge("UNKNOWN")); return; }
-        pc.appendChild(priceCell(r.data.value));
-        bc.appendChild(qualityBadge(r.data.quality));
-      });
-    });
-  }
+var BOTTOM=[
+ {id:"dashboard",label:"Accueil",icon:"⌂"},
+ {id:"markets",label:"Marchés",icon:"▥"},
+ {id:"trading",label:"Trading",icon:"◔"},
+ {id:"strategies",label:"Stratégies",icon:"⌁"},
+ {id:"settings",label:"Réglages",icon:"⚙"}
+];
+function buildNav(){var n=byId("nav");clear(n);BOTTOM.forEach(function(x){n.appendChild(h("button",{"data-view":x.id,onclick:function(){setView(x.id)}},[h("span",{class:"ic"},[x.icon]),x.label]))})}
+function setView(id){current=id;document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading")renderTrading();else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
+function poll(){refreshHealth();if(current==="dashboard")refreshDashboard();else if(current==="markets")refreshMarkets();else if(current==="forex")refreshForexMarket();else if(current==="system")renderSystem();else if(current==="detail")refreshDetail()}
+buildNav();refreshHealth();setView("dashboard");setInterval(poll,POLL_MS);
 
-  // ---- Forex (Massive) ----------------------------------------------------
-  function renderForex(){
-    var v = byId("view-forex"); clear(v);
-    v.appendChild(h("h2",{class:"section"},["Forex · Massive (réel)"]));
-    v.appendChild(h("div",{class:"card","id":"fx-market"},[ loading("État du marché…") ]));
-    v.appendChild(h("div",{"id":"fx-mappings"},[ loading("Lecture des mappings…") ]));
-    refreshForexMarket();
-    api("/api/v1/market/forex/mappings").then(function(r){
-      var mv = byId("fx-mappings"); if (!mv) return; clear(mv);
-      if (!r.ok || !r.data){ mv.appendChild(emptyState("Forex indisponible", errorMessage(r))); return; }
-      var act = r.data.activation || {};
-      var note = act.activated
-        ? (act.confirmed_count + " paire(s) mappée(s) officiellement")
-        : "Mappings non activés (clé provider absente côté serveur) — symboles NOT_MAPPED.";
-      mv.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:0 4px 10px"},[note]));
-      var card = h("div",{class:"card"},[]);
-      (r.data.mappings||[]).forEach(function(m){
-        var mapped = m.status === "MAPPED";
-        card.appendChild(h("div",{class:"row "+(mapped?"tap":"disabled"),
-          onclick: mapped ? function(){ openDetail("forex", m.canonical); } : null },[
-          h("div",{},[ h("div",{class:"sym"},[m.canonical]),
-            h("div",{class:"sub"},[ mapped ? ("Massive · "+(m.provider_symbol||"")) : "Non disponible" ]) ]),
-          qualityBadge(mapped ? "MAPPED" : "NOT_MAPPED")
-        ]));
-      });
-      mv.appendChild(card);
-      if (act.xau && act.xau.ticker){
-        mv.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:2px 4px"},
-          ["XAU détecté par le provider ("+act.xau.ticker+") — non intégré dans cette version."]));
-      }
-    });
-  }
-  function fxCountdown(iso){
-    if (!iso) return "";
-    var t = Date.parse(iso); if (isNaN(t)) return "";
-    var s = Math.max(0, Math.round((t - Date.now())/1000));
-    var hh = Math.floor(s/3600), mm = Math.floor((s%3600)/60);
-    return hh + " h " + (mm<10?"0":"") + mm;
-  }
-  function refreshForexMarket(){
-    api("/api/v1/market/forex/market-state").then(function(r){
-      var w = byId("fx-market"); if (!w) return; clear(w);
-      // Market state is independent from data quality (OPEN != LIVE).
-      var d = (r.ok && r.data) ? r.data : { market_state:"UNKNOWN" };
-      var st = d.market_state || "UNKNOWN";
-      var dot = st==="OPEN" ? "🟢" : (st==="UNKNOWN" ? "⚪" : "🔴");
-      var title = st==="OPEN" ? "Marché ouvert"
-        : st==="CLOSED_WEEKEND" ? "Marché fermé — week-end"
-        : st==="CLOSED" ? "Marché fermé" : "État du marché inconnu";
-      var lines = [ h("div",{style:"font-weight:600"},[ dot+" "+title ]) ];
-      if (st==="OPEN"){
-        if (d.current_session) lines.push(h("div",{class:"sub"},["Session : "+d.current_session+" (indicative)"]));
-        if (d.next_close) lines.push(h("div",{class:"sub"},["Ferme dans : "+fxCountdown(d.next_close)+
-          " · "+formatMontrealTime(d.next_close)]));
-      } else if (st==="CLOSED_WEEKEND" || st==="CLOSED"){
-        if (d.next_open) lines.push(h("div",{class:"sub"},["Réouverture : "+formatMontrealTime(d.next_open)+" (Montréal)"]));
-      }
-      var body = h("div",{style:"padding:12px 16px"}, lines);
-      var info = h("button",{class:"back",style:"margin:0 0 0 auto;padding:6px 12px",
-        onclick:function(){ toggleFxInfo(); }},["ⓘ Horaires"]);
-      var headRow = h("div",{style:"display:flex;align-items:center;justify-content:space-between;padding:0 4px"},
-        [ h("div",{}), info ]);
-      w.appendChild(headRow); w.appendChild(body);
-      w.appendChild(h("div",{"id":"fx-info","class":"muted","style":"display:none;padding:0 16px 14px;font-size:12px;line-height:1.5"},[
-        "Horaires du marché Forex — l'état ouvert/fermé et les sessions sont déterminés à partir du calendrier marché configuré. ",
-        "Les heures sont affichées selon le fuseau de Montréal ; le moteur conserve UTC comme référence temporelle. ",
-        "Les sessions (Sydney/Tokyo/London/New York) sont indicatives (heures locales des centres), pas les heures d'un broker."
-      ]));
-    });
-  }
-  function toggleFxInfo(){
-    var el = byId("fx-info"); if (!el) return;
-    el.style.display = el.style.display === "none" ? "block" : "none";
-  }
 
-  // ---- Detail (price + recent candles) ------------------------------------
-  function alignHour(sec){ return Math.floor(sec/3600)*3600; }
-  function openDetail(kind, symbol){
-    detailCtx = { kind:kind, symbol:symbol, canonical:symbol };
-    setView("detail");
-  }
-  function renderDetail(){
-    var v = byId("view-detail"); clear(v);
-    if (!detailCtx){ v.appendChild(emptyState("Aucun actif sélectionné","")); return; }
-    var backTo = detailCtx.kind==="forex" ? "forex" : detailCtx.kind==="metal" ? "metal"
-      : detailCtx.kind==="index" ? "index" : "markets";
-    var label = detailCtx.kind==="forex" ? "Forex Massive"
-      : detailCtx.kind==="metal" ? "Gold Spot · Twelve Data"
-      : detailCtx.kind==="index" ? "Indice cash · Massive" : "Crypto Coinbase";
-    v.appendChild(h("button",{class:"back", onclick:function(){ setView(backTo); }},["← Retour"]));
-    v.appendChild(h("h2",{class:"section"},[detailCtx.symbol + " · " + label]));
-
-    if (detailCtx.kind === "crypto" || detailCtx.kind === "metal"){
-      var quote = h("div",{class:"card"},[ h("div",{class:"kv"},[
-        h("span",{class:"k"},["Prix"]), h("span",{class:"v","id":"d-price"},[h("span",{class:"spin"})]) ]) ]);
-      v.appendChild(quote);
+function applyOfficialAssetLogos(){
+  document.querySelectorAll(".frow").forEach(row=>{
+    const txt=(row.textContent||"").toUpperCase();
+    let key=null;
+    for(const k of ["BTC","ETH","SOL","XRP","LTC","ADA","XAU","US30"]){
+      if(txt.includes(k)){key=k;break}
     }
-    var histWrap = h("div",{class:"card","id":"d-hist"},[ loading("Historique réel…") ]);
-    v.appendChild(histWrap);
-    refreshDetail();
-  }
-  function refreshDetail(){
-    if (!detailCtx) return;
-    if (detailCtx.kind === "crypto"){
-      api("/api/v1/market/ticker/"+encodeURIComponent(detailCtx.symbol)).then(function(r){
-        var pe = byId("d-price"); if (!pe) return; clear(pe);
-        if (!r.ok || !r.data){ pe.appendChild(h("span",{class:"na"},["—"])); return; }
-        pe.appendChild(priceCell(r.data.value));
-        pe.appendChild(document.createTextNode("  "));
-        pe.appendChild(qualityBadge(r.data.quality));
-        if (r.data.timestamp){ pe.appendChild(h("span",{class:"sub",style:"margin-left:8px"},
-          ["il y a "+tsAgo(r.data.timestamp)])); }
-      });
-      loadCandles("/api/v1/market/candles/"+encodeURIComponent(detailCtx.symbol)+"?granularity=1h");
-    } else if (detailCtx.kind === "metal"){
-      api("/api/v1/market/metal/"+encodeURIComponent(detailCtx.canonical)+"/quote").then(function(r){
-        var pe = byId("d-price"); if (!pe) return; clear(pe);
-        if (!r.ok || !r.data || r.data.price == null){
-          pe.appendChild(h("span",{class:"na"},["—"]));
-          pe.appendChild(document.createTextNode("  "));
-          pe.appendChild(qualityBadge((r.data && r.data.quality) || "UNKNOWN"));
-          return;
-        }
-        var d = r.data;
-        pe.appendChild(priceCell(d.price));   // d.price is a string (Decimal), never fabricated
-        pe.appendChild(document.createTextNode("  "));
-        pe.appendChild(qualityBadge(d.quality || "UNKNOWN"));   // quality != is_market_open
-        if (d.quote_time){ pe.appendChild(h("span",{class:"sub",style:"margin-left:8px"},
-          ["il y a "+tsAgo(d.quote_time)])); }
-        if (d.is_market_open === true || d.is_market_open === false){
-          // provider flag, informational only — NOT our calendar, NOT the data quality
-          pe.appendChild(h("div",{class:"sub"},
-            ["Marché (fournisseur) : "+(d.is_market_open ? "ouvert" : "fermé")]));
-        }
-      });
-      var mend = alignHour(Math.floor(Date.now()/1000));
-      var mstart = mend - 12*3600;
-      loadCandles("/api/v1/market/metal/"+encodeURIComponent(detailCtx.canonical)+
-        "/history?granularity=1h&start="+mstart+"&end="+mend);
-    } else if (detailCtx.kind === "index"){
-      // US cash index: daily bars (EOD on Basic). Absence of a bar is not a gap.
-      var iend = Math.floor(Date.now()/1000);
-      var istart = iend - 30*86400;   // ~30 days of daily bars
-      loadCandles("/api/v1/market/index/"+encodeURIComponent(detailCtx.canonical)+
-        "/history?granularity=1d&start="+istart+"&end="+iend);
-    } else {
-      var end = alignHour(Math.floor(Date.now()/1000));
-      var start = end - 12*3600;
-      loadCandles("/api/v1/market/forex/"+encodeURIComponent(detailCtx.canonical)+
-        "/history?granularity=1h&start="+start+"&end="+end);
-    }
-  }
-  function loadCandles(path){
-    api(path).then(function(r){
-      var w = byId("d-hist"); if (!w) return; clear(w);
-      if (!r.ok){
-        // Never show a raw httpx exception/URL: clean, per-status message only.
-        var msg;
-        if (r.status===403) msg="Données indisponibles — accès refusé par le fournisseur (403).";
-        else if (r.status===409) msg="Symbole non mappé.";
-        else if (r.status===429) msg="Trop de requêtes — réessayez plus tard.";
-        else if (r.status===503) msg="Provider temporairement indisponible.";
-        else msg=errorMessage(r);
-        w.appendChild(emptyState("Historique indisponible", msg)); return;
-      }
-      var d = r.data || {};
-      var candles = (d.candles || []).slice().sort(function(a,b){
-        return (Date.parse(a.start)||0) - (Date.parse(b.start)||0);   // chronological, deterministic
-      });
-      // Badge reflects the freshness of the NEWEST bar actually received, never
-      // just "HTTP succeeded". Prefer the backend's latest_quality.
-      var badgeQ = d.latest_quality || (candles.length ? candles[candles.length-1].quality : "MISSING");
-      var header = h("div",{class:"kv"},[ h("span",{class:"k"},["Dernières bougies (1h)"]),
-        h("span",{class:"v"},[ qualityBadge(badgeQ) ]) ]);
-      w.appendChild(header);
-      if (!candles.length){ w.appendChild(emptyState("Pas de données",
-        d.status==="EMPTY"?"Aucune bougie sur la période.":"")); return; }
-      var rows = candles.slice(-10).reverse().map(function(c){
-        return h("tr",{},[
-          h("td",{},[
-            h("div",{},[ formatMontrealTime(c.start) ]),
-            h("div",{class:"sub",style:"font-size:10px"},[ formatUtcTime(c.start) ])
-          ]),
-          h("td",{},[ priceCell(c.open) ]), h("td",{},[ priceCell(c.high) ]),
-          h("td",{},[ priceCell(c.low) ]), h("td",{},[ priceCell(c.close) ])
-        ]);
-      });
-      w.appendChild(h("div",{class:"tbl-wrap"},[ h("table",{class:"tbl"},[
-        h("thead",{},[ h("tr",{},[ h("th",{},["Heure (Montréal)"]), h("th",{},["O"]),
-          h("th",{},["H"]), h("th",{},["L"]), h("th",{},["C"]) ]) ]),
-        h("tbody",{}, rows)
-      ]) ]));
-      if (d.market_calendar){
-        var calLabel = d.market_calendar === "US_EQUITY_RTH"
-          ? "RTH US 09:30–16:00 ET (jours fériés/fermetures anticipées non modélisés)"
-          : d.market_calendar;
-        w.appendChild(h("div",{class:"muted",style:"font-size:11px;padding:8px 12px 0"},
-          ["Calendrier marché: " + calLabel + (d.market_timezone ? " · " + d.market_timezone : "")]));
-      }
-      if (d.gaps_status === "UNKNOWN"){
-        var gapReason = d.market_calendar === "US_EQUITY_RTH"
-          ? "Massive n'émet pas de barre sans nouvelle valeur d'indice; l'absence n'est donc pas déclarée comme trou."
-          : "Une barre absente n'est pas automatiquement déclarée comme trou.";
-        w.appendChild(h("div",{class:"muted",style:"font-size:11px;padding:8px 12px"},
-          ["Détection de trous: UNKNOWN — " + gapReason]));
-      }
-    });
-  }
+    if(!key)return;
+    const el=row.querySelector(".coin");
+    if(el && ASSET_LOGOS[key]){el.innerHTML=ASSET_LOGOS[key];el.classList.add("official-logo")}
+  });
+}
 
-  // ---- System (health) ----------------------------------------------------
-  function renderSystem(){
-    var v = byId("view-system"); clear(v);
-    v.appendChild(h("h2",{class:"section"},["Santé backend & données"]));
-    v.appendChild(loading("Lecture de /health…"));
-    api("/health").then(function(r){
-      clear(v); v.appendChild(h("h2",{class:"section"},["Santé backend & données"]));
-      if (!r.ok || !r.data){ v.appendChild(emptyState("Backend indisponible", errorMessage(r))); return; }
-      var d = r.data;
-      var card = h("div",{class:"card"},[]);
-      card.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["État global"]),
-        h("span",{class:"v"},[ d.overall || "UNKNOWN" ])]));
-      (d.components||[]).forEach(function(c){
-        card.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},[c.name]),
-          h("span",{class:"v"},[ c.state || "?" ])]));
-      });
-      if (d.persistence){
-        card.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["Persistance"]),
-          h("span",{class:"v"},[ d.persistence.persistence_status || "?" ])]));
-      }
-      v.appendChild(card);
-    });
-  }
+setInterval(applyOfficialAssetLogos,500);setTimeout(applyOfficialAssetLogos,0);
 
-  // ---- Router / nav -------------------------------------------------------
-  function setView(id){
-    current = id;
-    var views = document.querySelectorAll(".view");
-    for (var i=0;i<views.length;i++){
-      views[i].classList.toggle("active", views[i].getAttribute("data-view")===id);
-    }
-    var btns = document.querySelectorAll("#nav button");
-    for (var j=0;j<btns.length;j++){
-      var on = btns[j].getAttribute("data-view")===id;
-      if (on) btns[j].setAttribute("aria-current","page"); else btns[j].removeAttribute("aria-current");
-    }
-    if (id==="markets") renderMarkets();
-    else if (id==="forex") renderForex();
-    else if (id==="metal") renderMetal();
-    else if (id==="index") renderIndex();
-    else if (id==="system") renderSystem();
-    else if (id==="detail") renderDetail();
-  }
 
-  // ---- Metals (Gold XAU/USD via Twelve Data) -------------------------------
-  function renderMetal(){
-    var v = byId("view-metal"); clear(v);
-    v.appendChild(h("h2",{class:"section"},["Métaux · Twelve Data (réel)"]));
-    var card = h("div",{class:"card"},[]);
-    card.appendChild(h("div",{class:"row tap", onclick:function(){ openDetail("metal","XAU-USD"); }},[
-      h("div",{},[ h("div",{class:"sym"},["XAU-USD"]),
-        h("div",{class:"sub"},["Gold Spot · Twelve Data"]) ]),
-      qualityBadge("MAPPED")
-    ]));
-    v.appendChild(card);
-    v.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:2px 4px"},
-      ["Prix/historique réels si la clé provider est configurée côté serveur ; sinon état explicite."]));
-  }
+function renderHelpGlossary(){
+  return modCard("Glossaire intégré","NOT IMPLEMENTED",h("div",{class:"help-grid"},[
+    h("div",{class:"help-card"},[h("b",{},["BOS"]),h("p",{},["Break of Structure : rupture structurale selon les règles du moteur."])]),
+    h("div",{class:"help-card"},[h("b",{},["CHoCH / MSS"]),h("p",{},["Changement de caractère / market structure shift."])]),
+    h("div",{class:"help-card"},[h("b",{},["FVG"]),h("p",{},["Fair Value Gap : déséquilibre de prix à formaliser."])]),
+    h("div",{class:"help-card"},[h("b",{},["Order Block"]),h("p",{},["Zone institutionnelle candidate, jamais utilisée seule."])]),
+    h("div",{class:"help-card"},[h("b",{},["RR"]),h("p",{},["Rapport rendement/risque du scénario."])]),
+    h("div",{class:"help-card"},[h("b",{},["WAIT"]),h("p",{},["Décision valide quand les conditions d'entrée ne sont pas réunies."])])
+  ]))
+}
 
-  // ---- US cash indices (Massive) ------------------------------------------
-  function renderIndex(){
-    var v = byId("view-index"); clear(v);
-    v.appendChild(h("h2",{class:"section"},["Indices US cash · Massive (réel)"]));
-    var card = h("div",{class:"card"},[]);
-    [["SPX","S&P 500"],["NDX","Nasdaq-100"],["US30","Dow Jones (US30)"]].forEach(function(it){
-      card.appendChild(h("div",{class:"row tap", onclick:function(){ openDetail("index",it[0]); }},[
-        h("div",{},[ h("div",{class:"sym"},[it[0]]),
-          h("div",{class:"sub"},[it[1]+" · indice cash · Massive"]) ]),
-        qualityBadge("MAPPED")
-      ]));
-    });
-    v.appendChild(card);
-    v.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:2px 4px"},
-      ["Indices cash officiels (I:SPX/I:NDX/I:DJI), sans volume. Données réelles selon l'entitlement du plan Massive ; sinon état explicite."]));
-  }
-  function buildNav(){
-    var nav = byId("nav"); clear(nav);
-    VIEWS.forEach(function(v){
-      nav.appendChild(h("button",{"data-view":v.id, onclick:function(){ setView(v.id); }},[
-        h("span",{class:"ic"},[v.icon]), v.label
-      ]));
-    });
-  }
-
-  // ---- Polling (provisional, every 5s; NOT websocket/streaming) -----------
-  function poll(){
-    refreshHealth();
-    if (current==="markets") refreshMarkets();
-    else if (current==="detail") refreshDetail();
-    else if (current==="system") renderSystem();
-    else if (current==="forex") refreshForexMarket();
-  }
-
-  // ---- Boot ---------------------------------------------------------------
-  buildNav();
-  refreshHealth();
-  setView("markets");
-  setInterval(poll, POLL_MS);
-  </script>
+</script>
 </body>
 </html>

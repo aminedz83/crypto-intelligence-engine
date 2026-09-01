@@ -467,9 +467,19 @@
           h("th",{},["H"]), h("th",{},["L"]), h("th",{},["C"]) ]) ]),
         h("tbody",{}, rows)
       ]) ]));
+      if (d.market_calendar){
+        var calLabel = d.market_calendar === "US_EQUITY_RTH"
+          ? "RTH US 09:30–16:00 ET (jours fériés/fermetures anticipées non modélisés)"
+          : d.market_calendar;
+        w.appendChild(h("div",{class:"muted",style:"font-size:11px;padding:8px 12px 0"},
+          ["Calendrier marché: " + calLabel + (d.market_timezone ? " · " + d.market_timezone : "")]));
+      }
       if (d.gaps_status === "UNKNOWN"){
+        var gapReason = d.market_calendar === "US_EQUITY_RTH"
+          ? "Massive n'émet pas de barre sans nouvelle valeur d'indice; l'absence n'est donc pas déclarée comme trou."
+          : "Une barre absente n'est pas automatiquement déclarée comme trou.";
         w.appendChild(h("div",{class:"muted",style:"font-size:11px;padding:8px 12px"},
-          ["Détection de trous: UNKNOWN (calendrier Forex non configuré — une barre absente n'est pas un trou)."]));
+          ["Détection de trous: UNKNOWN — " + gapReason]));
       }
     });
   }

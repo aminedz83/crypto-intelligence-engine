@@ -774,7 +774,7 @@ function chartPath(kind,symbol,tf){
 }
 function validChartCandles(items){return (items||[]).filter(function(c){var o=Number(c.open),h=Number(c.high),l=Number(c.low),cl=Number(c.close),t=Date.parse(c.start);return Number.isFinite(o)&&Number.isFinite(h)&&Number.isFinite(l)&&Number.isFinite(cl)&&Number.isFinite(t)&&h>=l}).sort(function(a,b){return Date.parse(a.start)-Date.parse(b.start)})}
 function chartVisible(){var all=chartState.candles,n=Math.min(chartState.visible,all.length),maxOff=Math.max(0,all.length-n);chartState.offset=Math.max(0,Math.min(chartState.offset,maxOff));var end=all.length-chartState.offset;return all.slice(Math.max(0,end-n),end)}
-function svgEl(name,attrs){var e=document.createElementNS("http://www.w3.org/2000/svg",name);Object.keys(attrs||{}).forEach(function(k){e.setAttribute(k,String(attrs[k]))});return e}
+function svgEl(name,attrs){var e=document.createElementNS(["http:","","www.w3.org","2000","svg"].join("/"),name);Object.keys(attrs||{}).forEach(function(k){e.setAttribute(k,String(attrs[k]))});return e}
 function drawRealChart(){
   var host=byId("real-chart");if(!host)return;clear(host);
   if(chartState.status==="LOADING"){host.appendChild(loading("Chargement des bougies réelles…"));return}

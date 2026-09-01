@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  # ── DEPENDENCIES → POSTGRES → REDIS → FASTAPI → COLLECT(==26) → TESTS → HTTP ─
+  # ── DEPENDENCIES → POSTGRES → REDIS → FASTAPI → COLLECT(==EXPECTED_TESTS) → TESTS → HTTP ─
   test:
     name: integration-tests
     runs-on: ubuntu-latest
@@ -38,7 +38,7 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "367"
+      EXPECTED_TESTS: "379"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -70,7 +70,7 @@ jobs:
 
       # Collection proof: pytest must collect EXACTLY 26. No auto-correction —
       # on mismatch, print the full collection and FAIL for analysis.
-      - name: Collect tests and assert exactly 26
+      - name: Collect tests and assert exactly EXPECTED_TESTS
         run: |
           pytest --collect-only -q | tee /tmp/collect.log
           python - <<'PY'
@@ -85,8 +85,8 @@ jobs:
           PY
 
       # Execute. pytest exit code fails on any failure/error. Then a guard
-      # enforces skipped == 0 and passed == 26.
-      - name: Run pytest and enforce 26 passed / 0 skipped
+      # enforces skipped == 0 and passed == EXPECTED_TESTS.
+      - name: Run pytest and enforce EXPECTED_TESTS passed / 0 skipped
         run: |
           pytest -v -ra | tee /tmp/pytest.log
           python - <<'PY'

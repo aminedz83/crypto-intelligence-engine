@@ -2841,9 +2841,38 @@ class IndexInstrumentTests(unittest.TestCase):
         self.assertIsNone(inst.price_precision)
         self.assertIsNone(inst.tick_size)
 
-    def test_calendar_not_configured(self):
-        self.assertEqual(instrument_registry.get("SPX").market_calendar,
-                         MarketCalendarPolicy.NOT_CONFIGURED)
+    def test_index_calendar_is_us_equity_rth(self):
+        for symbol in ("SPX", "NDX", "US30"):
+            self.assertEqual(instrument_registry.get(symbol).market_calendar,
+                             MarketCalendarPolicy.US_EQUITY_RTH)
+
+    def test_index_calendar_regular_hours_open(self):
+        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
+        # 2026-08-31 14:00 UTC = Monday 10:00 EDT.
+        self.assertEqual(cal.is_market_expected_open(1788184800), OpenState.OPEN)
+
+    def test_index_calendar_before_open_closed(self):
+        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
+        # 2026-08-31 13:00 UTC = Monday 09:00 EDT.
+        self.assertEqual(cal.is_market_expected_open(1788181200), OpenState.CLOSED)
+
+    def test_index_calendar_at_close_closed(self):
+        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
+        # 2026-08-31 20:00 UTC = Monday 16:00 EDT; half-open RTH interval.
+        self.assertEqual(cal.is_market_expected_open(1788206400), OpenState.CLOSED)
+
+    def test_index_calendar_weekend_closed(self):
+        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
+        self.assertEqual(cal.is_market_expected_open(1788012000), OpenState.CLOSED)
+
+    def test_index_calendar_invalid_timestamp_unknown(self):
+        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
+        self.assertEqual(cal.is_market_expected_open(10**30), OpenState.UNKNOWN)
+
+    def test_index_calendar_never_fabricates_gap_grid(self):
+        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
+        self.assertIsNone(cal.expected_bucket_starts("1h", 0, 7200))
+        self.assertEqual(cal.analyze_gaps([0, 7200], 3600).status, "UNKNOWN")
 
 
 class IndexParsingTests(unittest.TestCase):

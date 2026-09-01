@@ -3162,15 +3162,32 @@ class RealtimeCoreV1UiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.html = INDEX.read_text(encoding="utf-8")
-    def test_frontend_starts_existing_backend_ws(self): self.assertIn('/api/v1/market/websocket/start', self.html)
-    def test_frontend_subscribes_ticker(self): self.assertIn('{channel:"ticker",products:CRYPTO_SYMBOLS}', self.html)
-    def test_frontend_subscribes_candles(self): self.assertIn('{channel:"candles",products:CRYPTO_SYMBOLS}', self.html)
-    def test_frontend_reads_realtime_state(self): self.assertIn('/api/v1/market/realtime/', self.html)
-    def test_realtime_poll_is_one_second(self): self.assertIn('REALTIME_POLL_MS=1000', self.html)
-    def test_only_verified_5m_ws_updates_chart(self): self.assertIn('chartState.tf==="5m"', self.html)
-    def test_other_crypto_tf_remain_rest(self): self.assertIn('LIVE PRICE · OHLC "+chartState.tf.toUpperCase()+" REST', self.html)
+
+    def test_frontend_starts_existing_backend_ws(self):
+        self.assertIn("/api/v1/market/websocket/start", self.html)
+
+    def test_frontend_subscribes_ticker(self):
+        self.assertIn('{channel:"ticker",products:CRYPTO_SYMBOLS}', self.html)
+
+    def test_frontend_subscribes_candles(self):
+        self.assertIn('{channel:"candles",products:CRYPTO_SYMBOLS}', self.html)
+
+    def test_frontend_reads_realtime_state(self):
+        self.assertIn("/api/v1/market/realtime/", self.html)
+
+    def test_realtime_poll_is_one_second(self):
+        self.assertIn("REALTIME_POLL_MS=1000", self.html)
+
+    def test_only_verified_5m_ws_updates_chart(self):
+        self.assertIn('chartState.tf==="5m"', self.html)
+
+    def test_other_crypto_tf_remain_rest(self):
+        marker = 'LIVE PRICE · OHLC "+chartState.tf.toUpperCase()+" REST'
+        self.assertIn(marker, self.html)
+
     def test_no_synthetic_realtime(self):
-        self.assertNotIn('Math.random()', self.html); self.assertIn('aucune bougie synthétique', self.html)
+        self.assertNotIn("Math.random()", self.html)
+        self.assertIn("aucune bougie synthétique", self.html)
 
 
 class RealtimeCoreV2AForexTests(unittest.TestCase):
@@ -3178,17 +3195,45 @@ class RealtimeCoreV2AForexTests(unittest.TestCase):
     def setUpClass(cls):
         cls.main_src = Path(main.__file__).read_text(encoding="utf-8")
         cls.html = INDEX.read_text(encoding="utf-8")
-    def test_massive_official_forex_ws_url(self): self.assertIn('wss://socket.massive.com/forex', self.main_src)
-    def test_auth_message_server_side(self): self.assertIn('{"action": "auth", "params": self.api_key}', self.main_src)
+
+    def test_massive_official_forex_ws_url(self):
+        self.assertIn("wss://socket.massive.com/forex", self.main_src)
+
+    def test_auth_message_server_side(self):
+        marker = '{"action": "auth", "params": self.api_key}'
+        self.assertIn(marker, self.main_src)
+
     def test_quote_and_minute_topics(self):
-        self.assertIn('f"C.{pair}"', self.main_src); self.assertIn('f"CA.{pair}"', self.main_src)
+        self.assertIn('f"C.{pair}"', self.main_src)
+        self.assertIn('f"CA.{pair}"', self.main_src)
+
     def test_quote_parser_uses_bid_ask_not_midpoint(self):
-        self.assertIn('parse_massive_forex_quote', self.main_src); self.assertNotIn('(bid + ask) / 2', self.main_src)
-    def test_minute_parser_present(self): self.assertIn('parse_massive_forex_minute', self.main_src)
-    def test_only_verified_mapping_can_be_ws_pair(self): self.assertIn('mapped = provider_symbol_map.to_provider("massive", canonical)', self.main_src)
-    def test_forex_ws_start_endpoint(self): self.assertIn('/market/forex/websocket/start', self.main_src)
-    def test_forex_realtime_endpoint(self): self.assertIn('/market/forex/{symbol}/realtime', self.main_src)
-    def test_frontend_starts_forex_realtime(self): self.assertIn('startForexRealtime', self.html)
-    def test_frontend_reads_forex_realtime(self): self.assertIn('/api/v1/market/forex/"+encodeURIComponent(sym)+"/realtime', self.html)
-    def test_only_one_minute_ws_updates_forex_chart(self): self.assertIn('chartState.tf==="1m"', self.html)
-    def test_other_forex_tf_explicitly_rest(self): self.assertIn('LIVE BBO · OHLC "+chartState.tf.toUpperCase()+" REST', self.html)
+        self.assertIn("parse_massive_forex_quote", self.main_src)
+        self.assertNotIn("(bid + ask) / 2", self.main_src)
+
+    def test_minute_parser_present(self):
+        self.assertIn("parse_massive_forex_minute", self.main_src)
+
+    def test_only_verified_mapping_can_be_ws_pair(self):
+        marker = 'mapped = provider_symbol_map.to_provider("massive", canonical)'
+        self.assertIn(marker, self.main_src)
+
+    def test_forex_ws_start_endpoint(self):
+        self.assertIn("/market/forex/websocket/start", self.main_src)
+
+    def test_forex_realtime_endpoint(self):
+        self.assertIn("/market/forex/{symbol}/realtime", self.main_src)
+
+    def test_frontend_starts_forex_realtime(self):
+        self.assertIn("startForexRealtime", self.html)
+
+    def test_frontend_reads_forex_realtime(self):
+        marker = '/api/v1/market/forex/"+encodeURIComponent(sym)+"/realtime'
+        self.assertIn(marker, self.html)
+
+    def test_only_one_minute_ws_updates_forex_chart(self):
+        self.assertIn('chartState.tf==="1m"', self.html)
+
+    def test_other_forex_tf_explicitly_rest(self):
+        marker = 'LIVE BBO · OHLC "+chartState.tf.toUpperCase()+" REST'
+        self.assertIn(marker, self.html)

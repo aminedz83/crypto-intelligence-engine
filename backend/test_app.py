@@ -3726,3 +3726,51 @@ class TestChartEngineV10OrderBlockRetestQuality(unittest.TestCase):
 
     def test_order_block_retest_quality_ui_is_active(self):
         self.assertIn("OB RETEST / QUALITY ACTIF", self.html)
+
+
+class TestChartEngineV11SmcStateMachine(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_smc_state_machine_present(self):
+        self.assertIn("function buildSmcSetupStates", self.html)
+
+    def test_sweep_to_displacement_window_is_explicit(self):
+        self.assertIn("SMC_SWEEP_TO_DISPLACEMENT_MAX_BARS=12", self.html)
+
+    def test_displacement_to_structure_window_is_explicit(self):
+        self.assertIn("SMC_DISPLACEMENT_TO_STRUCTURE_MAX_BARS=6", self.html)
+
+    def test_ssl_sweep_maps_to_bullish_direction(self):
+        self.assertIn('s.type==="SELL_SIDE"?"BULLISH":"BEARISH"', self.html)
+
+    def test_state_machine_starts_at_liquidity_sweep(self):
+        self.assertIn('state="LIQUIDITY_SWEEP"', self.html)
+
+    def test_state_machine_advances_to_displacement(self):
+        self.assertIn('if(disp)state="DISPLACEMENT"', self.html)
+
+    def test_state_machine_advances_to_structure_confirmation(self):
+        self.assertIn('state="STRUCTURE_CONFIRMED"', self.html)
+
+    def test_entry_zone_requires_order_block(self):
+        self.assertIn('else state="ENTRY_ZONE"', self.html)
+
+    def test_retested_state_comes_from_order_block_state(self):
+        self.assertIn('ob.state==="RETESTED")state="RETESTED"', self.html)
+
+    def test_invalidated_state_comes_from_order_block_state(self):
+        self.assertIn('ob.state==="INVALIDATED")state="INVALIDATED"', self.html)
+
+    def test_state_machine_excludes_latest_potentially_open_candle(self):
+        self.assertIn("closedEnd=Math.max(0,cs.length-1)", self.html)
+
+    def test_fvg_is_recorded_as_optional_confirmation(self):
+        self.assertIn("fvgConfirmed:Boolean(fvg)", self.html)
+
+    def test_methodology_says_entry_zone_is_not_execution(self):
+        self.assertIn("ne sont pas encore des ordres ni des signaux d’exécution", self.html)
+
+    def test_smc_state_machine_ui_is_active(self):
+        self.assertIn("SMC STATE MACHINE ACTIF", self.html)

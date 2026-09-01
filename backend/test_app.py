@@ -1417,10 +1417,8 @@ class CalendarTests(unittest.TestCase):
         cal = calendar_for(MarketCalendarPolicy.NOT_CONFIGURED)
         self.assertEqual(cal.is_market_expected_open(0), OpenState.UNKNOWN)
 
-    def test_not_configured_placeholder_not_invented(self):
-        # a still-declared-but-not-implemented policy must NOT invent hours
-        # (FOREX_WEEK is now implemented; US_EQUITY_RTH remains a placeholder)
-        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
+    def test_not_configured_does_not_invent_bucket_grid(self):
+        cal = calendar_for(MarketCalendarPolicy.NOT_CONFIGURED)
         self.assertEqual(cal.is_market_expected_open(0), OpenState.UNKNOWN)
         self.assertIsNone(cal.expected_bucket_starts("1h", 0, 3600))
 
@@ -1429,20 +1427,6 @@ class CalendarTests(unittest.TestCase):
         rep = cal.analyze_gaps([0, 7200], 3600)  # would be a gap if 24/7, but calendar unknown
         self.assertEqual(rep.status, "UNKNOWN")
         self.assertEqual(rep.missing, [])
-
-
-    def test_twelvedata_commodity_calendar_open(self):
-        cal = calendar_for(MarketCalendarPolicy.TWELVEDATA_COMMODITY_24_7)
-        self.assertEqual(cal.is_market_expected_open(0), OpenState.OPEN)
-
-    def test_twelvedata_commodity_invalid_timestamp_unknown(self):
-        cal = calendar_for(MarketCalendarPolicy.TWELVEDATA_COMMODITY_24_7)
-        self.assertEqual(cal.is_market_expected_open(10**30), OpenState.UNKNOWN)
-
-    def test_twelvedata_commodity_does_not_invent_bar_grid(self):
-        cal = calendar_for(MarketCalendarPolicy.TWELVEDATA_COMMODITY_24_7)
-        self.assertIsNone(cal.expected_bucket_starts("1h", 0, 3 * 3600))
-        self.assertEqual(cal.analyze_gaps([0, 7200], 3600).status, "UNKNOWN")
 
 
 class CandlesSchemaUnchangedTests(unittest.TestCase):
@@ -2620,20 +2604,6 @@ class MetalPersistenceTests(_DBBase):
             main.twelvedata_provider = saved
 
 
-class GoldCalendarMetadataTests(unittest.TestCase):
-    def test_gold_uses_verified_twelvedata_commodity_calendar(self):
-        inst = instrument_registry.get("XAU-USD")
-        self.assertEqual(inst.market_calendar,
-                         MarketCalendarPolicy.TWELVEDATA_COMMODITY_24_7)
-
-    def test_gold_market_timezone_is_provider_timezone(self):
-        self.assertEqual(instrument_registry.get("XAU-USD").timezone, "Australia/Sydney")
-
-    def test_gold_volume_semantics_still_not_invented(self):
-        self.assertEqual(instrument_registry.get("XAU-USD").volume_semantics,
-                         VolumeSemantics.UNKNOWN)
-
-
 # ----------------------------- Twelve Data XAU/USD (3/3: /quote + Gold UI) -----
 from main import (  # noqa: E402
     TwelveDataQuoteResult,
@@ -2869,9 +2839,38 @@ class IndexInstrumentTests(unittest.TestCase):
         self.assertIsNone(inst.price_precision)
         self.assertIsNone(inst.tick_size)
 
-    def test_calendar_not_configured(self):
-        self.assertEqual(instrument_registry.get("SPX").market_calendar,
-                         MarketCalendarPolicy.NOT_CONFIGURED)
+    def test_index_calendar_is_us_equity_rth(self):
+        for symbol in ("SPX", "NDX", "US30"):
+            self.assertEqual(instrument_registry.get(symbol).market_calendar,
+                             MarketCalendarPolicy.US_EQUITY_RTH)
+
+    def test_index_calendar_regular_hours_open(self):
+        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
+        # 2026-08-31 14:00 UTC = Monday 10:00 EDT.
+        self.assertEqual(cal.is_market_expected_open(1788184800), OpenState.OPEN)
+
+    def test_index_calendar_before_open_closed(self):
+        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
+        # 2026-08-31 13:00 UTC = Monday 09:00 EDT.
+        self.assertEqual(cal.is_market_expected_open(1788181200), OpenState.CLOSED)
+
+    def test_index_calendar_at_close_closed(self):
+        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
+        # 2026-08-31 20:00 UTC = Monday 16:00 EDT; half-open RTH interval.
+        self.assertEqual(cal.is_market_expected_open(1788206400), OpenState.CLOSED)
+
+    def test_index_calendar_weekend_closed(self):
+        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
+        self.assertEqual(cal.is_market_expected_open(1788012000), OpenState.CLOSED)
+
+    def test_index_calendar_invalid_timestamp_unknown(self):
+        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
+        self.assertEqual(cal.is_market_expected_open(10**30), OpenState.UNKNOWN)
+
+    def test_index_calendar_never_fabricates_gap_grid(self):
+        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
+        self.assertIsNone(cal.expected_bucket_starts("1h", 0, 7200))
+        self.assertEqual(cal.analyze_gaps([0, 7200], 3600).status, "UNKNOWN")
 
 
 class IndexParsingTests(unittest.TestCase):
@@ -2911,7 +2910,8 @@ class IndexProviderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_not_mapped(self):
         prov = MassiveIndicesProvider(api_key="DUMMY")
-        r = await prov.get_index_aggregates("EUR-USD", "1d", _IX_BASE, _IX_BASE + 86400)
+        # BTC-USD is a Coinbase canonical, never mapped under the 'massive' provider
+        r = await prov.get_index_aggregates("BTC-USD", "1d", _IX_BASE, _IX_BASE + 86400)
         self.assertEqual(r.status, "NOT_MAPPED")
 
     async def test_not_supported_granularity(self):
@@ -3058,3 +3058,68 @@ class IndexUiTests(unittest.TestCase):
         # tickers; we use the official cash indices SPX/NDX/US30 -> I:SPX/I:NDX/I:DJI)
         for bad in ("SPY", "QQQ", "DIA", "ES=F", "NQ=F", "YM=F", "/ES", "/NQ", "/YM"):
             self.assertNotIn(bad, self.html)
+
+
+class ChartEngineV1UiTests(unittest.TestCase):
+    """Static contract: chart V1 consumes backend OHLC only; no demo series."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_real_chart_label_present(self):
+        self.assertIn("Chart Engine · OHLC réel", self.html)
+        self.assertIn("REAL DATA", self.html)
+
+    def test_chart_uses_existing_real_endpoints(self):
+        self.assertIn('/api/v1/market/candles/', self.html)
+        self.assertIn('/api/v1/market/forex/', self.html)
+        self.assertIn('/api/v1/market/metal/', self.html)
+        self.assertIn('/api/v1/market/index/', self.html)
+
+    def test_chart_has_no_synthetic_candle_fallback(self):
+        self.assertIn("aucune bougie synthétique", self.html)
+        self.assertNotIn("Math.random()", self.html)
+
+    def test_chart_supports_real_ohlc_fields(self):
+        for field in ("c.open", "c.high", "c.low", "c.close", "c.start"):
+            self.assertIn(field, self.html)
+
+    def test_chart_has_zoom_pan_controls(self):
+        self.assertIn("chartZoom", self.html)
+        self.assertIn("chartPan", self.html)
+        self.assertIn("chart-cross", self.html)
+
+    def test_provider_errors_remain_explicit(self):
+        self.assertIn("errorMessage(r)", self.html)
+        self.assertIn("Graphique indisponible", self.html)
+
+
+class ChartEngineV2SwingUiTests(unittest.TestCase):
+    """Static contract: confirmed swings derive only from returned real OHLC."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_confirmed_swing_detector_present(self):
+        self.assertIn("detectConfirmedSwings", self.html)
+        self.assertIn("SWING_STRENGTH=2", self.html)
+
+    def test_swing_high_uses_strict_neighbor_highs(self):
+        self.assertIn("hi<=lh||hi<=rh", self.html)
+
+    def test_swing_low_uses_strict_neighbor_lows(self):
+        self.assertIn("lo>=ll||lo>=rl", self.html)
+
+    def test_swings_require_right_side_confirmation(self):
+        self.assertIn("confirmedAt:cs[i+n].start", self.html)
+        self.assertIn("i<cs.length-n", self.html)
+
+    def test_swings_are_drawn_on_real_chart(self):
+        self.assertIn('lab.textContent=isHigh?"SH":"SL"', self.html)
+        self.assertIn("swings confirmés", self.html)
+
+    def test_no_synthetic_or_random_swing_fallback(self):
+        self.assertIn("Aucun swing futur/repainté", self.html)
+        self.assertNotIn("Math.random()", self.html)

@@ -2897,6 +2897,274 @@ async def market_metal_quote(symbol: str) -> dict:
     return result
 
 
+# ==================== Massive US Cash Indices REST ============================
+# Official cash indices (I: prefix), verified (massive.com/docs/rest/indices):
+# I:SPX (S&P 500), I:NDX (Nasdaq-100), I:DJI (Dow). NOT ETFs (SPY/QQQ/DIA), NOT
+# futures (ES/NQ/YM), NOT CFDs. GET /v2/aggs/ticker/{I:XXX}/range/{mult}/{timespan}
+# /{from}/{to} -> results[{o,h,l,c,t}] with NO volume (index aggregates are derived
+# from index VALUES, not trades); t = Unix ms, bars aligned in Eastern Time; no bar
+# when no index update (absence != gap). Same account/key as Massive Forex (Bearer),
+# but Indices is a SEPARATE entitlement: MAPPED != entitlement (403 -> NOT_ENTITLED).
+# D2: indices are served/qualified live only; NOT persisted (candles.volume is NOT
+# NULL and indices have no volume; no volume=0 sentinel is ever written).
+
+MASSIVE_INDEX_GRANULARITIES: Dict[str, tuple] = {
+    "1m": (1, "minute"),
+    "5m": (5, "minute"),
+    "15m": (15, "minute"),
+    "30m": (30, "minute"),
+    "1h": (1, "hour"),
+    "2h": (2, "hour"),
+    "4h": (4, "hour"),
+    "6h": (6, "hour"),
+    "1d": (1, "day"),
+}
+
+
+@dataclass(frozen=True)
+class IndexBar:
+    """A parsed index aggregate. OHLC are exact Decimals (never float). Indices have
+    NO volume (aggregates are derived from index values, not trades)."""
+    datetime_utc: Optional[datetime]
+    open: Optional[Decimal]
+    high: Optional[Decimal]
+    low: Optional[Decimal]
+    close: Optional[Decimal]
+    status: DataQualityStatus
+
+
+@dataclass(frozen=True)
+class MassiveIndexResult:
+    status: str  # OK | EMPTY | NOT_MAPPED | NOT_SUPPORTED | NO_KEY |
+    #              ACCESS_DENIED | RATE_LIMITED | UNAVAILABLE
+    bars: List[IndexBar]
+    reason: Optional[str] = None
+
+
+def index_bar_from_agg(
+    item: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> IndexBar:
+    """Parse one index aggregate (t ms + o/h/l/c). OHLC via Decimal only; no volume.
+    Missing/non-numeric/negative OHLC or timestamp -> INVALID (never fabricated)."""
+    if not isinstance(item, dict):
+        return IndexBar(None, None, None, None, None, DataQualityStatus.INVALID)
+    dt = _unix_ms_to_dt(item.get("t"))
+    open_ = _to_decimal(item.get("o"))
+    high = _to_decimal(item.get("h"))
+    low = _to_decimal(item.get("l"))
+    close = _to_decimal(item.get("c"))
+    if dt is None or open_ is None or high is None or low is None or close is None:
+        return IndexBar(dt, open_, high, low, close, DataQualityStatus.INVALID)
+    if open_ < 0 or high < 0 or low < 0 or close < 0:
+        return IndexBar(dt, open_, high, low, close, DataQualityStatus.INVALID)
+    return IndexBar(dt, open_, high, low, close, classify_freshness(dt, max_age_seconds, now=now))
+
+
+def parse_massive_index_aggs(
+    payload: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> MassiveIndexResult:
+    """Parse an index aggregates body. Empty results -> EMPTY (a legitimate no-update
+    period, never a gap). Malformed -> UNAVAILABLE."""
+    if not isinstance(payload, dict):
+        return MassiveIndexResult("UNAVAILABLE", [], "malformed provider response")
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        return MassiveIndexResult("EMPTY", [], None)
+    bars = [index_bar_from_agg(x, max_age_seconds, now=now) for x in results]
+    return MassiveIndexResult("OK", bars, None)
+
+
+class MassiveIndicesProvider:
+    """Massive Indices REST adapter. Same account/key as Forex (Bearer header, never
+    in URL/logs/response); no network without a key. OHLC decoded with
+    parse_float=Decimal so index values are exact (never float)."""
+
+    SOURCE = "massive"
+
+    def __init__(self, rest_url: Optional[str] = None, api_key: Optional[str] = None) -> None:
+        self.rest_url = (rest_url or settings.massive_rest_url).rstrip("/")
+        self.api_key = api_key if api_key is not None else settings.massive_api_key
+        self.client: Optional[httpx.AsyncClient] = None
+
+    async def connect(self) -> None:
+        if self.client is None:
+            headers = {"Accept": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            self.client = httpx.AsyncClient(
+                base_url=self.rest_url,
+                timeout=settings.massive_request_timeout_seconds,
+                headers=headers,
+            )
+
+    async def disconnect(self) -> None:
+        if self.client is not None:
+            await self.client.aclose()
+            self.client = None
+
+    async def get_index_aggregates(
+        self, canonical_symbol: str, granularity: str, start: int, end: int
+    ) -> MassiveIndexResult:
+        """Fetch index aggregates over [start, end] UNIX seconds. Returns an explicit
+        MassiveIndexResult; never raises for provider/HTTP errors."""
+        ticker = provider_symbol_map.to_provider(self.SOURCE, canonical_symbol)
+        if ticker is None:
+            return MassiveIndexResult(
+                "NOT_MAPPED", [], f"no verified Massive index symbol for {canonical_symbol}")
+        if granularity not in MASSIVE_INDEX_GRANULARITIES:
+            return MassiveIndexResult(
+                "NOT_SUPPORTED", [], f"granularity {granularity} not supported (massive indices)")
+        if not self.api_key:
+            return MassiveIndexResult("NO_KEY", [], "MASSIVE_API_KEY not set")
+        if self.client is None:
+            await self.connect()
+        assert self.client is not None
+        multiplier, timespan = MASSIVE_INDEX_GRANULARITIES[granularity]
+        start_ms = int(start) * 1000
+        end_ms = int(end) * 1000
+        try:
+            resp = await self.client.get(
+                f"/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{start_ms}/{end_ms}",
+                params={"adjusted": "true", "sort": "asc", "limit": 50000},
+            )
+        except httpx.TimeoutException:
+            return MassiveIndexResult("UNAVAILABLE", [], "provider timeout")
+        except httpx.HTTPError:
+            return MassiveIndexResult("UNAVAILABLE", [], "provider unreachable")
+        code = resp.status_code
+        if code in (401, 403):
+            return MassiveIndexResult(
+                "ACCESS_DENIED", [], f"access denied by provider ({code})")
+        if code == 429:
+            return MassiveIndexResult("RATE_LIMITED", [], "rate limited by provider (429)")
+        if code >= 500:
+            return MassiveIndexResult("UNAVAILABLE", [], f"provider server error ({code})")
+        try:
+            # parse_float=Decimal -> exact index OHLC, no intermediate float
+            payload = json.loads(resp.text, parse_float=Decimal)
+        except (ValueError, json.JSONDecodeError):
+            return MassiveIndexResult("UNAVAILABLE", [], "malformed provider response")
+        return parse_massive_index_aggs(payload, max_age_seconds=float("inf"))
+
+
+def _register_index_instruments() -> None:
+    """Register the 3 canonical US cash indices. INDEX class, quote in USD points,
+    volume NOT_AVAILABLE (indices have no volume), calendar NOT_CONFIGURED (RTH is a
+    separate increment), precision/tick None. Mappings are documentation-verified ->
+    MAPPED (independent of entitlement)."""
+    indices = (
+        ("SPX", "I:SPX", "S&P 500"),
+        ("NDX", "I:NDX", "Nasdaq-100"),
+        ("US30", "I:DJI", "Dow Jones Industrial Average"),
+    )
+    for canonical, provider_ticker, name in indices:
+        instrument_registry.register(
+            Instrument(
+                canonical_symbol=canonical,
+                asset_class=AssetClass.INDEX,
+                base_asset=None,
+                quote_asset="USD",
+                display_name=name,
+                timezone="America/New_York",  # US cash index (points); internal stays UTC
+                market_calendar=MarketCalendarPolicy.NOT_CONFIGURED,
+                volume_semantics=VolumeSemantics.NOT_AVAILABLE,
+                price_precision=None,
+                tick_size=None,
+            )
+        )
+        provider_symbol_map.add("massive", canonical, provider_ticker)
+
+
+massive_indices_provider = MassiveIndicesProvider()
+_register_index_instruments()
+
+
+def _index_bar_dict(bar: IndexBar) -> Dict[str, object]:
+    """JSON-safe index bar: Decimals as strings, datetime ISO UTC. No volume key."""
+    def s(v: Optional[Decimal]) -> Optional[str]:
+        return str(v) if v is not None else None
+    return {
+        "start": bar.datetime_utc.isoformat() if bar.datetime_utc else None,
+        "open": s(bar.open), "high": s(bar.high), "low": s(bar.low),
+        "close": s(bar.close), "quality": bar.status.value,
+    }
+
+
+async def fetch_index_history(
+    canonical_symbol: str, granularity: str, start: int, end: int
+) -> Dict[str, object]:
+    """Assemble US cash index history from Massive (live only, NOT persisted). Half-open
+    [start, end), dedup by timestamp, ascending, INVALID excluded. Gaps UNKNOWN (no
+    RTH calendar): a missing bar is never a gap. No volume (NOT_AVAILABLE)."""
+    inst = instrument_registry.get(canonical_symbol)
+    if inst is None or inst.asset_class != AssetClass.INDEX:
+        raise ValueError(f"unknown index instrument: {canonical_symbol}")
+    if start >= end:
+        raise ValueError("start must be strictly before end")
+    provider_symbol = provider_symbol_map.to_provider("massive", canonical_symbol)
+    res = await massive_indices_provider.get_index_aggregates(
+        canonical_symbol, granularity, start, end)
+    base: Dict[str, object] = {
+        "source": "massive",
+        "canonical_symbol": canonical_symbol,
+        "provider_symbol": provider_symbol,
+        "granularity": granularity,
+        "requested_range": {"start": start, "end": end},
+        "timezone_internal": "UTC",
+        "display_timezone": "America/Toronto",
+        "volume_semantics": inst.volume_semantics.value,  # NOT_AVAILABLE
+        "persisted": False,  # D2: indices are never written to candles this increment
+    }
+    if res.status != "OK":
+        base.update({"status": res.status, "reason": res.reason, "count": 0, "candles": []})
+        return base
+    collected: Dict[int, IndexBar] = {}
+    invalid = 0
+    for bar in res.bars:
+        if bar.datetime_utc is None or bar.status == DataQualityStatus.INVALID:
+            invalid += 1
+            continue
+        key = int(bar.datetime_utc.timestamp())
+        if key < start or key >= end:
+            continue
+        collected[key] = bar
+    kept = [collected[k] for k in sorted(collected)]
+    dts = [b.datetime_utc for b in kept if b.datetime_utc is not None]
+    bucket = GRANULARITIES[granularity][1] if granularity in GRANULARITIES else 86400
+    latest_quality = (
+        classify_freshness(max(dts), bucket * 2).value if dts
+        else DataQualityStatus.MISSING.value
+    )
+    base.update({
+        "status": "EMPTY" if not kept else "OK",
+        "count": len(kept),
+        "invalid_candles_count": invalid,
+        "latest_quality": latest_quality,   # never forced LIVE; EOD data is often STALE
+        "gaps_status": "UNKNOWN",            # no RTH calendar -> absence is not a gap
+        "candles": [_index_bar_dict(b) for b in kept],
+    })
+    return base
+
+
+@api_router.get("/market/index/{symbol}/history")
+async def market_index_history(
+    symbol: str, start: int, end: int, granularity: str = "1d"
+) -> dict:
+    try:
+        result = await fetch_index_history(symbol.upper(), granularity, start, end)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": str(exc)}
+        ) from exc
+    status = str(result.get("status"))
+    http = _METAL_HTTP_STATUS.get(status)  # same status->HTTP mapping
+    if http is not None:
+        raise HTTPException(
+            status_code=http, detail={"status": status, "reason": result.get("reason")}
+        )
+    return result
+
+
 massive_forex_provider = MassiveForexProvider()
 _register_massive_forex_instruments()
 
@@ -3069,6 +3337,7 @@ async def lifespan(app: FastAPI):
     await market_provider.connect()
     await massive_forex_provider.connect()
     await twelvedata_provider.connect()
+    await massive_indices_provider.connect()
     activation = await activate_massive_forex_mappings()
     log.info("Massive forex mapping activation: %s", activation)
     try:
@@ -3085,6 +3354,7 @@ async def lifespan(app: FastAPI):
         await market_provider.disconnect()
         await massive_forex_provider.disconnect()
         await twelvedata_provider.disconnect()
+        await massive_indices_provider.disconnect()
         log.info("Shutting down %s", settings.app_name)
 
 

@@ -3626,3 +3626,55 @@ class TestChartEngineV8FVG(unittest.TestCase):
 
     def test_fvg_methodology_says_not_entry_signal(self):
         self.assertIn("un FVG isolé n’est pas un signal d’entrée", self.html)
+
+
+class TestChartEngineV9OrderBlocks(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_order_block_detector_present(self):
+        self.assertIn("function detectOrderBlocks", self.html)
+
+    def test_order_block_requires_displacement(self):
+        self.assertIn("ds.forEach(function(d)", self.html)
+
+    def test_order_block_requires_structure_confirmation(self):
+        self.assertIn("if(!structural)return", self.html)
+
+    def test_order_block_accepts_bos_or_choch_source(self):
+        self.assertIn("bs.concat(ch).forEach", self.html)
+
+    def test_order_block_requires_same_direction_structure(self):
+        self.assertIn('bullish&&e.type==="BULLISH"', self.html)
+        self.assertIn('!bullish&&e.type==="BEARISH"', self.html)
+
+    def test_order_block_search_is_bounded_to_five_prior_candles(self):
+        self.assertIn("j>=Math.max(0,d.index-5)", self.html)
+
+    def test_bullish_order_block_uses_opposite_bearish_candle(self):
+        self.assertIn("(bullish&&c<o)", self.html)
+
+    def test_bearish_order_block_uses_opposite_bullish_candle(self):
+        self.assertIn("(!bullish&&c>o)", self.html)
+
+    def test_order_block_uses_real_high_low_zone(self):
+        self.assertIn("low=Number(ob.low),high=Number(ob.high)", self.html)
+
+    def test_order_block_states_are_explicit(self):
+        for token in ['state="FRESH"', 'state="RETESTED"', 'state="INVALIDATED"']:
+            self.assertIn(token, self.html)
+
+    def test_bullish_invalidation_requires_close_below_zone(self):
+        self.assertIn("bullish&&close<low", self.html)
+
+    def test_bearish_invalidation_requires_close_above_zone(self):
+        self.assertIn("!bullish&&close>high", self.html)
+
+    def test_sweep_and_fvg_are_separate_confirmations(self):
+        self.assertIn("sweepConfirmed:sweepConfirmed", self.html)
+        self.assertIn("fvgConfirmed:fvgConfirmed", self.html)
+
+    def test_order_block_ui_and_methodology_are_present(self):
+        self.assertIn("ORDER BLOCK ACTIF", self.html)
+        self.assertIn("pas comme obligations ni comme signal d’entrée", self.html)

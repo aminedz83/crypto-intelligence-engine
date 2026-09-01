@@ -3488,3 +3488,55 @@ class TestChartEngineV5CHOCHMSS(unittest.TestCase):
     def test_choch_counter_is_visible(self):
         self.assertIn('" · CHoCH/MSS ↑ "+chochBull', self.html)
         self.assertIn('" · CHoCH/MSS ↓ "+chochBear', self.html)
+
+
+class TestChartEngineV6LiquiditySweep(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_liquidity_sweep_detector_present(self):
+        self.assertIn("function detectLiquiditySweeps", self.html)
+
+    def test_sweep_uses_confirmed_swings(self):
+        self.assertIn("if(s.index+n!==i)return", self.html)
+
+    def test_swing_is_activated_after_sweep_evaluation(self):
+        start = self.html.index("function detectLiquiditySweeps")
+        end = self.html.index("function detectConfirmedCHOCH", start)
+        detector = self.html[start:end]
+        sweep_check = detector.index("high>latestHigh.price&&close<latestHigh.price")
+        activation = detector.index("if(s.index+n!==i)return")
+        self.assertLess(sweep_check, activation)
+
+    def test_buy_side_sweep_requires_wick_above_and_close_below(self):
+        self.assertIn("high>latestHigh.price&&close<latestHigh.price", self.html)
+
+    def test_sell_side_sweep_requires_wick_below_and_close_above(self):
+        self.assertIn("low<latestLow.price&&close>latestLow.price", self.html)
+
+    def test_sweep_uses_strict_inequalities(self):
+        self.assertNotIn("high>=latestHigh.price", self.html)
+        self.assertNotIn("low<=latestLow.price", self.html)
+
+    def test_sweep_excludes_latest_potentially_open_candle(self):
+        self.assertIn("i<Math.max(0,cs.length-1)", self.html)
+
+    def test_one_buy_side_sweep_per_reference_level(self):
+        self.assertIn("!sweptHigh[latestHigh.index]", self.html)
+        self.assertIn("sweptHigh[latestHigh.index]=true", self.html)
+
+    def test_one_sell_side_sweep_per_reference_level(self):
+        self.assertIn("!sweptLow[latestLow.index]", self.html)
+        self.assertIn("sweptLow[latestLow.index]=true", self.html)
+
+    def test_sweep_labels_are_rendered(self):
+        self.assertIn('label:"BSL SWEEP"', self.html)
+        self.assertIn('label:"SSL SWEEP"', self.html)
+
+    def test_liquidity_sweep_ui_is_active(self):
+        self.assertIn("LIQUIDITY SWEEP ACTIF", self.html)
+
+    def test_sweep_counters_are_visible(self):
+        self.assertIn('" · BSL Sweep "+buySweeps', self.html)
+        self.assertIn('" · SSL Sweep "+sellSweeps', self.html)

@@ -10,6 +10,7 @@ import asyncio
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -3237,3 +3238,87 @@ class RealtimeCoreV2AForexTests(unittest.TestCase):
     def test_other_forex_tf_explicitly_rest(self):
         marker = 'LIVE BBO · OHLC "+chartState.tf.toUpperCase()+" REST'
         self.assertIn(marker, self.html)
+
+
+class RealtimeCoreV2BGoldTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.main_src = Path(main.__file__).read_text(encoding="utf-8")
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_twelvedata_official_gold_ws_base_url(self):
+        marker = 'wss://ws.twelvedata.com/v1/quotes/price'
+        self.assertIn(marker, self.main_src)
+
+    def test_gold_ws_subscribes_xau_usd(self):
+        self.assertIn('"symbols": "XAU/USD"', self.main_src)
+
+    def test_gold_ws_price_parser_present(self):
+        self.assertIn("parse_twelvedata_ws_price", self.main_src)
+
+    def test_gold_ws_rejects_non_price_event(self):
+        result = main.parse_twelvedata_ws_price(
+            {"event": "heartbeat"},
+            "XAU-USD",
+        )
+        self.assertIsNone(result)
+
+    def test_gold_ws_parses_price_as_decimal(self):
+        observed = datetime(2026, 9, 1, 18, 0, tzinfo=timezone.utc)
+        payload = {
+            "event": "price",
+            "symbol": "XAU/USD",
+            "price": "3456.789",
+            "timestamp": observed.timestamp(),
+        }
+        result = main.parse_twelvedata_ws_price(
+            payload,
+            "XAU-USD",
+            received_at=observed,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.price, Decimal("3456.789"))
+
+    def test_gold_ws_rejects_wrong_symbol(self):
+        payload = {
+            "event": "price",
+            "symbol": "XAG/USD",
+            "price": "40.0",
+            "timestamp": 1788285600,
+        }
+        result = main.parse_twelvedata_ws_price(payload, "XAU-USD")
+        self.assertIsNone(result)
+
+    def test_gold_ws_rejects_non_positive_price(self):
+        payload = {
+            "event": "price",
+            "symbol": "XAU/USD",
+            "price": "0",
+            "timestamp": 1788285600,
+        }
+        result = main.parse_twelvedata_ws_price(payload, "XAU-USD")
+        self.assertIsNone(result)
+
+    def test_gold_ws_start_endpoint_present(self):
+        self.assertIn("/market/metal/websocket/start", self.main_src)
+
+    def test_gold_realtime_endpoint_present(self):
+        self.assertIn("/market/metal/{symbol}/realtime", self.main_src)
+
+    def test_gold_realtime_declares_ohlc_rest(self):
+        self.assertIn('"ohlc_transport": "REST"', self.main_src)
+
+    def test_frontend_starts_gold_realtime(self):
+        self.assertIn("startGoldRealtime", self.html)
+
+    def test_frontend_reads_gold_realtime(self):
+        marker = "/api/v1/market/metal/XAU-USD/realtime"
+        self.assertIn(marker, self.html)
+
+    def test_frontend_gold_badge_says_ohlc_rest(self):
+        marker = "LIVE PRICE · TWELVE DATA WS · OHLC REST"
+        self.assertIn(marker, self.html)
+
+    def test_gold_ws_does_not_synthesize_ohlc(self):
+        self.assertNotIn("mergeRealtimeGoldCandle", self.html)

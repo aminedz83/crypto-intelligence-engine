@@ -2975,7 +2975,7 @@ def parse_massive_index_aggs(
 
 
 class MassiveIndicesProvider:
-    """Massive Indices REST adapter. Same account/key as Forex (Bearer header, never
+    """Massive Indices REST adapter. Same account/key as Forex (auth header, never
     in URL/logs/response); no network without a key. OHLC decoded with
     parse_float=Decimal so index values are exact (never float)."""
 

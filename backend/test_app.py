@@ -3396,3 +3396,47 @@ class TestRealtimeCoreV2CIndices(unittest.TestCase):
     def test_frontend_never_labels_delayed_indices_live(self):
         self.assertIn("15M DELAYED · MASSIVE WS", self.html)
         self.assertNotIn("LIVE INDEX · MASSIVE WS", self.html)
+
+
+class TestChartEngineV4BOS(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_bos_detector_present(self):
+        self.assertIn("function detectConfirmedBOS", self.html)
+
+    def test_bos_uses_confirmed_swing_delay(self):
+        self.assertIn("if(s.index+n!==i)return", self.html)
+
+    def test_bos_bull_requires_close_above(self):
+        self.assertIn("close>latestHigh.price", self.html)
+
+    def test_bos_bear_requires_close_below(self):
+        self.assertIn("close<latestLow.price", self.html)
+
+    def test_bos_strict_comparison_rejects_equal(self):
+        self.assertNotIn("close>=latestHigh.price", self.html)
+        self.assertNotIn("close<=latestLow.price", self.html)
+
+    def test_bos_does_not_use_wick_for_break(self):
+        self.assertNotIn("Number(cs[i].high)>latestHigh.price", self.html)
+        self.assertNotIn("Number(cs[i].low)<latestLow.price", self.html)
+
+    def test_bos_excludes_latest_potentially_open_candle(self):
+        self.assertIn("i<Math.max(0,cs.length-1)", self.html)
+
+    def test_bos_deduplicates_broken_high(self):
+        self.assertIn("!brokenHigh[latestHigh.index]", self.html)
+
+    def test_bos_deduplicates_broken_low(self):
+        self.assertIn("!brokenLow[latestLow.index]", self.html)
+
+    def test_bos_renders_bull_and_bear_labels(self):
+        self.assertIn('lab.textContent=bull?"BOS ↑":"BOS ↓"', self.html)
+
+    def test_bos_ui_is_active(self):
+        self.assertIn("BOS ACTIF", self.html)
+
+    def test_choch_remains_next_step(self):
+        self.assertIn("CHoCH/MSS · prochaine étape", self.html)

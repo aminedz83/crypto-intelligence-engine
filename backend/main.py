@@ -29,7 +29,7 @@ from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set
-from urllib.parse import quote
+from urllib.parse import quote as url_quote
 
 import httpx
 import redis.asyncio as aioredis
@@ -3107,7 +3107,7 @@ class TwelveDataGoldWsManager:
         delay = 1.0
         while self.running:
             try:
-                key = quote(settings.twelvedata_api_key, safe="")
+                key = url_quote(settings.twelvedata_api_key, safe="")
                 connect_url = f"{settings.twelvedata_ws_url}?apikey={key}"
                 async with websockets.connect(
                     connect_url,
@@ -3227,7 +3227,7 @@ async def market_metal_ws_health() -> dict:
 
 @api_router.get("/market/metal/{symbol}/realtime")
 async def market_metal_realtime(symbol: str) -> dict:
-    canonical = canonical_symbol(symbol)
+    canonical = symbol.upper().replace("/", "-")
     if canonical != "XAU-USD":
         raise HTTPException(
             status_code=404,

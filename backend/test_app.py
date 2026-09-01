@@ -3438,5 +3438,53 @@ class TestChartEngineV4BOS(unittest.TestCase):
     def test_bos_ui_is_active(self):
         self.assertIn("BOS ACTIF", self.html)
 
-    def test_choch_remains_next_step(self):
-        self.assertIn("CHoCH/MSS · prochaine étape", self.html)
+    def test_choch_no_longer_marked_next_step(self):
+        self.assertNotIn("CHoCH/MSS · prochaine étape", self.html)
+
+
+class TestChartEngineV5CHOCHMSS(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_choch_detector_present(self):
+        self.assertIn("function detectConfirmedCHOCH", self.html)
+
+    def test_choch_uses_confirmed_swing_delay(self):
+        self.assertIn("if(s.index+n===i)confirmed.push(s)", self.html)
+
+    def test_choch_requires_bull_structure_pair(self):
+        self.assertIn('if(s.structure==="HH")bullHigh=s', self.html)
+        self.assertIn('if(s.structure==="HL")bullLow=s', self.html)
+
+    def test_choch_requires_bear_structure_pair(self):
+        self.assertIn('if(s.structure==="LH")bearHigh=s', self.html)
+        self.assertIn('if(s.structure==="LL")bearLow=s', self.html)
+
+    def test_bearish_choch_requires_close_below_last_low(self):
+        self.assertIn('bias==="BULLISH"&&latestLow&&close<latestLow.price', self.html)
+
+    def test_bullish_choch_requires_close_above_last_high(self):
+        self.assertIn('bias==="BEARISH"&&latestHigh&&close>latestHigh.price', self.html)
+
+    def test_choch_uses_strict_close_not_equal(self):
+        self.assertNotIn("close<=latestLow.price", self.html)
+        self.assertNotIn("close>=latestHigh.price", self.html)
+
+    def test_choch_excludes_latest_potentially_open_candle(self):
+        self.assertIn("i<Math.max(0,cs.length-1)", self.html)
+
+    def test_choch_resets_bias_after_event(self):
+        self.assertIn("brokenLow[latestLow.index]=true;bias=null", self.html)
+        self.assertIn("brokenHigh[latestHigh.index]=true;bias=null", self.html)
+
+    def test_choch_renders_both_directions(self):
+        self.assertIn('label:"CHoCH/MSS ↓"', self.html)
+        self.assertIn('label:"CHoCH/MSS ↑"', self.html)
+
+    def test_choch_ui_is_active(self):
+        self.assertIn("CHoCH/MSS ACTIF", self.html)
+
+    def test_choch_counter_is_visible(self):
+        self.assertIn('" · CHoCH/MSS ↑ "+chochBull', self.html)
+        self.assertIn('" · CHoCH/MSS ↓ "+chochBear', self.html)

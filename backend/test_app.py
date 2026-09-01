@@ -3540,3 +3540,46 @@ class TestChartEngineV6LiquiditySweep(unittest.TestCase):
     def test_sweep_counters_are_visible(self):
         self.assertIn('" · BSL Sweep "+buySweeps', self.html)
         self.assertIn('" · SSL Sweep "+sellSweeps', self.html)
+
+
+class TestChartEngineV7Displacement(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_displacement_detector_present(self):
+        self.assertIn("function detectDisplacement", self.html)
+
+    def test_displacement_lookback_is_explicit(self):
+        self.assertIn("const DISPLACEMENT_LOOKBACK=20", self.html)
+
+    def test_displacement_body_multiplier_is_explicit(self):
+        self.assertIn("const DISPLACEMENT_BODY_MULTIPLIER=1.5", self.html)
+
+    def test_displacement_body_range_ratio_is_explicit(self):
+        self.assertIn("const DISPLACEMENT_MIN_BODY_RANGE_RATIO=0.7", self.html)
+
+    def test_displacement_close_extreme_fraction_is_explicit(self):
+        self.assertIn("const DISPLACEMENT_CLOSE_EXTREME_FRACTION=0.2", self.html)
+
+    def test_displacement_uses_only_prior_bodies_for_baseline(self):
+        self.assertIn("for(var j=i-lookback;j<i;j++)", self.html)
+
+    def test_displacement_requires_large_and_strong_body(self):
+        self.assertIn("largeBody&&strongBody&&(bullish||bearish)", self.html)
+
+    def test_bullish_displacement_requires_directional_close(self):
+        self.assertIn("close>open&&(high-close)/range", self.html)
+
+    def test_bearish_displacement_requires_directional_close(self):
+        self.assertIn("close<open&&(close-low)/range", self.html)
+
+    def test_displacement_excludes_potentially_open_last_candle(self):
+        self.assertIn("i<Math.max(0,cs.length-1)", self.html)
+
+    def test_displacement_labels_and_ui_are_present(self):
+        self.assertIn('label:bullish?"DISP ↑":"DISP ↓"', self.html)
+        self.assertIn("DISPLACEMENT ACTIF", self.html)
+
+    def test_displacement_methodology_warns_backtest_required(self):
+        self.assertIn("Seuils à valider par backtest/OOS", self.html)

@@ -3322,3 +3322,77 @@ class RealtimeCoreV2BGoldTests(unittest.TestCase):
 
     def test_gold_ws_does_not_synthesize_ohlc(self):
         self.assertNotIn("mergeRealtimeGoldCandle", self.html)
+
+class TestRealtimeCoreV2CIndices(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.main_src = Path(main.__file__).read_text(encoding="utf-8")
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_indices_ws_uses_documented_delayed_url(self):
+        self.assertIn("wss://delayed.massive.com/indices", self.main_src)
+
+    def test_indices_ws_topics_use_verified_symbols(self):
+        manager = main.MassiveIndicesWsManager(api_key="test")
+        topics = manager._topics()
+        self.assertIn("V.I:SPX", topics)
+        self.assertIn("AM.I:NDX", topics)
+        self.assertIn("AM.I:DJI", topics)
+
+    def test_index_value_parser_decimal(self):
+        observed = datetime(2026, 9, 1, 18, 0, tzinfo=timezone.utc)
+        result = main.parse_massive_index_value(
+            {"ev": "V", "T": "I:SPX", "val": "6500.25", "t": 1788285600000},
+            received_at=observed,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.value, Decimal("6500.25"))
+
+    def test_index_value_rejects_unknown_ticker(self):
+        result = main.parse_massive_index_value(
+            {"ev": "V", "T": "I:UNKNOWN", "val": "1", "t": 1788285600000}
+        )
+        self.assertIsNone(result)
+
+    def test_index_minute_parser_has_no_volume(self):
+        observed = datetime(2026, 9, 1, 18, 0, tzinfo=timezone.utc)
+        result = main.parse_massive_index_minute(
+            {
+                "ev": "AM", "sym": "I:NDX", "o": "24000", "h": "24010",
+                "l": "23990", "c": "24005", "s": 1788285600000,
+            },
+            received_at=observed,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertNotIn("volume", result.to_dict())
+
+    def test_index_minute_rejects_invalid_ohlc(self):
+        result = main.parse_massive_index_minute(
+            {
+                "ev": "AM", "sym": "I:SPX", "o": "10", "h": "9",
+                "l": "8", "c": "9", "s": 1788285600000,
+            }
+        )
+        self.assertIsNone(result)
+
+    def test_index_ws_start_endpoint_present(self):
+        self.assertIn("/market/index/websocket/start", self.main_src)
+
+    def test_index_realtime_endpoint_present(self):
+        self.assertIn("/market/index/{symbol}/realtime", self.main_src)
+
+    def test_index_feed_is_explicitly_delayed(self):
+        self.assertIn('FEED_RECENCY = "15_MIN_DELAYED"', self.main_src)
+
+    def test_frontend_starts_index_realtime(self):
+        self.assertIn("startIndexRealtime", self.html)
+
+    def test_frontend_reads_index_realtime(self):
+        marker = '/api/v1/market/index/"+encodeURIComponent(sym)+"/realtime'
+        self.assertIn(marker, self.html)
+
+    def test_frontend_never_labels_delayed_indices_live(self):
+        self.assertIn("15M DELAYED · MASSIVE WS", self.html)
+        self.assertNotIn("LIVE INDEX · MASSIVE WS", self.html)

@@ -97,6 +97,7 @@
     <section class="view active" id="view-markets" data-view="markets"></section>
     <section class="view" id="view-forex" data-view="forex"></section>
     <section class="view" id="view-metal" data-view="metal"></section>
+    <section class="view" id="view-index" data-view="index"></section>
     <section class="view" id="view-system" data-view="system"></section>
     <section class="view" id="view-detail" data-view="detail"></section>
   </main>
@@ -110,6 +111,7 @@
     { id:"markets", label:"Crypto", icon:"₿" },
     { id:"forex",   label:"Forex",  icon:"$" },
     { id:"metal",   label:"Métaux", icon:"◆" },
+    { id:"index",   label:"Indices", icon:"▤" },
     { id:"system",  label:"Système", icon:"◔" }
     // id:"detail" is an internal view (asset detail), not a bottom tab
   ];
@@ -357,9 +359,11 @@
   function renderDetail(){
     var v = byId("view-detail"); clear(v);
     if (!detailCtx){ v.appendChild(emptyState("Aucun actif sélectionné","")); return; }
-    var backTo = detailCtx.kind==="forex" ? "forex" : detailCtx.kind==="metal" ? "metal" : "markets";
+    var backTo = detailCtx.kind==="forex" ? "forex" : detailCtx.kind==="metal" ? "metal"
+      : detailCtx.kind==="index" ? "index" : "markets";
     var label = detailCtx.kind==="forex" ? "Forex Massive"
-      : detailCtx.kind==="metal" ? "Gold Spot · Twelve Data" : "Crypto Coinbase";
+      : detailCtx.kind==="metal" ? "Gold Spot · Twelve Data"
+      : detailCtx.kind==="index" ? "Indice cash · Massive" : "Crypto Coinbase";
     v.appendChild(h("button",{class:"back", onclick:function(){ setView(backTo); }},["← Retour"]));
     v.appendChild(h("h2",{class:"section"},[detailCtx.symbol + " · " + label]));
 
@@ -410,6 +414,12 @@
       var mstart = mend - 12*3600;
       loadCandles("/api/v1/market/metal/"+encodeURIComponent(detailCtx.canonical)+
         "/history?granularity=1h&start="+mstart+"&end="+mend);
+    } else if (detailCtx.kind === "index"){
+      // US cash index: daily bars (EOD on Basic). Absence of a bar is not a gap.
+      var iend = Math.floor(Date.now()/1000);
+      var istart = iend - 30*86400;   // ~30 days of daily bars
+      loadCandles("/api/v1/market/index/"+encodeURIComponent(detailCtx.canonical)+
+        "/history?granularity=1d&start="+istart+"&end="+iend);
     } else {
       var end = alignHour(Math.floor(Date.now()/1000));
       var start = end - 12*3600;
@@ -503,6 +513,7 @@
     if (id==="markets") renderMarkets();
     else if (id==="forex") renderForex();
     else if (id==="metal") renderMetal();
+    else if (id==="index") renderIndex();
     else if (id==="system") renderSystem();
     else if (id==="detail") renderDetail();
   }
@@ -520,6 +531,23 @@
     v.appendChild(card);
     v.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:2px 4px"},
       ["Prix/historique réels si la clé provider est configurée côté serveur ; sinon état explicite."]));
+  }
+
+  // ---- US cash indices (Massive) ------------------------------------------
+  function renderIndex(){
+    var v = byId("view-index"); clear(v);
+    v.appendChild(h("h2",{class:"section"},["Indices US cash · Massive (réel)"]));
+    var card = h("div",{class:"card"},[]);
+    [["SPX","S&P 500"],["NDX","Nasdaq-100"],["US30","Dow Jones (US30)"]].forEach(function(it){
+      card.appendChild(h("div",{class:"row tap", onclick:function(){ openDetail("index",it[0]); }},[
+        h("div",{},[ h("div",{class:"sym"},[it[0]]),
+          h("div",{class:"sub"},[it[1]+" · indice cash · Massive"]) ]),
+        qualityBadge("MAPPED")
+      ]));
+    });
+    v.appendChild(card);
+    v.appendChild(h("div",{class:"muted",style:"font-size:12px;padding:2px 4px"},
+      ["Indices cash officiels (I:SPX/I:NDX/I:DJI), sans volume. Données réelles selon l'entitlement du plan Massive ; sinon état explicite."]));
   }
   function buildNav(){
     var nav = byId("nav"); clear(nav);

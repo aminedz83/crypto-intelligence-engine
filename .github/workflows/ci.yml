@@ -38,7 +38,7 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "379"
+      EXPECTED_TESTS: "385"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -68,7 +68,7 @@ jobs:
           asyncio.run(main())
           PY
 
-      # Collection proof: pytest must collect EXACTLY 26. No auto-correction —
+      # Collection proof: pytest must collect exactly EXPECTED_TESTS. No auto-correction —
       # on mismatch, print the full collection and FAIL for analysis.
       - name: Collect tests and assert exactly EXPECTED_TESTS
         run: |

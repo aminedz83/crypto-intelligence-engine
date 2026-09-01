@@ -1733,7 +1733,10 @@ class VolumeSemantics(str, Enum):
 class MarketCalendarPolicy(str, Enum):
     ALWAYS_OPEN_24_7 = "ALWAYS_OPEN_24_7"
     NOT_CONFIGURED = "NOT_CONFIGURED"
+    # Declared intent only; NOT implemented in 6A (no invented hours). Until real
+    # official hours are added, calendar_for() maps these to NotConfigured -> UNKNOWN.
     FOREX_WEEK = "FOREX_WEEK"
+    TWELVEDATA_COMMODITY_24_7 = "TWELVEDATA_COMMODITY_24_7"
     US_EQUITY_RTH = "US_EQUITY_RTH"
 
 
@@ -1875,6 +1878,31 @@ class NotConfiguredCalendar(MarketCalendar):
         return GapReport("UNKNOWN", [])
 
 
+class TwelveDataCommodity24_7Calendar(MarketCalendar):
+    """Twelve Data Commodity calendar. The provider's official Commodity market
+    specification lists trading hours as 24/7 with timezone Australia/Sydney.
+
+    OPEN/CLOSED is therefore provider-calendar truth. Gap analysis deliberately stays
+    UNKNOWN: verified trading hours do not prove that Twelve Data must emit one OHLC
+    bar for every theoretical bucket, so absence is never promoted to a data gap.
+    """
+
+    policy = MarketCalendarPolicy.TWELVEDATA_COMMODITY_24_7
+
+    def is_market_expected_open(self, ts_unix: int) -> OpenState:
+        try:
+            datetime.fromtimestamp(int(ts_unix), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return OpenState.UNKNOWN
+        return OpenState.OPEN
+
+    def expected_bucket_starts(self, granularity: str, start: int, end: int) -> Optional[List[int]]:
+        return None
+
+    def analyze_gaps(self, starts: List[int], bucket: int) -> GapReport:
+        return GapReport("UNKNOWN", [])
+
+
 # Verified weekly Forex hours: opens Sunday 17:00 and closes Friday 17:00 in
 # America/New_York local time (DST handled by IANA -> 22:00 UTC in winter, 21:00
 # UTC in summer). NEVER a fixed UTC offset. Source: widely corroborated retail
@@ -1942,39 +1970,6 @@ def _forex_week_bounds(now_utc: datetime) -> Optional[Dict[str, object]]:
     }
 
 
-class USEquityRTHCalendar(MarketCalendar):
-    """Baseline U.S. cash-index regular-hours calendar.
-
-    Massive documents most U.S. indices as updating Monday-Friday 09:30-16:00
-    America/New_York. DST is handled by IANA ZoneInfo. This class intentionally
-    does NOT fabricate holiday/early-close knowledge: it provides the documented
-    regular-hours baseline only, and gap analysis remains UNKNOWN because Massive
-    explicitly emits no aggregate when an index has no update.
-    """
-
-    policy = MarketCalendarPolicy.US_EQUITY_RTH
-    timezone_name = "America/New_York"
-
-    def is_market_expected_open(self, ts_unix: int) -> OpenState:
-        ny = _zone(self.timezone_name)
-        if ny is None:
-            return OpenState.UNKNOWN
-        try:
-            now = datetime.fromtimestamp(int(ts_unix), tz=timezone.utc).astimezone(ny)
-        except (OverflowError, OSError, ValueError):
-            return OpenState.UNKNOWN
-        if now.weekday() >= 5:
-            return OpenState.CLOSED
-        minutes = now.hour * 60 + now.minute
-        return OpenState.OPEN if 570 <= minutes < 960 else OpenState.CLOSED
-
-    def expected_bucket_starts(self, granularity: str, start: int, end: int) -> Optional[List[int]]:
-        return None  # holidays/early closes/index-specific update cadence not fabricated
-
-    def analyze_gaps(self, starts: List[int], bucket: int) -> GapReport:
-        return GapReport("UNKNOWN", [])  # no index update != missing market data
-
-
 class ForexWeekCalendar(MarketCalendar):
     """Forex weekly calendar: OPEN/CLOSED anchored on America/New_York 17:00 Sun->Fri
     (DST via IANA). Gap analysis stays UNKNOWN: a missing bar is never a gap because
@@ -2002,18 +1997,19 @@ class ForexWeekCalendar(MarketCalendar):
 _ALWAYS_24_7 = Always24_7Calendar()
 _NOT_CONFIGURED = NotConfiguredCalendar()
 _FOREX_WEEK = ForexWeekCalendar()
-_US_EQUITY_RTH = USEquityRTHCalendar()
+_TWELVEDATA_COMMODITY_24_7 = TwelveDataCommodity24_7Calendar()
 _COINBASE_CALENDAR = _ALWAYS_24_7
 
 
 def calendar_for(policy: MarketCalendarPolicy) -> MarketCalendar:
-    """Resolve implemented calendar policies; unknown configuration stays UNKNOWN."""
+    """ALWAYS_OPEN_24_7 -> crypto; FOREX_WEEK -> Forex weekly (NY-anchored). Every
+    other policy resolves to NotConfigured -> UNKNOWN (no invented hours)."""
     if policy == MarketCalendarPolicy.ALWAYS_OPEN_24_7:
         return _ALWAYS_24_7
     if policy == MarketCalendarPolicy.FOREX_WEEK:
         return _FOREX_WEEK
-    if policy == MarketCalendarPolicy.US_EQUITY_RTH:
-        return _US_EQUITY_RTH
+    if policy == MarketCalendarPolicy.TWELVEDATA_COMMODITY_24_7:
+        return _TWELVEDATA_COMMODITY_24_7
     return _NOT_CONFIGURED
 
 
@@ -2708,8 +2704,9 @@ twelvedata_provider = TwelveDataProvider()
 
 
 def _register_metal_instruments() -> None:
-    """Register the canonical Gold Spot instrument. Calendar NOT_CONFIGURED (no Gold
-    calendar invented in this increment); volume UNKNOWN; precision/tick None."""
+    """Register Gold Spot using Twelve Data's verified Commodity calendar metadata.
+    Provider trading hours are 24/7 in Australia/Sydney. Volume semantics and financial
+    precision remain UNKNOWN/None until independently verified."""
     instrument_registry.register(
         Instrument(
             canonical_symbol="XAU-USD",
@@ -2717,8 +2714,8 @@ def _register_metal_instruments() -> None:
             base_asset="XAU",
             quote_asset="USD",
             display_name="Gold Spot",
-            timezone="UTC",
-            market_calendar=MarketCalendarPolicy.NOT_CONFIGURED,
+            timezone="Australia/Sydney",
+            market_calendar=MarketCalendarPolicy.TWELVEDATA_COMMODITY_24_7,
             volume_semantics=VolumeSemantics.UNKNOWN,
             price_precision=None,
             tick_size=None,
@@ -2791,8 +2788,8 @@ async def fetch_metal_history(
     canonical_symbol: str, granularity: str, start: int, end: int
 ) -> MetalHistory:
     """Assemble Gold XAU/USD history from Twelve Data. [start, end) half-open, dedup
-    by timestamp, ascending, INVALID excluded. Gaps stay UNKNOWN (no Gold calendar):
-    a missing bar is never a gap. Provider/business status is surfaced explicitly."""
+    by timestamp, ascending, INVALID excluded. Provider calendar is verified 24/7, but
+    gaps remain UNKNOWN because provider bar-emission semantics are not inferred."""
     inst = instrument_registry.get(canonical_symbol)
     if inst is None or inst.asset_class != AssetClass.METAL:
         raise ValueError(f"unknown metal instrument: {canonical_symbol}")
@@ -2814,6 +2811,7 @@ async def fetch_metal_history(
         "display_timezone": "America/Toronto",
         "market_timezone": inst.timezone,
         "market_calendar": inst.market_calendar.value,
+        "market_state": calendar_for(inst.market_calendar).is_market_expected_open(start).value,
         "volume_semantics": inst.volume_semantics.value,  # UNKNOWN (never invented)
     }
     if tdr.status != "OK":
@@ -2836,7 +2834,10 @@ async def fetch_metal_history(
         "count": len(kept),
         "invalid_candles_count": invalid,
         "latest_quality": _metal_latest_quality(kept, granularity),
-        "gaps_status": "UNKNOWN",   # no Gold calendar -> absence is not a gap
+        "gaps_status": calendar_for(inst.market_calendar).analyze_gaps(
+            [int(b.datetime_utc.timestamp()) for b in kept if b.datetime_utc],
+            GRANULARITIES[granularity][1] if granularity in GRANULARITIES else 3600,
+        ).status,
         "candles": [_td_bar_dict(b) for b in kept],
     })
     return MetalHistory(base, rows)
@@ -2873,9 +2874,9 @@ async def market_metal_history(
 
 
 async def fetch_metal_quote(canonical_symbol: str) -> Dict[str, object]:
-    """Latest Gold quote from Twelve Data. price is Decimal (serialised as string);
-    is_market_open is a provider flag, kept SEPARATE from data quality and from any
-    (future) Gold calendar. Quality here is the freshness of the quote timestamp."""
+    """Latest Gold quote from Twelve Data. Provider is_market_open remains separate
+    from data quality; expected_market_state comes from the verified Commodity calendar.
+    Quality remains freshness of the quote's own provider timestamp."""
     inst = instrument_registry.get(canonical_symbol)
     if inst is None or inst.asset_class != AssetClass.METAL:
         raise ValueError(f"unknown metal instrument: {canonical_symbol}")
@@ -2887,6 +2888,11 @@ async def fetch_metal_quote(canonical_symbol: str) -> Dict[str, object]:
         "provider_symbol": provider_symbol,
         "timezone_internal": "UTC",
         "display_timezone": "America/Toronto",
+        "market_timezone": inst.timezone,
+        "market_calendar": inst.market_calendar.value,
+        "expected_market_state": calendar_for(inst.market_calendar).is_market_expected_open(
+            int(utcnow().timestamp())
+        ).value,
     }
     if q.status != "OK":
         base.update({"status": q.status, "reason": q.reason, "price": None,
@@ -3010,7 +3016,7 @@ def parse_massive_index_aggs(
 
 
 class MassiveIndicesProvider:
-    """Massive Indices REST adapter. Same account/key as Forex (auth header, never
+    """Massive Indices REST adapter. Same account/key as Forex (Bearer header, never
     in URL/logs/response); no network without a key. OHLC decoded with
     parse_float=Decimal so index values are exact (never float)."""
 
@@ -3084,9 +3090,9 @@ class MassiveIndicesProvider:
 
 def _register_index_instruments() -> None:
     """Register the 3 canonical US cash indices. INDEX class, quote in USD points,
-    volume NOT_AVAILABLE (indices have no volume), documented U.S. equity RTH baseline
-    calendar (holidays/early closes intentionally not inferred), precision/tick None.
-    Mappings are documentation-verified -> MAPPED (independent of entitlement)."""
+    volume NOT_AVAILABLE (indices have no volume), calendar NOT_CONFIGURED (RTH is a
+    separate increment), precision/tick None. Mappings are documentation-verified ->
+    MAPPED (independent of entitlement)."""
     indices = (
         ("SPX", "I:SPX", "S&P 500"),
         ("NDX", "I:NDX", "Nasdaq-100"),
@@ -3101,7 +3107,7 @@ def _register_index_instruments() -> None:
                 quote_asset="USD",
                 display_name=name,
                 timezone="America/New_York",  # US cash index (points); internal stays UTC
-                market_calendar=MarketCalendarPolicy.US_EQUITY_RTH,
+                market_calendar=MarketCalendarPolicy.NOT_CONFIGURED,
                 volume_semantics=VolumeSemantics.NOT_AVAILABLE,
                 price_precision=None,
                 tick_size=None,
@@ -3147,8 +3153,6 @@ async def fetch_index_history(
         "requested_range": {"start": start, "end": end},
         "timezone_internal": "UTC",
         "display_timezone": "America/Toronto",
-        "market_timezone": inst.timezone,
-        "market_calendar": inst.market_calendar.value,
         "volume_semantics": inst.volume_semantics.value,  # NOT_AVAILABLE
         "persisted": False,  # D2: indices are never written to candles this increment
     }
@@ -3177,7 +3181,7 @@ async def fetch_index_history(
         "count": len(kept),
         "invalid_candles_count": invalid,
         "latest_quality": latest_quality,   # never forced LIVE; EOD data is often STALE
-        "gaps_status": calendar_for(inst.market_calendar).analyze_gaps([], bucket).status,
+        "gaps_status": "UNKNOWN",            # no RTH calendar -> absence is not a gap
         "candles": [_index_bar_dict(b) for b in kept],
     })
     return base

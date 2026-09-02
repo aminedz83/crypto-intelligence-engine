@@ -4511,7 +4511,7 @@ class TestPaperTradingUiV16I(unittest.TestCase):
 
     def test_paper_ui_fetches_account(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('api("/api/v1/paper/account")', html)
+        self.assertIn('api("/api/v1/paper/account/live")', html)
 
     def test_paper_ui_fetches_positions(self):
         html = INDEX.read_text(encoding="utf-8")
@@ -4718,3 +4718,63 @@ class TestPaperAccountInitializationV16K(unittest.TestCase):
         source = inspect.getsource(main.get_paper_account)
         self.assertIn('"paper_only": True', source)
         self.assertIn('"execution": False', source)
+
+
+class TestPaperLiveEquityV16L(unittest.TestCase):
+    def test_live_account_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/paper/account/live", paths)
+
+    def test_live_account_route_is_get(self):
+        route = next(r for r in main.api_router.routes if r.path == "/paper/account/live")
+        self.assertIn("GET", route.methods)
+
+    def test_live_account_reuses_persisted_account(self):
+        source = inspect.getsource(main.get_live_paper_account)
+        self.assertIn("account = await get_paper_account()", source)
+
+    def test_live_account_reads_only_open_positions(self):
+        source = inspect.getsource(main.get_live_paper_account)
+        self.assertIn("WHERE status='OPEN'", source)
+
+    def test_live_account_reuses_multi_asset_mark_builder(self):
+        source = inspect.getsource(main.get_live_paper_account)
+        self.assertIn("await paper_mark_from_realtime", source)
+
+    def test_live_account_calculates_unrealized_pnl(self):
+        source = inspect.getsource(main.get_live_paper_account)
+        self.assertIn("calculate_paper_pnl", source)
+
+    def test_live_equity_adds_unrealized_to_realized_capital(self):
+        source = inspect.getsource(main.get_live_paper_account)
+        self.assertIn("live_equity = current_capital + unrealized", source)
+
+    def test_missing_mark_makes_global_equity_partial(self):
+        source = inspect.getsource(main.get_live_paper_account)
+        self.assertIn('live_equity_status": "VALID" if complete else "PARTIAL"', source)
+
+    def test_partial_equity_does_not_publish_fake_total(self):
+        source = inspect.getsource(main.get_live_paper_account)
+        self.assertIn('"live_equity": str(live_equity) if complete else None', source)
+
+    def test_partial_unrealized_does_not_publish_fake_total(self):
+        source = inspect.getsource(main.get_live_paper_account)
+        self.assertIn('"unrealized_pnl": str(unrealized) if complete else None', source)
+
+    def test_live_account_remains_paper_only(self):
+        source = inspect.getsource(main.get_live_paper_account)
+        self.assertIn('"paper_only": True', source)
+        self.assertIn('"execution": False', source)
+
+    def test_ui_fetches_live_account(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('api("/api/v1/paper/account/live")', html)
+
+    def test_ui_shows_live_equity_and_latent_pnl(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('["Équité live"]', html)
+        self.assertIn('["P&L latent"]', html)
+
+    def test_ui_hides_partial_live_equity(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('a.live_equity_status==="VALID"?paperMoney(a.live_equity):"—"', html)

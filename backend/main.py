@@ -1575,23 +1575,72 @@ class PaperPositionMark(BaseModel):
 
 
 async def paper_mark_from_realtime(symbol: str) -> Optional[PaperPositionMark]:
-    canonical = symbol.upper()
+    canonical = symbol.upper().replace("/", "-")
     instrument = instrument_registry.get(canonical)
-    if instrument is None or instrument.asset_class != AssetClass.CRYPTO:
+    if instrument is None:
         return None
-    provider_symbol = provider_symbol_map.to_provider("coinbase", canonical)
-    if provider_symbol is None:
-        return None
-    datum = await market_store.get_ticker(provider_symbol)
-    if datum is None or datum.status != DataQualityStatus.VALID:
-        return None
-    if datum.value is None or datum.value <= 0 or datum.source_timestamp is None:
+
+    price: Optional[Decimal] = None
+    received_at: Optional[datetime] = None
+    source_timestamp: Optional[datetime] = None
+    source = ""
+
+    if instrument.asset_class == AssetClass.CRYPTO:
+        provider_symbol = provider_symbol_map.to_provider("coinbase", canonical)
+        if provider_symbol is None:
+            return None
+        datum = await market_store.get_ticker(provider_symbol)
+        if datum is None or datum.status != DataQualityStatus.VALID:
+            return None
+        if datum.value is None or datum.value <= 0 or datum.source_timestamp is None:
+            return None
+        price = Decimal(str(datum.value))
+        received_at = datum.received_at
+        source_timestamp = datum.source_timestamp
+        source = datum.source
+
+    elif instrument.asset_class == AssetClass.FOREX:
+        quote = massive_forex_ws.quotes.get(canonical)
+        if quote is None or quote.quality != DataQualityStatus.VALID:
+            return None
+        if quote.bid <= 0 or quote.ask <= 0 or quote.bid > quote.ask:
+            return None
+        price = (quote.bid + quote.ask) / Decimal("2")
+        received_at = quote.received_at
+        source_timestamp = quote.source_timestamp
+        source = "massive"
+
+    elif instrument.asset_class == AssetClass.METAL:
+        if canonical != "XAU-USD":
+            return None
+        gold = twelvedata_gold_ws.last_price
+        if gold is None or gold.quality != DataQualityStatus.VALID:
+            return None
+        if gold.price <= 0:
+            return None
+        price = gold.price
+        received_at = gold.received_at
+        source_timestamp = gold.source_timestamp
+        source = "twelvedata"
+
+    elif instrument.asset_class == AssetClass.INDEX:
+        value = massive_indices_ws.values.get(canonical)
+        if value is None or value.quality != DataQualityStatus.VALID:
+            return None
+        if value.value <= 0:
+            return None
+        price = value.value
+        received_at = value.received_at
+        source_timestamp = value.source_timestamp
+        source = "massive"
+
+    if price is None or received_at is None or source_timestamp is None or not source:
         return None
     return PaperPositionMark(
-        current_price=Decimal(str(datum.value)),
-        observed_at=datum.received_at,
-        source=datum.source,
-        source_timestamp=datum.source_timestamp,
+        current_price=price,
+        observed_at=received_at,
+        source=source,
+        source_timestamp=source_timestamp,
     )
 
 

@@ -1919,70 +1919,6 @@ def confirmed_swing_indexes(
     return highs, lows
 
 
-def detect_server_bos_choch(
-    candles: List[Candle],
-    swing_highs: List[int],
-    swing_lows: List[int],
-) -> Dict[str, object]:
-    if not candles or not swing_highs or not swing_lows:
-        return {
-            "bos": None,
-            "choch": None,
-            "break_index": None,
-            "break_level": None,
-        }
-
-    latest_high_index = swing_highs[-1]
-    latest_low_index = swing_lows[-1]
-    latest_high = candles[latest_high_index].high
-    latest_low = candles[latest_low_index].low
-    if latest_high is None or latest_low is None:
-        return {
-            "bos": None,
-            "choch": None,
-            "break_index": None,
-            "break_level": None,
-        }
-
-    prior_structure = "RANGE"
-    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-        high_a = candles[swing_highs[-2]].high
-        high_b = candles[swing_highs[-1]].high
-        low_a = candles[swing_lows[-2]].low
-        low_b = candles[swing_lows[-1]].low
-        if None not in (high_a, high_b, low_a, low_b):
-            if high_b > high_a and low_b > low_a:
-                prior_structure = "BULLISH"
-            elif high_b < high_a and low_b < low_a:
-                prior_structure = "BEARISH"
-
-    start_index = max(latest_high_index, latest_low_index) + 1
-    for index in range(start_index, len(candles)):
-        close = candles[index].close
-        if close is None:
-            continue
-        if close > latest_high:
-            return {
-                "bos": "BULLISH",
-                "choch": "BULLISH" if prior_structure == "BEARISH" else None,
-                "break_index": index,
-                "break_level": latest_high,
-            }
-        if close < latest_low:
-            return {
-                "bos": "BEARISH",
-                "choch": "BEARISH" if prior_structure == "BULLISH" else None,
-                "break_index": index,
-                "break_level": latest_low,
-            }
-    return {
-        "bos": None,
-        "choch": None,
-        "break_index": None,
-        "break_level": None,
-    }
-
-
 def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict[str, object]:
     closed = closed_valid_candles(candles, now)
     if len(closed) < SERVER_SWING_STRENGTH * 2 + 3:
@@ -1998,30 +1934,29 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
     if high_a is None or high_b is None or low_a is None or low_b is None:
         return {"status": "WAIT", "reason": "SWING_VALUE_MISSING"}
 
-    if high_b > high_a and low_b > low_a:
+    high_a_value: float = float(high_a)
+    high_b_value: float = float(high_b)
+    low_a_value: float = float(low_a)
+    low_b_value: float = float(low_b)
+
+    if high_b_value > high_a_value and low_b_value > low_a_value:
         structure = "BULLISH"
-    elif high_b < high_a and low_b < low_a:
+    elif high_b_value < high_a_value and low_b_value < low_a_value:
         structure = "BEARISH"
     else:
         structure = "RANGE"
 
-    break_state = detect_server_bos_choch(closed, highs, lows)
     latest = closed[-1]
     return {
         "status": "READY",
         "structure": structure,
-        "bos": break_state["bos"],
-        "choch": break_state["choch"],
-        "break_index": break_state["break_index"],
-        "break_level": break_state["break_level"],
         "closed_candles": len(closed),
         "confirmed_swing_highs": len(highs),
         "confirmed_swing_lows": len(lows),
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
         "setup_state": "WAIT",
         "auto_queue": False,
-        "smc_confirmation": "BOS_CHOCH_V1",
-        "next_confirmation": "LIQUIDITY_SWEEP_NOT_IMPLEMENTED",
+        "smc_confirmation": "NOT_IMPLEMENTED",
     }
 
 

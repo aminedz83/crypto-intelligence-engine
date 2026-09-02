@@ -1867,6 +1867,10 @@ async def verified_auto_paper_entry(
 SERVER_SETUP_GRANULARITY = "5m"
 SERVER_SETUP_CANDLE_LIMIT = 120
 SERVER_SWING_STRENGTH = 2
+SERVER_DISPLACEMENT_LOOKBACK = 20
+SERVER_DISPLACEMENT_BODY_MULTIPLIER = 1.5
+SERVER_DISPLACEMENT_MIN_BODY_RANGE_RATIO = 0.70
+SERVER_DISPLACEMENT_CLOSE_EXTREME_FRACTION = 0.20
 
 
 def closed_valid_candles(candles: List[Candle], now: datetime) -> List[Candle]:
@@ -2060,6 +2064,74 @@ def latest_confirmed_liquidity_sweep(
     return max(events, key=sweep_index_value)
 
 
+
+def latest_confirmed_displacement(
+    candles: List[Candle],
+    lookback: int = SERVER_DISPLACEMENT_LOOKBACK,
+) -> Optional[Dict[str, object]]:
+    """Return the latest objective displacement candle from closed VALID input.
+
+    The candidate body must be >= 1.5x the mean body of the previous 20
+    candles, body/range >= 70%, and its close must finish inside the final
+    20% of the candle range in the displacement direction. No future candle
+    is consulted, so the detector is non-repainting once the candle is closed.
+    """
+    if lookback < 1 or len(candles) <= lookback:
+        return None
+    events: List[Dict[str, object]] = []
+    for index in range(lookback, len(candles)):
+        candidate = candles[index]
+        if (candidate.open is None or candidate.high is None
+                or candidate.low is None or candidate.close is None):
+            continue
+        prior = candles[index - lookback:index]
+        prior_bodies: List[float] = []
+        for candle in prior:
+            if candle.open is None or candle.close is None:
+                prior_bodies = []
+                break
+            prior_bodies.append(abs(candle.close - candle.open))
+        if len(prior_bodies) != lookback:
+            continue
+        average_body = sum(prior_bodies) / lookback
+        if average_body <= 0:
+            continue
+        body = abs(candidate.close - candidate.open)
+        candle_range = candidate.high - candidate.low
+        if candle_range <= 0:
+            continue
+        if body < average_body * SERVER_DISPLACEMENT_BODY_MULTIPLIER:
+            continue
+        if body / candle_range < SERVER_DISPLACEMENT_MIN_BODY_RANGE_RATIO:
+            continue
+        if candidate.close > candidate.open:
+            extreme_threshold = candidate.high - (
+                candle_range * SERVER_DISPLACEMENT_CLOSE_EXTREME_FRACTION
+            )
+            if candidate.close < extreme_threshold:
+                continue
+            direction = "BULLISH"
+        elif candidate.close < candidate.open:
+            extreme_threshold = candidate.low + (
+                candle_range * SERVER_DISPLACEMENT_CLOSE_EXTREME_FRACTION
+            )
+            if candidate.close > extreme_threshold:
+                continue
+            direction = "BEARISH"
+        else:
+            continue
+        events.append({
+            "event": "DISPLACEMENT",
+            "direction": direction,
+            "candle_index": index,
+            "body": body,
+            "range": candle_range,
+            "average_reference_body": average_body,
+            "body_multiple": body / average_body,
+            "body_range_ratio": body / candle_range,
+        })
+    return events[-1] if events else None
+
 def structure_from_confirmed_swings(
     candles: List[Candle],
     swing_highs: List[int],
@@ -2159,6 +2231,7 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
     structure_event = classify_bos_choch(prior_structure, break_event)
     structure_event["prior_structure"] = prior_structure
     liquidity_sweep = latest_confirmed_liquidity_sweep(closed, highs, lows)
+    displacement = latest_confirmed_displacement(closed)
     latest = closed[-1]
     return {
         "status": "READY",
@@ -2170,8 +2243,9 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
         "setup_state": "WAIT",
         "auto_queue": False,
-        "smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_V1",
+        "smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_V1",
         "liquidity_sweep": liquidity_sweep or {"event": "NONE", "direction": None},
+        "displacement": displacement or {"event": "NONE", "direction": None},
     }
 
 
@@ -2327,6 +2401,7 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "interval_seconds": AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS,
         "market_setup_detection": "STRUCTURE_BOS_CHOCH_V1",
         "liquidity_sweep_detection": "SERVER_LIQUIDITY_SWEEP_V1",
+        "displacement_detection": "SERVER_DISPLACEMENT_V1",
         "smc_auto_candidate_generation": "NOT_IMPLEMENTED",
         "paper_only": True,
         "execution": False,

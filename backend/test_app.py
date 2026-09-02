@@ -4616,6 +4616,8 @@ class TestPaperTradingMobileRenderV16J1(unittest.TestCase):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("function renderTradingContent()", html)
         self.assertIn("function renderTrading()", html)
+        self.assertIn("var a=paperUiState.account;", html)
+        self.assertNotIn("clear(v),a=paperUiState.account", html)
 
     def test_trading_renderer_catches_local_render_error(self):
         html = INDEX.read_text(encoding="utf-8")

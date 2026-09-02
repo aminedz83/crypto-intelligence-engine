@@ -4240,3 +4240,63 @@ class TestPaperPersistenceV16D(unittest.TestCase):
     def test_paper_persistence_ui_is_active(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("PAPER PERSISTENCE V1 ACTIF", html)
+
+
+class TestPaperMarkV16E(unittest.TestCase):
+    def test_mark_model_uses_decimal_price(self):
+        field = main.PaperPositionMark.model_fields["current_price"]
+        self.assertIs(field.annotation, Decimal)
+
+    def test_mark_model_requires_source_timestamp(self):
+        fields = main.PaperPositionMark.model_fields
+        self.assertIn("source", fields)
+        self.assertIn("source_timestamp", fields)
+
+    def test_close_evaluator_long_stop(self):
+        result = main.evaluate_paper_close("LONG", Decimal("89"), Decimal("90"), Decimal("120"))
+        self.assertEqual(result, ("STOP_LOSS", Decimal("90")))
+
+    def test_close_evaluator_long_target(self):
+        result = main.evaluate_paper_close("LONG", Decimal("121"), Decimal("90"), Decimal("120"))
+        self.assertEqual(result, ("TAKE_PROFIT", Decimal("120")))
+
+    def test_close_evaluator_short_stop(self):
+        result = main.evaluate_paper_close("SHORT", Decimal("111"), Decimal("110"), Decimal("80"))
+        self.assertEqual(result, ("STOP_LOSS", Decimal("110")))
+
+    def test_close_evaluator_short_target(self):
+        result = main.evaluate_paper_close("SHORT", Decimal("79"), Decimal("110"), Decimal("80"))
+        self.assertEqual(result, ("TAKE_PROFIT", Decimal("80")))
+
+    def test_close_evaluator_no_hit(self):
+        result = main.evaluate_paper_close("LONG", Decimal("105"), Decimal("90"), Decimal("120"))
+        self.assertIsNone(result)
+
+    def test_long_pnl(self):
+        pnl = main.calculate_paper_pnl("LONG", Decimal("100"), Decimal("110"), Decimal("2"))
+        self.assertEqual(pnl, Decimal("20"))
+
+    def test_short_pnl(self):
+        pnl = main.calculate_paper_pnl("SHORT", Decimal("100"), Decimal("90"), Decimal("2"))
+        self.assertEqual(pnl, Decimal("20"))
+
+    def test_mark_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/paper/positions/{position_id}/mark", paths)
+
+    def test_mark_uses_row_lock(self):
+        source = inspect.getsource(main.mark_paper_position)
+        self.assertIn("FOR UPDATE", source)
+
+    def test_mark_closes_only_open_position(self):
+        source = inspect.getsource(main.mark_paper_position)
+        self.assertIn("AND status='OPEN'", source)
+
+    def test_mark_exposes_unrealized_and_realized_pnl(self):
+        source = inspect.getsource(main.mark_paper_position)
+        self.assertIn('"unrealized_pnl"', source)
+        self.assertIn('"realized_pnl"', source)
+
+    def test_paper_pnl_ui_is_active(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("PAPER P&L V1 ACTIF", html)

@@ -1360,6 +1360,20 @@ async def market_candles_history(
 
 metadata = MetaData()
 
+PAPER_ACCOUNT_ID = "default"
+PAPER_INITIAL_CAPITAL = Decimal("1000")
+PAPER_ACCOUNT_CURRENCY = "USD"
+
+paper_account_table = Table(
+    "paper_account",
+    metadata,
+    Column("account_id", String, primary_key=True),
+    Column("currency", String, nullable=False),
+    Column("initial_capital", Numeric(38, 18), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
 paper_positions_table = Table(
     "paper_positions",
     metadata,
@@ -1832,9 +1846,17 @@ async def get_paper_account() -> Dict[str, object]:
         )
     try:
         async with engine.connect() as conn:
+            account_result = await conn.execute(
+                text(
+                    "SELECT currency, initial_capital FROM paper_account "
+                    "WHERE account_id=:account_id"
+                ),
+                {"account_id": PAPER_ACCOUNT_ID},
+            )
+            account = account_result.fetchone()
             result = await conn.execute(
                 text(
-                    "SELECT status, side, entry, size, capital_before, close_price "
+                    "SELECT status, side, entry, size, close_price "
                     "FROM paper_positions ORDER BY opened_at ASC, position_id ASC"
                 )
             )
@@ -1844,15 +1866,17 @@ async def get_paper_account() -> Dict[str, object]:
         raise HTTPException(
             status_code=503, detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"}
         ) from exc
+    if account is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "paper account not initialized"},
+        )
 
     realized = Decimal("0")
     open_count = 0
     closed_count = 0
-    capital: Optional[Decimal] = None
     for row in rows:
         data = row._mapping
-        if capital is None and data["capital_before"] is not None:
-            capital = data["capital_before"]
         if data["status"] == "OPEN":
             open_count += 1
         elif data["status"] == "CLOSED" and data["close_price"] is not None:
@@ -1860,11 +1884,13 @@ async def get_paper_account() -> Dict[str, object]:
             realized += calculate_paper_pnl(
                 data["side"], data["entry"], data["close_price"], data["size"]
             )
-    current_capital = capital + realized if capital is not None else None
+    initial_capital = account._mapping["initial_capital"]
+    current_capital = initial_capital + realized
     return {
         "status": "OK",
-        "initial_capital": str(capital) if capital is not None else None,
-        "current_capital": str(current_capital) if current_capital is not None else None,
+        "currency": account._mapping["currency"],
+        "initial_capital": str(initial_capital),
+        "current_capital": str(current_capital),
         "realized_pnl": str(realized),
         "open_positions": open_count,
         "closed_positions": closed_count,
@@ -1906,6 +1932,16 @@ async def init_candle_schema() -> None:
     so it is NEVER swallowed into a silent false success."""
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
+        now = utcnow()
+        stmt = pg_insert(paper_account_table).values(
+            account_id=PAPER_ACCOUNT_ID,
+            currency=PAPER_ACCOUNT_CURRENCY,
+            initial_capital=PAPER_INITIAL_CAPITAL,
+            created_at=now,
+            updated_at=now,
+        )
+        stmt = stmt.on_conflict_do_nothing(index_elements=["account_id"])
+        await conn.execute(stmt)
 
 
 @dataclass(frozen=True)

@@ -4019,3 +4019,51 @@ class TestChartEngineV15SignalQuality(unittest.TestCase):
 
     def test_quality_ui_is_active(self):
         self.assertIn("SIGNAL QUALITY V1 ACTIF", self.html)
+
+
+class TestChartEngineV16PaperRisk(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_paper_default_capital_is_explicit(self):
+        self.assertIn("PAPER_DEFAULT_CAPITAL_USD=1000", self.html)
+
+    def test_paper_default_risk_percent_is_explicit(self):
+        self.assertIn("PAPER_DEFAULT_RISK_PERCENT=1", self.html)
+
+    def test_paper_candidate_builder_present(self):
+        self.assertIn("function buildPaperTradeCandidates", self.html)
+
+    def test_wait_signal_is_blocked(self):
+        self.assertIn('reason:"SIGNAL_WAIT"', self.html)
+
+    def test_incomplete_plan_is_blocked(self):
+        self.assertIn('reason:"PLAN_INCOMPLETE"', self.html)
+
+    def test_risk_money_uses_capital_times_percent(self):
+        self.assertIn("riskMoney=capital*(riskPct/100)", self.html)
+
+    def test_risk_distance_uses_entry_stop(self):
+        self.assertIn("riskPerUnit=Math.abs(entry-stop)", self.html)
+
+    def test_raw_units_use_risk_money_over_distance(self):
+        self.assertIn("units=riskMoney/riskPerUnit", self.html)
+
+    def test_invalid_risk_distance_is_blocked(self):
+        self.assertIn('reason:"RISK_DISTANCE_INVALID"', self.html)
+
+    def test_invalid_size_is_blocked(self):
+        self.assertIn('reason:"SIZE_INVALID"', self.html)
+
+    def test_instrument_specs_are_explicitly_unvalidated(self):
+        self.assertIn('sizeStatus:"UNVALIDATED_INSTRUMENT_SPECS"', self.html)
+
+    def test_paper_candidate_never_executes(self):
+        self.assertIn('sizeStatus:"UNVALIDATED_INSTRUMENT_SPECS",execution:false', self.html)
+
+    def test_methodology_requires_verified_instrument_specs(self):
+        self.assertIn("sans spécifications instrument vérifiées", self.html)
+
+    def test_paper_risk_ui_is_active(self):
+        self.assertIn("PAPER RISK V1 ACTIF", self.html)

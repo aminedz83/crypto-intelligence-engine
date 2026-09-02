@@ -1838,6 +1838,58 @@ async def get_live_paper_positions() -> Dict[str, object]:
     }
 
 
+@api_router.get("/paper/account/live")
+async def get_live_paper_account() -> Dict[str, object]:
+    account = await get_paper_account()
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
+        )
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT position_id, symbol, side, entry, size "
+                    "FROM paper_positions WHERE status='OPEN' "
+                    "ORDER BY opened_at ASC, position_id ASC"
+                )
+            )
+            rows = result.fetchall()
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"}
+        ) from exc
+
+    unrealized = Decimal("0")
+    marked = 0
+    unavailable = 0
+    for row in rows:
+        data = row._mapping
+        mark = await paper_mark_from_realtime(str(data["symbol"]))
+        if mark is None:
+            unavailable += 1
+            continue
+        unrealized += calculate_paper_pnl(
+            data["side"], data["entry"], mark.current_price, data["size"]
+        )
+        marked += 1
+
+    current_capital = Decimal(str(account["current_capital"]))
+    live_equity = current_capital + unrealized
+    complete = unavailable == 0
+    return {
+        **account,
+        "unrealized_pnl": str(unrealized) if complete else None,
+        "live_equity": str(live_equity) if complete else None,
+        "marked_open_positions": marked,
+        "unavailable_open_positions": unavailable,
+        "live_equity_status": "VALID" if complete else "PARTIAL",
+        "paper_only": True,
+        "execution": False,
+    }
+
+
 @api_router.get("/paper/account")
 async def get_paper_account() -> Dict[str, object]:
     if not persistence_state.ready:

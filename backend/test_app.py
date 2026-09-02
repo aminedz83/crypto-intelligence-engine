@@ -5764,23 +5764,39 @@ class TestServerFvgV16M5B5(unittest.TestCase):
         )
 
     def test_bullish_fvg_detected_with_zone(self):
-        candles = [self.candle(0, 100, 101, 99, 100.5), self.candle(1, 100.5, 103, 100, 102.5), self.candle(2, 102.5, 104, 102, 103)]
+        candles = [
+            self.candle(0, 100, 101, 99, 100.5),
+            self.candle(1, 100.5, 103, 100, 102.5),
+            self.candle(2, 102.5, 104, 102, 103),
+        ]
         event = main.latest_confirmed_fvg(candles)
         self.assertEqual(event["direction"], "BULLISH")
         self.assertEqual((event["zone_low"], event["zone_high"]), (101.0, 102.0))
 
     def test_bearish_fvg_detected_with_zone(self):
-        candles = [self.candle(0, 100, 101, 99, 99.5), self.candle(1, 99.5, 100, 96, 96.5), self.candle(2, 96.5, 98, 95, 96)]
+        candles = [
+            self.candle(0, 100, 101, 99, 99.5),
+            self.candle(1, 99.5, 100, 96, 96.5),
+            self.candle(2, 96.5, 98, 95, 96),
+        ]
         event = main.latest_confirmed_fvg(candles)
         self.assertEqual(event["direction"], "BEARISH")
         self.assertEqual((event["zone_low"], event["zone_high"]), (98.0, 99.0))
 
     def test_bullish_equal_boundary_is_not_fvg(self):
-        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 100, 102, 99, 101), self.candle(2, 101, 103, 101, 102)]
+        candles = [
+            self.candle(0, 100, 101, 99, 100),
+            self.candle(1, 100, 102, 99, 101),
+            self.candle(2, 101, 103, 101, 102),
+        ]
         self.assertIsNone(main.latest_confirmed_fvg(candles))
 
     def test_bearish_equal_boundary_is_not_fvg(self):
-        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 100, 101, 97, 98), self.candle(2, 98, 99, 96, 97)]
+        candles = [
+            self.candle(0, 100, 101, 99, 100),
+            self.candle(1, 100, 101, 97, 98),
+            self.candle(2, 98, 99, 96, 97),
+        ]
         self.assertIsNone(main.latest_confirmed_fvg(candles))
 
     def test_requires_three_closed_candles(self):
@@ -5797,32 +5813,63 @@ class TestServerFvgV16M5B5(unittest.TestCase):
         self.assertIsNone(main.latest_confirmed_fvg(candles))
 
     def test_latest_fvg_wins(self):
-        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 100, 103, 100, 102), self.candle(2, 102, 104, 102, 103), self.candle(3, 103, 104, 101.5, 102), self.candle(4, 102, 102.5, 100, 100.5), self.candle(5, 100, 100.5, 98, 98.5)]
+        candles = [
+            self.candle(0, 100, 101, 99, 100),
+            self.candle(1, 100, 103, 100, 102),
+            self.candle(2, 102, 104, 102, 103),
+            self.candle(3, 103, 104, 101.5, 102),
+            self.candle(4, 102, 102.5, 100, 100.5),
+            self.candle(5, 100, 100.5, 98, 98.5),
+        ]
         event = main.latest_confirmed_fvg(candles)
         self.assertEqual(event["formation_index"], 5)
 
     def test_new_bullish_fvg_starts_open(self):
-        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 100, 103, 100, 102), self.candle(2, 102, 104, 102, 103)]
+        candles = [
+            self.candle(0, 100, 101, 99, 100),
+            self.candle(1, 100, 103, 100, 102),
+            self.candle(2, 102, 104, 102, 103),
+        ]
         self.assertEqual(main.latest_confirmed_fvg(candles)["state"], "OPEN")
 
     def test_bullish_partial_mitigation(self):
-        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 100, 103, 100, 102), self.candle(2, 102, 104, 102, 103), self.candle(3, 103, 104, 101.5, 103)]
+        candles = [
+            self.candle(0, 100, 101, 99, 100),
+            self.candle(1, 100, 103, 100, 102),
+            self.candle(2, 102, 104, 102, 103),
+            self.candle(3, 103, 104, 101.5, 103),
+        ]
         event = main.latest_confirmed_fvg(candles)
         self.assertEqual(event["state"], "PARTIALLY_MITIGATED")
         self.assertEqual(event["mitigation_index"], 3)
 
     def test_bullish_full_mitigation(self):
-        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 100, 103, 100, 102), self.candle(2, 102, 104, 102, 103), self.candle(3, 103, 104, 100.9, 101)]
+        candles = [
+            self.candle(0, 100, 101, 99, 100),
+            self.candle(1, 100, 103, 100, 102),
+            self.candle(2, 102, 104, 102, 103),
+            self.candle(3, 103, 104, 100.9, 101),
+        ]
         self.assertEqual(main.latest_confirmed_fvg(candles)["state"], "MITIGATED")
 
     def test_bearish_partial_mitigation(self):
-        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 99, 100, 96, 97), self.candle(2, 97, 98, 95, 96), self.candle(3, 96, 98.5, 95, 97)]
+        candles = [
+            self.candle(0, 100, 101, 99, 100),
+            self.candle(1, 99, 100, 96, 97),
+            self.candle(2, 97, 98, 95, 96),
+            self.candle(3, 96, 98.5, 95, 97),
+        ]
         event = main.latest_confirmed_fvg(candles)
         self.assertEqual(event["state"], "PARTIALLY_MITIGATED")
         self.assertEqual(event["mitigation_index"], 3)
 
     def test_bearish_full_mitigation(self):
-        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 99, 100, 96, 97), self.candle(2, 97, 98, 95, 96), self.candle(3, 96, 99.1, 95, 98)]
+        candles = [
+            self.candle(0, 100, 101, 99, 100),
+            self.candle(1, 99, 100, 96, 97),
+            self.candle(2, 97, 98, 95, 96),
+            self.candle(3, 96, 99.1, 95, 98),
+        ]
         self.assertEqual(main.latest_confirmed_fvg(candles)["state"], "MITIGATED")
 
     def test_detector_exposes_server_fvg(self):

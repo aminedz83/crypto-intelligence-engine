@@ -4067,3 +4067,51 @@ class TestChartEngineV16PaperRisk(unittest.TestCase):
 
     def test_paper_risk_ui_is_active(self):
         self.assertIn("PAPER RISK V1 ACTIF", self.html)
+
+
+class TestChartEngineV16BInstrumentSpecs(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_instrument_spec_validator_present(self):
+        self.assertIn("function validatePaperInstrumentSpecs", self.html)
+
+    def test_specs_require_source(self):
+        self.assertIn('"source","sourceTimestamp","assetClass","sizeMode"', self.html)
+
+    def test_missing_spec_field_is_unavailable(self):
+        self.assertIn('reason:"SPEC_FIELD_MISSING"', self.html)
+
+    def test_units_mode_requires_volume_rules(self):
+        self.assertIn('reason:"VOLUME_RULES_MISSING"', self.html)
+
+    def test_contract_mode_requires_tick_size(self):
+        self.assertIn("var tickSize=Number(s.tickSize)", self.html)
+
+    def test_contract_mode_requires_tick_value(self):
+        self.assertIn("tickValue=Number(s.tickValue)", self.html)
+
+    def test_contract_mode_requires_contract_size(self):
+        self.assertIn("contractSize=Number(s.contractSize)", self.html)
+
+    def test_contract_missing_specs_are_unavailable(self):
+        self.assertIn('reason:"CONTRACT_SPEC_MISSING"', self.html)
+
+    def test_contract_invalid_specs_are_unavailable(self):
+        self.assertIn('reason:"CONTRACT_SPEC_INVALID"', self.html)
+
+    def test_unsupported_size_mode_is_unavailable(self):
+        self.assertIn('reason:"SIZE_MODE_UNSUPPORTED"', self.html)
+
+    def test_size_normalizer_present(self):
+        self.assertIn("function normalizePaperSize", self.html)
+
+    def test_size_is_rounded_down_to_step(self):
+        self.assertIn("Math.floor(raw/step)*step", self.html)
+
+    def test_below_minimum_volume_is_unavailable(self):
+        self.assertIn('reason:"BELOW_MINIMUM_VOLUME"', self.html)
+
+    def test_instrument_specs_ui_is_active(self):
+        self.assertIn("INSTRUMENT SPECS V1 ACTIF", self.html)

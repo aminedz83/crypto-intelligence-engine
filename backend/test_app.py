@@ -4484,3 +4484,65 @@ class TestPaperMultiAssetMonitorV16H(unittest.TestCase):
     def test_multi_asset_monitor_does_not_enable_live_trading(self):
         source = inspect.getsource(main.paper_mark_from_realtime)
         self.assertNotIn("live_trading_enabled", source)
+
+
+class TestPaperTradingUiV16I(unittest.TestCase):
+    def test_paper_account_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/paper/account", paths)
+
+    def test_paper_account_is_read_only(self):
+        route = next(r for r in main.api_router.routes if r.path == "/paper/account")
+        self.assertIn("GET", route.methods)
+
+    def test_paper_account_uses_persisted_positions(self):
+        source = inspect.getsource(main.get_paper_account)
+        self.assertIn("FROM paper_positions", source)
+
+    def test_paper_account_calculates_realized_pnl(self):
+        source = inspect.getsource(main.get_paper_account)
+        self.assertIn("calculate_paper_pnl", source)
+
+    def test_paper_account_is_paper_only(self):
+        source = inspect.getsource(main.get_paper_account)
+        self.assertIn('"paper_only": True', source)
+        self.assertIn('"execution": False', source)
+
+    def test_paper_ui_fetches_account(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('api("/api/v1/paper/account")', html)
+
+    def test_paper_ui_fetches_positions(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('api("/api/v1/paper/positions")', html)
+
+    def test_paper_ui_has_real_positions_section(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('modCard("Positions ouvertes",open.length+" OPEN"', html)
+
+    def test_paper_ui_has_history_section(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('modCard("Historique",closed.length+" CLOSED"', html)
+
+    def test_paper_ui_shows_entry_sl_tp(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('["Entry"]', html)
+        self.assertIn('["SL"]', html)
+        self.assertIn('["TP"]', html)
+
+    def test_paper_ui_does_not_invent_unrealized_pnl(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('closed&&pnl!==null?paperMoney(pnl):"—"', html)
+
+    def test_paper_ui_marks_broker_execution_disabled(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('["Exécution broker / MT5"]', html)
+        self.assertIn('["DÉSACTIVÉE"]', html)
+
+    def test_paper_ui_poll_refreshes_trading(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('current==="trading")refreshPaperTrading()', html)
+
+    def test_paper_ui_help_is_present(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("Paper Trading UI V1", html)

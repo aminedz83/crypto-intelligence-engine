@@ -1986,6 +1986,80 @@ def latest_confirmed_break(
     return max(events, key=break_index_value)
 
 
+def latest_confirmed_liquidity_sweep(
+    candles: List[Candle],
+    swing_highs: List[int],
+    swing_lows: List[int],
+    strength: int = SERVER_SWING_STRENGTH,
+) -> Optional[Dict[str, object]]:
+    """Return the latest strict liquidity sweep without look-ahead.
+
+    BSL: after a Swing High is confirmed, a later closed candle must trade
+    strictly above the level and close strictly back below it.
+    SSL: after a Swing Low is confirmed, a later closed candle must trade
+    strictly below the level and close strictly back above it.
+    The confirmation candle itself is never eligible.
+    """
+    if not candles or strength < 1:
+        return None
+    events: List[Dict[str, object]] = []
+
+    for swing_index in swing_highs:
+        if swing_index < 0 or swing_index >= len(candles):
+            continue
+        level = candles[swing_index].high
+        if level is None:
+            continue
+        first_eligible = swing_index + strength + 1
+        for index in range(first_eligible, len(candles)):
+            high = candles[index].high
+            close = candles[index].close
+            if high is not None and close is not None and high > level and close < level:
+                events.append({
+                    "type": "BSL_SWEEP",
+                    "direction": "BEARISH",
+                    "swing_index": swing_index,
+                    "confirmation_index": swing_index + strength,
+                    "sweep_index": index,
+                    "level": level,
+                    "extreme": high,
+                    "close": close,
+                })
+                break
+
+    for swing_index in swing_lows:
+        if swing_index < 0 or swing_index >= len(candles):
+            continue
+        level = candles[swing_index].low
+        if level is None:
+            continue
+        first_eligible = swing_index + strength + 1
+        for index in range(first_eligible, len(candles)):
+            low = candles[index].low
+            close = candles[index].close
+            if low is not None and close is not None and low < level and close > level:
+                events.append({
+                    "type": "SSL_SWEEP",
+                    "direction": "BULLISH",
+                    "swing_index": swing_index,
+                    "confirmation_index": swing_index + strength,
+                    "sweep_index": index,
+                    "level": level,
+                    "extreme": low,
+                    "close": close,
+                })
+                break
+
+    if not events:
+        return None
+
+    def sweep_index_value(event: Dict[str, object]) -> int:
+        value = event.get("sweep_index")
+        return value if isinstance(value, int) else -1
+
+    return max(events, key=sweep_index_value)
+
+
 def structure_from_confirmed_swings(
     candles: List[Candle],
     swing_highs: List[int],
@@ -2084,6 +2158,7 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
         )
     structure_event = classify_bos_choch(prior_structure, break_event)
     structure_event["prior_structure"] = prior_structure
+    liquidity_sweep = latest_confirmed_liquidity_sweep(closed, highs, lows)
     latest = closed[-1]
     return {
         "status": "READY",
@@ -2095,8 +2170,8 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
         "setup_state": "WAIT",
         "auto_queue": False,
-        "smc_confirmation": "STRUCTURE_EVENTS_V1",
-        "liquidity_sweep": "NOT_IMPLEMENTED",
+        "smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_V1",
+        "liquidity_sweep": liquidity_sweep or {"event": "NONE", "direction": None},
     }
 
 
@@ -2251,6 +2326,7 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "queued_candidates": len(auto_entry_candidates),
         "interval_seconds": AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS,
         "market_setup_detection": "STRUCTURE_BOS_CHOCH_V1",
+        "liquidity_sweep_detection": "SERVER_LIQUIDITY_SWEEP_V1",
         "smc_auto_candidate_generation": "NOT_IMPLEMENTED",
         "paper_only": True,
         "execution": False,

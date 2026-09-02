@@ -1,4936 +1,4908 @@
-"""All backend tests in one file (single-file layout).
+"""Crypto Intelligence Engine — single-file backend (Phase 1 + frontend serving).
 
-38 tests, none skipped. Pure-logic tests (data quality, health aggregation) plus
-integration tests (health endpoints, failure modes, frontend serving) that need
-FastAPI + httpx. No conditional skip: a missing dependency fails the run rather
-than skipping.
+Consolidated into one module for a minimal file layout. Behaviour is identical
+to the previous modular version:
+
+* configuration from environment variables (paper-only; no live-trading path);
+* data-quality primitives (VALID/STALE/INVALID/MISSING/CONFLICTED/UNKNOWN);
+* health aggregation + REAL Postgres (SELECT 1) and Redis (PING) probes;
+* endpoints /health, /health/live, /health/ready, /api/v1/;
+* serves the single-file frontend/index.html at GET /.
+
+No fabricated data. No real order/withdrawal capability exists anywhere.
 """
 
-import inspect
+from __future__ import annotations
+
 import asyncio
 import json
-import unittest
+import logging
+import re
+import sys
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from decimal import Decimal, InvalidOperation
+from enum import Enum
+from functools import lru_cache
 from pathlib import Path
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote as url_quote
 
 import httpx
-from fastapi.testclient import TestClient
-
-import main
-from main import (
-    ComponentHealth,
-    DataQualityStatus,
-    HealthReport,
-    HealthState,
-    QualifiedValue,
-    aggregate_health,
-    classify_freshness,
-    compute_age_seconds,
-    create_app,
+import redis.asyncio as aioredis
+from fastapi import APIRouter, FastAPI, HTTPException, Response, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    MetaData,
+    Numeric,
+    String,
+    Table,
+    text,
+)
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
 )
 
-NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
-FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
-INDEX = FRONTEND / "index.html"
-VIEW_IDS = ["markets", "forex", "metal", "index", "system", "detail"]
+try:
+    import websockets
+except ImportError:  # pragma: no cover - only needed when the WS feed is used
+    websockets = None  # type: ignore[assignment]
 
 
-# ----------------------------- data quality -----------------------------
-class ComputeAgeTests(unittest.TestCase):
-    def test_age_positive(self):
-        self.assertAlmostEqual(compute_age_seconds(NOW - timedelta(seconds=30), now=NOW), 30.0)
-
-    def test_naive_timestamp_rejected(self):
-        with self.assertRaises(ValueError):
-            compute_age_seconds(datetime(2026, 8, 24, 12, 0, 0), now=NOW)
-
-
-class ClassifyFreshnessTests(unittest.TestCase):
-    def test_missing(self):
-        self.assertEqual(classify_freshness(None, 10, now=NOW), DataQualityStatus.MISSING)
-
-    def test_valid(self):
-        ts = NOW - timedelta(seconds=5)
-        self.assertEqual(classify_freshness(ts, 10, now=NOW), DataQualityStatus.VALID)
-
-    def test_boundary_is_valid(self):
-        ts = NOW - timedelta(seconds=10)
-        self.assertEqual(classify_freshness(ts, 10, now=NOW), DataQualityStatus.VALID)
-
-    def test_stale(self):
-        ts = NOW - timedelta(seconds=11)
-        self.assertEqual(classify_freshness(ts, 10, now=NOW), DataQualityStatus.STALE)
-
-    def test_future_timestamp_is_invalid(self):
-        ts = NOW + timedelta(seconds=5)
-        self.assertEqual(classify_freshness(ts, 10, now=NOW), DataQualityStatus.INVALID)
-
-    def test_naive_timestamp_is_invalid(self):
-        ts = datetime(2026, 8, 24, 11, 59, 55)
-        self.assertEqual(classify_freshness(ts, 10, now=NOW), DataQualityStatus.INVALID)
+# ============================ logging ============================
+def configure_logging(level: str = "INFO") -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S%z",
+        )
+    )
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level.upper())
 
 
-class QualifiedValueTests(unittest.TestCase):
-    def test_usable_only_when_valid(self):
-        self.assertTrue(QualifiedValue(185.2, "coinbase", NOW, DataQualityStatus.VALID).is_usable)
-
-    def test_stale_value_not_usable(self):
-        self.assertFalse(QualifiedValue(185.2, "coinbase", NOW, DataQualityStatus.STALE).is_usable)
-
-    def test_none_value_not_usable(self):
-        self.assertFalse(QualifiedValue(None, "coinbase", NOW, DataQualityStatus.VALID).is_usable)
+log = logging.getLogger("app")
 
 
-# ----------------------------- health model -----------------------------
-class AggregateHealthTests(unittest.TestCase):
-    @staticmethod
-    def _c(state):
-        return ComponentHealth("x", state)
+# ============================ configuration ============================
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
+    )
 
-    def test_empty_is_unknown(self):
-        self.assertEqual(aggregate_health([]), HealthState.UNKNOWN)
+    app_name: str = "Crypto Intelligence Engine"
+    environment: str = Field(default="development")  # development | test | production
+    debug: bool = Field(default=False)
+    api_prefix: str = "/api/v1"
 
-    def test_all_up(self):
-        comps = [self._c(HealthState.UP), self._c(HealthState.UP)]
-        self.assertEqual(aggregate_health(comps), HealthState.UP)
+    # Hard safety flag. There is NO live-execution path in this codebase; this
+    # is a second guard rail on top of that.
+    live_trading_enabled: bool = Field(default=False)
 
-    def test_any_down_wins(self):
-        comps = [self._c(HealthState.UP), self._c(HealthState.DOWN)]
-        self.assertEqual(aggregate_health(comps), HealthState.DOWN)
+    # Empty => auto-resolve to the repo's frontend/. Set FRONTEND_DIR to override.
+    frontend_dir: str = Field(default="")
 
-    def test_down_outranks_degraded(self):
-        comps = [self._c(HealthState.DEGRADED), self._c(HealthState.DOWN)]
-        self.assertEqual(aggregate_health(comps), HealthState.DOWN)
+    cors_origins: List[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 
-    def test_unknown_prevents_up(self):
-        comps = [self._c(HealthState.UP), self._c(HealthState.UNKNOWN)]
-        self.assertEqual(aggregate_health(comps), HealthState.DEGRADED)
+    postgres_host: str = "localhost"
+    postgres_port: int = 5432
+    postgres_user: str = "cie"
+    postgres_password: str = "cie"
+    postgres_db: str = "cie"
 
-    def test_degraded_when_only_degraded(self):
-        comps = [self._c(HealthState.UP), self._c(HealthState.DEGRADED)]
-        self.assertEqual(aggregate_health(comps), HealthState.DEGRADED)
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_db: int = 0
 
+    ticker_max_age_seconds: float = 10.0
+    candle_max_age_seconds: float = 120.0
 
-class HealthReportTests(unittest.TestCase):
-    def test_report_serialises(self):
-        d = HealthReport.from_components([ComponentHealth("postgres", HealthState.UP)]).to_dict()
-        self.assertEqual(d["overall"], "UP")
-        self.assertEqual(len(d["components"]), 1)
-        self.assertIn("generated_at", d)
-        self.assertEqual(d["components"][0]["name"], "postgres")
+    # Application-level guard rail (NOT a Coinbase limit): max provider windows
+    # (sequential REST calls) a single /history request may fan out to.
+    history_max_windows: int = 20
 
+    # Persistence (Postgres). Batch size = technical statement size inside ONE
+    # atomic transaction (not a separate commit per batch). Margin (seconds) after
+    # a bucket's own end before we consider it time-closed (0 = fully elapsed).
+    persist_batch_size: int = 500
+    candle_finalization_margin_seconds: float = 0.0
+    db_read_max_rows: int = 1000
 
-# ----------------------------- health endpoints -----------------------------
-class HealthEndpointTests(unittest.TestCase):
-    def setUp(self):
-        async def up_db():
-            return ComponentHealth("postgres", HealthState.UP)
+    # Paper monitor. One second matches the backend-to-frontend realtime cadence.
+    paper_monitor_interval_seconds: float = 1.0
 
-        async def up_redis():
-            return ComponentHealth("redis", HealthState.UP)
+    # Massive (ex-Polygon) Forex REST. api_key empty by default: no calls happen
+    # until an officially-verified symbol mapping is registered (never deduced).
+    massive_api_key: str = ""
+    massive_rest_url: str = "https://api.massive.com"
+    massive_request_timeout_seconds: float = 10.0
+    massive_forex_ws_url: str = "wss://socket.massive.com/forex"
+    # Massive Indices Starter WebSocket documented as 15-minute delayed. Never label LIVE.
+    massive_indices_ws_url: str = "wss://delayed.massive.com/indices"
 
-        self._orig = (main.check_database, main.check_redis)
-        main.check_database = up_db
-        main.check_redis = up_redis
-        self.client = TestClient(create_app())
+    # Twelve Data REST (Gold XAU/USD spot). Key server-side only, header auth; no
+    # call is made without a key. Availability on the account's plan is determined
+    # at runtime from the provider response, never assumed.
+    twelvedata_api_key: str = ""
+    twelvedata_rest_url: str = "https://api.twelvedata.com"
+    twelvedata_request_timeout_seconds: float = 10.0
+    twelvedata_ws_url: str = "wss://ws.twelvedata.com/v1/quotes/price"
 
-    def tearDown(self):
-        main.check_database, main.check_redis = self._orig
+    @property
+    def database_url(self) -> str:
+        return (
+            f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
 
-    def test_liveness(self):
-        r = self.client.get("/health/live")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["status"], "alive")
+    @property
+    def redis_url(self) -> str:
+        return f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
 
-    def test_health_overall_up(self):
-        r = self.client.get("/health")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["overall"], "UP")
-
-    def test_ready_returns_200_when_up(self):
-        r = self.client.get("/health/ready")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["overall"], "UP")
-
-
-# ----------------------------- failure modes -----------------------------
-UNREACHABLE_DB = "postgresql+asyncpg://cie:cie@127.0.0.1:1/cie"
-UNREACHABLE_REDIS = "redis://127.0.0.1:1/0"
-
-
-class ReadinessEndpointFailureTests(unittest.TestCase):
-    def setUp(self):
-        self._orig = (main.check_database, main.check_redis)
-
-    def tearDown(self):
-        main.check_database, main.check_redis = self._orig
-
-    def _client(self, db_state, redis_state, db_detail=None):
-        async def fdb():
-            return ComponentHealth("postgres", db_state, detail=db_detail)
-
-        async def fredis():
-            return ComponentHealth("redis", redis_state)
-
-        main.check_database = fdb
-        main.check_redis = fredis
-        return TestClient(create_app())
-
-    def test_ready_503_when_db_down(self):
-        r = self._client(HealthState.DOWN, HealthState.UP).get("/health/ready")
-        self.assertEqual(r.status_code, 503)
-        self.assertEqual(r.json()["overall"], "DOWN")
-
-    def test_ready_503_when_redis_down(self):
-        r = self._client(HealthState.UP, HealthState.DOWN).get("/health/ready")
-        self.assertEqual(r.status_code, 503)
-        self.assertEqual(r.json()["overall"], "DOWN")
-
-    def test_health_200_but_surfaces_down_detail(self):
-        client = self._client(HealthState.DOWN, HealthState.UP, db_detail="connection refused")
-        r = client.get("/health")
-        self.assertEqual(r.status_code, 200)
-        body = r.json()
-        self.assertEqual(body["overall"], "DOWN")
-        pg = next(c for c in body["components"] if c["name"] == "postgres")
-        self.assertEqual(pg["state"], "DOWN")
-        self.assertIn("refused", pg["detail"])
+    @property
+    def is_production(self) -> bool:
+        return self.environment.lower() == "production"
 
 
-class RealProbeFailureTests(unittest.IsolatedAsyncioTestCase):
-    async def test_database_probe_down_when_unreachable(self):
-        from sqlalchemy.ext.asyncio import create_async_engine
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
 
-        bad = create_async_engine(UNREACHABLE_DB)
-        orig = main.engine
-        main.engine = bad
+
+settings = get_settings()
+configure_logging("DEBUG" if settings.debug else "INFO")
+
+
+# ============================ data quality ============================
+class DataQualityStatus(str, Enum):
+    VALID = "VALID"
+    STALE = "STALE"
+    INVALID = "INVALID"
+    MISSING = "MISSING"
+    CONFLICTED = "CONFLICTED"
+    UNKNOWN = "UNKNOWN"
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def compute_age_seconds(timestamp: datetime, now: Optional[datetime] = None) -> float:
+    if timestamp.tzinfo is None:
+        raise ValueError("timestamp must be timezone-aware (UTC)")
+    reference = now or utcnow()
+    if reference.tzinfo is None:
+        raise ValueError("reference time must be timezone-aware (UTC)")
+    return (reference - timestamp).total_seconds()
+
+
+def classify_freshness(
+    timestamp: Optional[datetime], max_age_seconds: float, now: Optional[datetime] = None
+) -> DataQualityStatus:
+    if timestamp is None:
+        return DataQualityStatus.MISSING
+    try:
+        age = compute_age_seconds(timestamp, now=now)
+    except ValueError:
+        return DataQualityStatus.INVALID
+    if age < 0:
+        return DataQualityStatus.INVALID
+    if age <= max_age_seconds:
+        return DataQualityStatus.VALID
+    return DataQualityStatus.STALE
+
+
+@dataclass(frozen=True)
+class QualifiedValue:
+    value: Optional[float]
+    source: str
+    timestamp: Optional[datetime]
+    status: DataQualityStatus
+
+    @property
+    def is_usable(self) -> bool:
+        return self.status == DataQualityStatus.VALID and self.value is not None
+
+    def age_seconds(self, now: Optional[datetime] = None) -> Optional[float]:
+        if self.timestamp is None:
+            return None
         try:
-            comp = await main.check_database()
-        finally:
-            main.engine = orig
-            await bad.dispose()
-        self.assertEqual(comp.state, HealthState.DOWN)
-        self.assertIsNotNone(comp.detail)
-
-    async def test_redis_probe_down_when_unreachable(self):
-        import redis.asyncio as redis
-
-        bad = redis.from_url(UNREACHABLE_REDIS, decode_responses=True)
-        orig = main.redis_client
-        main.redis_client = bad
-        try:
-            comp = await main.check_redis()
-        finally:
-            main.redis_client = orig
-            await bad.aclose()
-        self.assertEqual(comp.state, HealthState.DOWN)
-        self.assertIsNotNone(comp.detail)
+            return compute_age_seconds(self.timestamp, now=now)
+        except ValueError:
+            return None
 
 
-# ----------------------------- frontend serving -----------------------------
-class FrontendServingTests(unittest.TestCase):
-    def setUp(self):
-        self.client = TestClient(create_app())
-
-    def test_root_serves_index_200(self):
-        self.assertEqual(self.client.get("/").status_code, 200)
-
-    def test_root_content_type_is_html(self):
-        self.assertIn("text/html", self.client.get("/").headers.get("content-type", ""))
-
-    def test_index_content_matches_file(self):
-        self.assertEqual(self.client.get("/").text, INDEX.read_text(encoding="utf-8"))
-
-    def test_index_is_self_contained(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertNotRegex(html, r'<link[^>]+rel=["\']stylesheet')
-        self.assertNotRegex(html, r"<script[^>]+src=")
-        self.assertIn("<style>", html)
-        self.assertIn("<script>", html)
-
-    def test_index_contains_all_views(self):
-        html = INDEX.read_text(encoding="utf-8")
-        for vid in VIEW_IDS:
-            self.assertIn(f'id:"{vid}"', html)
-
-    def test_missing_path_returns_404(self):
-        self.assertEqual(self.client.get("/does-not-exist-xyz").status_code, 404)
+# ============================ health model ============================
+class HealthState(str, Enum):
+    UP = "UP"
+    DOWN = "DOWN"
+    DEGRADED = "DEGRADED"
+    UNKNOWN = "UNKNOWN"
 
 
-class ApiRegressionTests(unittest.TestCase):
-    def setUp(self):
-        async def up_db():
-            return ComponentHealth("postgres", HealthState.UP)
-
-        async def up_redis():
-            return ComponentHealth("redis", HealthState.UP)
-
-        self._orig = (main.check_database, main.check_redis)
-        main.check_database = up_db
-        main.check_redis = up_redis
-        self.client = TestClient(create_app())
-
-    def tearDown(self):
-        main.check_database, main.check_redis = self._orig
-
-    def test_health_live_still_works(self):
-        r = self.client.get("/health/live")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["status"], "alive")
-
-    def test_health_still_works(self):
-        r = self.client.get("/health")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["overall"], "UP")
-
-    def test_health_ready_still_works(self):
-        r = self.client.get("/health/ready")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["overall"], "UP")
-
-    def test_api_v1_root_works(self):
-        r = self.client.get("/api/v1/")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["service"], "crypto-intelligence-engine")
+_SEVERITY = {
+    HealthState.DOWN: 3,
+    HealthState.DEGRADED: 2,
+    HealthState.UNKNOWN: 1,
+    HealthState.UP: 0,
+}
 
 
-class ApiOnlyRegressionTests(unittest.TestCase):
-    def setUp(self):
-        self._orig = main._frontend_dir
-        main._frontend_dir = lambda cfg: Path("/nonexistent-frontend-xyz")
-        self.client = TestClient(create_app())
+@dataclass
+class ComponentHealth:
+    name: str
+    state: HealthState = HealthState.UNKNOWN
+    detail: Optional[str] = None
+    latency_ms: Optional[float] = None
+    checked_at: datetime = field(default_factory=utcnow)
 
-    def tearDown(self):
-        main._frontend_dir = self._orig
-
-    def test_root_is_404_without_frontend(self):
-        self.assertEqual(self.client.get("/").status_code, 404)
-
-    def test_health_live_works_without_frontend(self):
-        self.assertEqual(self.client.get("/health/live").status_code, 200)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "name": self.name,
+            "state": self.state.value,
+            "detail": self.detail,
+            "latency_ms": self.latency_ms,
+            "checked_at": self.checked_at.isoformat(),
+        }
 
 
-# ----------------------------- market data (Phase 2) -----------------------------
-from datetime import timedelta as _td  # noqa: E402
-
-from main import (  # noqa: E402
-    CoinbaseProvider,
-    MarketDatum,
-    MarketWsManager,
-    parse_iso8601,
-    ticker_datum_from_payload,
-    ws_backoff,
-)
+def aggregate_health(components: List[ComponentHealth]) -> HealthState:
+    if not components:
+        return HealthState.UNKNOWN
+    worst = max(components, key=lambda c: _SEVERITY[c.state]).state
+    if worst == HealthState.DOWN:
+        return HealthState.DOWN
+    if worst in (HealthState.DEGRADED, HealthState.UNKNOWN):
+        return HealthState.DEGRADED
+    return HealthState.UP
 
 
-class ParseIso8601Tests(unittest.TestCase):
-    def test_valid_z_suffix(self):
-        dt = parse_iso8601("2026-08-24T12:00:00Z")
-        self.assertIsNotNone(dt)
-        self.assertEqual(dt.tzinfo, timezone.utc)
+@dataclass
+class HealthReport:
+    overall: HealthState
+    components: List[ComponentHealth]
+    generated_at: datetime = field(default_factory=utcnow)
 
-    def test_naive_returns_none(self):
-        self.assertIsNone(parse_iso8601("2026-08-24T12:00:00"))
+    @classmethod
+    def from_components(cls, components: List[ComponentHealth]) -> "HealthReport":
+        return cls(overall=aggregate_health(components), components=components)
 
-    def test_garbage_returns_none(self):
-        self.assertIsNone(parse_iso8601("not-a-date"))
-
-    def test_non_string_returns_none(self):
-        self.assertIsNone(parse_iso8601(12345))
-
-
-class TickerDatumTests(unittest.TestCase):
-    def _payload(self, price, when):
-        return {"trades": [{"price": price, "time": when}]}
-
-    def test_valid_recent_is_valid(self):
-        now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
-        ts = (now - _td(seconds=2)).isoformat().replace("+00:00", "Z")
-        d = ticker_datum_from_payload("BTC-USD", self._payload("50000.5", ts), now=now)
-        self.assertEqual(d.value, 50000.5)
-        self.assertEqual(d.status, DataQualityStatus.VALID)
-
-    def test_old_is_stale(self):
-        now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
-        ts = (now - _td(seconds=999)).isoformat().replace("+00:00", "Z")
-        d = ticker_datum_from_payload("BTC-USD", self._payload("50000", ts), now=now)
-        self.assertEqual(d.status, DataQualityStatus.STALE)
-
-    def test_no_trades_is_missing(self):
-        d = ticker_datum_from_payload("BTC-USD", {"trades": []})
-        self.assertEqual(d.status, DataQualityStatus.MISSING)
-        self.assertIsNone(d.value)
-
-    def test_bad_price_is_invalid(self):
-        d = ticker_datum_from_payload("BTC-USD", self._payload("abc", "2026-08-24T12:00:00Z"))
-        self.assertEqual(d.status, DataQualityStatus.INVALID)
-
-    def test_non_positive_price_is_invalid(self):
-        d = ticker_datum_from_payload("BTC-USD", self._payload("0", "2026-08-24T12:00:00Z"))
-        self.assertEqual(d.status, DataQualityStatus.INVALID)
-
-    def test_to_dict_shape(self):
-        d = MarketDatum("coinbase", "BTC-USD", 100.0, None, DataQualityStatus.MISSING)
-        out = d.to_dict()
-        self.assertEqual(
-            set(out), {"source", "symbol", "value", "timestamp", "freshness_seconds", "quality"}
-        )
-        self.assertEqual(out["quality"], "MISSING")
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "overall": self.overall.value,
+            "generated_at": self.generated_at.isoformat(),
+            "components": [c.to_dict() for c in self.components],
+        }
 
 
-class WsManagerPureTests(unittest.TestCase):
-    def test_build_subscribe_format(self):
-        msg = MarketWsManager.build_subscribe("ticker", ["btc-usd", "eth-usd"])
-        self.assertEqual(msg["type"], "subscribe")
-        self.assertEqual(msg["channel"], "ticker")
-        self.assertEqual(msg["product_ids"], ["BTC-USD", "ETH-USD"])
-
-    def test_backoff_grows_and_caps(self):
-        self.assertEqual(ws_backoff(1), 1.0)
-        self.assertEqual(ws_backoff(2), 2.0)
-        self.assertLessEqual(ws_backoff(50), 60.0)
-
-    def test_health_disconnected_is_unknown(self):
-        async def run():
-            return await MarketWsManager().health_check()
-        h = asyncio.run(run())
-        self.assertFalse(h["connected"])
-        self.assertEqual(h["quality"], "UNKNOWN")
+# ============================ db + redis + probes ============================
+engine = create_async_engine(settings.database_url, pool_pre_ping=True, echo=False, future=True)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
 
 
-class MarketEndpointTests(unittest.TestCase):
-    def setUp(self):
-        self._orig = main.market_provider
-
-    def tearDown(self):
-        main.market_provider = self._orig
-
-    def _client_with_provider(self, provider):
-        main.market_provider = provider
-        return TestClient(create_app())
-
-    def test_ticker_ok(self):
-        class FakeProvider:
-            async def get_ticker(self, symbol):
-                return MarketDatum(
-                    "coinbase", symbol.upper(), 42.0, None, DataQualityStatus.MISSING
-                )
-        r = self._client_with_provider(FakeProvider()).get("/api/v1/market/ticker/btc-usd")
-        self.assertEqual(r.status_code, 200)
-        body = r.json()
-        self.assertEqual(body["symbol"], "BTC-USD")
-        self.assertEqual(body["value"], 42.0)
-        self.assertEqual(body["quality"], "MISSING")
-
-    def test_ticker_upstream_error_503(self):
-        class FailingProvider:
-            async def get_ticker(self, symbol):
-                raise httpx.ConnectError("upstream down")
-        r = self._client_with_provider(FailingProvider()).get("/api/v1/market/ticker/btc-usd")
-        self.assertEqual(r.status_code, 503)
-
-    def test_ws_subscribe_rejects_unknown_channel(self):
-        client = TestClient(create_app())
-        r = client.post(
-            "/api/v1/market/websocket/subscribe",
-            json={"channel": "bogus", "products": ["BTC-USD"]},
-        )
-        self.assertEqual(r.status_code, 400)
-
-    def test_ws_health_endpoint_ok(self):
-        client = TestClient(create_app())
-        r = client.get("/api/v1/market/websocket/health")
-        self.assertEqual(r.status_code, 200)
-        body = r.json()
-        self.assertIn("connection", body)
-        self.assertIn("transport", body)
-        self.assertIn("connected", body["connection"])
+@asynccontextmanager
+async def get_session() -> AsyncIterator[AsyncSession]:
+    async with SessionLocal() as session:
+        yield session
 
 
-class CoinbaseProviderConfigTests(unittest.TestCase):
-    def test_uses_verified_public_rest_base(self):
-        self.assertEqual(
-            CoinbaseProvider().rest_url, "https://api.coinbase.com/api/v3/brokerage"
-        )
+async def check_database() -> ComponentHealth:
+    """Real probe: SELECT 1. Returns DOWN + reason on failure, never a fake UP."""
+    start = time.perf_counter()
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        latency = (time.perf_counter() - start) * 1000
+        return ComponentHealth("postgres", HealthState.UP, latency_ms=round(latency, 2))
+    except Exception as exc:  # noqa: BLE001 - surface the reason, don't swallow it
+        return ComponentHealth("postgres", HealthState.DOWN, detail=str(exc))
 
 
-# ----------------------------- candles (Phase 2) -----------------------------
-from main import (  # noqa: E402
-    CANDLE_MAX_LIMIT,
-    GRANULARITIES,
-    Candle,
-    candle_from_payload,
-    candles_from_payload,
-)
+async def check_redis() -> ComponentHealth:
+    """Real probe: PING. Returns DOWN + reason on failure, never a fake UP."""
+    start = time.perf_counter()
+    try:
+        pong = await redis_client.ping()
+        if pong is not True:
+            return ComponentHealth("redis", HealthState.DEGRADED, detail="unexpected PING reply")
+        latency = (time.perf_counter() - start) * 1000
+        return ComponentHealth("redis", HealthState.UP, latency_ms=round(latency, 2))
+    except Exception as exc:  # noqa: BLE001
+        return ComponentHealth("redis", HealthState.DOWN, detail=str(exc))
 
-_CANDLE_NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+# ============================ routers ============================
+health_router = APIRouter(tags=["health"])
 
 
-def _candle_item(start_unix, low="100", high="110", open_="105", close="108", volume="12.5"):
+@health_router.get("/health/live")
+async def liveness() -> dict:
+    return {"status": "alive"}
+
+
+@health_router.get("/health")
+async def health() -> dict:
+    components = [await check_database(), await check_redis()]
+    report = HealthReport.from_components(components).to_dict()
+    report["persistence"] = persistence_state.to_dict()
+    return report
+
+
+@health_router.get("/health/ready")
+async def readiness(response: Response) -> dict:
+    components = [await check_database(), await check_redis()]
+    report = HealthReport.from_components(components)
+    if report.overall != HealthState.UP:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return report.to_dict()
+
+
+api_router = APIRouter()
+
+
+@api_router.get("/")
+async def api_root() -> dict:
     return {
-        "start": str(start_unix),
-        "low": low,
-        "high": high,
-        "open": open_,
-        "close": close,
-        "volume": volume,
+        "service": "crypto-intelligence-engine",
+        "phase": 1,
+        "status": "operational",
+        "note": "Paper trading only. No real execution. No withdrawals.",
     }
 
 
-class CandleParsingTests(unittest.TestCase):
-    def test_valid_payload_converts(self):
-        start = int((_CANDLE_NOW - _td(seconds=30)).timestamp())
-        c = candle_from_payload(_candle_item(start), 120, now=_CANDLE_NOW)
-        self.assertEqual(c.status, DataQualityStatus.VALID)
-        self.assertEqual(c.low, 100.0)
-        self.assertEqual(c.high, 110.0)
-        self.assertEqual(c.open, 105.0)
-        self.assertEqual(c.close, 108.0)
-
-    def test_start_is_unix_seconds_to_utc(self):
-        # 1639508050 -> 2021-12-14T20:14:10Z (seconds, not ms)
-        c = candle_from_payload(_candle_item(1639508050), 10**12, now=_CANDLE_NOW)
-        self.assertEqual(c.start.year, 2021)
-        self.assertEqual(c.start.tzinfo, timezone.utc)
-
-    def test_price_parsed_as_float(self):
-        c = candle_from_payload(_candle_item(1639508050, low="140.21"), 10**12, now=_CANDLE_NOW)
-        self.assertEqual(c.low, 140.21)
-
-    def test_volume_parsed_as_float(self):
-        item = _candle_item(1639508050, volume="56437345")
-        c = candle_from_payload(item, 10**12, now=_CANDLE_NOW)
-        self.assertEqual(c.volume, 56437345.0)
-
-    def test_invalid_timestamp_is_invalid(self):
-        item = _candle_item(1639508050)
-        item["start"] = "not-a-number"
-        c = candle_from_payload(item, 120, now=_CANDLE_NOW)
-        self.assertEqual(c.status, DataQualityStatus.INVALID)
-
-    def test_bad_price_is_invalid(self):
-        item = _candle_item(1639508050, high="abc")
-        c = candle_from_payload(item, 10**12, now=_CANDLE_NOW)
-        self.assertEqual(c.status, DataQualityStatus.INVALID)
-
-    def test_stale_candle_detected(self):
-        start = int((_CANDLE_NOW - _td(seconds=1000)).timestamp())
-        c = candle_from_payload(_candle_item(start), 120, now=_CANDLE_NOW)
-        self.assertEqual(c.status, DataQualityStatus.STALE)
-
-    def test_empty_response_is_missing(self):
-        candles, status = candles_from_payload({"candles": []}, 120, now=_CANDLE_NOW)
-        self.assertEqual(candles, [])
-        self.assertEqual(status, DataQualityStatus.MISSING)
-
-
-
-class CandleGranularityTests(unittest.TestCase):
-    def test_nine_official_granularities(self):
-        self.assertEqual(
-            sorted(GRANULARITIES),
-            sorted(["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "1d"]),
-        )
-
-    def test_maps_to_official_enum_values(self):
-        enums = {v[0] for v in GRANULARITIES.values()}
-        self.assertEqual(
-            enums,
-            {
-                "ONE_MINUTE", "FIVE_MINUTE", "FIFTEEN_MINUTE", "THIRTY_MINUTE",
-                "ONE_HOUR", "TWO_HOUR", "FOUR_HOUR", "SIX_HOUR", "ONE_DAY",
-            },
-        )
-
-
-class CandleProviderRequestTests(unittest.IsolatedAsyncioTestCase):
-    async def test_limit_clamped_to_350_and_official_params(self):
-        captured = {}
-
-        class FakeClient:
-            async def get(self, path, params=None):
-                captured["path"] = path
-                captured["params"] = params
-
-                class R:
-                    def raise_for_status(self):
-                        return None
-
-                    def json(self):
-                        return {"candles": []}
-
-                return R()
-
-        provider = CoinbaseProvider()
-        provider.client = FakeClient()
-        await provider.get_candles("btc-usd", "1m", limit=999)
-        self.assertEqual(captured["params"]["limit"], CANDLE_MAX_LIMIT)  # clamped
-        self.assertEqual(captured["params"]["granularity"], "ONE_MINUTE")
-        self.assertIn("start", captured["params"])
-        self.assertIn("end", captured["params"])
-        self.assertTrue(captured["path"].endswith("/market/products/BTC-USD/candles"))
-
-
-class CandleEndpointTests(unittest.TestCase):
-    def setUp(self):
-        self._orig = main.market_provider
-
-    def tearDown(self):
-        main.market_provider = self._orig
-
-    def _client(self, provider):
-        main.market_provider = provider
-        return TestClient(create_app())
-
-    def test_endpoint_ok_with_mocked_provider(self):
-        class FakeProvider:
-            async def get_candles(self, symbol, granularity, limit=350):
-                start = _CANDLE_NOW
-                candle = Candle(start, 1.0, 2.0, 1.5, 1.8, 3.0, DataQualityStatus.VALID)
-                return [candle], DataQualityStatus.VALID
-        r = self._client(FakeProvider()).get("/api/v1/market/candles/btc-usd?granularity=1h")
-        self.assertEqual(r.status_code, 200)
-        body = r.json()
-        self.assertEqual(body["symbol"], "BTC-USD")
-        self.assertEqual(body["granularity"], "1h")
-        self.assertEqual(body["count"], 1)
-        self.assertEqual(body["quality"], "VALID")
-
-    def test_endpoint_rejects_unknown_granularity(self):
-        r = TestClient(create_app()).get("/api/v1/market/candles/btc-usd?granularity=4m")
-        self.assertEqual(r.status_code, 400)
-
-    def test_endpoint_http_error_returns_503(self):
-        class FailingProvider:
-            async def get_candles(self, symbol, granularity, limit=350):
-                raise httpx.ConnectTimeout("timeout")
-        r = self._client(FailingProvider()).get("/api/v1/market/candles/btc-usd")
-        self.assertEqual(r.status_code, 503)
-
-
-# ----------------------------- realtime WS pipeline (Phase 2) -----------------
-from main import (  # noqa: E402
-    MarketBus,
-    MarketStateStore,
-    RealtimeDatum,
-    extract_candle_data,
-    extract_ticker_data,
-    parse_ws_message,
-)
-
-_RT_NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
-
-
-def _ticker_msg(product_id, price, seq=1, ts="2026-08-24T12:00:00Z"):
-    return json.dumps({
-        "channel": "ticker",
-        "timestamp": ts,
-        "sequence_num": seq,
-        "events": [{"type": "update", "tickers": [
-            {"type": "ticker", "product_id": product_id, "price": price}
-        ]}],
-    })
-
-
-def _candle_msg(product_id, start, close="108", seq=1):
-    return json.dumps({
-        "channel": "candles",
-        "timestamp": "2026-08-24T12:00:00Z",
-        "sequence_num": seq,
-        "events": [{"type": "update", "candles": [
-            {"product_id": product_id, "start": str(start),
-             "low": "100", "high": "110", "open": "105", "close": close, "volume": "5"}
-        ]}],
-    })
-
-
-class WsParseTests(unittest.TestCase):
-    def test_parse_valid_message(self):
-        msg = parse_ws_message(_ticker_msg("BTC-USD", "50000"))
-        self.assertIsInstance(msg, dict)
-        self.assertEqual(msg["channel"], "ticker")
-
-    def test_parse_malformed_returns_none(self):
-        self.assertIsNone(parse_ws_message("{not json"))
-
-    def test_parse_non_object_returns_none(self):
-        self.assertIsNone(parse_ws_message("[1, 2, 3]"))
-
-
-class ExtractTickerTests(unittest.TestCase):
-    def test_valid_ticker_extracted(self):
-        msg = parse_ws_message(_ticker_msg("BTC-USD", "50000", ts="2026-08-24T11:59:58Z"))
-        data = extract_ticker_data(msg, received_at=_RT_NOW, now=_RT_NOW)
-        self.assertEqual(len(data), 1)
-        self.assertEqual(data[0].product_id, "BTC-USD")
-        self.assertEqual(data[0].value, 50000.0)
-        self.assertEqual(data[0].data_type, "ticker")
-        self.assertEqual(data[0].sequence_num, 1)
-
-    def test_missing_tickers_yields_nothing(self):
-        msg = {"channel": "ticker", "timestamp": "2026-08-24T12:00:00Z",
-               "sequence_num": 1, "events": [{"type": "update"}]}
-        self.assertEqual(extract_ticker_data(msg, received_at=_RT_NOW), [])
-
-    def test_invalid_price_skipped(self):
-        msg = parse_ws_message(_ticker_msg("BTC-USD", "abc"))
-        self.assertEqual(extract_ticker_data(msg, received_at=_RT_NOW, now=_RT_NOW), [])
-
-
-class ExtractCandleTests(unittest.TestCase):
-    def test_valid_candle_extracted(self):
-        start = int((_RT_NOW - _td(seconds=60)).timestamp())
-        msg = parse_ws_message(_candle_msg("BTC-USD", start))
-        data = extract_candle_data(msg, received_at=_RT_NOW, now=_RT_NOW)
-        self.assertEqual(len(data), 1)
-        self.assertEqual(data[0].data_type, "candle")
-        self.assertEqual(data[0].value, 108.0)
-        self.assertIsNotNone(data[0].ohlcv)
-
-
-class SequenceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_in_order(self):
-        s = MarketStateStore()
-        self.assertEqual(await s.check_sequence(100), "first")
-        self.assertEqual(await s.check_sequence(101), "ok")
-
-    async def test_gap(self):
-        s = MarketStateStore()
-        await s.check_sequence(100)
-        self.assertEqual(await s.check_sequence(102), "gap")
-
-    async def test_out_of_order(self):
-        s = MarketStateStore()
-        await s.check_sequence(102)
-        self.assertEqual(await s.check_sequence(101), "out_of_order")
-
-    async def test_duplicate(self):
-        s = MarketStateStore()
-        await s.check_sequence(102)
-        self.assertEqual(await s.check_sequence(102), "duplicate")
-
-    async def test_reset_transport_no_false_out_of_order(self):
-        s = MarketStateStore()
-        await s.check_sequence(5000)
-        await s.reset_transport()
-        self.assertEqual(await s.check_sequence(3), "first")
-
-
-class PerProductStateTests(unittest.IsolatedAsyncioTestCase):
-    def _tick(self, product_id, price, ts):
-        return RealtimeDatum("coinbase", product_id, "ticker", price, ts, _RT_NOW,
-                             DataQualityStatus.VALID, 1)
-
-    def _candle(self, product_id, price, start, seq=1):
-        return RealtimeDatum("coinbase", product_id, "candle", price, start, _RT_NOW,
-                             DataQualityStatus.VALID, seq)
-
-    async def test_btc_eth_independent(self):
-        s = MarketStateStore()
-        await s.apply_ticker(self._tick("BTC-USD", 50000.0, _RT_NOW))
-        await s.apply_ticker(self._tick("ETH-USD", 3000.0, _RT_NOW - _td(seconds=100)))
-        btc = await s.get_ticker("BTC-USD")
-        eth = await s.get_ticker("ETH-USD")
-        self.assertEqual(btc.value, 50000.0)
-        self.assertEqual(eth.value, 3000.0)
-
-    async def test_older_ticker_does_not_overwrite(self):
-        s = MarketStateStore()
-        await s.apply_ticker(self._tick("BTC-USD", 50000.0, _RT_NOW))
-        applied = await s.apply_ticker(self._tick("BTC-USD", 49000.0, _RT_NOW - _td(seconds=10)))
-        self.assertFalse(applied)
-        btc = await s.get_ticker("BTC-USD")
-        self.assertEqual(btc.value, 50000.0)
-
-    async def test_invalid_ticker_not_stored(self):
-        s = MarketStateStore()
-        bad = RealtimeDatum("coinbase", "BTC-USD", "ticker", None, _RT_NOW, _RT_NOW,
-                            DataQualityStatus.INVALID, 1)
-        self.assertFalse(await s.apply_ticker(bad))
-        self.assertIsNone(await s.get_ticker("BTC-USD"))
-
-    async def test_candle_same_start_updates_in_place(self):
-        s = MarketStateStore()
-        await s.apply_candle(self._candle("BTC-USD", 100.0, _RT_NOW, seq=1))
-        applied = await s.apply_candle(self._candle("BTC-USD", 105.0, _RT_NOW, seq=2))
-        self.assertTrue(applied)
-        cur = await s.get_candle("BTC-USD")
-        self.assertEqual(cur.value, 105.0)
-
-    async def test_older_candle_bucket_not_overwrite(self):
-        s = MarketStateStore()
-        await s.apply_candle(self._candle("BTC-USD", 105.0, _RT_NOW, seq=2))
-        older = self._candle("BTC-USD", 100.0, _RT_NOW - _td(seconds=300), seq=1)
-        self.assertFalse(await s.apply_candle(older))
-        cur = await s.get_candle("BTC-USD")
-        self.assertEqual(cur.value, 105.0)
-
-
-class RealtimeStoreTests(unittest.IsolatedAsyncioTestCase):
-    async def test_get_realtime_missing_when_empty(self):
-        s = MarketStateStore()
-        out = await s.get_realtime("BTC-USD")
-        self.assertEqual(out["status"], "MISSING")
-
-    async def test_heartbeat_not_in_price_store(self):
-        s = MarketStateStore()
-        await s.record_heartbeat(42, _RT_NOW)
-        self.assertIsNone(await s.get_ticker("BTC-USD"))
-        h = await s.health()
-        self.assertEqual(h["heartbeat_counter"], 42)
-
-
-class MarketBusTests(unittest.IsolatedAsyncioTestCase):
-    async def test_consumer_receives_published(self):
-        bus = MarketBus()
-        seen = []
-        bus.subscribe(lambda d: seen.append(d))
-        datum = RealtimeDatum("coinbase", "BTC-USD", "ticker", 1.0, _RT_NOW, _RT_NOW,
-                              DataQualityStatus.VALID, 1)
-        await bus.publish(datum)
-        self.assertEqual(len(seen), 1)
-        self.assertEqual(seen[0].product_id, "BTC-USD")
-
-
-class RealtimeHandleTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self._store = main.market_store
-        self._bus = main.market_bus
-        main.market_store = MarketStateStore()
-        main.market_bus = MarketBus()
-
-    async def asyncTearDown(self):
-        main.market_store = self._store
-        main.market_bus = self._bus
-
-    async def test_handle_ticker_stores(self):
-        ts = _RT_NOW.isoformat().replace("+00:00", "Z")
-        await main.market_ws._handle(_ticker_msg("BTC-USD", "50000", ts=ts))
-        d = await main.market_store.get_ticker("BTC-USD")
-        self.assertIsNotNone(d)
-        self.assertEqual(d.value, 50000.0)
-
-    async def test_handle_unknown_channel_ignored(self):
-        raw = json.dumps({"channel": "l2_data", "sequence_num": 1, "events": []})
-        await main.market_ws._handle(raw)
-        self.assertIsNone(await main.market_store.get_ticker("BTC-USD"))
-
-    async def test_handle_malformed_no_state_change(self):
-        await main.market_ws._handle("{bad json")
-        h = await main.market_store.health()
-        self.assertEqual(h["messages"], 0)
-        self.assertIsNone(await main.market_store.get_ticker("BTC-USD"))
-
-
-class RealtimeEndpointTests(unittest.TestCase):
-    def setUp(self):
-        self._store = main.market_store
-        main.market_store = MarketStateStore()
-        self.client = TestClient(create_app())
-
-    def tearDown(self):
-        main.market_store = self._store
-
-    def test_realtime_missing_when_no_data(self):
-        r = self.client.get("/api/v1/market/realtime/btc-usd")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["status"], "MISSING")
-
-
-# ----------------------------- paginated history (Phase 2) --------------------
-from main import (  # noqa: E402
-    PROVIDER_SAFE_BUCKETS,
-    fetch_candle_history,
-    max_history_span,
-    plan_candle_windows,
-)
-
-_H = 3600  # ONE_HOUR bucket seconds
-
-
-def _hist_candle(start_unix, close=100.0, status=DataQualityStatus.VALID):
-    dt = datetime.fromtimestamp(start_unix, tz=timezone.utc)
-    return Candle(dt, 90.0, 110.0, 95.0, close, 5.0, status)
-
-
-class FakeRangeProvider:
-    """Simulates Coinbase get_candles_range over a set of available starts.
-    `inclusive` toggles end-boundary semantics to prove robustness either way."""
-
-    def __init__(self, available, bucket=_H, inclusive=True, fail_on=None, invalid=None):
-        self.available = sorted(available)
-        self.bucket = bucket
-        self.inclusive = inclusive
-        self.fail_on = set(fail_on or [])
-        self.invalid = set(invalid or [])
-        self.calls = 0
-
-    async def get_candles_range(self, symbol, granularity, start, end):
-        self.calls += 1
-        if start in self.fail_on:
-            raise httpx.ConnectError("window failed")
-        out = []
-        for s in self.available:
-            inside = (start <= s <= end) if self.inclusive else (start <= s < end)
-            if inside:
-                st = DataQualityStatus.INVALID if s in self.invalid else DataQualityStatus.VALID
-                out.append(_hist_candle(s, status=st))
-        return out, DataQualityStatus.VALID
-
-
-class PlanWindowsTests(unittest.TestCase):
-    def test_small_range_one_window(self):
-        self.assertEqual(len(plan_candle_windows("1h", 0, 3 * _H)), 1)
-
-    def test_safe_width_one_window(self):
-        self.assertEqual(len(plan_candle_windows("1h", 0, PROVIDER_SAFE_BUCKETS * _H)), 1)
-
-    def test_350_buckets_two_windows(self):
-        self.assertEqual(len(plan_candle_windows("1h", 0, 350 * _H)), 2)
-
-    def test_multiple_windows_count(self):
-        self.assertEqual(len(plan_candle_windows("1h", 0, 700 * _H)), 3)
-
-    def test_bucket_math_per_granularity(self):
-        # 15m bucket = 900s; 350 buckets -> 2 windows
-        self.assertEqual(len(plan_candle_windows("15m", 0, 350 * 900)), 2)
-
-    def test_exact_bounds(self):
-        w = plan_candle_windows("1h", 0, 700 * _H)
-        self.assertEqual(w[0], (0, PROVIDER_SAFE_BUCKETS * _H))
-        self.assertEqual(w[1][0], PROVIDER_SAFE_BUCKETS * _H)
-
-    def test_window_never_exceeds_350_starts(self):
-        w = plan_candle_windows("1h", 0, 5000 * _H)
-        self.assertTrue(all((e - s) // _H <= 349 for s, e in w))
-
-    def test_misaligned_raises(self):
-        with self.assertRaises(ValueError):
-            plan_candle_windows("1h", 1, 3 * _H)
-
-    def test_start_ge_end_raises(self):
-        with self.assertRaises(ValueError):
-            plan_candle_windows("1h", 3 * _H, 3 * _H)
-
-    def test_unknown_granularity_raises(self):
-        with self.assertRaises(ValueError):
-            plan_candle_windows("4m", 0, 3 * _H)
-
-
-class MaxHistorySpanTests(unittest.TestCase):
-    def test_scales_with_granularity(self):
-        self.assertEqual(max_history_span("1h"), PROVIDER_SAFE_BUCKETS * _H * 20)
-        self.assertGreater(max_history_span("1d"), max_history_span("1h"))
-
-
-class HistoryAssemblerTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self._orig = main.market_provider
-
-    def tearDown(self):
-        main.market_provider = self._orig
-
-    async def _run(self, provider, start, end, gran="1h"):
-        main.market_provider = provider
-        return await fetch_candle_history("BTC-USD", gran, start, end)
-
-    async def test_end_inclusive_all_found_after_dedup(self):
-        avail = [i * _H for i in range(350)]
-        res = await self._run(FakeRangeProvider(avail, inclusive=True), 0, 350 * _H)
-        self.assertEqual(res["count"], 350)
-        self.assertEqual(res["status"], "COMPLETE")
-        self.assertTrue(res["data_complete"])
-
-    async def test_end_exclusive_all_found(self):
-        avail = [i * _H for i in range(350)]
-        res = await self._run(FakeRangeProvider(avail, inclusive=False), 0, 350 * _H)
-        self.assertEqual(res["count"], 350)
-
-    async def test_duplicate_boundary_single_candle(self):
-        avail = [i * _H for i in range(350)]
-        res = await self._run(FakeRangeProvider(avail, inclusive=True), 0, 350 * _H)
-        starts = [c["start"] for c in res["candles"]]
-        self.assertEqual(len(starts), len(set(starts)))
-
-    async def test_sorted_chronological(self):
-        avail = [i * _H for i in range(10)]
-        res = await self._run(FakeRangeProvider(avail), 0, 10 * _H)
-        starts = [c["start"] for c in res["candles"]]
-        self.assertEqual(starts, sorted(starts))
-
-    async def test_half_open_range_filter(self):
-        avail = [0, _H, 2 * _H]
-        res = await self._run(FakeRangeProvider(avail, inclusive=True), 0, 2 * _H)
-        # end (2*_H) excluded by [start, end)
-        self.assertEqual(res["count"], 2)
-
-    async def test_empty_is_EMPTY(self):
-        res = await self._run(FakeRangeProvider([]), 0, 10 * _H)
-        self.assertEqual(res["status"], "EMPTY")
-        self.assertEqual(res["count"], 0)
-        self.assertFalse(res["data_complete"])
-
-    async def test_gap_marks_incomplete_without_fabrication(self):
-        avail = [0, _H, 3 * _H, 4 * _H]  # missing 2*_H
-        res = await self._run(FakeRangeProvider(avail), 0, 5 * _H)
-        self.assertTrue(res["gaps"])
-        self.assertFalse(res["data_complete"])
-        self.assertEqual(res["status"], "PARTIAL")
-        self.assertEqual(res["count"], 4)  # no fabricated candle
-
-    async def test_invalid_candle_counted_and_incomplete(self):
-        avail = [0, _H, 2 * _H]
-        res = await self._run(
-            FakeRangeProvider(avail, invalid={_H}), 0, 3 * _H
-        )
-        self.assertEqual(res["invalid_candles_count"], 1)
-        self.assertFalse(res["data_complete"])
-
-    async def test_window_failure_is_partial(self):
-        avail = [i * _H for i in range(350)]
-        # second window starts at PROVIDER_SAFE_BUCKETS*_H
-        provider = FakeRangeProvider(avail, fail_on={PROVIDER_SAFE_BUCKETS * _H})
-        res = await self._run(provider, 0, 350 * _H)
-        self.assertEqual(res["status"], "PARTIAL")
-        self.assertEqual(res["provider_windows"]["failed"], 1)
-        self.assertFalse(res["transport_complete"])
-
-    async def test_complete_when_all_good(self):
-        avail = [i * _H for i in range(10)]
-        res = await self._run(FakeRangeProvider(avail), 0, 10 * _H)
-        self.assertEqual(res["status"], "COMPLETE")
-        self.assertTrue(res["transport_complete"])
-        self.assertTrue(res["data_complete"])
-
-
-class HistoryEndpointTests(unittest.TestCase):
-    def setUp(self):
-        self._orig = main.market_provider
-
-    def tearDown(self):
-        main.market_provider = self._orig
-
-    def _client(self, provider):
-        main.market_provider = provider
-        return TestClient(create_app())
-
-    def test_history_ok(self):
-        avail = [i * _H for i in range(5)]
-        r = self._client(FakeRangeProvider(avail)).get(
-            "/api/v1/market/candles/btc-usd/history?granularity=1h&start=0&end=" + str(5 * _H)
-        )
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["count"], 5)
-
-    def test_history_misaligned_400(self):
-        r = TestClient(create_app()).get(
-            "/api/v1/market/candles/btc-usd/history?granularity=1h&start=1&end=" + str(3 * _H)
-        )
-        self.assertEqual(r.status_code, 400)
-
-    def test_history_start_ge_end_400(self):
-        r = TestClient(create_app()).get(
-            "/api/v1/market/candles/btc-usd/history?granularity=1h&start=3600&end=3600"
-        )
-        self.assertEqual(r.status_code, 400)
-
-    def test_history_range_too_large_400(self):
-        too_big = PROVIDER_SAFE_BUCKETS * _H * 20 + _H
-        r = TestClient(create_app()).get(
-            "/api/v1/market/candles/btc-usd/history?granularity=1h&start=0&end=" + str(too_big)
-        )
-        self.assertEqual(r.status_code, 400)
-
-    def test_history_unknown_granularity_400(self):
-        r = TestClient(create_app()).get(
-            "/api/v1/market/candles/btc-usd/history?granularity=4m&start=0&end=3600"
-        )
-        self.assertEqual(r.status_code, 400)
-
-
-# ----------------------------- persistence (Phase 2) --------------------------
-from main import (  # noqa: E402
-    CandleRow,
-    PersistenceState,
-    PersistenceStatus,
-    is_candle_closed,
-    persist_candles,
-    persist_history_result,
-    persistence_consumer,
-    persistence_state,
-    read_stored_candles,
-)
-
-_DB_NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
-
-
-def _row(product="BTC-USD", gran="1h", start_unix=0, close=100.0, source="coinbase",
-         quality=DataQualityStatus.VALID, observed=_DB_NOW, origin="rest", st=None):
-    bs = datetime.fromtimestamp(start_unix, tz=timezone.utc)
-    return CandleRow(source, product, gran, bs, 90.0, 110.0, 95.0, close, 5.0,
-                     quality, origin, st, observed)
-
-
-class _DBBase(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        await main.engine.dispose()  # fresh pool bound to THIS test's loop
-        await main.init_candle_schema()
-        async with main.engine.begin() as conn:
-            await conn.execute(main.text("TRUNCATE candles"))
-
-    async def asyncTearDown(self):
-        await main.engine.dispose()
-
-    async def _raw_count(self):
-        async with main.engine.connect() as conn:
-            r = await conn.execute(main.text("SELECT count(*) FROM candles"))
-            return r.scalar()
-
-
-class DBPersistenceTests(_DBBase):
-    async def test_insert_and_read(self):
-        n = await persist_candles([_row(start_unix=0, close=100.0)])
-        self.assertEqual(n, 1)
-        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["start"], 0)
-
-    async def test_upsert_same_one_row(self):
-        await persist_candles([_row(start_unix=0)])
-        await persist_candles([_row(start_unix=0)])
-        self.assertEqual(await self._raw_count(), 1)
-
-    async def test_update_newer_observation(self):
-        await persist_candles([_row(start_unix=0, close=100.0, observed=_DB_NOW)])
-        newer = _DB_NOW + timedelta(seconds=10)
-        await persist_candles([_row(start_unix=0, close=200.0, observed=newer)])
-        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
-        self.assertEqual(float(rows[0]["close"]), 200.0)
-
-    async def test_reject_older_observation(self):
-        await persist_candles([_row(start_unix=0, close=100.0, observed=_DB_NOW)])
-        older = _DB_NOW - timedelta(seconds=10)
-        await persist_candles([_row(start_unix=0, close=999.0, observed=older)])
-        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
-        self.assertEqual(float(rows[0]["close"]), 100.0)
-
-    async def test_numeric_precision_roundtrip(self):
-        await persist_candles([_row(start_unix=0, close=50000.123456)])
-        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
-        self.assertEqual(float(rows[0]["close"]), 50000.123456)
-
-    async def test_multiple_granularities(self):
-        await persist_candles([_row(gran="1h", start_unix=0)])
-        await persist_candles([_row(gran="15m", start_unix=0)])
-        self.assertEqual(await self._raw_count(), 2)
-
-    async def test_multiple_products(self):
-        await persist_candles([_row(product="BTC-USD", start_unix=0)])
-        await persist_candles([_row(product="ETH-USD", start_unix=0)])
-        self.assertEqual(len(await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)), 1)
-        self.assertEqual(len(await read_stored_candles("ETH-USD", "1h", 0, 3600, 10)), 1)
-
-    async def test_separation_by_source(self):
-        await persist_candles([_row(source="coinbase", start_unix=0)])
-        await persist_candles([_row(source="kraken", start_unix=0)])
-        self.assertEqual(await self._raw_count(), 2)  # distinct PK by source
-        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
-        self.assertEqual(len(rows), 1)  # read filters source=coinbase
-
-    async def test_batch_insert(self):
-        rows = [_row(start_unix=i * 3600) for i in range(5)]
-        n = await persist_candles(rows)
-        self.assertEqual(n, 5)
-        self.assertEqual(await self._raw_count(), 5)
-
-    async def test_transaction_rollback_atomic(self):
-        orig = main.settings.persist_batch_size
-        main.settings.persist_batch_size = 1  # force separate SQL batches in ONE tx
-        try:
-            good = _row(start_unix=0, close=100.0)
-            bad = _row(start_unix=3600, close=1e50)  # overflows NUMERIC(38,18)
-            with self.assertRaises(Exception):
-                await persist_candles([good, bad])
-        finally:
-            main.settings.persist_batch_size = orig
-        self.assertEqual(await self._raw_count(), 0)  # whole operation rolled back
-
-    async def test_invalid_not_stored(self):
-        n = await persist_candles([_row(quality=DataQualityStatus.INVALID)])
-        self.assertEqual(n, 0)
-        self.assertEqual(await self._raw_count(), 0)
-
-    async def test_invalid_does_not_replace_valid(self):
-        await persist_candles([_row(start_unix=0, close=100.0)])
-        await persist_candles([_row(start_unix=0, close=999.0, quality=DataQualityStatus.INVALID)])
-        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(float(rows[0]["close"]), 100.0)
-
-    async def test_time_closed_accepts_newer_correction(self):
-        await persist_candles([_row(start_unix=0, close=100.0, observed=_DB_NOW)])
-        newer = _DB_NOW + timedelta(seconds=10)
-        await persist_candles([_row(start_unix=0, close=200.0, observed=newer)])
-        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
-        self.assertTrue(rows[0]["is_closed"])  # 1970 bucket is time-closed
-        self.assertEqual(float(rows[0]["close"]), 200.0)  # yet correction applied
-
-    async def test_read_empty(self):
-        rows = await read_stored_candles("BTC-USD", "1h", 0, 3600, 10)
-        self.assertEqual(rows, [])
-
-    async def test_read_sorted(self):
-        await persist_candles([_row(start_unix=2 * 3600), _row(start_unix=0),
-                               _row(start_unix=3600)])
-        rows = await read_stored_candles("BTC-USD", "1h", 0, 3 * 3600, 10)
-        self.assertEqual([r["start"] for r in rows], [0, 3600, 7200])
-
-    async def test_read_filters_half_open(self):
-        await persist_candles([_row(start_unix=0), _row(start_unix=3600),
-                               _row(start_unix=7200)])
-        rows = await read_stored_candles("BTC-USD", "1h", 0, 7200, 10)
-        self.assertEqual([r["start"] for r in rows], [0, 3600])  # 7200 excluded
-
-    async def test_ws_candle_via_consumer(self):
-        orig = persistence_state.ready
-        persistence_state.ready = True
-        try:
-            start = datetime.fromtimestamp(0, tz=timezone.utc)
-            datum = main.RealtimeDatum(
-                "coinbase", "BTC-USD", "candle", 108.0, start, _DB_NOW,
-                DataQualityStatus.VALID, 1,
-                ohlcv={"open": 105.0, "high": 110.0, "low": 100.0, "close": 108.0,
-                       "volume": 5.0},
+# ============================ market data (Phase 2) ============================
+# Provider: Coinbase Advanced Trade PUBLIC market data. Endpoints verified against
+# the official docs (docs.cdp.coinbase.com):
+#   REST base  : https://api.coinbase.com/api/v3/brokerage   (public market data,
+#                no authentication)
+#   WS (public): wss://advanced-trade-ws.coinbase.com        (market channels work
+#                without auth; subscribe within 5s; heartbeats keep it open)
+# No API key, no orders, no withdrawals. No fabricated data: absent/late/invalid
+# data is surfaced as MISSING/STALE/INVALID/UNKNOWN, never invented.
+
+COINBASE_REST_URL = "https://api.coinbase.com/api/v3/brokerage"
+COINBASE_WS_URL = "wss://advanced-trade-ws.coinbase.com"
+WS_INITIAL_BACKOFF = 1.0
+WS_MAX_BACKOFF = 60.0
+WS_ALLOWED_CHANNELS = {
+    "ticker", "ticker_batch", "candles", "market_trades", "level2", "status", "heartbeats",
+}
+
+# Candles (defined before CoinbaseProvider: used as a default arg in get_candles).
+# friendly -> (Coinbase enum, bucket duration in seconds)
+GRANULARITIES: Dict[str, tuple] = {
+    "1m": ("ONE_MINUTE", 60),
+    "5m": ("FIVE_MINUTE", 300),
+    "15m": ("FIFTEEN_MINUTE", 900),
+    "30m": ("THIRTY_MINUTE", 1800),
+    "1h": ("ONE_HOUR", 3600),
+    "2h": ("TWO_HOUR", 7200),
+    "4h": ("FOUR_HOUR", 14400),
+    "6h": ("SIX_HOUR", 21600),
+    "1d": ("ONE_DAY", 86400),
+}
+CANDLE_MAX_LIMIT = 350
+# Coinbase caps a request at CANDLE_MAX_LIMIT candles. `end` inclusivity is not
+# guaranteed by the docs, so a paginated window must never request more than
+# CANDLE_MAX_LIMIT candidate starts: width = (CANDLE_MAX_LIMIT - 1) * bucket
+# keeps it <= CANDLE_MAX_LIMIT even if `end` is inclusive. Never hardcode 349.
+PROVIDER_SAFE_BUCKETS = CANDLE_MAX_LIMIT - 1
+
+
+def parse_iso8601(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 string to aware UTC. Returns None if absent/invalid/naive
+    (never invents a timestamp)."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+@dataclass(frozen=True)
+class MarketDatum:
+    source: str
+    symbol: str
+    value: Optional[float]
+    timestamp: Optional[datetime]
+    status: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        age: Optional[float] = None
+        if self.timestamp is not None:
+            age = max(0.0, (utcnow() - self.timestamp).total_seconds())
+        return {
+            "source": self.source,
+            "symbol": self.symbol,
+            "value": self.value,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+            "freshness_seconds": age,
+            "quality": self.status.value,
+        }
+
+
+def ticker_datum_from_payload(
+    symbol: str, payload: Any, now: Optional[datetime] = None
+) -> MarketDatum:
+    """Build a qualified MarketDatum from a Coinbase ticker payload. Pure, no network.
+    Coinbase returns recent trades; we use the latest trade's price + time."""
+    src = "coinbase"
+    trades = payload.get("trades") if isinstance(payload, dict) else None
+    if not isinstance(trades, list) or not trades or not isinstance(trades[0], dict):
+        return MarketDatum(src, symbol, None, None, DataQualityStatus.MISSING)
+    latest = trades[0]
+    price = _to_float(latest.get("price"))
+    if price is None or price <= 0:
+        return MarketDatum(src, symbol, None, None, DataQualityStatus.INVALID)
+    ts = parse_iso8601(latest.get("time"))
+    quality = classify_freshness(ts, settings.ticker_max_age_seconds, now=now)
+    return MarketDatum(src, symbol, price, ts, quality)
+
+
+class CoinbaseProvider:
+    """Public REST access to Coinbase Advanced Trade market data. No API key."""
+
+    SOURCE = "coinbase"
+
+    def __init__(self, rest_url: str = COINBASE_REST_URL) -> None:
+        self.rest_url = rest_url.rstrip("/")
+        self.client: Optional[httpx.AsyncClient] = None
+
+    async def connect(self) -> None:
+        if self.client is None:
+            self.client = httpx.AsyncClient(
+                base_url=self.rest_url, timeout=10.0, headers={"Accept": "application/json"}
             )
-            await persistence_consumer(datum)
-            rows = await read_stored_candles("BTC-USD", "5m", 0, 3600, 10)
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(float(rows[0]["close"]), 108.0)
-        finally:
-            persistence_state.ready = orig
 
-    async def test_history_persisted(self):
-        saved = main.market_provider
-        main.market_provider = FakeRangeProvider([i * _H for i in range(5)])
-        try:
-            res = await fetch_candle_history("BTC-USD", "1h", 0, 5 * _H)
-            out = await persist_history_result(res)
-            self.assertEqual(out["persisted"], 5)
-            rows = await read_stored_candles("BTC-USD", "1h", 0, 5 * _H, 100)
-            self.assertEqual(len(rows), 5)
-        finally:
-            main.market_provider = saved
-
-
-class PersistenceStateTests(unittest.TestCase):
-    def test_init_failed_is_unavailable(self):
-        s = PersistenceState()
-        s.mark_init_failed("boom")
-        self.assertFalse(s.ready)
-        self.assertEqual(s.status, PersistenceStatus.UNAVAILABLE)
-        self.assertEqual(s.errors, 1)
-
-    def test_runtime_error_degrades_then_recovers(self):
-        s = PersistenceState()
-        s.mark_ready()
-        s.mark_runtime_error("db down")
-        self.assertEqual(s.status, PersistenceStatus.DEGRADED)
-        self.assertEqual(s.errors, 1)
-        s.mark_write_ok()  # a later success recovers
-        self.assertEqual(s.status, PersistenceStatus.READY)
-        self.assertEqual(s.errors, 1)  # counter stays cumulative
-
-    def test_is_candle_closed_time_rule(self):
-        start = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        now_open = start + timedelta(seconds=100)
-        now_closed = start + timedelta(seconds=4000)
-        self.assertFalse(is_candle_closed(start, 3600, now=now_open))
-        self.assertTrue(is_candle_closed(start, 3600, now=now_closed))
-
-
-class StoredEndpointTests(unittest.TestCase):
-    def setUp(self):
-        self._ready = persistence_state.ready
-
-    def tearDown(self):
-        persistence_state.ready = self._ready
-
-    def test_stored_not_ready_503(self):
-        persistence_state.ready = False
-        r = TestClient(create_app()).get(
-            "/api/v1/market/candles/btc-usd/stored?granularity=1h&start=0&end=3600"
-        )
-        self.assertEqual(r.status_code, 503)
-
-    def test_stored_bad_granularity_400(self):
-        persistence_state.ready = True
-        r = TestClient(create_app()).get(
-            "/api/v1/market/candles/btc-usd/stored?granularity=4m&start=0&end=3600"
-        )
-        self.assertEqual(r.status_code, 400)
-
-    def test_stored_start_ge_end_400(self):
-        persistence_state.ready = True
-        r = TestClient(create_app()).get(
-            "/api/v1/market/candles/btc-usd/stored?granularity=1h&start=3600&end=3600"
-        )
-        self.assertEqual(r.status_code, 400)
-
-
-# ----------------------------- multi-asset 6A --------------------------------
-from main import (  # noqa: E402
-    COINBASE_PROFILE,
-    AssetClass,
-    Capability,
-    Instrument,
-    MarketAvailability,
-    MarketCalendarPolicy,
-    OpenState,
-    ProviderProfile,
-    ProviderSymbolMap,
-    VolumeSemantics,
-    calendar_for,
-    candles_table,
-    instrument_registry,
-    provider_symbol_map,
-)
-
-
-class RegistryMappingTests(unittest.TestCase):
-    def test_coinbase_instrument_registered(self):
-        inst = instrument_registry.get("BTC-USD")
-        self.assertIsNotNone(inst)
-        self.assertEqual(inst.asset_class, AssetClass.CRYPTO)
-
-    def test_canonical_stable(self):
-        self.assertIs(instrument_registry.get("BTC-USD"), instrument_registry.get("BTC-USD"))
-
-    def test_mapping_coinbase_to_canonical(self):
-        self.assertEqual(provider_symbol_map.to_canonical("coinbase", "BTC-USD"), "BTC-USD")
-
-    def test_canonical_can_differ_from_provider_symbol(self):
-        m = ProviderSymbolMap()
-        m.add("provX", "XAU-USD", "XAU/USD")
-        self.assertEqual(m.to_canonical("provX", "XAU/USD"), "XAU-USD")
-        self.assertNotEqual(m.to_provider("provX", "XAU-USD"), "XAU-USD")
-
-    def test_two_providers_same_canonical(self):
-        m = ProviderSymbolMap()
-        m.add("a", "XAU-USD", "XAU/USD")
-        m.add("b", "XAU-USD", "XAUUSD")
-        self.assertEqual(m.to_canonical("a", "XAU/USD"), "XAU-USD")
-        self.assertEqual(m.to_canonical("b", "XAUUSD"), "XAU-USD")
-
-    def test_provider_symbol_not_global_identity(self):
-        # a raw provider symbol is NOT a canonical identity
-        self.assertIsNone(instrument_registry.get("XAUUSD"))
-
-    def test_unknown_instrument_failsafe(self):
-        self.assertIsNone(instrument_registry.get("DOES-NOT-EXIST"))
-
-    def test_unknown_provider_failsafe(self):
-        self.assertIsNone(provider_symbol_map.to_canonical("ghost", "BTC-USD"))
-
-    def test_unmapped_is_none(self):
-        self.assertIsNone(provider_symbol_map.to_provider("coinbase", "XAU-USD"))
-
-
-class AssetMetadataTests(unittest.TestCase):
-    def test_distinct_asset_classes(self):
-        self.assertEqual(
-            {AssetClass.CRYPTO, AssetClass.FOREX, AssetClass.METAL, AssetClass.INDEX},
-            set(AssetClass),
-        )
-
-    def test_no_metadata_inferred_from_symbol(self):
-        # unverified financial metadata stays None/UNKNOWN, never guessed
-        xau = Instrument("XAU-USD", AssetClass.METAL, "XAU", "USD", "Gold / USD",
-                         "UTC", MarketCalendarPolicy.NOT_CONFIGURED, VolumeSemantics.UNKNOWN)
-        self.assertIsNone(xau.price_precision)
-        self.assertIsNone(xau.tick_size)
-        self.assertEqual(xau.volume_semantics, VolumeSemantics.UNKNOWN)
-
-    def test_coinbase_volume_semantics(self):
-        self.assertEqual(
-            instrument_registry.get("BTC-USD").volume_semantics,
-            VolumeSemantics.BASE_ASSET_VOLUME,
-        )
-
-    def test_instrument_timezone_stored(self):
-        self.assertEqual(instrument_registry.get("BTC-USD").timezone, "UTC")
-
-    def test_market_availability_distinct_from_quality(self):
-        # orthogonal axes: a market close is not a data-quality value
-        self.assertNotIn(MarketAvailability.CLOSED.value,
-                         {s.value for s in [DataQualityStatus.MISSING,
-                                            DataQualityStatus.INVALID]})
-
-
-class CapabilityTests(unittest.TestCase):
-    def test_coinbase_supports_candles_rest(self):
-        self.assertTrue(COINBASE_PROFILE.supports(Capability.CANDLES_REST, AssetClass.CRYPTO))
-
-    def test_missing_capability_not_supported(self):
-        self.assertFalse(COINBASE_PROFILE.supports(Capability.ORDER_BOOK, AssetClass.CRYPTO))
-
-    def test_capabilities_per_asset_class(self):
-        prof = ProviderProfile(
-            "demo",
-            {AssetClass.FOREX: {Capability.HISTORY_INTRADAY},
-             AssetClass.METAL: {Capability.HISTORY_DAILY}},
-            {AssetClass.FOREX: {"1m"}, AssetClass.METAL: {"1d"}},
-        )
-        self.assertTrue(prof.supports(Capability.HISTORY_INTRADAY, AssetClass.FOREX))
-        self.assertFalse(prof.supports(Capability.HISTORY_INTRADAY, AssetClass.METAL))
-
-    def test_granularity_supported_or_not(self):
-        self.assertTrue(COINBASE_PROFILE.supports_granularity("1m", AssetClass.CRYPTO))
-        self.assertFalse(COINBASE_PROFILE.supports_granularity("3m", AssetClass.CRYPTO))
-
-
-class CalendarTests(unittest.TestCase):
-    def test_always_24_7_open_everywhere(self):
-        cal = calendar_for(MarketCalendarPolicy.ALWAYS_OPEN_24_7)
-        self.assertEqual(cal.is_market_expected_open(0), OpenState.OPEN)
-        self.assertEqual(cal.is_market_expected_open(10**12), OpenState.OPEN)
-
-    def test_always_24_7_expected_grid(self):
-        cal = calendar_for(MarketCalendarPolicy.ALWAYS_OPEN_24_7)
-        self.assertEqual(cal.expected_bucket_starts("1h", 0, 3 * 3600), [0, 3600, 7200])
-
-    def test_absence_during_open_is_gap(self):
-        cal = calendar_for(MarketCalendarPolicy.ALWAYS_OPEN_24_7)
-        rep = cal.analyze_gaps([0, 3600, 10800], 3600)  # missing 7200
-        self.assertEqual(rep.status, "ANALYZED")
-        self.assertTrue(rep.missing)
-
-    def test_gap_24_7_matches_legacy(self):
-        cal = calendar_for(MarketCalendarPolicy.ALWAYS_OPEN_24_7)
-        starts = [0, 3600, 10800, 14400]
-        self.assertEqual(cal.analyze_gaps(starts, 3600).missing,
-                         main._missing_buckets_24_7(starts, 3600))
-
-    def test_not_configured_never_open_or_closed(self):
-        cal = calendar_for(MarketCalendarPolicy.NOT_CONFIGURED)
-        self.assertEqual(cal.is_market_expected_open(0), OpenState.UNKNOWN)
-
-    def test_not_configured_does_not_invent_bucket_grid(self):
-        cal = calendar_for(MarketCalendarPolicy.NOT_CONFIGURED)
-        self.assertEqual(cal.is_market_expected_open(0), OpenState.UNKNOWN)
-        self.assertIsNone(cal.expected_bucket_starts("1h", 0, 3600))
-
-    def test_not_configured_gaps_unknown(self):
-        cal = calendar_for(MarketCalendarPolicy.NOT_CONFIGURED)
-        rep = cal.analyze_gaps([0, 7200], 3600)  # would be a gap if 24/7, but calendar unknown
-        self.assertEqual(rep.status, "UNKNOWN")
-        self.assertEqual(rep.missing, [])
-
-
-class CandlesSchemaUnchangedTests(unittest.TestCase):
-    def test_pk_unchanged(self):
-        pk = [c.name for c in candles_table.primary_key.columns]
-        self.assertEqual(pk, ["source", "product_id", "granularity", "bucket_start"])
-
-    def test_table_name_unchanged(self):
-        self.assertEqual(candles_table.name, "candles")
-
-
-# ----------------------------- Massive Forex REST 6B-1 ------------------------
-from main import (  # noqa: E402
-    MASSIVE_FOREX_PROFILE,
-    fetch_forex_history,
-    massive_agg_to_candle,
-    massive_aggs_to_candles,
-    persist_forex_result,
-    register_massive_forex_symbol,
-)
-
-_FX_BASE = int(datetime(2026, 8, 24, 0, 0, tzinfo=timezone.utc).timestamp())
-
-
-def _agg(k, close=1.1, vol=10.0):
-    return {"t": (_FX_BASE + k * 3600) * 1000, "o": 1.1, "h": 1.2, "l": 1.0,
-            "c": close, "v": vol}
-
-
-class FakeMassiveProvider:
-    def __init__(self, ks=None, raise_exc=None, invalid_ks=None):
-        self.ks = ks if ks is not None else [0, 1, 2]
-        self.raise_exc = raise_exc
-        self.invalid_ks = set(invalid_ks or [])
-
-    async def get_candles_range(self, canonical, granularity, start, end):
-        if self.raise_exc is not None:
-            raise self.raise_exc
-        out = []
-        for k in self.ks:
-            item = _agg(k, close=1.1 + k)
-            if k in self.invalid_ks:
-                item = {"t": (_FX_BASE + k * 3600) * 1000, "o": "x"}  # invalid OHLC
-            out.append(massive_agg_to_candle(item, float("inf")))
-        return out, DataQualityStatus.VALID
-
-
-class MassiveParsingTests(unittest.TestCase):
-    def test_agg_parsed_ms_to_utc(self):
-        c = massive_agg_to_candle(_agg(0), float("inf"))
-        self.assertNotEqual(c.status, DataQualityStatus.INVALID)
-        self.assertEqual(int(c.start.timestamp()), _FX_BASE)
-
-    def test_invalid_ohlc_is_invalid(self):
-        c = massive_agg_to_candle({"t": _FX_BASE * 1000, "o": "x", "h": "1",
-                                   "l": "1", "c": "1", "v": "1"}, float("inf"))
-        self.assertEqual(c.status, DataQualityStatus.INVALID)
-
-    def test_malformed_response_missing(self):
-        candles, status = massive_aggs_to_candles({"no": "results"}, float("inf"))
-        self.assertEqual(candles, [])
-        self.assertEqual(status, DataQualityStatus.MISSING)
-
-    def test_empty_results_missing(self):
-        candles, status = massive_aggs_to_candles({"results": []}, float("inf"))
-        self.assertEqual(status, DataQualityStatus.MISSING)
-
-
-class MassiveInstrumentTests(unittest.TestCase):
-    def test_forex_instruments_registered(self):
-        inst = instrument_registry.get("EUR-USD")
-        self.assertIsNotNone(inst)
-        self.assertEqual(inst.asset_class, AssetClass.FOREX)
-
-    def test_forex_calendar_is_forex_week(self):
-        self.assertEqual(instrument_registry.get("EUR-USD").market_calendar,
-                         MarketCalendarPolicy.FOREX_WEEK)
-
-    def test_forex_volume_semantics_unknown(self):
-        self.assertEqual(instrument_registry.get("EUR-USD").volume_semantics,
-                         VolumeSemantics.UNKNOWN)
-
-    def test_no_financial_metadata_invented(self):
-        inst = instrument_registry.get("EUR-CAD")
-        self.assertIsNone(inst.price_precision)
-        self.assertIsNone(inst.tick_size)
-
-    def test_massive_symbol_not_mapped_by_default(self):
-        # rule: no provider_symbol registered by deduction -> NOT_MAPPED
-        self.assertIsNone(provider_symbol_map.to_provider("massive", "GBP-USD"))
-
-    def test_profile_capabilities_and_granularity(self):
-        self.assertTrue(MASSIVE_FOREX_PROFILE.supports(Capability.CANDLES_REST,
-                                                       AssetClass.FOREX))
-        self.assertFalse(MASSIVE_FOREX_PROFILE.supports(Capability.ORDER_BOOK,
-                                                        AssetClass.FOREX))
-        self.assertTrue(MASSIVE_FOREX_PROFILE.supports_granularity("5m", AssetClass.FOREX))
-        self.assertFalse(MASSIVE_FOREX_PROFILE.supports_granularity("3m", AssetClass.FOREX))
-
-
-class ForexHistoryAssemblerTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self._saved = main.massive_forex_provider
-        self._had = provider_symbol_map.to_provider("massive", "EUR-USD")
-        register_massive_forex_symbol("EUR-USD", "C:EURUSD")
-
-    def tearDown(self):
-        main.massive_forex_provider = self._saved
-        # keep mapping registered across tests is fine (verified in-test only)
-
-    async def test_not_mapped_failsafe(self):
-        # USD-CHF has no mapping -> NOT_MAPPED, no fetch
-        main.massive_forex_provider = FakeMassiveProvider()
-        r = await fetch_forex_history("USD-CHF", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
-        self.assertEqual(r["status"], "NOT_MAPPED")
-        self.assertEqual(r["candles"], [])
-
-    async def test_ok_sorted_and_deduped(self):
-        main.massive_forex_provider = FakeMassiveProvider(ks=[2, 0, 1, 1])
-        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
-        self.assertEqual(r["status"], "OK")
-        self.assertEqual(r["count"], 3)  # deduped
-        starts = [c["start"] for c in r["candles"]]
-        self.assertEqual(starts, sorted(starts))
-
-    async def test_absence_is_not_coinbase_gap(self):
-        # hole at k=2; forex calendar NOT_CONFIGURED -> gaps UNKNOWN, never a gap
-        main.massive_forex_provider = FakeMassiveProvider(ks=[0, 1, 3])
-        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
-        self.assertEqual(r["gaps_status"], "UNKNOWN")
-        self.assertEqual(r["gaps"], [])
-        self.assertFalse(r["data_complete"])
-        self.assertEqual(r["count"], 3)  # no fabricated bar
-
-    async def test_invalid_candle_counted(self):
-        main.massive_forex_provider = FakeMassiveProvider(ks=[0, 1, 2], invalid_ks=[1])
-        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
-        self.assertEqual(r["invalid_candles_count"], 1)
-        self.assertEqual(r["count"], 2)
-
-    async def test_half_open_range_filter(self):
-        main.massive_forex_provider = FakeMassiveProvider(ks=[0, 1, 2])
-        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 2 * 3600)
-        self.assertEqual(r["count"], 2)  # k=2 (== end) excluded
-
-    async def test_volume_semantics_unknown_in_result(self):
-        main.massive_forex_provider = FakeMassiveProvider()
-        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
-        self.assertEqual(r["volume_semantics"], "UNKNOWN")
-
-    async def test_provider_timeout_unavailable(self):
-        main.massive_forex_provider = FakeMassiveProvider(raise_exc=httpx.TimeoutException("t"))
-        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
-        self.assertEqual(r["status"], "UNAVAILABLE")
-
-    async def test_http_error_unavailable(self):
-        main.massive_forex_provider = FakeMassiveProvider(raise_exc=httpx.ConnectError("x"))
-        r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
-        self.assertEqual(r["status"], "UNAVAILABLE")
-
-    async def test_unsupported_granularity_raises(self):
-        main.massive_forex_provider = FakeMassiveProvider()
-        with self.assertRaises(ValueError):
-            await fetch_forex_history("EUR-USD", "3m", _FX_BASE, _FX_BASE + 5 * 3600)
-
-    async def test_start_ge_end_raises(self):
-        main.massive_forex_provider = FakeMassiveProvider()
-        with self.assertRaises(ValueError):
-            await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE)
-
-    async def test_unknown_instrument_raises(self):
-        with self.assertRaises(ValueError):
-            await fetch_forex_history("ZZZ-ZZZ", "1h", _FX_BASE, _FX_BASE + 3600)
-
-
-class ForexEndpointTests(unittest.TestCase):
-    def setUp(self):
-        register_massive_forex_symbol("EUR-USD", "C:EURUSD")
-
-    def test_forex_not_mapped_409(self):
-        # NZD-USD unmapped -> 409
-        r = TestClient(create_app()).get(
-            "/api/v1/market/forex/NZD-USD/history?granularity=1h&start=%d&end=%d"
-            % (_FX_BASE, _FX_BASE + 3600)
-        )
-        self.assertEqual(r.status_code, 409)
-
-    def test_forex_bad_granularity_400(self):
-        r = TestClient(create_app()).get(
-            "/api/v1/market/forex/EUR-USD/history?granularity=3m&start=%d&end=%d"
-            % (_FX_BASE, _FX_BASE + 3600)
-        )
-        self.assertEqual(r.status_code, 400)
-
-
-class ForexPersistenceTests(_DBBase):
-    async def test_forex_persisted_under_massive_source(self):
-        register_massive_forex_symbol("EUR-USD", "C:EURUSD")
-        saved = main.massive_forex_provider
-        main.massive_forex_provider = FakeMassiveProvider(ks=[0, 1, 2])
-        try:
-            r = await fetch_forex_history("EUR-USD", "1h", _FX_BASE, _FX_BASE + 5 * 3600)
-            n = await persist_forex_result(r)
-            self.assertEqual(n, 3)
-            async with main.engine.connect() as conn:
-                res = await conn.execute(
-                    main.text("SELECT count(*) FROM candles WHERE source='massive'")
-                )
-                self.assertEqual(res.scalar(), 3)
-                res2 = await conn.execute(
-                    main.text("SELECT count(*) FROM candles WHERE source='coinbase'")
-                )
-                self.assertEqual(res2.scalar(), 0)  # no Coinbase regression
-        finally:
-            main.massive_forex_provider = saved
-
-
-# ----------------------------- Massive mapping activation 6B-1A ---------------
-from main import (  # noqa: E402
-    EXPECTED_MASSIVE_FOREX,
-    MassiveForexProvider,
-    activate_massive_forex_mappings,
-    massive_forex_activation,
-)
-from main import _redact_secret as redact_secret  # noqa: E402
-
-
-class RedactionTests(unittest.TestCase):
-    def test_redacts_apikey_query(self):
-        out = redact_secret("GET https://api.x/y?apiKey=SECRET123&z=1")
-        self.assertIn("apiKey=REDACTED", out)
-        self.assertNotIn("SECRET123", out)
-
-    def test_no_apikey_unchanged(self):
-        self.assertEqual(redact_secret("plain text no secret"), "plain text no secret")
-
-
-class _MassiveMapBase(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self._prov = main.massive_forex_provider
-        self._key = main.settings.massive_api_key
-        self._snap_p = dict(provider_symbol_map._to_provider)
-        self._snap_c = dict(provider_symbol_map._to_canonical)
-        for k in [kk for kk in list(provider_symbol_map._to_provider) if kk[0] == "massive"]:
-            del provider_symbol_map._to_provider[k]
-        for k in [kk for kk in list(provider_symbol_map._to_canonical) if kk[0] == "massive"]:
-            del provider_symbol_map._to_canonical[k]
-        massive_forex_activation.__init__()
-
-    def tearDown(self):
-        main.massive_forex_provider = self._prov
-        main.settings.massive_api_key = self._key
-        provider_symbol_map._to_provider.clear()
-        provider_symbol_map._to_provider.update(self._snap_p)
-        provider_symbol_map._to_canonical.clear()
-        provider_symbol_map._to_canonical.update(self._snap_c)
-        massive_forex_activation.__init__()
-
-
-class _FakeRef:
-    def __init__(self, tickers=None, exc=None):
-        self._t = tickers or []
-        self._exc = exc
-
-    async def list_forex_tickers(self):
-        if self._exc is not None:
-            raise self._exc
-        return list(self._t)
-
-
-class MassiveActivationTests(_MassiveMapBase):
-    async def test_no_key_no_activation(self):
-        main.settings.massive_api_key = ""
-        res = await activate_massive_forex_mappings()
-        self.assertTrue(res["attempted"])
-        self.assertFalse(res["activated"])
-        self.assertIsNone(provider_symbol_map.to_provider("massive", "EUR-USD"))
-
-    async def test_activation_registers_only_confirmed(self):
-        main.settings.massive_api_key = "DUMMY_TEST"
-        main.massive_forex_provider = _FakeRef(["C:EURUSD", "C:GBPUSD", "C:OTHER"])
-        res = await activate_massive_forex_mappings()
-        self.assertTrue(res["activated"])
-        self.assertEqual(res["confirmed_count"], 2)
-        self.assertEqual(provider_symbol_map.to_provider("massive", "EUR-USD"), "C:EURUSD")
-        self.assertEqual(provider_symbol_map.to_provider("massive", "GBP-USD"), "C:GBPUSD")
-
-    async def test_absent_not_mapped_no_deduction(self):
-        main.settings.massive_api_key = "DUMMY_TEST"
-        main.massive_forex_provider = _FakeRef(["C:EURUSD"])  # only EUR
-        await activate_massive_forex_mappings()
-        self.assertIsNone(provider_symbol_map.to_provider("massive", "USD-CHF"))
-        self.assertIsNone(provider_symbol_map.to_provider("massive", "GBP-USD"))
-
-    async def test_canonical_provider_separated(self):
-        main.settings.massive_api_key = "DUMMY_TEST"
-        main.massive_forex_provider = _FakeRef(["C:EURUSD"])
-        await activate_massive_forex_mappings()
-        self.assertNotEqual(provider_symbol_map.to_provider("massive", "EUR-USD"), "EUR-USD")
-        self.assertEqual(provider_symbol_map.to_canonical("massive", "C:EURUSD"), "EUR-USD")
-
-    async def test_xau_reported_but_not_integrated(self):
-        main.settings.massive_api_key = "DUMMY_TEST"
-        main.massive_forex_provider = _FakeRef(["C:EURUSD", "C:XAUUSD"])
-        res = await activate_massive_forex_mappings()
-        self.assertEqual(res["xau"], {"ticker": "C:XAUUSD"})
-        self.assertIsNone(provider_symbol_map.to_provider("massive", "XAU-USD"))
-
-    async def test_xau_absent_is_none(self):
-        main.settings.massive_api_key = "DUMMY_TEST"
-        main.massive_forex_provider = _FakeRef(["C:EURUSD"])
-        res = await activate_massive_forex_mappings()
-        self.assertIsNone(res["xau"])
-
-    async def test_activation_failure_is_failsafe(self):
-        main.settings.massive_api_key = "DUMMY_TEST"
-        main.massive_forex_provider = _FakeRef(exc=httpx.ConnectError("down"))
-        res = await activate_massive_forex_mappings()
-        self.assertFalse(res["activated"])
-        self.assertIsNone(provider_symbol_map.to_provider("massive", "EUR-USD"))
-
-    async def test_failure_reason_is_redacted(self):
-        main.settings.massive_api_key = "DUMMY_TEST"
-        main.massive_forex_provider = _FakeRef(exc=Exception("boom apiKey=SECRET999 x"))
-        res = await activate_massive_forex_mappings()
-        self.assertNotIn("SECRET999", res["reason"] or "")
-        self.assertIn("REDACTED", res["reason"] or "")
-
-
-class MassiveAuthSecurityTests(_MassiveMapBase):
-    async def test_header_auth_key_not_in_url(self):
-        prov = MassiveForexProvider(api_key="DUMMYKEY")
-        await prov.connect()
-        try:
-            auth = prov.client.headers.get("authorization")
-            self.assertIsNotNone(auth)
-            self.assertTrue(auth.startswith("Bearer "))
-            self.assertIn("DUMMYKEY", auth)
-            self.assertNotIn("DUMMYKEY", str(prov.rest_url))  # never in the URL
-        finally:
-            await prov.disconnect()
-
-    async def test_get_candles_params_have_no_apikey(self):
-        prov = MassiveForexProvider(api_key="DUMMYKEY")
-        captured = {}
-
-        async def fake_get(path, params=None):
-            captured["params"] = params or {}
-            return {"results": []}
-
-        prov._get = fake_get
-        main.register_massive_forex_symbol("EUR-USD", "C:EURUSD")
-        await prov.get_candles_range("EUR-USD", "1h", _FX_BASE, _FX_BASE + 3600)
-        self.assertNotIn("apiKey", captured["params"])
-        self.assertNotIn("apikey", captured["params"])
-
-
-class ForexMappingsEndpointTests(unittest.TestCase):
-    def test_mappings_endpoint_structure(self):
-        r = TestClient(create_app()).get("/api/v1/market/forex/mappings")
-        self.assertEqual(r.status_code, 200)
-        body = r.json()
-        self.assertEqual(len(body["mappings"]), len(EXPECTED_MASSIVE_FOREX))
-        for m_ in body["mappings"]:
-            self.assertIn(m_["status"], ("MAPPED", "NOT_MAPPED"))
-
-    def test_mappings_endpoint_no_auth_leak(self):
-        raw = TestClient(create_app()).get("/api/v1/market/forex/mappings").text.lower()
-        for bad in ("apikey", "authorization", "bearer", "massive_api_key"):
-            self.assertNotIn(bad, raw)
-
-
-class RepoKeySecurityTests(unittest.TestCase):
-    def test_main_bearer_is_fstring_only(self):
-        src = open("main.py").read()
-        for seg in src.split("Bearer ")[1:]:
-            self.assertTrue(seg.startswith("{"), "Bearer must be an f-string var in main.py")
-
-    def test_massive_key_default_empty(self):
-        self.assertEqual(main.settings.massive_api_key, "")
-
-
-# ----------------------------- testable UI (frontend) -------------------------
-class FrontendUiTests(unittest.TestCase):
-    def setUp(self):
-        self.html = INDEX.read_text(encoding="utf-8")
-
-    def test_no_massive_secret_in_frontend(self):
-        low = self.html.lower()
-        for bad in ("massive_api_key", "apikey=", "bearer ", "authorization"):
-            self.assertNotIn(bad, low)
-
-    def test_only_relative_api_calls(self):
-        # no hardcoded backend origin; browser talks same-origin only
-        self.assertNotIn("http://", self.html)
-        self.assertNotIn("https://", self.html)
-        self.assertIn('fetch(path', self.html)
-
-    def test_references_real_endpoints_only(self):
-        for ep in ("/health", "/api/v1/market/ticker/",
-                   "/api/v1/market/forex/mappings", "/api/v1/market/candles/"):
-            self.assertIn(ep, self.html)
-
-    def test_polling_labeled_not_streaming(self):
-        self.assertIn("Auto-refresh", self.html)
-        self.assertIn("setInterval(poll", self.html)
-
-    def test_mobile_viewport_and_safe_area(self):
-        self.assertIn("viewport-fit=cover", self.html)
-        self.assertIn("safe-area-inset", self.html)
-
-    def test_forex_not_mapped_guard_present(self):
-        # NOT_MAPPED rows must not be tappable to history (guarded by "MAPPED")
-        self.assertIn('m.status === "MAPPED"', self.html)
-
-
-class UiEndpointCompatibilityTests(unittest.TestCase):
-    def setUp(self):
-        self.client = TestClient(create_app())
-
-    def test_forex_mappings_shape_for_ui(self):
-        body = self.client.get("/api/v1/market/forex/mappings").json()
-        self.assertIn("mappings", body)
-        self.assertIn("activation", body)
-        for m_ in body["mappings"]:
-            self.assertIn("canonical", m_)
-            self.assertIn("status", m_)
-
-    def test_health_shape_for_ui(self):
-        r = self.client.get("/health")
-        self.assertIn(r.status_code, (200, 503))
-        self.assertIn("overall", r.json())
-
-
-# ----------------------------- test-feedback fixes (candles freshness + 403) --
-from main import _latest_quality  # noqa: E402
-
-_FIX_NOW = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)
-
-
-def _cndl(dt, q=DataQualityStatus.VALID):
-    return Candle(dt, 1.0, 2.0, 0.5, 1.5, 3.0, q)
-
-
-class LatestQualityTests(unittest.TestCase):
-    def test_latest_is_newest_bar(self):
-        old = _cndl(_FIX_NOW - timedelta(days=14), DataQualityStatus.STALE)
-        fresh = _cndl(_FIX_NOW, DataQualityStatus.VALID)
-        self.assertEqual(_latest_quality([old, fresh]), "VALID")
-
-    def test_latest_stale_when_newest_old(self):
-        old = _cndl(_FIX_NOW - timedelta(days=14), DataQualityStatus.STALE)
-        older = _cndl(_FIX_NOW - timedelta(days=15), DataQualityStatus.STALE)
-        self.assertEqual(_latest_quality([older, old]), "STALE")
-
-    def test_latest_missing_when_empty(self):
-        self.assertEqual(_latest_quality([]), "MISSING")
-
-
-class CandleOrderingEndpointTests(unittest.TestCase):
-    def setUp(self):
-        self._orig = main.market_provider
-
-    def tearDown(self):
-        main.market_provider = self._orig
-
-    def _client(self, provider):
-        main.market_provider = provider
-        return TestClient(create_app())
-
-    def test_candles_sorted_ascending_and_latest_recent(self):
-        # provider returns NEWEST-FIRST (like Coinbase) + an old tail
-        newest = _cndl(_FIX_NOW, DataQualityStatus.VALID)
-        mid = _cndl(_FIX_NOW - timedelta(hours=1), DataQualityStatus.VALID)
-        old = _cndl(_FIX_NOW - timedelta(days=14), DataQualityStatus.STALE)
-
-        class FakeProvider:
-            async def get_candles(self, symbol, granularity, limit=350):
-                return [newest, mid, old], DataQualityStatus.VALID  # desc / unsorted
-
-        body = self._client(FakeProvider()).get(
-            "/api/v1/market/candles/eth-usd?granularity=1h").json()
-        starts = [c["start"] for c in body["candles"]]
-        self.assertEqual(starts, sorted(starts))                 # ascending
-        self.assertEqual(body["latest_quality"], "VALID")        # newest bar fresh
-        # the last element is the most recent, not the 14-day-old one
-        self.assertTrue(body["candles"][-1]["start"] > body["candles"][0]["start"])
-
-    def test_latest_quality_stale_when_newest_is_old(self):
-        old1 = _cndl(_FIX_NOW - timedelta(days=14), DataQualityStatus.STALE)
-        old2 = _cndl(_FIX_NOW - timedelta(days=14, hours=1), DataQualityStatus.STALE)
-
-        class FakeProvider:
-            async def get_candles(self, symbol, granularity, limit=350):
-                return [old1, old2], DataQualityStatus.VALID
-
-        body = self._client(FakeProvider()).get(
-            "/api/v1/market/candles/eth-usd?granularity=1h").json()
-        self.assertEqual(body["latest_quality"], "STALE")       # not LIVE despite HTTP 200
-
-    def test_ticker_regression_still_ok(self):
-        class FakeProvider:
-            async def get_ticker(self, symbol):
-                return main.MarketDatum("coinbase", symbol.upper(), 100.0,
-                                        _FIX_NOW, DataQualityStatus.VALID)
-        r = self._client(FakeProvider()).get("/api/v1/market/ticker/btc-usd")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["quality"], "VALID")
-
-
-def _http_status_error(code):
-    class _Resp:
-        status_code = code
-    return httpx.HTTPStatusError("boom apiKey=SECRET https://api.massive.com/x MDN mozilla",
-                                 request=None, response=_Resp())
-
-
-class MassiveErrorHandlingTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self._prov = main.massive_forex_provider
-        register_massive_forex_symbol("EUR-USD", "C:EURUSD")
-
-    def tearDown(self):
-        main.massive_forex_provider = self._prov
-
-    async def test_403_is_access_denied_clean(self):
-        class P:
-            async def get_candles_range(self, *a, **k):
-                raise _http_status_error(403)
-        main.massive_forex_provider = P()
-        r = await fetch_forex_history("EUR-USD", "1h", 1756512000, 1756555200)
-        self.assertEqual(r["status"], "ACCESS_DENIED")
-        self.assertEqual(r["provider_symbol"], "C:EURUSD")       # mapping kept
-        for bad in ("SECRET", "mozilla", "http", "apiKey"):
-            self.assertNotIn(bad, r["reason"])
-
-    async def test_429_is_rate_limited(self):
-        class P:
-            async def get_candles_range(self, *a, **k):
-                raise _http_status_error(429)
-        main.massive_forex_provider = P()
-        r = await fetch_forex_history("EUR-USD", "1h", 1756512000, 1756555200)
-        self.assertEqual(r["status"], "RATE_LIMITED")
-
-    async def test_network_error_unavailable_clean(self):
-        class P:
-            async def get_candles_range(self, *a, **k):
-                raise httpx.ConnectError("connect fail apiKey=SECRET https://x")
-        main.massive_forex_provider = P()
-        r = await fetch_forex_history("EUR-USD", "1h", 1756512000, 1756555200)
-        self.assertEqual(r["status"], "UNAVAILABLE")
-        self.assertNotIn("SECRET", r["reason"])
-
-
-class ForexErrorEndpointTests(unittest.TestCase):
-    def setUp(self):
-        self._prov = main.massive_forex_provider
-        register_massive_forex_symbol("EUR-USD", "C:EURUSD")
-
-    def tearDown(self):
-        main.massive_forex_provider = self._prov
-
-    def test_endpoint_403_maps_to_403_clean(self):
-        class P:
-            async def get_candles_range(self, *a, **k):
-                raise _http_status_error(403)
-        main.massive_forex_provider = P()
-        r = TestClient(create_app()).get(
-            "/api/v1/market/forex/EUR-USD/history?granularity=1h&start=1756512000&end=1756555200")
-        self.assertEqual(r.status_code, 403)
-        raw = r.text.lower()
-        for bad in ("secret", "mozilla", "apikey", "http://", "https://"):
-            self.assertNotIn(bad, raw)
-
-
-class UiFreshnessStaticTests(unittest.TestCase):
-    def setUp(self):
-        self.html = INDEX.read_text(encoding="utf-8")
-
-    def test_candles_badge_uses_latest_quality(self):
-        self.assertIn("latest_quality", self.html)
-
-    def test_candles_sorted_before_slice(self):
-        self.assertIn("Date.parse(a.start)", self.html)
-
-    def test_forex_list_not_shown_as_live(self):
-        self.assertIn('mapped ? "MAPPED"', self.html)
-        self.assertIn("b-mapped", self.html)
-
-    def test_clean_403_message_present(self):
-        self.assertIn("accès refusé par le fournisseur (403)", self.html)
-
-    def test_no_raw_exception_rendered(self):
-        # the UI maps status codes to clean text; it never renders a raw exception
-        self.assertNotIn("str(exc)", self.html)
-        self.assertNotIn(".stack", self.html)
-
-
-# ----------------------------- UI: Montreal time + MAPPED != LIVE -------------
-class MontrealTimeUiTests(unittest.TestCase):
-    def setUp(self):
-        self.html = INDEX.read_text(encoding="utf-8")
-
-    def test_montreal_timezone_present(self):
-        self.assertIn("America/Toronto", self.html)
-        self.assertIn("formatMontrealTime", self.html)
-
-    def test_no_hardcoded_utc_offset(self):
-        # DST must come from Intl, never a fixed offset or manual hour math
-        for bad in ("UTC-4", "UTC-5", "-04:00", "-05:00", "getTimezoneOffset", "setHours"):
-            self.assertNotIn(bad, self.html)
-
-    def test_montreal_used_in_candle_table(self):
-        self.assertIn("formatMontrealTime(c.start)", self.html)
-        self.assertIn("Heure (Montréal)", self.html)
-
-    def test_utc_kept_as_secondary(self):
-        self.assertIn("formatUtcTime", self.html)
-
-    def test_mapped_distinct_from_live(self):
-        # forex mapped rows show MAPPED, never converted to LIVE/VALID
-        self.assertIn('qualityBadge(mapped ? "MAPPED"', self.html)
-        self.assertNotIn('qualityBadge(mapped ? "VALID"', self.html)
-        self.assertIn(".b-mapped", self.html)
-
-    def test_not_mapped_unchanged(self):
-        self.assertIn("NOT_MAPPED", self.html)
-
-    def test_crypto_live_from_backend_quality(self):
-        # crypto badge still driven by backend quality (LIVE only if VALID)
-        self.assertIn("qualityBadge(r.data.quality)", self.html)
-        self.assertIn('VALID:["LIVE"', self.html)
-
-
-# ----------------------------- Forex market calendar & sessions ---------------
-from datetime import datetime as _dt  # noqa: E402
-from main import (  # noqa: E402
-    ForexWeekCalendar,
-    calendar_for as _calendar_for,
-    forex_active_sessions,
-    forex_market_state,
-)
-
-
-def _utc(y, mo, d, h, mi=0):
-    return _dt(y, mo, d, h, mi, tzinfo=timezone.utc)
-
-
-class ForexCalendarTests(unittest.TestCase):
-    def test_open_midweek(self):
-        r = forex_market_state(_utc(2026, 1, 14, 12))  # Wednesday noon
-        self.assertEqual(r["market_state"], "OPEN")
-        self.assertIsNotNone(r["next_close"])
-        self.assertIsNone(r["next_open"])
-
-    def test_closed_weekend(self):
-        r = forex_market_state(_utc(2026, 1, 17, 12))  # Saturday
-        self.assertEqual(r["market_state"], "CLOSED_WEEKEND")
-        self.assertIsNotNone(r["next_open"])
-        self.assertIsNone(r["next_close"])
-
-    def test_open_boundary_winter_2200z(self):
-        # Winter (EST): opens Sunday 22:00 UTC
-        self.assertEqual(forex_market_state(_utc(2026, 1, 11, 21, 59))["market_state"],
-                         "CLOSED_WEEKEND")
-        self.assertEqual(forex_market_state(_utc(2026, 1, 11, 22, 0))["market_state"], "OPEN")
-
-    def test_open_boundary_summer_2100z(self):
-        # Summer (EDT): opens Sunday 21:00 UTC (DST auto, never a fixed offset)
-        self.assertEqual(forex_market_state(_utc(2026, 7, 12, 20, 59))["market_state"],
-                         "CLOSED_WEEKEND")
-        self.assertEqual(forex_market_state(_utc(2026, 7, 12, 21, 0))["market_state"], "OPEN")
-
-    def test_close_boundary_friday_winter(self):
-        self.assertEqual(forex_market_state(_utc(2026, 1, 16, 21, 59))["market_state"], "OPEN")
-        self.assertEqual(forex_market_state(_utc(2026, 1, 16, 22, 0))["market_state"],
-                         "CLOSED_WEEKEND")
-
-    def test_dst_transition_march(self):
-        # US DST starts 2026-03-08; the Sunday open still resolves via IANA (not a
-        # fixed offset). Just assert it computes a definitive OPEN/CLOSED, not UNKNOWN.
-        r = forex_market_state(_utc(2026, 3, 8, 21, 30))
-        self.assertIn(r["market_state"], ("OPEN", "CLOSED_WEEKEND"))
-
-    def test_utc_day_change(self):
-        # Thursday 23:30 UTC -> Friday 00:xx local NY still within the week -> OPEN
-        self.assertEqual(forex_market_state(_utc(2026, 1, 15, 23, 30))["market_state"], "OPEN")
-
-    def test_market_state_independent_from_quality(self):
-        r = forex_market_state(_utc(2026, 1, 14, 12))
-        self.assertNotIn("quality", r)  # OPEN != LIVE; no data-quality field here
-        self.assertEqual(r["timezone_internal"], "UTC")
-        self.assertEqual(r["display_timezone"], "America/Toronto")
-
-    def test_holidays_not_implemented(self):
-        self.assertEqual(forex_market_state(_utc(2026, 1, 14, 12))["holidays"], "NOT_IMPLEMENTED")
-
-    def test_sessions_marked_indicative(self):
-        sessions = forex_active_sessions(_utc(2026, 1, 14, 12))
-        self.assertEqual(len(sessions), 4)
-        self.assertTrue(all(s["indicative"] is True for s in sessions))
-
-    def test_session_active_london_midday(self):
-        # 12:00 UTC in January -> London local ~12:00 (within 08-17) -> active
-        sessions = forex_active_sessions(_utc(2026, 1, 14, 12))
-        london = next(s for s in sessions if s["name"] == "London")
-        self.assertTrue(london["active"])
-
-    def test_calendar_for_forex_week(self):
-        cal = _calendar_for(MarketCalendarPolicy.FOREX_WEEK)
-        self.assertIsInstance(cal, ForexWeekCalendar)
-
-    def test_forex_calendar_open_closed(self):
-        cal = _calendar_for(MarketCalendarPolicy.FOREX_WEEK)
-        open_ts = int(_utc(2026, 1, 14, 12).timestamp())
-        wknd_ts = int(_utc(2026, 1, 17, 12).timestamp())
-        self.assertEqual(cal.is_market_expected_open(open_ts), OpenState.OPEN)
-        self.assertEqual(cal.is_market_expected_open(wknd_ts), OpenState.CLOSED)
-
-    def test_forex_gaps_still_unknown_no_regression(self):
-        # closed market / no quote must NOT become a gap
-        cal = _calendar_for(MarketCalendarPolicy.FOREX_WEEK)
-        rep = cal.analyze_gaps([0, 7200], 3600)
-        self.assertEqual(rep.status, "UNKNOWN")
-        self.assertEqual(rep.missing, [])
-
-    def test_coinbase_24_7_unchanged(self):
-        cal = _calendar_for(MarketCalendarPolicy.ALWAYS_OPEN_24_7)
-        self.assertEqual(cal.is_market_expected_open(0), OpenState.OPEN)
-
-    def test_api_serialisation_shape(self):
-        r = forex_market_state(_utc(2026, 1, 14, 12))
-        for key in ("asset_class", "market_state", "reason", "current_session",
-                    "sessions", "next_open", "next_close", "timezone_internal",
-                    "display_timezone", "source", "as_of"):
-            self.assertIn(key, r)
-        # timestamps are ISO strings or None (JSON-serialisable), never datetime
-        for k in ("next_open", "next_close", "as_of"):
-            self.assertTrue(r[k] is None or isinstance(r[k], str))
-
-
-class ForexMarketStateEndpointTests(unittest.TestCase):
-    def test_endpoint_ok(self):
-        r = TestClient(create_app()).get("/api/v1/market/forex/market-state")
-        self.assertEqual(r.status_code, 200)
-        body = r.json()
-        self.assertEqual(body["asset_class"], "FOREX")
-        self.assertIn(body["market_state"], ("OPEN", "CLOSED", "CLOSED_WEEKEND", "UNKNOWN"))
-
-
-class ForexCalendarUiTests(unittest.TestCase):
-    def setUp(self):
-        self.html = INDEX.read_text(encoding="utf-8")
-
-    def test_market_state_endpoint_used(self):
-        self.assertIn("/api/v1/market/forex/market-state", self.html)
-
-    def test_market_hours_in_montreal(self):
-        self.assertIn("formatMontrealTime(d.next_close)", self.html)
-        self.assertIn("formatMontrealTime(d.next_open)", self.html)
-
-    def test_info_help_present(self):
-        self.assertIn("Horaires du marché Forex", self.html)
-
-    def test_no_hardcoded_offset_in_ui(self):
-        for bad in ("UTC-4", "UTC-5", "-04:00", "-05:00", "getTimezoneOffset"):
-            self.assertNotIn(bad, self.html)
-
-
-# ----------------------------- Twelve Data XAU/USD (1/3: provider REST) --------
-from decimal import Decimal as _Dec  # noqa: E402
-from main import (  # noqa: E402
-    TWELVEDATA_GRANULARITIES,
-    TwelveDataProvider,
-    parse_twelvedata_time_series,
-    twelvedata_bar_from_value,
-)
-
-
-def _td_val(dt="2026-08-30 14:30:00", o="2650.5", h="2651", low="2649", c="2650.9", v="0"):
-    return {"datetime": dt, "open": o, "high": h, "low": low, "close": c, "volume": v}
-
-
-class _TDResp:
-    def __init__(self, status_code, body):
-        self.status_code = status_code
-        self._body = body
-
-    def json(self):
-        return self._body
-
-
-class _TDClient:
-    def __init__(self, resp=None, exc=None):
-        self.resp = resp
-        self.exc = exc
-        self.calls = []
-
-    async def get(self, path, params=None):
-        self.calls.append((path, params))
-        if self.exc is not None:
-            raise self.exc
-        return self.resp
-
-
-class TwelveDataParsingTests(unittest.TestCase):
-    def test_ohlc_parsed_as_exact_decimal_no_float(self):
-        bar = twelvedata_bar_from_value(
-            _td_val(o="2650.123456789012345678"), float("inf"))
-        self.assertNotEqual(bar.status, DataQualityStatus.INVALID)
-        self.assertIsInstance(bar.open, _Dec)
-        self.assertNotIsInstance(bar.open, float)
-        # full precision preserved -> proves no intermediate float conversion
-        self.assertEqual(str(bar.open), "2650.123456789012345678")
-
-    def test_timestamp_utc_intraday(self):
-        bar = twelvedata_bar_from_value(_td_val(dt="2026-08-30 14:30:00"), float("inf"))
-        self.assertIsNotNone(bar.datetime_utc.tzinfo)
-        self.assertEqual(bar.datetime_utc.hour, 14)
-
-    def test_invalid_ohlc_is_invalid(self):
-        self.assertEqual(
-            twelvedata_bar_from_value(_td_val(o="x"), float("inf")).status,
-            DataQualityStatus.INVALID)
-
-    def test_bad_datetime_is_invalid(self):
-        self.assertEqual(
-            twelvedata_bar_from_value(_td_val(dt="nope"), float("inf")).status,
-            DataQualityStatus.INVALID)
-
-    def test_volume_optional_for_spot(self):
-        item = {"datetime": "2026-08-30 14:30:00", "open": "1", "high": "1",
-                "low": "1", "close": "1"}
-        bar = twelvedata_bar_from_value(item, float("inf"))
-        self.assertNotEqual(bar.status, DataQualityStatus.INVALID)
-        self.assertIsNone(bar.volume)
-
-    def test_negative_price_invalid(self):
-        self.assertEqual(
-            twelvedata_bar_from_value(_td_val(o="-1"), float("inf")).status,
-            DataQualityStatus.INVALID)
-
-    def test_body_status_error_429_rate_limited(self):
-        r = parse_twelvedata_time_series({"status": "error", "code": 429}, float("inf"))
-        self.assertEqual(r.status, "RATE_LIMITED")
-
-    def test_body_status_error_403_access_denied(self):
-        r = parse_twelvedata_time_series({"status": "error", "code": 403}, float("inf"))
-        self.assertEqual(r.status, "ACCESS_DENIED")
-
-    def test_body_status_error_other_unavailable(self):
-        r = parse_twelvedata_time_series({"status": "error", "code": 500}, float("inf"))
-        self.assertEqual(r.status, "UNAVAILABLE")
-
-    def test_empty_values_is_empty(self):
-        r = parse_twelvedata_time_series({"status": "ok", "values": []}, float("inf"))
-        self.assertEqual(r.status, "EMPTY")
-
-    def test_malformed_payload_unavailable(self):
-        self.assertEqual(
-            parse_twelvedata_time_series("not-a-dict", float("inf")).status, "UNAVAILABLE")
-
-
-class TwelveDataMappingTests(unittest.TestCase):
-    def test_official_mapping_xau(self):
-        self.assertEqual(provider_symbol_map.to_provider("twelvedata", "XAU-USD"), "XAU/USD")
-
-    def test_granularities_verified_only(self):
-        self.assertEqual(TWELVEDATA_GRANULARITIES["1h"], "1h")
-        self.assertIn("4h", TWELVEDATA_GRANULARITIES)
-        self.assertNotIn("6h", TWELVEDATA_GRANULARITIES)  # 6h NOT_SUPPORTED
-        self.assertNotIn("1d", TWELVEDATA_GRANULARITIES)  # 1d NOT_IMPLEMENTED here
-
-
-class TwelveDataProviderTests(unittest.IsolatedAsyncioTestCase):
-    async def test_no_key_no_network(self):
-        prov = TwelveDataProvider(api_key="")
-        spy = _TDClient(_TDResp(200, {"values": []}))
-        prov.client = spy
-        r = await prov.get_time_series("XAU-USD", "1h")
-        self.assertEqual(r.status, "NO_KEY")
-        self.assertEqual(spy.calls, [])  # no request performed
-
-    async def test_not_mapped(self):
-        prov = TwelveDataProvider(api_key="DUMMY")
-        self.assertEqual((await prov.get_time_series("EUR-USD", "1h")).status, "NOT_MAPPED")
-
-    async def test_6h_not_supported(self):
-        prov = TwelveDataProvider(api_key="DUMMY")
-        self.assertEqual((await prov.get_time_series("XAU-USD", "6h")).status, "NOT_SUPPORTED")
-
-    async def test_http_403_access_denied(self):
-        prov = TwelveDataProvider(api_key="DUMMY")
-        prov.client = _TDClient(_TDResp(403, {}))
-        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "ACCESS_DENIED")
-
-    async def test_http_401_access_denied(self):
-        prov = TwelveDataProvider(api_key="DUMMY")
-        prov.client = _TDClient(_TDResp(401, {}))
-        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "ACCESS_DENIED")
-
-    async def test_http_429_rate_limited(self):
-        prov = TwelveDataProvider(api_key="DUMMY")
-        prov.client = _TDClient(_TDResp(429, {}))
-        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "RATE_LIMITED")
-
-    async def test_http_500_unavailable(self):
-        prov = TwelveDataProvider(api_key="DUMMY")
-        prov.client = _TDClient(_TDResp(500, {}))
-        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "UNAVAILABLE")
-
-    async def test_timeout_unavailable(self):
-        prov = TwelveDataProvider(api_key="DUMMY")
-        prov.client = _TDClient(exc=httpx.TimeoutException("t"))
-        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "UNAVAILABLE")
-
-    async def test_network_error_unavailable(self):
-        prov = TwelveDataProvider(api_key="DUMMY")
-        prov.client = _TDClient(exc=httpx.ConnectError("x"))
-        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "UNAVAILABLE")
-
-    async def test_body_error_on_http_200(self):
-        prov = TwelveDataProvider(api_key="DUMMY")
-        prov.client = _TDClient(_TDResp(200, {"status": "error", "code": 429}))
-        self.assertEqual((await prov.get_time_series("XAU-USD", "1h")).status, "RATE_LIMITED")
-
-    async def test_ok_returns_bars_ascending(self):
-        prov = TwelveDataProvider(api_key="DUMMY")
-        body = {"values": [_td_val(dt="2026-08-30 14:00:00", c="2652"),
-                           _td_val(dt="2026-08-30 15:00:00", c="2653")]}
-        prov.client = _TDClient(_TDResp(200, body))
-        r = await prov.get_time_series("XAU-USD", "1h")
-        self.assertEqual(r.status, "OK")
-        self.assertEqual(len(r.bars), 2)
-
-    async def test_key_absent_from_request_params(self):
-        prov = TwelveDataProvider(api_key="DUMMYKEY")
-        fc = _TDClient(_TDResp(200, {"values": []}))
-        prov.client = fc
-        await prov.get_time_series("XAU-USD", "1h")
-        for _path, params in fc.calls:
-            self.assertNotIn("apikey", params or {})
-            self.assertNotIn("DUMMYKEY", str(params))
-
-    async def test_header_auth_key_not_in_url(self):
-        prov = TwelveDataProvider(api_key="DUMMYKEY")
-        await prov.connect()
-        try:
-            auth = prov.client.headers.get("authorization")
-            self.assertIsNotNone(auth)
-            self.assertTrue(auth.startswith("apikey "))
-            self.assertNotIn("DUMMYKEY", str(prov.rest_url))
-        finally:
-            await prov.disconnect()
-
-    async def test_error_reason_has_no_secret(self):
-        prov = TwelveDataProvider(api_key="DUMMYKEY")
-        prov.client = _TDClient(_TDResp(403, {}))
-        r = await prov.get_time_series("XAU-USD", "1h")
-        self.assertNotIn("DUMMYKEY", r.reason or "")
-
-
-# ----------------------------- Twelve Data XAU/USD (2/3: instrument+history+DB) -
-from main import (  # noqa: E402
-    CandleRow as _CandleRow2,
-    TwelveDataBar,
-    TwelveDataResult,
-    fetch_metal_history,
-)
-
-_XAU_BASE = int(datetime(2026, 8, 30, 0, 0, tzinfo=timezone.utc).timestamp())
-
-
-def _xau_bar(k, close="2650.5", vol="0", status=DataQualityStatus.VALID):
-    dt = datetime.fromtimestamp(_XAU_BASE + k * 3600, tz=timezone.utc)
-    v = _Dec(vol) if vol is not None else None
-    return TwelveDataBar(dt, _Dec("2650"), _Dec("2655"), _Dec("2648"), _Dec(close), v, status)
-
-
-class _FakeTD:
-    def __init__(self, result):
-        self.result = result
-
-    async def get_time_series(self, canonical, granularity, outputsize=30, start=None, end=None):
-        return self.result
-
-
-class MetalInstrumentTests(unittest.TestCase):
-    def test_xau_registered_metal(self):
-        inst = instrument_registry.get("XAU-USD")
-        self.assertIsNotNone(inst)
-        self.assertEqual(inst.asset_class, AssetClass.METAL)
-        self.assertEqual(inst.display_name, "Gold Spot")
-
-    def test_xau_calendar_not_configured(self):
-        self.assertEqual(instrument_registry.get("XAU-USD").market_calendar,
-                         MarketCalendarPolicy.NOT_CONFIGURED)
-
-    def test_xau_volume_unknown_and_metadata_none(self):
-        inst = instrument_registry.get("XAU-USD")
-        self.assertEqual(inst.volume_semantics, VolumeSemantics.UNKNOWN)
-        self.assertIsNone(inst.price_precision)
-        self.assertIsNone(inst.tick_size)
-
-    def test_mapping_present_even_though_entitlement_unknown(self):
-        # MAPPED is not an entitlement: the verified provider symbol stays mapped
-        self.assertEqual(provider_symbol_map.to_provider("twelvedata", "XAU-USD"), "XAU/USD")
-
-
-class CandleRowDecimalRegressionTests(unittest.TestCase):
-    def test_candlerow_row_to_values_exact_decimal(self):
-        row = _CandleRow2("coinbase", "BTC-USD", "1h",
-                          datetime(2026, 8, 30, 12, tzinfo=timezone.utc),
-                          _Dec("50000.12"), _Dec("50010"), _Dec("49990"),
-                          _Dec("50005.5"), _Dec("3.25"), DataQualityStatus.VALID,
-                          "rest", None, datetime(2026, 8, 30, 12, tzinfo=timezone.utc))
-        vals = main._row_to_values(row, datetime(2026, 8, 30, 12, tzinfo=timezone.utc))
-        self.assertIsInstance(vals["open"], _Dec)
-        self.assertEqual(vals["open"], _Dec("50000.12"))
-
-    def test_xau_full_precision_no_float_end_to_end(self):
-        # string -> Decimal -> CandleRow -> _row_to_values, precision preserved
-        rows = main._metal_bars_to_rows(
-            "twelvedata", "XAU/USD", "1h",
-            [_xau_bar(0, close="2650.123456789012345678")], datetime.now(timezone.utc))
-        vals = main._row_to_values(rows[0], datetime.now(timezone.utc))
-        self.assertEqual(str(vals["close"]), "2650.123456789012345678")
-
-
-class MetalHistoryAssemblerTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self._saved = main.twelvedata_provider
-
-    def tearDown(self):
-        main.twelvedata_provider = self._saved
-
-    async def _run(self, result, start=None, end=None, gran="1h"):
-        main.twelvedata_provider = _FakeTD(result)
-        return await fetch_metal_history("XAU-USD", gran,
-                                         start or _XAU_BASE, end or _XAU_BASE + 5 * 3600)
-
-    async def test_ok_sorted_deduped_decimal(self):
-        res = TwelveDataResult("OK", [_xau_bar(2), _xau_bar(0), _xau_bar(1), _xau_bar(1)])
-        h = await self._run(res)
-        self.assertEqual(h.result["status"], "OK")
-        self.assertEqual(h.result["count"], 3)  # deduped
-        starts = [c["start"] for c in h.result["candles"]]
-        self.assertEqual(starts, sorted(starts))
-        self.assertTrue(all(isinstance(r.close, _Dec) for r in h.rows))
-
-    async def test_absence_not_a_gap(self):
-        h = await self._run(TwelveDataResult("OK", [_xau_bar(0), _xau_bar(1), _xau_bar(3)]))
-        self.assertEqual(h.result["gaps_status"], "UNKNOWN")
-        self.assertEqual(h.result["count"], 3)  # no fabricated bar
-
-    async def test_invalid_excluded(self):
-        res = TwelveDataResult("OK", [_xau_bar(0), _xau_bar(1, status=DataQualityStatus.INVALID)])
-        h = await self._run(res)
-        self.assertEqual(h.result["invalid_candles_count"], 1)
-        self.assertEqual(h.result["count"], 1)
-
-    async def test_half_open_filter(self):
-        h = await self._run(TwelveDataResult("OK", [_xau_bar(0), _xau_bar(1), _xau_bar(2)]),
-                            start=_XAU_BASE, end=_XAU_BASE + 2 * 3600)
-        self.assertEqual(h.result["count"], 2)  # k=2 (== end) excluded
-
-    async def test_volume_semantics_unknown(self):
-        h = await self._run(TwelveDataResult("OK", [_xau_bar(0)]))
-        self.assertEqual(h.result["volume_semantics"], "UNKNOWN")
-
-    async def test_empty(self):
-        h = await self._run(TwelveDataResult("EMPTY", []))
-        self.assertEqual(h.result["status"], "EMPTY")
-        self.assertEqual(h.rows, [])
-
-    async def test_access_denied_propagated_no_rows(self):
-        denied = TwelveDataResult("ACCESS_DENIED", [], "access denied by provider (403)")
-        h = await self._run(denied)
-        self.assertEqual(h.result["status"], "ACCESS_DENIED")
-        self.assertEqual(h.rows, [])
-        self.assertNotIn("DUMMY", str(h.result.get("reason")))
-
-    async def test_no_key_propagated(self):
-        h = await self._run(TwelveDataResult("NO_KEY", [], "TWELVEDATA_API_KEY not set"))
-        self.assertEqual(h.result["status"], "NO_KEY")
-
-    async def test_unknown_instrument_raises(self):
-        main.twelvedata_provider = _FakeTD(TwelveDataResult("OK", []))
-        with self.assertRaises(ValueError):
-            await fetch_metal_history("ZZZ-ZZZ", "1h", _XAU_BASE, _XAU_BASE + 3600)
-
-    async def test_start_ge_end_raises(self):
-        main.twelvedata_provider = _FakeTD(TwelveDataResult("OK", []))
-        with self.assertRaises(ValueError):
-            await fetch_metal_history("XAU-USD", "1h", _XAU_BASE, _XAU_BASE)
-
-
-class MetalEndpointTests(unittest.TestCase):
-    def setUp(self):
-        self._saved = main.twelvedata_provider
-        self._ready = persistence_state.ready
-        persistence_state.ready = False  # avoid DB writes in these status-mapping tests
-
-    def tearDown(self):
-        main.twelvedata_provider = self._saved
-        persistence_state.ready = self._ready
-
-    def _client(self, result):
-        main.twelvedata_provider = _FakeTD(result)
-        return TestClient(create_app())
-
-    def test_ok_200(self):
-        r = self._client(TwelveDataResult("OK", [_xau_bar(0)])).get(
-            "/api/v1/market/metal/XAU-USD/history?granularity=1h&start=%d&end=%d"
-            % (_XAU_BASE, _XAU_BASE + 5 * 3600))
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["source"], "twelvedata")
-
-    def test_access_denied_403(self):
-        r = self._client(TwelveDataResult("ACCESS_DENIED", [], "x")).get(
-            "/api/v1/market/metal/XAU-USD/history?granularity=1h&start=%d&end=%d"
-            % (_XAU_BASE, _XAU_BASE + 3600))
-        self.assertEqual(r.status_code, 403)
-
-    def test_rate_limited_429(self):
-        r = self._client(TwelveDataResult("RATE_LIMITED", [], "x")).get(
-            "/api/v1/market/metal/XAU-USD/history?granularity=1h&start=%d&end=%d"
-            % (_XAU_BASE, _XAU_BASE + 3600))
-        self.assertEqual(r.status_code, 429)
-
-    def test_no_key_503(self):
-        r = self._client(TwelveDataResult("NO_KEY", [], "x")).get(
-            "/api/v1/market/metal/XAU-USD/history?granularity=1h&start=%d&end=%d"
-            % (_XAU_BASE, _XAU_BASE + 3600))
-        self.assertEqual(r.status_code, 503)
-
-    def test_6h_not_supported_409(self):
-        r = self._client(TwelveDataResult("NOT_SUPPORTED", [], "x")).get(
-            "/api/v1/market/metal/XAU-USD/history?granularity=6h&start=%d&end=%d"
-            % (_XAU_BASE, _XAU_BASE + 3600))
-        self.assertEqual(r.status_code, 409)
-
-    def test_no_secret_in_response(self):
-        denied = TwelveDataResult("ACCESS_DENIED", [], "access denied by provider (403)")
-        raw = self._client(denied).get(
-            "/api/v1/market/metal/XAU-USD/history?granularity=1h&start=%d&end=%d"
-            % (_XAU_BASE, _XAU_BASE + 3600)).text.lower()
-        for bad in ("apikey", "authorization", "bearer", "twelvedata_api_key"):
-            self.assertNotIn(bad, raw)
-
-
-class MetalPersistenceTests(_DBBase):
-    async def test_xau_persisted_source_twelvedata_exact_decimal(self):
-        saved = main.twelvedata_provider
-        main.twelvedata_provider = _FakeTD(TwelveDataResult(
-            "OK", [_xau_bar(0, close="2650.123456789012345678"), _xau_bar(1, close="2651.5")]))
-        try:
-            h = await fetch_metal_history("XAU-USD", "1h", _XAU_BASE, _XAU_BASE + 5 * 3600)
-            n = await main.persist_candles(h.rows)
-            self.assertEqual(n, 2)
-            # read_stored_candles filters source='coinbase'; check twelvedata rows raw
-            async with main.engine.connect() as conn:
-                res = await conn.execute(main.text(
-                    "SELECT close FROM candles WHERE source='twelvedata' "
-                    "AND product_id='XAU/USD' ORDER BY bucket_start ASC"))
-                closes = [str(r[0]) for r in res.fetchall()]
-            self.assertEqual(len(closes), 2)
-            # exact Decimal preserved through NUMERIC(38,18)
-            self.assertTrue(closes[0].startswith("2650.123456789012345678"))
-            async with main.engine.connect() as conn:
-                cnt = await conn.execute(main.text(
-                    "SELECT count(*) FROM candles WHERE source='coinbase'"))
-                self.assertEqual(cnt.scalar(), 0)  # no Coinbase regression/leak
-        finally:
-            main.twelvedata_provider = saved
-
-
-# ----------------------------- Twelve Data XAU/USD (3/3: /quote + Gold UI) -----
-from main import (  # noqa: E402
-    TwelveDataQuoteResult,
-    fetch_metal_quote,
-    parse_twelvedata_quote,
-)
-
-
-class TwelveDataQuoteTests(unittest.TestCase):
-    def test_quote_price_decimal_no_float(self):
-        q = parse_twelvedata_quote(
-            {"close": "2650.123456789012345678", "is_market_open": True,
-             "timestamp": int(datetime(2026, 8, 30, 14, tzinfo=timezone.utc).timestamp())})
-        self.assertEqual(q.status, "OK")
-        self.assertIsInstance(q.price, _Dec)
-        self.assertNotIsInstance(q.price, float)
-        self.assertEqual(str(q.price), "2650.123456789012345678")
-        self.assertIs(q.is_market_open, True)
-
-    def test_quote_body_error(self):
-        self.assertEqual(parse_twelvedata_quote({"status": "error", "code": 429}).status,
-                         "RATE_LIMITED")
-        self.assertEqual(parse_twelvedata_quote({"status": "error", "code": 403}).status,
-                         "ACCESS_DENIED")
-
-    def test_quote_bad_price_unavailable(self):
-        self.assertEqual(parse_twelvedata_quote({"close": "-1"}).status, "UNAVAILABLE")
-
-    def test_is_market_open_non_bool_becomes_none(self):
-        self.assertIsNone(parse_twelvedata_quote({"close": "2650", "is_market_open": "yes"})
-                          .is_market_open)
-
-
-class MetalQuoteAssemblerTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self._saved = main.twelvedata_provider
-
-    def tearDown(self):
-        main.twelvedata_provider = self._saved
-
-    async def _run(self, result):
-        main.twelvedata_provider = type("P", (), {
-            "get_quote": staticmethod(lambda canon: _async_return(result))})()
-        return await fetch_metal_quote("XAU-USD")
-
-    async def test_market_open_does_not_make_it_live(self):
-        # is_market_open=True but no quote timestamp -> quality UNKNOWN, never LIVE
-        r = await self._run(TwelveDataQuoteResult("OK", _Dec("2650"), True, None))
-        self.assertEqual(r["status"], "OK")
-        self.assertEqual(r["is_market_open"], True)
-        self.assertEqual(r["quality"], "UNKNOWN")  # not LIVE from is_market_open
-
-    async def test_price_serialised_as_string(self):
-        r = await self._run(TwelveDataQuoteResult("OK", _Dec("2650.5"), False, None))
-        self.assertEqual(r["price"], "2650.5")  # Decimal -> string
-
-    async def test_access_denied_no_price(self):
-        r = await self._run(TwelveDataQuoteResult("ACCESS_DENIED", None, None, None, "x"))
-        self.assertEqual(r["status"], "ACCESS_DENIED")
-        self.assertIsNone(r["price"])
-
-
-class MetalQuoteEndpointTests(unittest.TestCase):
-    def setUp(self):
-        self._saved = main.twelvedata_provider
-
-    def tearDown(self):
-        main.twelvedata_provider = self._saved
-
-    def _client(self, result):
-        main.twelvedata_provider = type("P", (), {
-            "get_quote": staticmethod(lambda canon: _async_return(result))})()
-        return TestClient(create_app())
-
-    def test_quote_ok_200(self):
-        r = self._client(TwelveDataQuoteResult("OK", _Dec("2650.5"), True, None)).get(
-            "/api/v1/market/metal/XAU-USD/quote")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["price"], "2650.5")
-
-    def test_quote_access_denied_403(self):
-        r = self._client(TwelveDataQuoteResult("ACCESS_DENIED", None, None, None, "x")).get(
-            "/api/v1/market/metal/XAU-USD/quote")
-        self.assertEqual(r.status_code, 403)
-
-    def test_quote_no_secret_in_response(self):
-        raw = self._client(TwelveDataQuoteResult("OK", _Dec("2650"), True, None)).get(
-            "/api/v1/market/metal/XAU-USD/quote").text.lower()
-        for bad in ("apikey", "authorization", "bearer", "twelvedata_api_key"):
-            self.assertNotIn(bad, raw)
-
-
-class GoldUiTests(unittest.TestCase):
-    def setUp(self):
-        self.html = INDEX.read_text(encoding="utf-8")
-
-    def test_metal_view_and_labels(self):
-        self.assertIn('id:"metal"', self.html)
-        self.assertIn("XAU-USD", self.html)
-        self.assertIn("Gold Spot", self.html)
-        self.assertIn("Twelve Data", self.html)
-
-    def test_metal_endpoints_used(self):
-        self.assertIn("/api/v1/market/metal/", self.html)
-        self.assertIn("/quote", self.html)
-
-    def test_quality_independent_from_market_open(self):
-        # the badge is driven by backend quality, not is_market_open
-        self.assertIn("qualityBadge(d.quality", self.html)
-        self.assertIn("Marché (fournisseur)", self.html)  # is_market_open shown as info only
-
-    def test_no_twelvedata_secret_in_frontend(self):
-        low = self.html.lower()
-        for bad in ("twelvedata_api_key", "apikey=", "bearer "):
-            self.assertNotIn(bad, low)
-
-    def test_price_from_string_not_fabricated(self):
-        # metal price comes from backend d.price (Decimal string), guarded by null check
-        self.assertIn("r.data.price == null", self.html)
-
-
-def _async_return(value):
-    async def _coro():
-        return value
-    return _coro()
-
-
-# ----------------------------- runtime fixes: quote STALE trace + mobile OHLC --
-class MetalQuoteFreshnessTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self._saved = main.twelvedata_provider
-
-    def tearDown(self):
-        main.twelvedata_provider = self._saved
-
-    async def _run(self, result):
-        main.twelvedata_provider = type("P", (), {
-            "get_quote": staticmethod(lambda canon: _async_return(result))})()
-        return await fetch_metal_quote("XAU-USD")
-
-    async def test_old_provider_timestamp_is_stale_not_live(self):
-        # provider quote timestamp 144 min old + market open -> STALE (correct), never LIVE
-        old = datetime.now(timezone.utc) - timedelta(minutes=144)
-        r = await self._run(TwelveDataQuoteResult("OK", _Dec("2650"), True, old))
-        self.assertEqual(r["quality"], DataQualityStatus.STALE.value)
-        self.assertIs(r["is_market_open"], True)  # open, yet still STALE
-        self.assertGreater(r["quote_age_seconds"], 8000)  # ~8640s, transparent reason
-
-    async def test_recent_timestamp_can_be_valid(self):
-        fresh = datetime.now(timezone.utc)
-        r = await self._run(TwelveDataQuoteResult("OK", _Dec("2650"), True, fresh))
-        self.assertEqual(r["quality"], DataQualityStatus.VALID.value)
-
-    async def test_threshold_unchanged_ticker_max_age(self):
-        # freshness budget for the quote is the ticker budget (unchanged), documenting
-        # that STALE is not forced to LIVE by widening the threshold
-        self.assertEqual(main.settings.ticker_max_age_seconds, 10.0)
-
-
-class MobileOhlcTableTests(unittest.TestCase):
-    def setUp(self):
-        self.html = INDEX.read_text(encoding="utf-8")
-
-    def test_ohlc_table_has_horizontal_scroll_wrapper(self):
-        self.assertIn(".tbl-wrap", self.html)
-        self.assertIn("overflow-x:auto", self.html)
-        self.assertIn('h("div",{class:"tbl-wrap"}', self.html)
-
-    def test_table_min_width_and_nowrap(self):
-        self.assertIn("min-width:440px", self.html)
-        self.assertIn("white-space:nowrap", self.html)
-
-    def test_all_ohlc_columns_present(self):
-        # no column removed: O/H/L/C still rendered
-        for col in ('h("th",{},["O"])', 'h("th",{},["H"])',
-                    'h("th",{},["L"])', 'h("th",{},["C"])'):
-            self.assertIn(col, self.html)
-
-
-# ----------------------------- Massive US cash indices REST -------------------
-import json as _json  # noqa: E402
-from main import (  # noqa: E402
-    MassiveIndexResult,
-    MassiveIndicesProvider,
-    fetch_index_history,
-    index_bar_from_agg,
-    parse_massive_index_aggs,
-)
-
-_IX_BASE = 1755000000  # some UNIX seconds anchor
-
-
-def _ix_agg(k, close="100.5"):
-    return {"o": "100", "h": "101", "l": "99", "c": close, "t": (_IX_BASE + k * 86400) * 1000}
-
-
-class _IXResp:
-    def __init__(self, status_code, text):
-        self.status_code = status_code
-        self.text = text
-
-
-class _IXClient:
-    def __init__(self, resp=None, exc=None):
-        self.resp = resp
-        self.exc = exc
-        self.calls = []
-
-    async def get(self, path, params=None):
-        self.calls.append((path, params))
-        if self.exc is not None:
-            raise self.exc
-        return self.resp
-
-
-class IndexInstrumentTests(unittest.TestCase):
-    def test_three_cash_indices_registered(self):
-        for c, name in (("SPX", "S&P 500"), ("NDX", "Nasdaq-100"),
-                        ("US30", "Dow Jones Industrial Average")):
-            inst = instrument_registry.get(c)
-            self.assertIsNotNone(inst)
-            self.assertEqual(inst.asset_class, AssetClass.INDEX)
-            self.assertEqual(inst.display_name, name)
-
-    def test_official_mappings_cash_not_etf_or_future(self):
-        self.assertEqual(provider_symbol_map.to_provider("massive", "SPX"), "I:SPX")
-        self.assertEqual(provider_symbol_map.to_provider("massive", "NDX"), "I:NDX")
-        self.assertEqual(provider_symbol_map.to_provider("massive", "US30"), "I:DJI")
-
-    def test_volume_not_available_and_metadata_none(self):
-        inst = instrument_registry.get("SPX")
-        self.assertEqual(inst.volume_semantics, VolumeSemantics.NOT_AVAILABLE)
-        self.assertIsNone(inst.price_precision)
-        self.assertIsNone(inst.tick_size)
-
-    def test_index_calendar_is_us_equity_rth(self):
-        for symbol in ("SPX", "NDX", "US30"):
-            self.assertEqual(instrument_registry.get(symbol).market_calendar,
-                             MarketCalendarPolicy.US_EQUITY_RTH)
-
-    def test_index_calendar_regular_hours_open(self):
-        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
-        # 2026-08-31 14:00 UTC = Monday 10:00 EDT.
-        self.assertEqual(cal.is_market_expected_open(1788184800), OpenState.OPEN)
-
-    def test_index_calendar_before_open_closed(self):
-        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
-        # 2026-08-31 13:00 UTC = Monday 09:00 EDT.
-        self.assertEqual(cal.is_market_expected_open(1788181200), OpenState.CLOSED)
-
-    def test_index_calendar_at_close_closed(self):
-        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
-        # 2026-08-31 20:00 UTC = Monday 16:00 EDT; half-open RTH interval.
-        self.assertEqual(cal.is_market_expected_open(1788206400), OpenState.CLOSED)
-
-    def test_index_calendar_weekend_closed(self):
-        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
-        self.assertEqual(cal.is_market_expected_open(1788012000), OpenState.CLOSED)
-
-    def test_index_calendar_invalid_timestamp_unknown(self):
-        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
-        self.assertEqual(cal.is_market_expected_open(10**30), OpenState.UNKNOWN)
-
-    def test_index_calendar_never_fabricates_gap_grid(self):
-        cal = calendar_for(MarketCalendarPolicy.US_EQUITY_RTH)
-        self.assertIsNone(cal.expected_bucket_starts("1h", 0, 7200))
-        self.assertEqual(cal.analyze_gaps([0, 7200], 3600).status, "UNKNOWN")
-
-
-class IndexParsingTests(unittest.TestCase):
-    def test_decimal_exact_via_parse_float(self):
-        body = _json.loads('{"results":[{"o":3985.67,"h":3990.12,"l":3980.0,"c":3987.5,'
-                           '"t":1755000000000}]}', parse_float=_Dec)
-        r = parse_massive_index_aggs(body, float("inf"))
-        self.assertEqual(r.status, "OK")
-        self.assertIsInstance(r.bars[0].open, _Dec)
-        self.assertNotIsInstance(r.bars[0].open, float)
-        self.assertEqual(str(r.bars[0].open), "3985.67")
-
-    def test_no_volume_on_index_bar(self):
-        bar = index_bar_from_agg(_ix_agg(0), float("inf"))
-        self.assertFalse(hasattr(bar, "volume"))
-
-    def test_invalid_ohlc(self):
-        self.assertEqual(
-            index_bar_from_agg({"o": "x", "h": "1", "l": "1", "c": "1", "t": 1755000000000},
-                              float("inf")).status, DataQualityStatus.INVALID)
-
-    def test_empty_results(self):
-        self.assertEqual(parse_massive_index_aggs({"results": []}, float("inf")).status, "EMPTY")
-
-    def test_malformed(self):
-        self.assertEqual(parse_massive_index_aggs("x", float("inf")).status, "UNAVAILABLE")
-
-
-class IndexProviderTests(unittest.IsolatedAsyncioTestCase):
-    async def test_no_key_no_network(self):
-        prov = MassiveIndicesProvider(api_key="")
-        spy = _IXClient(_IXResp(200, "{}"))
-        prov.client = spy
-        r = await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 86400)
-        self.assertEqual(r.status, "NO_KEY")
-        self.assertEqual(spy.calls, [])
-
-    async def test_not_mapped(self):
-        prov = MassiveIndicesProvider(api_key="DUMMY")
-        # BTC-USD is a Coinbase canonical, never mapped under the 'massive' provider
-        r = await prov.get_index_aggregates("BTC-USD", "1d", _IX_BASE, _IX_BASE + 86400)
-        self.assertEqual(r.status, "NOT_MAPPED")
-
-    async def test_not_supported_granularity(self):
-        prov = MassiveIndicesProvider(api_key="DUMMY")
-        r = await prov.get_index_aggregates("SPX", "3m", _IX_BASE, _IX_BASE + 86400)
-        self.assertEqual(r.status, "NOT_SUPPORTED")
-
-    async def test_403_access_denied(self):
-        prov = MassiveIndicesProvider(api_key="DUMMY")
-        prov.client = _IXClient(_IXResp(403, "{}"))
-        r = await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 86400)
-        self.assertEqual(r.status, "ACCESS_DENIED")
-
-    async def test_429_rate_limited(self):
-        prov = MassiveIndicesProvider(api_key="DUMMY")
-        prov.client = _IXClient(_IXResp(429, "{}"))
-        r = await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 86400)
-        self.assertEqual(r.status, "RATE_LIMITED")
-
-    async def test_500_unavailable(self):
-        prov = MassiveIndicesProvider(api_key="DUMMY")
-        prov.client = _IXClient(_IXResp(500, "{}"))
-        r = await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 86400)
-        self.assertEqual(r.status, "UNAVAILABLE")
-
-    async def test_timeout_unavailable(self):
-        prov = MassiveIndicesProvider(api_key="DUMMY")
-        prov.client = _IXClient(exc=httpx.TimeoutException("t"))
-        r = await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 86400)
-        self.assertEqual(r.status, "UNAVAILABLE")
-
-    async def test_ok_bars_decimal(self):
-        prov = MassiveIndicesProvider(api_key="DUMMY")
-        prov.client = _IXClient(_IXResp(200, _json.dumps({"results": [_ix_agg(0), _ix_agg(1)]})))
-        r = await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 5 * 86400)
-        self.assertEqual(r.status, "OK")
-        self.assertEqual(len(r.bars), 2)
-
-    async def test_key_absent_from_params(self):
-        prov = MassiveIndicesProvider(api_key="DUMMYKEY")
-        fc = _IXClient(_IXResp(200, "{}"))
-        prov.client = fc
-        await prov.get_index_aggregates("SPX", "1d", _IX_BASE, _IX_BASE + 86400)
-        for _p, params in fc.calls:
-            self.assertNotIn("apikey", params or {})
-            self.assertNotIn("DUMMYKEY", str(params))
-
-
-class IndexHistoryAssemblerTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self._saved = main.massive_indices_provider
-
-    def tearDown(self):
-        main.massive_indices_provider = self._saved
-
-    def _prov(self, result):
-        return type("P", (), {
-            "get_index_aggregates": staticmethod(
-                lambda canon, gran, start, end: _async_return(result))})()
-
-    async def test_ok_sorted_no_persist_no_volume(self):
-        main.massive_indices_provider = self._prov(MassiveIndexResult(
-            "OK", [index_bar_from_agg(_ix_agg(2), float("inf")),
-                   index_bar_from_agg(_ix_agg(0), float("inf")),
-                   index_bar_from_agg(_ix_agg(3), float("inf"))]))
-        h = await fetch_index_history("SPX", "1d", _IX_BASE, _IX_BASE + 5 * 86400)
-        self.assertEqual(h["status"], "OK")
-        self.assertEqual(h["count"], 3)
-        self.assertEqual(h["gaps_status"], "UNKNOWN")   # absence != gap
-        self.assertIs(h["persisted"], False)            # D2: never persisted
-        self.assertEqual(h["volume_semantics"], "NOT_AVAILABLE")
-        self.assertTrue(all("volume" not in c for c in h["candles"]))
-        starts = [c["start"] for c in h["candles"]]
-        self.assertEqual(starts, sorted(starts))
-
-    async def test_access_denied_propagated(self):
-        main.massive_indices_provider = self._prov(
-            MassiveIndexResult("ACCESS_DENIED", [], "access denied by provider (403)"))
-        h = await fetch_index_history("SPX", "1d", _IX_BASE, _IX_BASE + 5 * 86400)
-        self.assertEqual(h["status"], "ACCESS_DENIED")
-        self.assertEqual(h["count"], 0)
-
-    async def test_empty(self):
-        main.massive_indices_provider = self._prov(MassiveIndexResult("EMPTY", []))
-        h = await fetch_index_history("SPX", "1d", _IX_BASE, _IX_BASE + 5 * 86400)
-        self.assertEqual(h["status"], "EMPTY")
-
-    async def test_unknown_index_raises(self):
-        main.massive_indices_provider = self._prov(MassiveIndexResult("OK", []))
-        with self.assertRaises(ValueError):
-            await fetch_index_history("ZZZ", "1d", _IX_BASE, _IX_BASE + 86400)
-
-
-class IndexEndpointTests(unittest.TestCase):
-    def setUp(self):
-        self._saved = main.massive_indices_provider
-
-    def tearDown(self):
-        main.massive_indices_provider = self._saved
-
-    def _client(self, result):
-        main.massive_indices_provider = type("P", (), {
-            "get_index_aggregates": staticmethod(
-                lambda canon, gran, start, end: _async_return(result))})()
-        return TestClient(create_app())
-
-    def test_ok_200(self):
-        r = self._client(MassiveIndexResult(
-            "OK", [index_bar_from_agg(_ix_agg(0), float("inf"))])).get(
-            "/api/v1/market/index/SPX/history?granularity=1d&start=%d&end=%d"
-            % (_IX_BASE, _IX_BASE + 5 * 86400))
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["source"], "massive")
-
-    def test_access_denied_403(self):
-        r = self._client(MassiveIndexResult("ACCESS_DENIED", [], "x")).get(
-            "/api/v1/market/index/SPX/history?granularity=1d&start=%d&end=%d"
-            % (_IX_BASE, _IX_BASE + 86400))
-        self.assertEqual(r.status_code, 403)
-
-    def test_no_secret_in_response(self):
-        raw = self._client(MassiveIndexResult("ACCESS_DENIED", [], "x")).get(
-            "/api/v1/market/index/SPX/history?granularity=1d&start=%d&end=%d"
-            % (_IX_BASE, _IX_BASE + 86400)).text.lower()
-        for bad in ("apikey", "authorization", "bearer", "massive_api_key"):
-            self.assertNotIn(bad, raw)
-
-
-class IndexUiTests(unittest.TestCase):
-    def setUp(self):
-        self.html = INDEX.read_text(encoding="utf-8")
-
-    def test_index_view_and_labels(self):
-        self.assertIn('id:"index"', self.html)
-        self.assertIn("SPX", self.html)
-        self.assertIn("NDX", self.html)
-        self.assertIn("US30", self.html)
-
-    def test_index_endpoint_used(self):
-        self.assertIn("/api/v1/market/index/", self.html)
-
-    def test_no_fallback_to_etf_or_futures(self):
-        # ETF proxies and index futures must never appear (case-sensitive uppercase
-        # tickers; we use the official cash indices SPX/NDX/US30 -> I:SPX/I:NDX/I:DJI)
-        for bad in ("SPY", "QQQ", "DIA", "ES=F", "NQ=F", "YM=F", "/ES", "/NQ", "/YM"):
-            self.assertNotIn(bad, self.html)
-
-
-class ChartEngineV1UiTests(unittest.TestCase):
-    """Static contract: chart V1 consumes backend OHLC only; no demo series."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_real_chart_label_present(self):
-        self.assertIn("Chart Engine · OHLC réel", self.html)
-        self.assertIn("REAL DATA", self.html)
-
-    def test_chart_uses_existing_real_endpoints(self):
-        self.assertIn('/api/v1/market/candles/', self.html)
-        self.assertIn('/api/v1/market/forex/', self.html)
-        self.assertIn('/api/v1/market/metal/', self.html)
-        self.assertIn('/api/v1/market/index/', self.html)
-
-    def test_chart_has_no_synthetic_candle_fallback(self):
-        self.assertIn("aucune bougie synthétique", self.html)
-        self.assertNotIn("Math.random()", self.html)
-
-    def test_chart_supports_real_ohlc_fields(self):
-        for field in ("c.open", "c.high", "c.low", "c.close", "c.start"):
-            self.assertIn(field, self.html)
-
-    def test_chart_has_zoom_pan_controls(self):
-        self.assertIn("chartZoom", self.html)
-        self.assertIn("chartPan", self.html)
-        self.assertIn("chart-cross", self.html)
-
-    def test_provider_errors_remain_explicit(self):
-        self.assertIn("errorMessage(r)", self.html)
-        self.assertIn("Graphique indisponible", self.html)
-
-
-class ChartEngineV2SwingUiTests(unittest.TestCase):
-    """Static contract: confirmed swings derive only from returned real OHLC."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_confirmed_swing_detector_present(self):
-        self.assertIn("detectConfirmedSwings", self.html)
-        self.assertIn("SWING_STRENGTH=2", self.html)
-
-    def test_swing_high_uses_strict_neighbor_highs(self):
-        self.assertIn("hi<=lh||hi<=rh", self.html)
-
-    def test_swing_low_uses_strict_neighbor_lows(self):
-        self.assertIn("lo>=ll||lo>=rl", self.html)
-
-    def test_swings_require_right_side_confirmation(self):
-        self.assertIn("confirmedAt:cs[i+n].start", self.html)
-        self.assertIn("i<cs.length-n", self.html)
-
-    def test_swings_are_drawn_on_real_chart(self):
-        self.assertIn('lab.textContent=isHigh?"SH":"SL"', self.html)
-        self.assertIn("swings confirmés", self.html)
-
-    def test_no_synthetic_or_random_swing_fallback(self):
-        self.assertIn("Aucun swing futur/repainté", self.html)
-        self.assertNotIn("Math.random()", self.html)
-
-
-class ChartEngineV3StructureUiTests(unittest.TestCase):
-    """Static contract: HH/HL/LH/LL derive only from confirmed swings."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_structure_classifier_present(self):
-        self.assertIn("classifyConfirmedStructure", self.html)
-        self.assertIn("HH/HL/LH/LL ACTIF", self.html)
-
-    def test_high_structure_compares_only_previous_high(self):
-        self.assertIn('if(s.price>prevHigh)label="HH"', self.html)
-        self.assertIn('else if(s.price<prevHigh)label="LH"', self.html)
-
-    def test_low_structure_compares_only_previous_low(self):
-        self.assertIn('if(s.price>prevLow)label="HL"', self.html)
-        self.assertIn('else if(s.price<prevLow)label="LL"', self.html)
-
-    def test_equal_swing_is_not_forced_into_structure(self):
-        self.assertIn("var label=null", self.html)
-        self.assertNotIn('else label="HH"', self.html)
-        self.assertNotIn('else label="LL"', self.html)
-
-    def test_structure_is_built_from_confirmed_swings(self):
-        self.assertIn("classifyConfirmedStructure(swings)", self.html)
-        self.assertIn("Structure comparée uniquement entre swings confirmés", self.html)
-
-    def test_structure_labels_are_drawn_without_random_fallback(self):
-        self.assertIn('lab.textContent=s.structure||(isHigh?"SH":"SL")', self.html)
-        self.assertNotIn("Math.random()", self.html)
-
-
-class RealtimeCoreV1UiTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_frontend_starts_existing_backend_ws(self):
-        self.assertIn("/api/v1/market/websocket/start", self.html)
-
-    def test_frontend_subscribes_ticker(self):
-        self.assertIn('{channel:"ticker",products:CRYPTO_SYMBOLS}', self.html)
-
-    def test_frontend_subscribes_candles(self):
-        self.assertIn('{channel:"candles",products:CRYPTO_SYMBOLS}', self.html)
-
-    def test_frontend_reads_realtime_state(self):
-        self.assertIn("/api/v1/market/realtime/", self.html)
-
-    def test_realtime_poll_is_one_second(self):
-        self.assertIn("REALTIME_POLL_MS=1000", self.html)
-
-    def test_only_verified_5m_ws_updates_chart(self):
-        self.assertIn('chartState.tf==="5m"', self.html)
-
-    def test_other_crypto_tf_remain_rest(self):
-        marker = 'LIVE PRICE · OHLC "+chartState.tf.toUpperCase()+" REST'
-        self.assertIn(marker, self.html)
-
-    def test_no_synthetic_realtime(self):
-        self.assertNotIn("Math.random()", self.html)
-        self.assertIn("aucune bougie synthétique", self.html)
-
-
-class RealtimeCoreV2AForexTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.main_src = Path(main.__file__).read_text(encoding="utf-8")
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_massive_official_forex_ws_url(self):
-        self.assertIn("wss://socket.massive.com/forex", self.main_src)
-
-    def test_auth_message_server_side(self):
-        marker = '{"action": "auth", "params": self.api_key}'
-        self.assertIn(marker, self.main_src)
-
-    def test_quote_and_minute_topics(self):
-        self.assertIn('f"C.{pair}"', self.main_src)
-        self.assertIn('f"CA.{pair}"', self.main_src)
-
-    def test_quote_parser_uses_bid_ask_not_midpoint(self):
-        self.assertIn("parse_massive_forex_quote", self.main_src)
-        self.assertNotIn("(bid + ask) / 2", self.main_src)
-
-    def test_minute_parser_present(self):
-        self.assertIn("parse_massive_forex_minute", self.main_src)
-
-    def test_only_verified_mapping_can_be_ws_pair(self):
-        marker = 'mapped = provider_symbol_map.to_provider("massive", canonical)'
-        self.assertIn(marker, self.main_src)
-
-    def test_forex_ws_start_endpoint(self):
-        self.assertIn("/market/forex/websocket/start", self.main_src)
-
-    def test_forex_realtime_endpoint(self):
-        self.assertIn("/market/forex/{symbol}/realtime", self.main_src)
-
-    def test_frontend_starts_forex_realtime(self):
-        self.assertIn("startForexRealtime", self.html)
-
-    def test_frontend_reads_forex_realtime(self):
-        marker = '/api/v1/market/forex/"+encodeURIComponent(sym)+"/realtime'
-        self.assertIn(marker, self.html)
-
-    def test_only_one_minute_ws_updates_forex_chart(self):
-        self.assertIn('chartState.tf==="1m"', self.html)
-
-    def test_other_forex_tf_explicitly_rest(self):
-        marker = 'LIVE BBO · OHLC "+chartState.tf.toUpperCase()+" REST'
-        self.assertIn(marker, self.html)
-
-
-class RealtimeCoreV2BGoldTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.main_src = Path(main.__file__).read_text(encoding="utf-8")
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_twelvedata_official_gold_ws_base_url(self):
-        marker = 'wss://ws.twelvedata.com/v1/quotes/price'
-        self.assertIn(marker, self.main_src)
-
-    def test_gold_ws_subscribes_xau_usd(self):
-        self.assertIn('"symbols": "XAU/USD"', self.main_src)
-
-    def test_gold_ws_price_parser_present(self):
-        self.assertIn("parse_twelvedata_ws_price", self.main_src)
-
-    def test_gold_ws_rejects_non_price_event(self):
-        result = main.parse_twelvedata_ws_price(
-            {"event": "heartbeat"},
-            "XAU-USD",
-        )
-        self.assertIsNone(result)
-
-    def test_gold_ws_parses_price_as_decimal(self):
-        observed = datetime(2026, 9, 1, 18, 0, tzinfo=timezone.utc)
-        payload = {
-            "event": "price",
-            "symbol": "XAU/USD",
-            "price": "3456.789",
-            "timestamp": observed.timestamp(),
-        }
-        result = main.parse_twelvedata_ws_price(
-            payload,
-            "XAU-USD",
-            received_at=observed,
-        )
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(result.price, Decimal("3456.789"))
-
-    def test_gold_ws_rejects_wrong_symbol(self):
-        payload = {
-            "event": "price",
-            "symbol": "XAG/USD",
-            "price": "40.0",
-            "timestamp": 1788285600,
-        }
-        result = main.parse_twelvedata_ws_price(payload, "XAU-USD")
-        self.assertIsNone(result)
-
-    def test_gold_ws_rejects_non_positive_price(self):
-        payload = {
-            "event": "price",
-            "symbol": "XAU/USD",
-            "price": "0",
-            "timestamp": 1788285600,
-        }
-        result = main.parse_twelvedata_ws_price(payload, "XAU-USD")
-        self.assertIsNone(result)
-
-    def test_gold_ws_start_endpoint_present(self):
-        self.assertIn("/market/metal/websocket/start", self.main_src)
-
-    def test_gold_realtime_endpoint_present(self):
-        self.assertIn("/market/metal/{symbol}/realtime", self.main_src)
-
-    def test_gold_realtime_declares_ohlc_rest(self):
-        self.assertIn('"ohlc_transport": "REST"', self.main_src)
-
-    def test_frontend_starts_gold_realtime(self):
-        self.assertIn("startGoldRealtime", self.html)
-
-    def test_frontend_reads_gold_realtime(self):
-        marker = "/api/v1/market/metal/XAU-USD/realtime"
-        self.assertIn(marker, self.html)
-
-    def test_frontend_gold_badge_says_ohlc_rest(self):
-        marker = "LIVE PRICE · TWELVE DATA WS · OHLC REST"
-        self.assertIn(marker, self.html)
-
-    def test_gold_ws_does_not_synthesize_ohlc(self):
-        self.assertNotIn("mergeRealtimeGoldCandle", self.html)
-
-class TestRealtimeCoreV2CIndices(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.main_src = Path(main.__file__).read_text(encoding="utf-8")
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_indices_ws_uses_documented_delayed_url(self):
-        self.assertIn("wss://delayed.massive.com/indices", self.main_src)
-
-    def test_indices_ws_topics_use_verified_symbols(self):
-        manager = main.MassiveIndicesWsManager(api_key="test")
-        topics = manager._topics()
-        self.assertIn("V.I:SPX", topics)
-        self.assertIn("AM.I:NDX", topics)
-        self.assertIn("AM.I:DJI", topics)
-
-    def test_index_value_parser_decimal(self):
-        observed = datetime(2026, 9, 1, 18, 0, tzinfo=timezone.utc)
-        result = main.parse_massive_index_value(
-            {"ev": "V", "T": "I:SPX", "val": "6500.25", "t": 1788285600000},
-            received_at=observed,
-        )
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(result.value, Decimal("6500.25"))
-
-    def test_index_value_rejects_unknown_ticker(self):
-        result = main.parse_massive_index_value(
-            {"ev": "V", "T": "I:UNKNOWN", "val": "1", "t": 1788285600000}
-        )
-        self.assertIsNone(result)
-
-    def test_index_minute_parser_has_no_volume(self):
-        observed = datetime(2026, 9, 1, 18, 0, tzinfo=timezone.utc)
-        result = main.parse_massive_index_minute(
-            {
-                "ev": "AM", "sym": "I:NDX", "o": "24000", "h": "24010",
-                "l": "23990", "c": "24005", "s": 1788285600000,
+    async def disconnect(self) -> None:
+        if self.client is not None:
+            await self.client.aclose()
+            self.client = None
+
+    async def _get(self, path: str, params: Optional[dict] = None) -> dict:
+        if self.client is None:
+            await self.connect()
+        assert self.client is not None
+        resp = await self.client.get(path, params=params)
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Coinbase returned a non-object JSON response")
+        return payload
+
+    async def get_ticker(self, symbol: str) -> MarketDatum:
+        symbol = symbol.upper()
+        payload = await self._get(f"/market/products/{symbol}/ticker")
+        return ticker_datum_from_payload(symbol, payload)
+
+    async def get_candles(self, symbol: str, granularity: str, limit: int = CANDLE_MAX_LIMIT):
+        """Fetch qualified candles from Coinbase Advanced Trade (public, no auth).
+        Verified params: granularity string enum + start/end UNIX seconds, max 350."""
+        if granularity not in GRANULARITIES:
+            raise ValueError(f"Unsupported granularity: {granularity}")
+        enum_value, bucket_seconds = GRANULARITIES[granularity]
+        limit = max(1, min(int(limit), CANDLE_MAX_LIMIT))
+        end = int(utcnow().timestamp())
+        start = end - limit * bucket_seconds
+        symbol = symbol.upper()
+        payload = await self._get(
+            f"/market/products/{symbol}/candles",
+            params={
+                "start": str(start),
+                "end": str(end),
+                "granularity": enum_value,
+                "limit": limit,
             },
-            received_at=observed,
         )
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertNotIn("volume", result.to_dict())
+        # A candle is "recent enough" within ~2 buckets of its own timeframe.
+        return candles_from_payload(payload, max_age_seconds=bucket_seconds * 2)
 
-    def test_index_minute_rejects_invalid_ohlc(self):
-        result = main.parse_massive_index_minute(
+    async def get_candles_range(self, symbol: str, granularity: str, start: int, end: int):
+        """Fetch candles for an EXPLICIT [start, end] window (UNIX seconds). Used by
+        the paginated history layer. Reuses the validated candles_from_payload parser.
+        Historical candles are qualified on data validity only (freshness is not a
+        meaningful axis for an explicit past range), so max_age is effectively off."""
+        if granularity not in GRANULARITIES:
+            raise ValueError(f"Unsupported granularity: {granularity}")
+        enum_value, _bucket = GRANULARITIES[granularity]
+        symbol = symbol.upper()
+        payload = await self._get(
+            f"/market/products/{symbol}/candles",
+            params={
+                "start": str(int(start)),
+                "end": str(int(end)),
+                "granularity": enum_value,
+                "limit": CANDLE_MAX_LIMIT,
+            },
+        )
+        return candles_from_payload(payload, max_age_seconds=float("inf"))
+
+    async def health_check(self) -> bool:
+        try:
+            payload = await self._get("/market/products/BTC-USD")
+            return isinstance(payload, dict)
+        except Exception:  # noqa: BLE001 - health probe must not raise
+            log.warning("Coinbase REST health check failed", exc_info=True)
+            return False
+
+
+def ws_backoff(attempt: int) -> float:
+    """Capped exponential backoff in seconds. attempt starts at 1."""
+    return min(WS_MAX_BACKOFF, WS_INITIAL_BACKOFF * 2 ** max(0, attempt - 1))
+
+
+class MarketWsManager:
+    """Coinbase PUBLIC market-data WebSocket manager. Idle until start() is called.
+    Builds real subscribe messages (verified format) and never fabricates data."""
+
+    SOURCE = "coinbase"
+
+    def __init__(self, url: str = COINBASE_WS_URL) -> None:
+        self.url = url
+        self.running = False
+        self.websocket: Any = None
+        self.subscriptions: Dict[str, set] = {}
+        self.last_message_at: Optional[datetime] = None
+        self.attempt = 0
+        self._task: Optional[asyncio.Task] = None
+
+    @staticmethod
+    def build_subscribe(channel: str, products: List[str]) -> Dict[str, object]:
+        return {
+            "type": "subscribe",
+            "channel": channel,
+            "product_ids": [p.upper() for p in products],
+        }
+
+    async def start(self) -> None:
+        if websockets is None:
+            raise RuntimeError("websockets dependency is not installed")
+        if self.running:
+            return
+        self.running = True
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self) -> None:
+        self.running = False
+        if self.websocket is not None:
+            try:
+                await self.websocket.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.websocket = None
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def subscribe(self, channel: str, products: List[str]) -> None:
+        prods = {p.upper() for p in products}
+        self.subscriptions.setdefault(channel, set()).update(prods)
+        if self.websocket is not None:
+            await self.websocket.send(json.dumps(self.build_subscribe(channel, sorted(prods))))
+
+    async def _run_loop(self) -> None:  # pragma: no cover - needs a live socket
+        while self.running:
+            try:
+                async with websockets.connect(
+                    self.url, ping_interval=20, ping_timeout=20, close_timeout=5
+                ) as ws:
+                    self.websocket = ws
+                    self.attempt = 0
+                    await market_store.reset_transport()
+                    for channel, prods in list(self.subscriptions.items()):
+                        await ws.send(json.dumps(self.build_subscribe(channel, sorted(prods))))
+                    # Heartbeats keep sparse subscriptions open (Coinbase docs).
+                    await ws.send(json.dumps({"type": "subscribe", "channel": "heartbeats"}))
+                    async for raw in ws:
+                        self.last_message_at = utcnow()
+                        await self._handle(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.websocket = None
+                if not self.running:
+                    break
+                self.attempt += 1
+                delay = ws_backoff(self.attempt)
+                log.warning("Coinbase WS disconnected: %s - reconnecting in %.1fs", exc, delay)
+                await asyncio.sleep(delay)
+
+    async def _handle(self, raw: str | bytes) -> None:
+        received_at = utcnow()
+        msg = parse_ws_message(raw)
+        if msg is None:
+            return  # malformed -> no state change, no fabricated data
+        channel = msg.get("channel")
+        await market_store.check_sequence(msg.get("sequence_num"))
+        if channel in WS_TICKER_TYPES:
+            for datum in extract_ticker_data(msg, received_at):
+                await market_store.apply_ticker(datum)
+                await market_bus.publish(datum)
+        elif channel == "candles":
+            for datum in extract_candle_data(msg, received_at):
+                await market_store.apply_candle(datum)
+                await market_bus.publish(datum)
+        elif channel == "heartbeats":
+            events = msg.get("events")
+            counter = None
+            if isinstance(events, list) and events and isinstance(events[0], dict):
+                counter = events[0].get("heartbeat_counter")
+            await market_store.record_heartbeat(
+                counter if isinstance(counter, int) else None, received_at
+            )
+        # unknown channel -> ignored (no fabricated data)
+
+    async def health_check(self) -> Dict[str, object]:
+        connected = self.websocket is not None
+        age: Optional[float] = None
+        if self.last_message_at is not None:
+            age = (utcnow() - self.last_message_at).total_seconds()
+        return {
+            "connected": connected,
+            "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
+            "last_message_age_seconds": age,
+            "quality": (
+                DataQualityStatus.VALID.value if connected else DataQualityStatus.UNKNOWN.value
+            ),
+        }
+
+
+market_provider = CoinbaseProvider()
+market_ws = MarketWsManager()
+
+
+class WsSubscribeRequest(BaseModel):
+    channel: str
+    products: List[str]
+
+
+@api_router.get("/market/ticker/{symbol}")
+async def market_ticker(symbol: str) -> dict:
+    try:
+        datum = await market_provider.get_ticker(symbol)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": str(exc)}
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500, detail={"status": "UNKNOWN", "reason": str(exc)}
+        ) from exc
+    return datum.to_dict()
+
+
+@api_router.post("/market/websocket/start")
+async def market_ws_start() -> dict:
+    await market_ws.start()
+    return {"status": "started", "source": "coinbase", "endpoint": COINBASE_WS_URL}
+
+
+@api_router.post("/market/websocket/stop")
+async def market_ws_stop() -> dict:
+    await market_ws.stop()
+    return {"status": "stopped", "source": "coinbase"}
+
+
+@api_router.post("/market/websocket/subscribe")
+async def market_ws_subscribe(req: WsSubscribeRequest) -> dict:
+    if req.channel not in WS_ALLOWED_CHANNELS:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "Unsupported public channel"}
+        )
+    if not req.products:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "At least one product required"}
+        )
+    await market_ws.subscribe(req.channel, req.products)
+    return {
+        "status": "subscribed",
+        "channel": req.channel,
+        "products": [p.upper() for p in req.products],
+    }
+
+
+@api_router.get("/market/websocket/health")
+async def market_ws_health() -> dict:
+    connection = await market_ws.health_check()
+    transport = await market_store.health()
+    return {"connection": connection, "transport": transport}
+
+
+# ---- candles (Coinbase Advanced Trade, verified OpenAPI) --------------------
+# GET /api/v3/brokerage/market/products/{product_id}/candles (public, no auth).
+# Query: start, end (UNIX seconds, required), granularity (string enum, required),
+# limit (max 350). Response: {"candles":[{start,low,high,open,close,volume}]} where
+# every field is a STRING and `start` is a UNIX timestamp in seconds.
+# NOT the old Exchange API (which used integer-second granularities 60/300/...).
+
+
+@dataclass(frozen=True)
+class Candle:
+    start: Optional[datetime]
+    low: Optional[float]
+    high: Optional[float]
+    open: Optional[float]
+    close: Optional[float]
+    volume: Optional[float]
+    status: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "start": self.start.isoformat() if self.start else None,
+            "low": self.low,
+            "high": self.high,
+            "open": self.open,
+            "close": self.close,
+            "volume": self.volume,
+            "quality": self.status.value,
+        }
+
+
+def _to_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_decimal(value: Any) -> Optional[Decimal]:
+    """Parse a financial value (a string from the provider) into an exact Decimal.
+    Never routes through float. Returns None on missing/non-numeric/non-finite."""
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _unix_seconds_to_dt(value: Any) -> Optional[datetime]:
+    """Coinbase candle `start` is a UNIX timestamp in seconds, as a string.
+    Returns aware UTC, or None if unparseable (never invents a timestamp)."""
+    try:
+        seconds = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def candle_from_payload(
+    item: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> Candle:
+    """Convert one Coinbase candle object into a qualified Candle. Pure, no network.
+    Invalid timestamp or unparseable OHLCV -> INVALID; never fabricated."""
+    if not isinstance(item, dict):
+        return Candle(None, None, None, None, None, None, DataQualityStatus.INVALID)
+    start = _unix_seconds_to_dt(item.get("start"))
+    low = _to_float(item.get("low"))
+    high = _to_float(item.get("high"))
+    open_ = _to_float(item.get("open"))
+    close = _to_float(item.get("close"))
+    volume = _to_float(item.get("volume"))
+    if (
+        start is None
+        or low is None
+        or high is None
+        or open_ is None
+        or close is None
+        or volume is None
+    ):
+        return Candle(start, low, high, open_, close, volume, DataQualityStatus.INVALID)
+    if low < 0 or high < 0 or open_ < 0 or close < 0 or volume < 0:
+        return Candle(start, low, high, open_, close, volume, DataQualityStatus.INVALID)
+    status = classify_freshness(start, max_age_seconds, now=now)
+    return Candle(start, low, high, open_, close, volume, status)
+
+
+def candles_from_payload(
+    payload: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> tuple:
+    """Parse a Coinbase candles response into (list[Candle], overall_status).
+    Empty/malformed -> ([], MISSING)."""
+    raw = payload.get("candles") if isinstance(payload, dict) else None
+    if not isinstance(raw, list) or not raw:
+        return [], DataQualityStatus.MISSING
+    candles = [candle_from_payload(item, max_age_seconds, now=now) for item in raw]
+    if all(c.status == DataQualityStatus.INVALID for c in candles):
+        return candles, DataQualityStatus.INVALID
+    return candles, DataQualityStatus.VALID
+
+
+def _latest_quality(candles: List[Candle]) -> str:
+    """Quality of the MOST RECENT candle actually received (freshness of the last
+    bar), or MISSING if none. A set of candles is only as 'live' as its newest bar
+    — a successful HTTP call never implies LIVE."""
+    dated = [c for c in candles if c.start is not None]
+    if not dated:
+        return DataQualityStatus.MISSING.value
+    newest = max(dated, key=lambda c: c.start.timestamp())  # type: ignore[union-attr]
+    return newest.status.value
+
+
+@api_router.get("/market/candles/{symbol}")
+async def market_candles(
+    symbol: str, granularity: str = "1m", limit: int = CANDLE_MAX_LIMIT
+) -> dict:
+    if granularity not in GRANULARITIES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "INVALID",
+                "reason": "Unsupported granularity",
+                "allowed": sorted(GRANULARITIES),
+            },
+        )
+    try:
+        candles, status = await market_provider.get_candles(symbol, granularity, limit)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": str(exc)}
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500, detail={"status": "UNKNOWN", "reason": str(exc)}
+        ) from exc
+    # Coinbase returns candles newest-first; sort ascending deterministically so
+    # consumers can reliably take the most-recent slice. Undated (INVALID) go first.
+    ordered = sorted(candles, key=lambda c: c.start.timestamp() if c.start else float("-inf"))
+    return {
+        "source": "coinbase",
+        "symbol": symbol.upper(),
+        "granularity": granularity,
+        "count": len(ordered),
+        "quality": status.value,               # overall (any non-invalid) — unchanged
+        "latest_quality": _latest_quality(ordered),  # freshness of the NEWEST bar
+        "candles": [c.to_dict() for c in ordered],
+    }
+
+
+# ============================ realtime pipeline (increment 3) =================
+# Turn REAL Coinbase Advanced Trade WS messages into qualified internal data.
+# Verified envelope (docs.cdp.coinbase.com): {channel, timestamp (server send
+# time, ISO8601), sequence_num (PER-CONNECTION), events:[{type: snapshot|update,
+# ...}]}.  ticker -> events[].tickers[] (price, product_id); market/server time =
+# envelope timestamp. candles -> events[].candles[] (start, OHLCV, product_id);
+# WS candles are 5-minute buckets refreshed every second (same `start` UPDATES
+# the bucket, it is NOT a duplicate). heartbeats -> connection health only.
+#
+# Two-layer integrity: (1) per-connection sequence_num for transport gap/dup/
+# out-of-order diagnostics; (2) per-product ordering by real timestamp so an
+# older update never overwrites a newer state. No fabricated data or sequence.
+
+WS_TICKER_TYPES = {"ticker", "ticker_batch"}
+WS_CANDLE_MAX_AGE_SECONDS = 330.0  # 5-min bucket + buffer
+
+
+@dataclass(frozen=True)
+class RealtimeDatum:
+    source: str
+    product_id: str
+    data_type: str  # "ticker" | "candle"
+    value: Optional[float]  # ticker price, or candle close
+    source_timestamp: Optional[datetime]  # ticker: server send time; candle: bucket start
+    received_at: datetime
+    status: DataQualityStatus
+    sequence_num: Optional[int]
+    ohlcv: Optional[Dict[str, float]] = None  # candles only
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "source": self.source,
+            "product_id": self.product_id,
+            "data_type": self.data_type,
+            "value": self.value,
+            "source_timestamp": (
+                self.source_timestamp.isoformat() if self.source_timestamp else None
+            ),
+            "received_at": self.received_at.isoformat(),
+            "quality": self.status.value,
+            "sequence_num": self.sequence_num,
+            "ohlcv": self.ohlcv,
+        }
+
+
+def parse_ws_message(raw: Any) -> Optional[dict]:
+    """json.loads a raw WS frame -> dict envelope, or None if malformed / not a
+    JSON object. Never fabricates a message."""
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except (UnicodeDecodeError, AttributeError):
+            return None
+    if not isinstance(raw, str):
+        return None
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return msg if isinstance(msg, dict) else None
+
+
+def extract_ticker_data(
+    msg: dict, received_at: datetime, now: Optional[datetime] = None
+) -> List[RealtimeDatum]:
+    """Pure: qualified ticker data from a ticker/ticker_batch envelope. Invalid
+    entries are skipped, never fabricated."""
+    out: List[RealtimeDatum] = []
+    seq = msg.get("sequence_num")
+    seq_num = seq if isinstance(seq, int) else None
+    server_ts = parse_iso8601(msg.get("timestamp"))
+    events = msg.get("events")
+    if not isinstance(events, list):
+        return out
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        tickers = event.get("tickers")
+        if not isinstance(tickers, list):
+            continue
+        for tick in tickers:
+            if not isinstance(tick, dict):
+                continue
+            product_id = tick.get("product_id")
+            if not isinstance(product_id, str) or not product_id:
+                continue
+            price = _to_float(tick.get("price"))
+            if price is None or price <= 0:
+                continue
+            status = classify_freshness(server_ts, settings.ticker_max_age_seconds, now=now)
+            out.append(
+                RealtimeDatum(
+                    source="coinbase",
+                    product_id=product_id,
+                    data_type="ticker",
+                    value=price,
+                    source_timestamp=server_ts,
+                    received_at=received_at,
+                    status=status,
+                    sequence_num=seq_num,
+                )
+            )
+    return out
+
+
+def extract_candle_data(
+    msg: dict, received_at: datetime, now: Optional[datetime] = None
+) -> List[RealtimeDatum]:
+    """Pure: qualified candle data from a candles envelope. WS candles are 5-min
+    buckets refreshed every second; `start` identifies the bucket."""
+    out: List[RealtimeDatum] = []
+    seq = msg.get("sequence_num")
+    seq_num = seq if isinstance(seq, int) else None
+    events = msg.get("events")
+    if not isinstance(events, list):
+        return out
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        candles = event.get("candles")
+        if not isinstance(candles, list):
+            continue
+        for item in candles:
+            if not isinstance(item, dict):
+                continue
+            product_id = item.get("product_id")
+            if not isinstance(product_id, str) or not product_id:
+                continue
+            candle = candle_from_payload(item, WS_CANDLE_MAX_AGE_SECONDS, now=now)
+            ohlcv: Optional[Dict[str, float]] = None
+            value: Optional[float] = None
+            if (
+                candle.status != DataQualityStatus.INVALID
+                and candle.open is not None
+                and candle.high is not None
+                and candle.low is not None
+                and candle.close is not None
+                and candle.volume is not None
+            ):
+                value = candle.close
+                ohlcv = {
+                    "open": candle.open,
+                    "high": candle.high,
+                    "low": candle.low,
+                    "close": candle.close,
+                    "volume": candle.volume,
+                }
+            out.append(
+                RealtimeDatum(
+                    source="coinbase",
+                    product_id=product_id,
+                    data_type="candle",
+                    value=value,
+                    source_timestamp=candle.start,
+                    received_at=received_at,
+                    status=candle.status,
+                    sequence_num=seq_num,
+                    ohlcv=ohlcv,
+                )
+            )
+    return out
+
+
+class MarketBus:
+    """Fan-out of qualified realtime data to registered consumers. Future Chart /
+    Signal engines and persistence subscribe here without touching the WS manager."""
+
+    def __init__(self) -> None:
+        self._consumers: List[Callable[[RealtimeDatum], Any]] = []
+
+    def subscribe(self, consumer: Callable[[RealtimeDatum], Any]) -> None:
+        self._consumers.append(consumer)
+
+    async def publish(self, datum: RealtimeDatum) -> None:
+        for consumer in list(self._consumers):
+            result = consumer(datum)
+            if asyncio.iscoroutine(result):
+                await result
+
+
+class MarketStateStore:
+    """Single in-memory source of truth for realtime data, guarded by one lock.
+
+    Transport integrity uses the per-connection sequence_num; per-product state
+    ordering uses each datum's real timestamp. Malformed / invalid data never
+    overwrites a valid last state, and no value or sequence is fabricated."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._tickers: Dict[str, RealtimeDatum] = {}
+        self._candles: Dict[str, RealtimeDatum] = {}
+        self._last_sequence: Optional[int] = None
+        self._gaps = 0
+        self._duplicates = 0
+        self._out_of_order = 0
+        self._messages = 0
+        self._heartbeat_counter: Optional[int] = None
+        self._last_heartbeat_at: Optional[datetime] = None
+
+    async def reset_transport(self) -> None:
+        """Called on every new/reconnected socket: never compare a new socket's
+        first sequence with the previous connection's last one."""
+        async with self._lock:
+            self._last_sequence = None
+
+    async def check_sequence(self, seq: Optional[int]) -> str:
+        async with self._lock:
+            self._messages += 1
+            if not isinstance(seq, int):
+                return "unknown"
+            if self._last_sequence is None:
+                self._last_sequence = seq
+                return "first"
+            if seq == self._last_sequence + 1:
+                self._last_sequence = seq
+                return "ok"
+            if seq > self._last_sequence + 1:
+                self._gaps += seq - self._last_sequence - 1
+                self._last_sequence = seq
+                return "gap"
+            if seq == self._last_sequence:
+                self._duplicates += 1
+                return "duplicate"
+            self._out_of_order += 1
+            return "out_of_order"
+
+    async def apply_ticker(self, datum: RealtimeDatum) -> bool:
+        if datum.status in (DataQualityStatus.INVALID, DataQualityStatus.MISSING):
+            return False
+        if datum.value is None:
+            return False
+        async with self._lock:
+            prev = self._tickers.get(datum.product_id)
+            if (
+                prev is not None
+                and prev.source_timestamp is not None
+                and datum.source_timestamp is not None
+                and datum.source_timestamp < prev.source_timestamp
+            ):
+                return False  # strictly older than stored -> keep the newer state
+            self._tickers[datum.product_id] = datum
+            return True
+
+    async def apply_candle(self, datum: RealtimeDatum) -> bool:
+        if datum.status == DataQualityStatus.INVALID:
+            return False
+        async with self._lock:
+            prev = self._candles.get(datum.product_id)
+            if (
+                prev is not None
+                and prev.source_timestamp is not None
+                and datum.source_timestamp is not None
+                and datum.source_timestamp < prev.source_timestamp
+            ):
+                return False  # earlier bucket than stored -> do not overwrite
+            # same `start` is allowed: the live 5-min bucket updates in place.
+            self._candles[datum.product_id] = datum
+            return True
+
+    async def record_heartbeat(self, counter: Optional[int], at: datetime) -> None:
+        async with self._lock:
+            if isinstance(counter, int):
+                self._heartbeat_counter = counter
+            self._last_heartbeat_at = at
+
+    async def get_ticker(self, product_id: str) -> Optional[RealtimeDatum]:
+        async with self._lock:
+            return self._tickers.get(product_id)
+
+    async def get_candle(self, product_id: str) -> Optional[RealtimeDatum]:
+        async with self._lock:
+            return self._candles.get(product_id)
+
+    async def get_realtime(self, product_id: str) -> Dict[str, object]:
+        async with self._lock:
+            ticker = self._tickers.get(product_id)
+            candle = self._candles.get(product_id)
+        if ticker is None and candle is None:
+            return {
+                "product_id": product_id,
+                "status": DataQualityStatus.MISSING.value,
+                "ticker": None,
+                "candle": None,
+            }
+        return {
+            "product_id": product_id,
+            "status": DataQualityStatus.VALID.value,
+            "ticker": ticker.to_dict() if ticker else None,
+            "candle": candle.to_dict() if candle else None,
+        }
+
+    async def health(self) -> Dict[str, object]:
+        async with self._lock:
+            products = sorted(set(self._tickers) | set(self._candles))
+            return {
+                "messages": self._messages,
+                "last_sequence_num": self._last_sequence,
+                "gaps_detected": self._gaps,
+                "duplicates_detected": self._duplicates,
+                "out_of_order_detected": self._out_of_order,
+                "heartbeat_counter": self._heartbeat_counter,
+                "last_heartbeat_at": (
+                    self._last_heartbeat_at.isoformat() if self._last_heartbeat_at else None
+                ),
+                "products_tracked": products,
+            }
+
+
+market_store = MarketStateStore()
+market_bus = MarketBus()
+
+
+@api_router.get("/market/realtime/{symbol}")
+async def market_realtime(symbol: str) -> dict:
+    return await market_store.get_realtime(symbol.upper())
+
+
+# ============================ paginated history (increment 4) =================
+# Fetch a candle history longer than one Coinbase request (max CANDLE_MAX_LIMIT)
+# by fanning out to sequential windows, then merge/dedup/sort. Robust to unknown
+# `end` inclusivity: each provider window requests at most PROVIDER_SAFE_BUCKETS
+# (= CANDLE_MAX_LIMIT - 1) buckets, so even an inclusive `end` yields <= 350
+# candidate starts; a repeated boundary candle is removed by dedup on
+# (product_id, granularity, start). The internal contract is a half-open range
+# [start, end): start < end and both aligned to the granularity. No candle is
+# ever fabricated; absences are diagnosed, never filled.
+
+
+def max_history_span(granularity: str) -> int:
+    """Max span (seconds) a single /history request may cover, from the safe
+    window width and the application guard rail. Granularity-dependent."""
+    bucket = GRANULARITIES[granularity][1]
+    return PROVIDER_SAFE_BUCKETS * bucket * settings.history_max_windows
+
+
+def plan_candle_windows(granularity: str, start: int, end: int) -> List[tuple]:
+    """Pure, deterministic window planner (no network). Windows are [w_start,
+    w_end] in UNIX seconds, each <= PROVIDER_SAFE_BUCKETS * bucket wide, stepping
+    by the same amount (1-bucket overlap at each boundary, removed later by dedup)."""
+    if granularity not in GRANULARITIES:
+        raise ValueError(f"unsupported granularity: {granularity}")
+    bucket = GRANULARITIES[granularity][1]
+    if start % bucket != 0 or end % bucket != 0:
+        raise ValueError("start and end must be aligned to the granularity (seconds)")
+    if start >= end:
+        raise ValueError("start must be strictly before end")
+    step = PROVIDER_SAFE_BUCKETS * bucket
+    windows: List[tuple] = []
+    w_start = start
+    while w_start < end:
+        w_end = min(end, w_start + step)
+        windows.append((w_start, w_end))
+        w_start += step
+    return windows
+
+
+def _missing_buckets_24_7(starts: List[int], bucket: int) -> List[Dict[str, int]]:
+    """Gap diagnostic on a 24/7 grid: within the data span, which buckets are
+    absent. Kept ABSTRACT so a market-calendar-aware version (Forex/Gold sessions,
+    weekends, holidays) can replace it later without touching the pipeline."""
+    gaps: List[Dict[str, int]] = []
+    for i in range(1, len(starts)):
+        step = starts[i] - starts[i - 1]
+        if step > bucket:
+            gaps.append({"after_start": starts[i - 1], "missing_buckets": step // bucket - 1})
+    return gaps
+
+
+async def fetch_candle_history(symbol: str, granularity: str, start: int, end: int) -> dict:
+    """Assemble a paginated candle history. Raises ValueError on invalid request
+    (unknown granularity, misaligned/reversed range, range too large)."""
+    if granularity in GRANULARITIES and end - start > max_history_span(granularity):
+        raise ValueError(
+            f"requested range too large (max {settings.history_max_windows} windows)"
+        )
+    windows = plan_candle_windows(granularity, start, end)  # validates gran/align/order
+    bucket = GRANULARITIES[granularity][1]
+
+    collected: Dict[int, Candle] = {}
+    invalid_count = 0
+    failed = 0
+    succeeded = 0
+    for w_start, w_end in windows:
+        try:
+            candles, _status = await market_provider.get_candles_range(
+                symbol, granularity, w_start, w_end
+            )
+            succeeded += 1
+        except httpx.HTTPError:
+            failed += 1
+            continue
+        for candle in candles:
+            if candle.start is None or candle.status == DataQualityStatus.INVALID:
+                invalid_count += 1
+                continue
+            key = int(candle.start.timestamp())
+            if key < start or key >= end:  # enforce internal [start, end) contract
+                continue
+            collected[key] = candle  # dedup by start (identity: product+gran+start)
+
+    starts_sorted = sorted(collected)
+    kept = [collected[k] for k in starts_sorted]
+    # Coinbase is 24/7: route gap detection through the ALWAYS_OPEN_24_7 calendar.
+    # Always24_7Calendar.analyze_gaps delegates to _missing_buckets_24_7, so the
+    # result is byte-for-byte identical to the pre-6A behaviour (no regression).
+    gaps = _COINBASE_CALENDAR.analyze_gaps(starts_sorted, bucket).missing
+
+    transport_complete = failed == 0
+    if failed > 0:
+        status = "PARTIAL"
+    elif not kept:
+        status = "EMPTY"
+    elif invalid_count > 0 or gaps:
+        status = "PARTIAL"
+    else:
+        status = "COMPLETE"
+    data_complete = status == "COMPLETE"
+
+    return {
+        "source": "coinbase",
+        "symbol": symbol.upper(),
+        "granularity": granularity,
+        "status": status,
+        "requested_range": {"start": start, "end": end},
+        "provider_windows": {
+            "planned": len(windows),
+            "succeeded": succeeded,
+            "failed": failed,
+        },
+        "first_candle_start": starts_sorted[0] if starts_sorted else None,
+        "last_candle_start": starts_sorted[-1] if starts_sorted else None,
+        "count": len(kept),
+        "invalid_candles_count": invalid_count,
+        "gaps": gaps,
+        "transport_complete": transport_complete,
+        "data_complete": data_complete,
+        "complete": data_complete,
+        "candles": [c.to_dict() for c in kept],
+    }
+
+
+@api_router.get("/market/candles/{symbol}/history")
+async def market_candles_history(
+    symbol: str, start: int, end: int, granularity: str = "1m"
+) -> dict:
+    try:
+        return await fetch_candle_history(symbol, granularity, start, end)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": str(exc)}
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": str(exc)}
+        ) from exc
+
+
+# ============================ persistence (increment 5) ======================
+# Postgres = durable HISTORICAL truth (MarketStateStore stays the in-memory
+# REALTIME truth). One pipeline: WS/REST -> parse/quality -> MarketBus ->
+# PersistenceConsumer. Identity/PK = (source, product_id, granularity,
+# bucket_start). OHLCV = NUMERIC(38,18) (exact decimal, never float).
+#
+# Time semantics kept distinct:
+#   observed_at      = OUR pipeline receive/observe clock (homogeneous REST/WS) —
+#                      the ONLY field used to arbitrate freshness on upsert.
+#   source_timestamp = provider time when present (audit/diagnostic only).
+#   updated_at       = OUR DB write time (audit only; never a freshness proof).
+# is_closed = bucket time-closed by OUR clock+margin; NEVER "provider-certified
+# final", so a time-closed row may still receive a newer admissible correction.
+
+metadata = MetaData()
+
+PAPER_ACCOUNT_ID = "default"
+PAPER_INITIAL_CAPITAL = Decimal("1000")
+PAPER_ACCOUNT_CURRENCY = "USD"
+
+paper_account_table = Table(
+    "paper_account",
+    metadata,
+    Column("account_id", String, primary_key=True),
+    Column("currency", String, nullable=False),
+    Column("initial_capital", Numeric(38, 18), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+paper_positions_table = Table(
+    "paper_positions",
+    metadata,
+    Column("position_id", String, primary_key=True),
+    Column("symbol", String, nullable=False),
+    Column("side", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("entry", Numeric(38, 18), nullable=False),
+    Column("stop_loss", Numeric(38, 18), nullable=False),
+    Column("take_profit", Numeric(38, 18), nullable=False),
+    Column("size", Numeric(38, 18), nullable=False),
+    Column("size_unit", String, nullable=False),
+    Column("risk_money", Numeric(38, 18), nullable=False),
+    Column("risk_percent", Numeric(18, 8), nullable=False),
+    Column("capital_before", Numeric(38, 18), nullable=False),
+    Column("source", String, nullable=False),
+    Column("source_timestamp", DateTime(timezone=True), nullable=False),
+    Column("opened_at", DateTime(timezone=True), nullable=False),
+    Column("close_reason", String, nullable=True),
+    Column("close_price", Numeric(38, 18), nullable=True),
+    Column("closed_at", DateTime(timezone=True), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+candles_table = Table(
+    "candles",
+    metadata,
+    Column("source", String, primary_key=True),
+    Column("product_id", String, primary_key=True),
+    Column("granularity", String, primary_key=True),
+    Column("bucket_start", DateTime(timezone=True), primary_key=True),
+    Column("open", Numeric(38, 18), nullable=False),
+    Column("high", Numeric(38, 18), nullable=False),
+    Column("low", Numeric(38, 18), nullable=False),
+    Column("close", Numeric(38, 18), nullable=False),
+    Column("volume", Numeric(38, 18), nullable=False),
+    Column("quality", String, nullable=False),
+    Column("is_closed", Boolean, nullable=False),
+    Column("origin", String, nullable=False),  # "ws" | "rest"
+    Column("source_timestamp", DateTime(timezone=True), nullable=True),
+    Column("observed_at", DateTime(timezone=True), nullable=False),
+    Column("received_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+
+class PersistenceStatus(str, Enum):
+    READY = "READY"
+    DEGRADED = "DEGRADED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class PersistenceState:
+    """Explicit, observable persistence health. Never a silent false success."""
+
+    def __init__(self) -> None:
+        self.ready = False
+        self.status = PersistenceStatus.UNAVAILABLE
+        self.errors = 0
+        self.last_error: Optional[str] = None
+
+    def mark_ready(self) -> None:
+        self.ready = True
+        self.status = PersistenceStatus.READY
+
+    def mark_init_failed(self, detail: str) -> None:
+        self.ready = False
+        self.status = PersistenceStatus.UNAVAILABLE
+        self.errors += 1
+        self.last_error = detail
+
+    def mark_runtime_error(self, detail: str) -> None:
+        # Transient runtime failure after a successful init: degrade, don't reset
+        # ready=False permanently; the counter stays cumulative.
+        self.errors += 1
+        self.last_error = detail
+        if self.ready:
+            self.status = PersistenceStatus.DEGRADED
+
+    def mark_write_ok(self) -> None:
+        # Deterministic recovery: a later successful write clears a transient
+        # DEGRADED back to READY. Never clears the cumulative error counter.
+        if self.ready and self.status == PersistenceStatus.DEGRADED:
+            self.status = PersistenceStatus.READY
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "persistence_ready": self.ready,
+            "persistence_status": self.status.value,
+            "persistence_errors": self.errors,
+            "persistence_last_error": self.last_error,
+        }
+
+
+persistence_state = PersistenceState()
+
+
+def is_candle_closed(
+    bucket_start: datetime, bucket_seconds: int, now: Optional[datetime] = None
+) -> bool:
+    """True if the bucket is time-closed by OUR clock + margin. Not provider-final."""
+    reference = now or utcnow()
+    margin = settings.candle_finalization_margin_seconds
+    end = bucket_start + timedelta(seconds=bucket_seconds + margin)
+    return reference >= end
+
+
+class ServerSignalRequest(BaseModel):
+    symbol: str = Field(min_length=1, max_length=64)
+    setup_state: str
+    direction: Optional[str] = None
+    entry: Optional[Decimal] = None
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+    risk_reward: Optional[Decimal] = None
+    structure_confirmed: bool = False
+    displacement_confirmed: bool = False
+    order_block_confirmed: bool = False
+    source_timestamp: datetime
+
+
+class PaperAutoEntryGateRequest(BaseModel):
+    symbol: str = Field(min_length=1, max_length=64)
+    signal_decision: str
+    entry: Optional[Decimal] = None
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+    risk_reward: Optional[Decimal] = None
+
+
+class PaperPositionCreate(BaseModel):
+    position_id: str = Field(min_length=1, max_length=128)
+    symbol: str = Field(min_length=1, max_length=64)
+    side: str
+    entry: Decimal
+    stop_loss: Decimal
+    take_profit: Decimal
+    size: Decimal
+    size_unit: str = Field(min_length=1, max_length=32)
+    risk_money: Decimal
+    risk_percent: Decimal
+    capital_before: Decimal
+    source: str = Field(min_length=1, max_length=64)
+    source_timestamp: datetime
+    opened_at: datetime
+
+
+def validate_paper_position_create(req: PaperPositionCreate) -> None:
+    if req.side not in {"LONG", "SHORT"}:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "SIDE_INVALID"}
+        )
+    positive = (req.entry, req.stop_loss, req.take_profit, req.size, req.risk_money)
+    if any(value <= Decimal("0") for value in positive):
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "VALUE_INVALID"}
+        )
+    if req.risk_percent <= Decimal("0") or req.risk_percent > Decimal("100"):
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "RISK_INVALID"}
+        )
+    if req.capital_before <= Decimal("0"):
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "CAPITAL_INVALID"}
+        )
+    if req.side == "LONG" and not (req.stop_loss < req.entry < req.take_profit):
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "LONG_LEVELS_INVALID"},
+        )
+    if req.side == "SHORT" and not (req.take_profit < req.entry < req.stop_loss):
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "SHORT_LEVELS_INVALID"},
+        )
+
+
+def paper_position_to_dict(row: Any) -> Dict[str, object]:
+    data = dict(row._mapping)
+    for key in ("entry", "stop_loss", "take_profit", "size", "risk_money",
+                "risk_percent", "capital_before", "close_price"):
+        if data.get(key) is not None:
+            data[key] = str(data[key])
+    for key in ("source_timestamp", "opened_at", "closed_at", "created_at", "updated_at"):
+        if data.get(key) is not None:
+            data[key] = data[key].isoformat()
+    data["paper_only"] = True
+    data["execution"] = False
+    return data
+
+
+def evaluate_server_signal(req: ServerSignalRequest) -> Dict[str, object]:
+    canonical = req.symbol.upper().replace("/", "-")
+    reasons: List[str] = []
+    decision = "WAIT"
+
+    if req.setup_state != "ENTRY_NOW":
+        reasons.append("SETUP_NOT_ENTRY_NOW")
+    if req.direction not in {"BULLISH", "BEARISH"}:
+        reasons.append("DIRECTION_INVALID")
+    if not req.structure_confirmed:
+        reasons.append("STRUCTURE_NOT_CONFIRMED")
+    if not req.displacement_confirmed:
+        reasons.append("DISPLACEMENT_NOT_CONFIRMED")
+    if not req.order_block_confirmed:
+        reasons.append("ORDER_BLOCK_NOT_CONFIRMED")
+
+    levels = (req.entry, req.stop_loss, req.take_profit, req.risk_reward)
+    if any(value is None for value in levels):
+        reasons.append("TRADE_PLAN_INCOMPLETE")
+    elif req.risk_reward is not None and req.risk_reward <= Decimal("0"):
+        reasons.append("RR_INVALID")
+    elif req.entry is not None and req.stop_loss is not None and req.take_profit is not None:
+        if req.direction == "BULLISH" and not req.stop_loss < req.entry < req.take_profit:
+            reasons.append("LONG_LEVELS_INVALID")
+        if req.direction == "BEARISH" and not req.take_profit < req.entry < req.stop_loss:
+            reasons.append("SHORT_LEVELS_INVALID")
+
+    quality = classify_freshness(req.source_timestamp, utcnow())
+    if quality != DataQualityStatus.VALID:
+        reasons.append("SOURCE_NOT_VALID")
+
+    if not reasons:
+        decision = "LONG" if req.direction == "BULLISH" else "SHORT"
+
+    return {
+        "status": "READY" if decision in {"LONG", "SHORT"} else "WAIT",
+        "symbol": canonical,
+        "decision": decision,
+        "reasons": reasons,
+        "source_timestamp": req.source_timestamp.isoformat(),
+        "quality": quality.value,
+        "authoritative": True,
+        "execution": False,
+    }
+
+
+@api_router.post("/paper/signal/evaluate")
+async def evaluate_paper_server_signal(req: ServerSignalRequest) -> Dict[str, object]:
+    return evaluate_server_signal(req)
+
+
+@api_router.post("/paper/auto-entry/gate")
+async def evaluate_paper_auto_entry_gate(
+    req: PaperAutoEntryGateRequest,
+) -> Dict[str, object]:
+    canonical = req.symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    blockers: List[str] = []
+
+    if req.signal_decision not in {"LONG", "SHORT", "WAIT"}:
+        blockers.append("SIGNAL_DECISION_INVALID")
+    elif req.signal_decision == "WAIT":
+        blockers.append("SIGNAL_WAIT")
+
+    if instrument is None:
+        blockers.append("INSTRUMENT_NOT_REGISTERED")
+
+    levels = (req.entry, req.stop_loss, req.take_profit, req.risk_reward)
+    if any(value is None for value in levels):
+        blockers.append("TRADE_PLAN_INCOMPLETE")
+    elif req.risk_reward is not None and req.risk_reward <= Decimal("0"):
+        blockers.append("RR_INVALID")
+    elif req.entry is not None and req.stop_loss is not None and req.take_profit is not None:
+        if req.signal_decision == "LONG" and not (
+            req.stop_loss < req.entry < req.take_profit
+        ):
+            blockers.append("LONG_LEVELS_INVALID")
+        if req.signal_decision == "SHORT" and not (
+            req.take_profit < req.entry < req.stop_loss
+        ):
+            blockers.append("SHORT_LEVELS_INVALID")
+
+    # V16-M2 provides a server-authoritative signal evaluator. This gate request still
+    # carries a decision field for compatibility; unattended creation must call the
+    # server evaluator first and use its derived decision, never trust browser voting.
+
+    # The backend registry intentionally contains no invented broker sizing rules.
+    # Auto entry stays blocked until source/timestamp + volume/tick/contract rules
+    # are represented and verified server-side for the selected instrument.
+    blockers.append("SERVER_INSTRUMENT_SPECS_NOT_IMPLEMENTED")
+
+    return {
+        "status": "BLOCKED",
+        "symbol": canonical,
+        "signal_decision": req.signal_decision,
+        "blockers": list(dict.fromkeys(blockers)),
+        "auto_create_position": False,
+        "paper_only": True,
+        "execution": False,
+    }
+
+
+@api_router.post("/paper/positions", status_code=201)
+async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
+        )
+    validate_paper_position_create(req)
+    now = utcnow()
+    values = {
+        "position_id": req.position_id, "symbol": req.symbol.upper(), "side": req.side,
+        "status": "OPEN", "entry": req.entry, "stop_loss": req.stop_loss,
+        "take_profit": req.take_profit, "size": req.size, "size_unit": req.size_unit,
+        "risk_money": req.risk_money, "risk_percent": req.risk_percent,
+        "capital_before": req.capital_before, "source": req.source,
+        "source_timestamp": req.source_timestamp, "opened_at": req.opened_at,
+        "close_reason": None, "close_price": None, "closed_at": None,
+        "created_at": now, "updated_at": now,
+    }
+    try:
+        async with engine.begin() as conn:
+            stmt = pg_insert(paper_positions_table).values(values)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["position_id"])
+            result = await conn.execute(stmt)
+            if result.rowcount != 1:
+                raise HTTPException(
+                    status_code=409, detail={"status": "CONFLICT", "reason": "POSITION_ID_EXISTS"}
+                )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"}
+        ) from exc
+    persistence_state.mark_write_ok()
+    return {**values, "paper_only": True, "execution": False}
+
+
+class PaperPositionMark(BaseModel):
+    current_price: Decimal
+    observed_at: datetime
+    source: str = Field(min_length=1, max_length=64)
+    source_timestamp: datetime
+
+
+async def paper_mark_from_realtime(symbol: str) -> Optional[PaperPositionMark]:
+    canonical = symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    if instrument is None:
+        return None
+
+    price: Optional[Decimal] = None
+    received_at: Optional[datetime] = None
+    source_timestamp: Optional[datetime] = None
+    source = ""
+
+    if instrument.asset_class == AssetClass.CRYPTO:
+        provider_symbol = provider_symbol_map.to_provider("coinbase", canonical)
+        if provider_symbol is None:
+            return None
+        datum = await market_store.get_ticker(provider_symbol)
+        if datum is None or datum.status != DataQualityStatus.VALID:
+            return None
+        if datum.value is None or datum.value <= 0 or datum.source_timestamp is None:
+            return None
+        price = Decimal(str(datum.value))
+        received_at = datum.received_at
+        source_timestamp = datum.source_timestamp
+        source = datum.source
+
+    elif instrument.asset_class == AssetClass.FOREX:
+        quote = massive_forex_ws.quotes.get(canonical)
+        if quote is None or quote.quality != DataQualityStatus.VALID:
+            return None
+        if quote.bid <= 0 or quote.ask <= 0 or quote.bid > quote.ask:
+            return None
+        price = (quote.bid + quote.ask) / Decimal("2")
+        received_at = quote.received_at
+        source_timestamp = quote.source_timestamp
+        source = "massive"
+
+    elif instrument.asset_class == AssetClass.METAL:
+        if canonical != "XAU-USD":
+            return None
+        gold = twelvedata_gold_ws.last_price
+        if gold is None or gold.quality != DataQualityStatus.VALID:
+            return None
+        if gold.price <= 0:
+            return None
+        price = gold.price
+        received_at = gold.received_at
+        source_timestamp = gold.source_timestamp
+        source = "twelvedata"
+
+    elif instrument.asset_class == AssetClass.INDEX:
+        value = massive_indices_ws.values.get(canonical)
+        if value is None or value.quality != DataQualityStatus.VALID:
+            return None
+        if value.value <= 0:
+            return None
+        price = value.value
+        received_at = value.received_at
+        source_timestamp = value.source_timestamp
+        source = "massive"
+
+    if price is None or received_at is None or source_timestamp is None or not source:
+        return None
+    return PaperPositionMark(
+        current_price=price,
+        observed_at=received_at,
+        source=source,
+        source_timestamp=source_timestamp,
+    )
+
+
+async def monitor_open_paper_positions_once() -> Dict[str, int]:
+    if not persistence_state.ready:
+        return {"checked": 0, "marked": 0, "unavailable": 0}
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text("SELECT position_id, symbol FROM paper_positions WHERE status='OPEN'")
+        )
+        rows = result.fetchall()
+    marked = 0
+    unavailable = 0
+    for row in rows:
+        mark = await paper_mark_from_realtime(row._mapping["symbol"])
+        if mark is None:
+            unavailable += 1
+            continue
+        await mark_paper_position(row._mapping["position_id"], mark)
+        marked += 1
+    return {"checked": len(rows), "marked": marked, "unavailable": unavailable}
+
+
+async def paper_monitor_loop(stop_event: asyncio.Event) -> None:
+    interval = max(settings.paper_monitor_interval_seconds, 1.0)
+    while not stop_event.is_set():
+        try:
+            await monitor_open_paper_positions_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - loop must fail safe and keep serving
+            log.error("Paper monitor iteration failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
+def evaluate_paper_close(side: str, price: Decimal, stop_loss: Decimal,
+                         take_profit: Decimal) -> Optional[Tuple[str, Decimal]]:
+    if side == "LONG":
+        if price <= stop_loss:
+            return ("STOP_LOSS", stop_loss)
+        if price >= take_profit:
+            return ("TAKE_PROFIT", take_profit)
+    elif side == "SHORT":
+        if price >= stop_loss:
+            return ("STOP_LOSS", stop_loss)
+        if price <= take_profit:
+            return ("TAKE_PROFIT", take_profit)
+    return None
+
+
+def calculate_paper_pnl(side: str, entry: Decimal, exit_price: Decimal,
+                        size: Decimal) -> Decimal:
+    delta = exit_price - entry if side == "LONG" else entry - exit_price
+    return delta * size
+
+
+@api_router.post("/paper/positions/{position_id}/mark")
+async def mark_paper_position(position_id: str, req: PaperPositionMark) -> Dict[str, object]:
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
+        )
+    if req.current_price <= Decimal("0"):
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "PRICE_INVALID"}
+        )
+    try:
+        async with engine.begin() as conn:
+            result = await conn.execute(
+                text("SELECT * FROM paper_positions WHERE position_id = :position_id FOR UPDATE"),
+                {"position_id": position_id},
+            )
+            row = result.fetchone()
+            if row is None:
+                raise HTTPException(
+                    status_code=404, detail={"status": "NOT_FOUND", "reason": "POSITION_NOT_FOUND"}
+                )
+            data = dict(row._mapping)
+            if data["status"] != "OPEN":
+                return paper_position_to_dict(row)
+            outcome = evaluate_paper_close(
+                data["side"], req.current_price, data["stop_loss"], data["take_profit"]
+            )
+            if outcome is None:
+                payload = paper_position_to_dict(row)
+                payload["mark_price"] = str(req.current_price)
+                payload["mark_observed_at"] = req.observed_at.isoformat()
+                payload["mark_source"] = req.source
+                payload["mark_source_timestamp"] = req.source_timestamp.isoformat()
+                payload["unrealized_pnl"] = str(
+                    calculate_paper_pnl(
+                        data["side"], data["entry"], req.current_price, data["size"]
+                    )
+                )
+                return payload
+            reason, close_price = outcome
+            pnl = calculate_paper_pnl(data["side"], data["entry"], close_price, data["size"])
+            now = utcnow()
+            await conn.execute(
+                text(
+                    "UPDATE paper_positions SET status='CLOSED', close_reason=:reason, "
+                    "close_price=:close_price, closed_at=:closed_at, updated_at=:updated_at "
+                    "WHERE position_id=:position_id AND status='OPEN'"
+                ),
+                {
+                    "reason": reason, "close_price": close_price, "closed_at": req.observed_at,
+                    "updated_at": now, "position_id": position_id,
+                },
+            )
+            data.update(
+                status="CLOSED", close_reason=reason, close_price=close_price,
+                closed_at=req.observed_at, updated_at=now,
+            )
+            payload = paper_position_to_dict(type("Row", (), {"_mapping": data})())
+            payload["realized_pnl"] = str(pnl)
+            payload["close_source"] = req.source
+            payload["close_source_timestamp"] = req.source_timestamp.isoformat()
+            return payload
+    except HTTPException:
+        raise
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "paper mark failed"}
+        ) from exc
+
+
+@api_router.get("/paper/positions/live")
+async def get_live_paper_positions() -> Dict[str, object]:
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
+        )
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT * FROM paper_positions WHERE status='OPEN' "
+                    "ORDER BY opened_at DESC, position_id DESC"
+                )
+            )
+            rows = result.fetchall()
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"}
+        ) from exc
+
+    positions: List[Dict[str, object]] = []
+    for row in rows:
+        payload = paper_position_to_dict(row)
+        mark = await paper_mark_from_realtime(str(row._mapping["symbol"]))
+        payload["mark_status"] = "UNAVAILABLE"
+        payload["mark_price"] = None
+        payload["mark_source"] = None
+        payload["mark_source_timestamp"] = None
+        payload["unrealized_pnl"] = None
+        if mark is not None:
+            payload["mark_status"] = "VALID"
+            payload["mark_price"] = str(mark.current_price)
+            payload["mark_source"] = mark.source
+            payload["mark_source_timestamp"] = mark.source_timestamp.isoformat()
+            payload["unrealized_pnl"] = str(
+                calculate_paper_pnl(
+                    row._mapping["side"],
+                    row._mapping["entry"],
+                    mark.current_price,
+                    row._mapping["size"],
+                )
+            )
+        positions.append(payload)
+    return {
+        "status": "OK",
+        "positions": positions,
+        "count": len(positions),
+        "paper_only": True,
+        "execution": False,
+    }
+
+
+@api_router.get("/paper/account/live")
+async def get_live_paper_account() -> Dict[str, object]:
+    account = await get_paper_account()
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
+        )
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT position_id, symbol, side, entry, size "
+                    "FROM paper_positions WHERE status='OPEN' "
+                    "ORDER BY opened_at ASC, position_id ASC"
+                )
+            )
+            rows = result.fetchall()
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"}
+        ) from exc
+
+    unrealized = Decimal("0")
+    marked = 0
+    unavailable = 0
+    for row in rows:
+        data = row._mapping
+        mark = await paper_mark_from_realtime(str(data["symbol"]))
+        if mark is None:
+            unavailable += 1
+            continue
+        unrealized += calculate_paper_pnl(
+            data["side"], data["entry"], mark.current_price, data["size"]
+        )
+        marked += 1
+
+    current_capital = Decimal(str(account["current_capital"]))
+    live_equity = current_capital + unrealized
+    complete = unavailable == 0
+    return {
+        **account,
+        "unrealized_pnl": str(unrealized) if complete else None,
+        "live_equity": str(live_equity) if complete else None,
+        "marked_open_positions": marked,
+        "unavailable_open_positions": unavailable,
+        "live_equity_status": "VALID" if complete else "PARTIAL",
+        "paper_only": True,
+        "execution": False,
+    }
+
+
+@api_router.get("/paper/account")
+async def get_paper_account() -> Dict[str, object]:
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
+        )
+    try:
+        async with engine.connect() as conn:
+            account_result = await conn.execute(
+                text(
+                    "SELECT currency, initial_capital FROM paper_account "
+                    "WHERE account_id=:account_id"
+                ),
+                {"account_id": PAPER_ACCOUNT_ID},
+            )
+            account = account_result.fetchone()
+            result = await conn.execute(
+                text(
+                    "SELECT status, side, entry, size, close_price "
+                    "FROM paper_positions ORDER BY opened_at ASC, position_id ASC"
+                )
+            )
+            rows = result.fetchall()
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"}
+        ) from exc
+    if account is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "paper account not initialized"},
+        )
+
+    realized = Decimal("0")
+    open_count = 0
+    closed_count = 0
+    for row in rows:
+        data = row._mapping
+        if data["status"] == "OPEN":
+            open_count += 1
+        elif data["status"] == "CLOSED" and data["close_price"] is not None:
+            closed_count += 1
+            realized += calculate_paper_pnl(
+                data["side"], data["entry"], data["close_price"], data["size"]
+            )
+    initial_capital = account._mapping["initial_capital"]
+    current_capital = initial_capital + realized
+    return {
+        "status": "OK",
+        "currency": account._mapping["currency"],
+        "initial_capital": str(initial_capital),
+        "current_capital": str(current_capital),
+        "realized_pnl": str(realized),
+        "open_positions": open_count,
+        "closed_positions": closed_count,
+        "paper_only": True,
+        "execution": False,
+    }
+
+
+@api_router.get("/paper/positions")
+async def list_paper_positions(status_filter: Optional[str] = None) -> Dict[str, object]:
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
+        )
+    sql = "SELECT * FROM paper_positions"
+    params: Dict[str, object] = {}
+    if status_filter is not None:
+        if status_filter not in {"OPEN", "CLOSED", "CONFLICT"}:
+            raise HTTPException(
+                status_code=400, detail={"status": "INVALID", "reason": "STATUS_INVALID"}
+            )
+        sql += " WHERE status = :status"
+        params["status"] = status_filter
+    sql += " ORDER BY opened_at DESC, position_id DESC"
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(text(sql), params)
+            rows = [paper_position_to_dict(row) for row in result.fetchall()]
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"}
+        ) from exc
+    return {"status": "OK", "positions": rows, "count": len(rows), "paper_only": True}
+
+
+async def init_candle_schema() -> None:
+    """Create persistence tables if absent (idempotent). Raises on real DDL failure
+    so it is NEVER swallowed into a silent false success."""
+    async with engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
+        now = utcnow()
+        stmt = pg_insert(paper_account_table).values(
+            account_id=PAPER_ACCOUNT_ID,
+            currency=PAPER_ACCOUNT_CURRENCY,
+            initial_capital=PAPER_INITIAL_CAPITAL,
+            created_at=now,
+            updated_at=now,
+        )
+        stmt = stmt.on_conflict_do_nothing(index_elements=["account_id"])
+        await conn.execute(stmt)
+
+
+@dataclass(frozen=True)
+class CandleRow:
+    source: str
+    product_id: str
+    granularity: str
+    bucket_start: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+    quality: DataQualityStatus
+    origin: str  # "ws" | "rest"
+    source_timestamp: Optional[datetime]
+    observed_at: datetime
+
+
+def _bucket_seconds_for(granularity: str) -> int:
+    if granularity in GRANULARITIES:
+        return GRANULARITIES[granularity][1]
+    return 300  # WS candles are 5-minute buckets
+
+
+def candle_row_from_realtime(datum: RealtimeDatum) -> Optional[CandleRow]:
+    """Build a persistable CandleRow from a WS candle RealtimeDatum. Returns None
+    for non-candle / invalid / incomplete data (never fabricates)."""
+    if datum.data_type != "candle" or datum.status == DataQualityStatus.INVALID:
+        return None
+    if datum.source_timestamp is None or datum.ohlcv is None:
+        return None
+    o = datum.ohlcv
+    return CandleRow(
+        source=datum.source,
+        product_id=datum.product_id,
+        granularity="5m",  # Coinbase WS candles are 5-minute buckets
+        bucket_start=datum.source_timestamp,
+        open=Decimal(str(o["open"])), high=Decimal(str(o["high"])),
+        low=Decimal(str(o["low"])), close=Decimal(str(o["close"])),
+        volume=Decimal(str(o["volume"])),
+        quality=datum.status,
+        origin="ws",
+        source_timestamp=datum.source_timestamp,
+        observed_at=datum.received_at,
+    )
+
+
+def _row_to_values(row: CandleRow, now: datetime) -> Dict[str, object]:
+    bucket_seconds = _bucket_seconds_for(row.granularity)
+    return {
+        "source": row.source,
+        "product_id": row.product_id,
+        "granularity": row.granularity,
+        "bucket_start": row.bucket_start,
+        "open": Decimal(str(row.open)),
+        "high": Decimal(str(row.high)),
+        "low": Decimal(str(row.low)),
+        "close": Decimal(str(row.close)),
+        "volume": Decimal(str(row.volume)),
+        "quality": row.quality.value,
+        "is_closed": is_candle_closed(row.bucket_start, bucket_seconds, now=now),
+        "origin": row.origin,
+        "source_timestamp": row.source_timestamp,
+        "observed_at": row.observed_at,
+        "received_at": now,
+        "updated_at": now,
+    }
+
+
+async def persist_candles(rows: List[CandleRow]) -> int:
+    """Idempotent, ATOMIC batch upsert of candle rows. One persist_candles call =
+    ONE transaction (multiple SQL batches inside, no intermediate commit). Any
+    batch failure rolls back the WHOLE operation. Returns the number of rows sent.
+    Upsert accepts a row only if it is not strictly older than the stored one
+    (observed_at), and INVALID rows are never sent. Raises on DB error."""
+    rows = [r for r in rows if r.quality != DataQualityStatus.INVALID]
+    if not rows:
+        return 0
+    now = utcnow()
+    batch_size = max(1, settings.persist_batch_size)
+    try:
+        async with engine.begin() as conn:  # BEGIN ... COMMIT (or ROLLBACK on error)
+            for i in range(0, len(rows), batch_size):
+                chunk = rows[i:i + batch_size]
+                values = [_row_to_values(r, now) for r in chunk]
+                stmt = pg_insert(candles_table).values(values)
+                update_cols = {
+                    c: stmt.excluded[c]
+                    for c in (
+                        "open", "high", "low", "close", "volume", "quality",
+                        "is_closed", "origin", "source_timestamp", "observed_at",
+                        "updated_at",
+                    )
+                }
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["source", "product_id", "granularity", "bucket_start"],
+                    set_=update_cols,
+                    # accept only a non-older observation; never degrade with stale data
+                    where=stmt.excluded["observed_at"] >= candles_table.c.observed_at,
+                )
+                await conn.execute(stmt)
+    except Exception as exc:  # noqa: BLE001 - surface, never a false success
+        persistence_state.mark_runtime_error(str(exc))
+        raise
+    persistence_state.mark_write_ok()
+    return len(rows)
+
+
+class PersistenceConsumer:
+    """MarketBus consumer that persists WS candle events. A DB error never kills
+    the bus/WS loop: it is logged, counted, and flips persistence to DEGRADED."""
+
+    async def __call__(self, datum: RealtimeDatum) -> None:
+        if not persistence_state.ready:
+            return
+        row = candle_row_from_realtime(datum)
+        if row is None:
+            return
+        try:
+            await persist_candles([row])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Persistence consumer error: %s", exc, exc_info=True)
+
+
+persistence_consumer = PersistenceConsumer()
+
+
+async def persist_history_result(result: Dict[str, object]) -> Dict[str, object]:
+    """Persist the VALID candles of a fetch_candle_history result. Persists real
+    VALID candles even when the fetch was PARTIAL, but NEVER asserts range
+    completeness in the DB (completeness is recomputed on read)."""
+    source = str(result.get("source", "coinbase"))
+    product_id = str(result["symbol"])
+    granularity = str(result["granularity"])
+    rows = _history_dicts_to_rows(source, product_id, granularity, result.get("candles"), utcnow())
+    written = await persist_candles(rows)
+    return {
+        "persisted": written,
+        "fetch_status": result.get("status"),
+        "data_complete": result.get("data_complete"),
+    }
+
+
+def _history_dicts_to_rows(
+    source: str, product_id: str, granularity: str, raw: object, observed_at: datetime
+) -> List[CandleRow]:
+    rows: List[CandleRow] = []
+    if not isinstance(raw, list):
+        return rows
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if item.get("quality") == DataQualityStatus.INVALID.value:
+            continue
+        start = parse_iso8601(item.get("start"))
+        o = _to_float(item.get("open"))
+        h = _to_float(item.get("high"))
+        low = _to_float(item.get("low"))
+        c = _to_float(item.get("close"))
+        v = _to_float(item.get("volume"))
+        if start is None or o is None or h is None or low is None or c is None or v is None:
+            continue
+        rows.append(
+            CandleRow(
+                source=source, product_id=product_id.upper(), granularity=granularity,
+                bucket_start=start,
+                open=Decimal(str(o)), high=Decimal(str(h)), low=Decimal(str(low)),
+                close=Decimal(str(c)), volume=Decimal(str(v)),
+                quality=DataQualityStatus.VALID, origin="rest",
+                source_timestamp=None, observed_at=observed_at,
+            )
+        )
+    return rows
+
+
+async def read_stored_candles(
+    symbol: str, granularity: str, start: int, end: int, limit: int
+) -> List[Dict[str, object]]:
+    """Read persisted candles, chronological ascending, half-open [start, end).
+    Parameterised query; raises on DB error (caller maps to 503)."""
+    bucket_seconds = _bucket_seconds_for(granularity)
+    start_dt = datetime.fromtimestamp(int(start), tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(int(end), tz=timezone.utc)
+    now = utcnow()
+    t = candles_table
+    stmt = (
+        t.select()
+        .where(t.c.source == "coinbase")
+        .where(t.c.product_id == symbol.upper())
+        .where(t.c.granularity == granularity)
+        .where(t.c.bucket_start >= start_dt)
+        .where(t.c.bucket_start < end_dt)
+        .order_by(t.c.bucket_start.asc())
+        .limit(max(1, min(int(limit), settings.db_read_max_rows)))
+    )
+    out: List[Dict[str, object]] = []
+    async with engine.connect() as conn:
+        result = await conn.execute(stmt)
+        for r in result.mappings():
+            out.append(
+                {
+                    "source": r["source"],
+                    "product_id": r["product_id"],
+                    "granularity": r["granularity"],
+                    "start": int(r["bucket_start"].timestamp()),
+                    "open": str(r["open"]),
+                    "high": str(r["high"]),
+                    "low": str(r["low"]),
+                    "close": str(r["close"]),
+                    "volume": str(r["volume"]),
+                    "quality": r["quality"],
+                    "is_closed": is_candle_closed(r["bucket_start"], bucket_seconds, now=now),
+                    "origin": r["origin"],
+                }
+            )
+    return out
+
+
+@api_router.get("/market/candles/{symbol}/stored")
+async def market_candles_stored(
+    symbol: str, start: int, end: int, granularity: str = "1m", limit: int = 1000
+) -> dict:
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+    if granularity not in GRANULARITIES:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "unsupported granularity"}
+        )
+    if start >= end:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "start must be before end"}
+        )
+    try:
+        candles = await read_stored_candles(symbol, granularity, start, end, limit)
+    except Exception as exc:  # noqa: BLE001
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": str(exc)}
+        ) from exc
+    return {
+        "source": "coinbase",
+        "symbol": symbol.upper(),
+        "granularity": granularity,
+        "status": "EMPTY" if not candles else "OK",
+        "count": len(candles),
+        "candles": candles,
+    }
+
+
+# ============================ multi-asset foundation (increment 6A) ===========
+# Canonical, provider-agnostic model so Chart/Strategy/Signal/History/DB never
+# need to know Coinbase (or a future provider) specifics. 6A is a PURE abstraction:
+# no external connector, no invented market calendar/hours, no invented instrument
+# metadata. Coinbase stays functionally identical; its 24/7 behaviour is the
+# ALWAYS_OPEN_24_7 policy, and gap detection is routed through it unchanged.
+
+
+class AssetClass(str, Enum):
+    CRYPTO = "CRYPTO"
+    FOREX = "FOREX"
+    METAL = "METAL"
+    INDEX = "INDEX"
+
+
+class Capability(str, Enum):
+    TICKER_REST = "TICKER_REST"
+    TICKER_WS = "TICKER_WS"
+    CANDLES_REST = "CANDLES_REST"
+    CANDLES_WS = "CANDLES_WS"
+    HISTORY_INTRADAY = "HISTORY_INTRADAY"
+    HISTORY_DAILY = "HISTORY_DAILY"
+    VOLUME = "VOLUME"
+    BID_ASK = "BID_ASK"
+    TRADES = "TRADES"
+    ORDER_BOOK = "ORDER_BOOK"
+
+
+class VolumeSemantics(str, Enum):
+    BASE_ASSET_VOLUME = "BASE_ASSET_VOLUME"
+    QUOTE_VOLUME = "QUOTE_VOLUME"
+    TICK_VOLUME = "TICK_VOLUME"
+    CONTRACT_VOLUME = "CONTRACT_VOLUME"
+    NOT_AVAILABLE = "NOT_AVAILABLE"
+    UNKNOWN = "UNKNOWN"
+
+
+class MarketCalendarPolicy(str, Enum):
+    ALWAYS_OPEN_24_7 = "ALWAYS_OPEN_24_7"
+    NOT_CONFIGURED = "NOT_CONFIGURED"
+    FOREX_WEEK = "FOREX_WEEK"
+    US_EQUITY_RTH = "US_EQUITY_RTH"
+
+
+class OpenState(str, Enum):
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    UNKNOWN = "UNKNOWN"
+
+
+class MarketAvailability(str, Enum):
+    # Orthogonal to DataQualityStatus (which is untouched). A normal market close
+    # is NOT a provider outage is NOT missing data — three distinct axes.
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+    NOT_SUPPORTED = "NOT_SUPPORTED"
+    CALENDAR_UNKNOWN = "CALENDAR_UNKNOWN"
+
+
+@dataclass(frozen=True)
+class Instrument:
+    canonical_symbol: str  # the ONLY global identity used across the app
+    asset_class: AssetClass
+    base_asset: Optional[str]
+    quote_asset: Optional[str]
+    display_name: str
+    timezone: str  # IANA market timezone (stored; no session math in 6A)
+    market_calendar: MarketCalendarPolicy
+    volume_semantics: VolumeSemantics
+    price_precision: Optional[int] = None  # None until verified (future risk calc)
+    tick_size: Optional[Decimal] = None  # None until verified (future risk calc)
+
+
+class InstrumentRegistry:
+    """Canonical instrument identities. In-memory in 6A (no Postgres table)."""
+
+    def __init__(self) -> None:
+        self._by_canonical: Dict[str, Instrument] = {}
+
+    def register(self, instrument: Instrument) -> None:
+        self._by_canonical[instrument.canonical_symbol] = instrument
+
+    def get(self, canonical_symbol: str) -> Optional[Instrument]:
+        return self._by_canonical.get(canonical_symbol)
+
+    def all(self) -> List[Instrument]:
+        return list(self._by_canonical.values())
+
+
+class ProviderSymbolMap:
+    """Bidirectional (provider, provider_symbol) <-> canonical_symbol mapping.
+    Never assumes canonical == provider symbol. Unmapped -> None (NOT_MAPPED)."""
+
+    def __init__(self) -> None:
+        self._to_provider: Dict[tuple, str] = {}
+        self._to_canonical: Dict[tuple, str] = {}
+
+    def add(self, provider: str, canonical: str, provider_symbol: str) -> None:
+        self._to_provider[(provider, canonical)] = provider_symbol
+        self._to_canonical[(provider, provider_symbol)] = canonical
+
+    def to_provider(self, provider: str, canonical: str) -> Optional[str]:
+        return self._to_provider.get((provider, canonical))
+
+    def to_canonical(self, provider: str, provider_symbol: str) -> Optional[str]:
+        return self._to_canonical.get((provider, provider_symbol))
+
+
+@dataclass
+class ProviderProfile:
+    """Explicit provider capabilities, PER asset class (a provider may offer FX
+    intraday but a metal only daily). Missing capability -> NOT_SUPPORTED, never a
+    silent fallback."""
+
+    name: str
+    capabilities_by_asset_class: Dict[AssetClass, Set[Capability]]
+    granularities_by_asset_class: Dict[AssetClass, Set[str]]
+
+    def supports(self, capability: Capability, asset_class: AssetClass) -> bool:
+        return capability in self.capabilities_by_asset_class.get(asset_class, set())
+
+    def supports_granularity(self, granularity: str, asset_class: AssetClass) -> bool:
+        return granularity in self.granularities_by_asset_class.get(asset_class, set())
+
+
+class MarketCalendar:
+    """Interface. is_market_expected_open / expected_bucket_starts / analyze_gaps.
+    Never concludes OPEN or CLOSED by assumption when not configured."""
+
+    policy: MarketCalendarPolicy = MarketCalendarPolicy.NOT_CONFIGURED
+
+    def is_market_expected_open(self, ts_unix: int) -> OpenState:
+        raise NotImplementedError
+
+    def expected_bucket_starts(self, granularity: str, start: int, end: int) -> Optional[List[int]]:
+        raise NotImplementedError
+
+    def analyze_gaps(self, starts: List[int], bucket: int) -> "GapReport":
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class GapReport:
+    status: str  # "ANALYZED" (missing meaningful) | "UNKNOWN" (no conclusion)
+    missing: List[Dict[str, int]]
+
+
+class Always24_7Calendar(MarketCalendar):
+    """Crypto 24/7. Reproduces the exact pre-6A gap logic (delegates to
+    _missing_buckets_24_7) so Coinbase behaviour is unchanged."""
+
+    policy = MarketCalendarPolicy.ALWAYS_OPEN_24_7
+
+    def is_market_expected_open(self, ts_unix: int) -> OpenState:
+        return OpenState.OPEN
+
+    def expected_bucket_starts(self, granularity: str, start: int, end: int) -> Optional[List[int]]:
+        if granularity not in GRANULARITIES:
+            return None
+        bucket = GRANULARITIES[granularity][1]
+        return list(range(start, end, bucket))
+
+    def analyze_gaps(self, starts: List[int], bucket: int) -> GapReport:
+        return GapReport("ANALYZED", _missing_buckets_24_7(starts, bucket))
+
+
+class NotConfiguredCalendar(MarketCalendar):
+    """No verified hours -> everything UNKNOWN. Never invents OPEN/CLOSED/gaps."""
+
+    policy = MarketCalendarPolicy.NOT_CONFIGURED
+
+    def is_market_expected_open(self, ts_unix: int) -> OpenState:
+        return OpenState.UNKNOWN
+
+    def expected_bucket_starts(self, granularity: str, start: int, end: int) -> Optional[List[int]]:
+        return None
+
+    def analyze_gaps(self, starts: List[int], bucket: int) -> GapReport:
+        return GapReport("UNKNOWN", [])
+
+
+# Verified weekly Forex hours: opens Sunday 17:00 and closes Friday 17:00 in
+# America/New_York local time (DST handled by IANA -> 22:00 UTC in winter, 21:00
+# UTC in summer). NEVER a fixed UTC offset. Source: widely corroborated retail
+# spot-forex week (FOREX.com, City Index, TMGM, babypips, ...).
+FOREX_ANCHOR_TZ = "America/New_York"
+FOREX_WEEK_OPEN_HOUR = 17   # Sunday 17:00 New York
+FOREX_WEEK_CLOSE_HOUR = 17  # Friday 17:00 New York
+
+# INDICATIVE financial-center session hours (local business hours via IANA, DST
+# automatic). These are indicative CENTER hours, NOT a specific broker's hours,
+# and are NOT used to authorise/deny trading. Tokyo does not observe DST.
+FOREX_SESSIONS = (
+    ("Sydney", "Australia/Sydney", 8, 17),
+    ("Tokyo", "Asia/Tokyo", 9, 18),
+    ("London", "Europe/London", 8, 17),
+    ("New York", "America/New_York", 8, 17),
+)
+
+
+def _zone(name: str) -> Optional[ZoneInfo]:
+    """Return a ZoneInfo or None (fail-safe) if IANA data is unavailable."""
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return None
+
+
+def _forex_week_bounds(now_utc: datetime) -> Optional[Dict[str, object]]:
+    """Compute Forex weekly OPEN/CLOSED anchored on America/New_York 17:00 Sun->Fri.
+    Returns dict{is_open, weekend, next_open_utc, next_close_utc} or None if the
+    timezone database is unavailable (caller maps None -> UNKNOWN)."""
+    ny = _zone(FOREX_ANCHOR_TZ)
+    if ny is None:
+        return None
+    now_ny = now_utc.astimezone(ny)
+    # Monday=0 .. Sunday=6
+    wd = now_ny.weekday()
+
+    def at_hour(day_offset: int, hour: int) -> datetime:
+        base = (now_ny + timedelta(days=day_offset)).replace(
+            hour=hour, minute=0, second=0, microsecond=0
+        )
+        return base.astimezone(timezone.utc)
+
+    # Previous Sunday 17:00 and this Friday 17:00 in NY local terms.
+    days_since_sunday = (wd + 1) % 7  # Sunday -> 0, Monday -> 1, ... Saturday -> 6
+    sunday_open = at_hour(-days_since_sunday, FOREX_WEEK_OPEN_HOUR)
+    friday_close = at_hour(-days_since_sunday + 5, FOREX_WEEK_CLOSE_HOUR)
+    is_open = sunday_open <= now_utc < friday_close
+    weekend = not is_open
+    if is_open:
+        next_close_utc: Optional[datetime] = friday_close
+        next_open_utc: Optional[datetime] = None
+    else:
+        # Next Sunday 17:00 NY (this week's if still ahead, else next week's).
+        candidate = sunday_open if now_utc < sunday_open else at_hour(-days_since_sunday + 7,
+                                                                      FOREX_WEEK_OPEN_HOUR)
+        next_open_utc = candidate
+        next_close_utc = None
+    return {
+        "is_open": is_open,
+        "weekend": weekend,
+        "next_open_utc": next_open_utc,
+        "next_close_utc": next_close_utc,
+    }
+
+
+class USEquityRTHCalendar(MarketCalendar):
+    """Baseline U.S. cash-index regular-hours calendar.
+
+    Massive documents most U.S. indices as updating Monday-Friday 09:30-16:00
+    America/New_York. DST is handled by IANA ZoneInfo. This class intentionally
+    does NOT fabricate holiday/early-close knowledge: it provides the documented
+    regular-hours baseline only, and gap analysis remains UNKNOWN because Massive
+    explicitly emits no aggregate when an index has no update.
+    """
+
+    policy = MarketCalendarPolicy.US_EQUITY_RTH
+    timezone_name = "America/New_York"
+
+    def is_market_expected_open(self, ts_unix: int) -> OpenState:
+        ny = _zone(self.timezone_name)
+        if ny is None:
+            return OpenState.UNKNOWN
+        try:
+            now = datetime.fromtimestamp(int(ts_unix), tz=timezone.utc).astimezone(ny)
+        except (OverflowError, OSError, ValueError):
+            return OpenState.UNKNOWN
+        if now.weekday() >= 5:
+            return OpenState.CLOSED
+        minutes = now.hour * 60 + now.minute
+        return OpenState.OPEN if 570 <= minutes < 960 else OpenState.CLOSED
+
+    def expected_bucket_starts(self, granularity: str, start: int, end: int) -> Optional[List[int]]:
+        return None  # holidays/early closes/index-specific update cadence not fabricated
+
+    def analyze_gaps(self, starts: List[int], bucket: int) -> GapReport:
+        return GapReport("UNKNOWN", [])  # no index update != missing market data
+
+
+class ForexWeekCalendar(MarketCalendar):
+    """Forex weekly calendar: OPEN/CLOSED anchored on America/New_York 17:00 Sun->Fri
+    (DST via IANA). Gap analysis stays UNKNOWN: a missing bar is never a gap because
+    Massive emits no bar without a new quote. Holidays are NOT modelled (UNKNOWN)."""
+
+    policy = MarketCalendarPolicy.FOREX_WEEK
+
+    def is_market_expected_open(self, ts_unix: int) -> OpenState:
+        try:
+            now = datetime.fromtimestamp(int(ts_unix), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return OpenState.UNKNOWN
+        bounds = _forex_week_bounds(now)
+        if bounds is None:
+            return OpenState.UNKNOWN
+        return OpenState.OPEN if bounds["is_open"] else OpenState.CLOSED
+
+    def expected_bucket_starts(self, granularity: str, start: int, end: int) -> Optional[List[int]]:
+        return None  # never fabricate a forex grid
+
+    def analyze_gaps(self, starts: List[int], bucket: int) -> GapReport:
+        return GapReport("UNKNOWN", [])  # no-quote != gap -> no fabricated gaps
+
+
+_ALWAYS_24_7 = Always24_7Calendar()
+_NOT_CONFIGURED = NotConfiguredCalendar()
+_FOREX_WEEK = ForexWeekCalendar()
+_US_EQUITY_RTH = USEquityRTHCalendar()
+_COINBASE_CALENDAR = _ALWAYS_24_7
+
+
+def calendar_for(policy: MarketCalendarPolicy) -> MarketCalendar:
+    """Resolve implemented calendar policies; unknown configuration stays UNKNOWN."""
+    if policy == MarketCalendarPolicy.ALWAYS_OPEN_24_7:
+        return _ALWAYS_24_7
+    if policy == MarketCalendarPolicy.FOREX_WEEK:
+        return _FOREX_WEEK
+    if policy == MarketCalendarPolicy.US_EQUITY_RTH:
+        return _US_EQUITY_RTH
+    return _NOT_CONFIGURED
+
+
+def forex_active_sessions(now_utc: datetime) -> List[Dict[str, object]]:
+    """INDICATIVE financial-center sessions (local business hours via IANA). Marked
+    indicative; NOT broker hours; NOT a trading authorisation. A session is active
+    only on a local weekday within its local business hours. tz missing -> active
+    UNKNOWN (None) for that center, never fabricated."""
+    out: List[Dict[str, object]] = []
+    for name, tz_name, open_h, close_h in FOREX_SESSIONS:
+        tz = _zone(tz_name)
+        if tz is None:
+            out.append({"name": name, "tz": tz_name, "active": None, "indicative": True})
+            continue
+        local = now_utc.astimezone(tz)
+        weekday = local.weekday() < 5  # Mon-Fri local
+        active = bool(weekday and open_h <= local.hour < close_h)
+        out.append({
+            "name": name, "tz": tz_name, "active": active, "indicative": True,
+            "local_open_hour": open_h, "local_close_hour": close_h,
+        })
+    return out
+
+
+def forex_market_state(now_utc: Optional[datetime] = None) -> Dict[str, object]:
+    """Full Forex market-state payload. Market truth = OPEN/CLOSED/CLOSED_WEEKEND/
+    UNKNOWN (NY-anchored). Sessions are indicative only. Never OPEN by default;
+    unprovable fields stay null/UNKNOWN. Market state is independent from data
+    quality (OPEN != LIVE; CLOSED != provider down)."""
+    now = now_utc or utcnow()
+    bounds = _forex_week_bounds(now)
+    sessions = forex_active_sessions(now)
+    if bounds is None:
+        market_state = "UNKNOWN"
+        reason = "timezone database unavailable"
+        next_open = next_close = None
+        current = None
+    elif bounds["is_open"]:
+        market_state = "OPEN"
+        reason = "within the Forex trading week (Sun 17:00 -> Fri 17:00 New York)"
+        next_open, next_close = None, bounds["next_close_utc"]
+        active_names = [s["name"] for s in sessions if s.get("active") is True]
+        current = active_names[0] if active_names else None
+    else:
+        market_state = "CLOSED_WEEKEND"
+        reason = "weekend close (Fri 17:00 -> Sun 17:00 New York)"
+        next_open, next_close = bounds["next_open_utc"], None
+        current = None
+
+    def iso(dt: object) -> Optional[str]:
+        return dt.isoformat() if isinstance(dt, datetime) else None
+
+    return {
+        "asset_class": "FOREX",
+        "market_state": market_state,
+        "reason": reason,
+        "current_session": current,       # indicative; may be null
+        "sessions": sessions,             # indicative center hours (not broker hours)
+        "next_open": iso(next_open),
+        "next_close": iso(next_close),
+        "timezone_internal": "UTC",
+        "display_timezone": "America/Toronto",
+        "holidays": "NOT_IMPLEMENTED",    # no robust verified holiday rule yet
+        "source": "retail spot-forex week: Sun 17:00 -> Fri 17:00 America/New_York",
+        "as_of": now.isoformat(),
+    }
+
+
+instrument_registry = InstrumentRegistry()
+provider_symbol_map = ProviderSymbolMap()
+
+
+def _register_coinbase_instruments() -> None:
+    """The only PROVEN real case in 6A. Coinbase crypto: 24/7, base-asset volume.
+    Unverified financial metadata (precision/tick) stays None (never invented)."""
+    for canon, base, quote, name in (
+        ("BTC-USD", "BTC", "USD", "Bitcoin / US Dollar"),
+        ("ETH-USD", "ETH", "USD", "Ethereum / US Dollar"),
+    ):
+        instrument_registry.register(
+            Instrument(
+                canonical_symbol=canon,
+                asset_class=AssetClass.CRYPTO,
+                base_asset=base,
+                quote_asset=quote,
+                display_name=name,
+                timezone="UTC",
+                market_calendar=MarketCalendarPolicy.ALWAYS_OPEN_24_7,
+                volume_semantics=VolumeSemantics.BASE_ASSET_VOLUME,
+                price_precision=None,
+                tick_size=None,
+            )
+        )
+        provider_symbol_map.add("coinbase", canon, canon)  # Coinbase symbol == canonical here
+
+
+COINBASE_PROFILE = ProviderProfile(
+    name="coinbase",
+    capabilities_by_asset_class={
+        AssetClass.CRYPTO: {
+            Capability.TICKER_REST,
+            Capability.TICKER_WS,
+            Capability.CANDLES_REST,
+            Capability.CANDLES_WS,
+            Capability.HISTORY_INTRADAY,
+            Capability.VOLUME,
+        },
+    },
+    granularities_by_asset_class={AssetClass.CRYPTO: set(GRANULARITIES)},
+)
+
+_register_coinbase_instruments()
+
+
+# ============================ Massive Forex REST (increment 6B-1) =============
+# First real Multi-Asset connector: Massive (ex-Polygon) Forex REST aggregates.
+# Reuses the 6A canonical model + the existing Candle/persistence bricks (NO
+# parallel architecture). Officially verified (massive.com/docs/rest/forex):
+#   GET /v2/aggs/ticker/{forexTicker}/range/{multiplier}/{timespan}/{from}/{to}
+#   response {results:[{o,h,l,c,v,t}]} with t = Unix MILLISECONDS, bars aligned in
+#   Eastern Time; aggregates are derived from bid/ask QUOTES, not executed trades,
+#   and no bar is emitted when no quote arrives (absence != gap).
+# Rules honoured: internal time = UTC; volume semantics = UNKNOWN (never invented);
+# no invented Forex calendar (NOT_CONFIGURED -> gaps UNKNOWN); NO provider symbol
+# registered by deduction -> unverified canonical stays NOT_MAPPED.
+
+MASSIVE_FOREX_GRANULARITIES: Dict[str, tuple] = {
+    "1m": (1, "minute"),
+    "5m": (5, "minute"),
+    "15m": (15, "minute"),
+    "30m": (30, "minute"),
+    "1h": (1, "hour"),
+    "2h": (2, "hour"),
+    "4h": (4, "hour"),
+    "6h": (6, "hour"),
+    "1d": (1, "day"),
+}
+
+
+def _unix_ms_to_dt(value: Any) -> Optional[datetime]:
+    """Massive aggregate `t` is a UNIX timestamp in MILLISECONDS. Returns aware UTC,
+    or None if unparseable (never invents a timestamp)."""
+    try:
+        ms = int(value)
+    except (TypeError, ValueError):
+        return None
+    if ms <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def massive_agg_to_candle(
+    item: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> Candle:
+    """Convert one Massive forex aggregate into a qualified Candle. Pure, no network.
+    Missing/unparseable OHLCV or timestamp -> INVALID; never fabricated."""
+    if not isinstance(item, dict):
+        return Candle(None, None, None, None, None, None, DataQualityStatus.INVALID)
+    start = _unix_ms_to_dt(item.get("t"))
+    open_ = _to_float(item.get("o"))
+    high = _to_float(item.get("h"))
+    low = _to_float(item.get("l"))
+    close = _to_float(item.get("c"))
+    volume = _to_float(item.get("v"))
+    if (
+        start is None or low is None or high is None
+        or open_ is None or close is None or volume is None
+    ):
+        return Candle(start, low, high, open_, close, volume, DataQualityStatus.INVALID)
+    if low < 0 or high < 0 or open_ < 0 or close < 0 or volume < 0:
+        return Candle(start, low, high, open_, close, volume, DataQualityStatus.INVALID)
+    return Candle(start, low, high, open_, close, volume,
+                  classify_freshness(start, max_age_seconds, now=now))
+
+
+def massive_aggs_to_candles(
+    payload: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> tuple:
+    """Parse a Massive forex aggregates response into (list[Candle], status).
+    Empty/malformed -> ([], MISSING)."""
+    raw = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(raw, list) or not raw:
+        return [], DataQualityStatus.MISSING
+    candles = [massive_agg_to_candle(x, max_age_seconds, now=now) for x in raw]
+    has_valid = any(c.status != DataQualityStatus.INVALID for c in candles)
+    return candles, (DataQualityStatus.VALID if has_valid else DataQualityStatus.INVALID)
+
+
+class MassiveForexProvider:
+    """Massive Forex REST aggregates adapter. No WebSocket, no failover (6B-1).
+    Resolves the provider ticker via the verified ProviderSymbolMap only."""
+
+    SOURCE = "massive"
+
+    def __init__(self, rest_url: Optional[str] = None, api_key: Optional[str] = None) -> None:
+        self.rest_url = (rest_url or settings.massive_rest_url).rstrip("/")
+        self.api_key = api_key if api_key is not None else settings.massive_api_key
+        self.client: Optional[httpx.AsyncClient] = None
+
+    async def connect(self) -> None:
+        if self.client is None:
+            headers = {"Accept": "application/json"}
+            if self.api_key:
+                # Header auth keeps the key OUT of the URL, so it can never leak via
+                # an httpx exception/request-URL. (Redaction below is defence in depth.)
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            self.client = httpx.AsyncClient(
+                base_url=self.rest_url,
+                timeout=settings.massive_request_timeout_seconds,
+                headers=headers,
+            )
+
+    async def disconnect(self) -> None:
+        if self.client is not None:
+            await self.client.aclose()
+            self.client = None
+
+    async def _get(self, path: str, params: Optional[dict] = None) -> dict:
+        if self.client is None:
+            await self.connect()
+        assert self.client is not None
+        resp = await self.client.get(path, params=params)
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Massive returned a non-object JSON response")
+        return payload
+
+    async def get_candles_range(
+        self, canonical_symbol: str, granularity: str, start: int, end: int
+    ):
+        """Fetch aggregates for a canonical forex symbol over [start, end] UNIX
+        seconds. NOT_MAPPED / NOT_SUPPORTED raise ValueError (fail-safe, no fake)."""
+        ticker = provider_symbol_map.to_provider(self.SOURCE, canonical_symbol)
+        if ticker is None:
+            raise ValueError(f"NOT_MAPPED: no verified Massive symbol for {canonical_symbol}")
+        if granularity not in MASSIVE_FOREX_GRANULARITIES:
+            raise ValueError(f"NOT_SUPPORTED granularity for Massive forex: {granularity}")
+        multiplier, timespan = MASSIVE_FOREX_GRANULARITIES[granularity]
+        start_ms = int(start) * 1000
+        end_ms = int(end) * 1000
+        payload = await self._get(
+            f"/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{start_ms}/{end_ms}",
+            params={"adjusted": "true", "sort": "asc", "limit": 50000},
+        )
+        return massive_aggs_to_candles(payload, max_age_seconds=float("inf"))
+
+    async def list_forex_tickers(self) -> List[str]:
+        """Fetch the REAL set of Massive forex ticker symbols (for verified mapping
+        activation). Header auth; a single page of up to 1000 (covers the majors)."""
+        payload = await self._get(
+            "/v3/reference/tickers",
+            params={"market": "fx", "active": "true", "limit": 1000},
+        )
+        results = payload.get("results")
+        out: List[str] = []
+        if isinstance(results, list):
+            for row in results:
+                if isinstance(row, dict) and isinstance(row.get("ticker"), str):
+                    out.append(row["ticker"])
+        return out
+
+
+def _register_massive_forex_instruments() -> None:
+    """Register the 8 CANONICAL forex identities (ours, not provider deductions).
+    Calendar NOT_CONFIGURED (no invented hours); volume UNKNOWN; precision/tick None.
+    NO provider_symbol mapping is added here: Massive symbols stay NOT_MAPPED until
+    officially verified via /v3/reference/tickers (register_massive_forex_symbol)."""
+    pairs = (
+        ("EUR-USD", "EUR", "USD", "Euro / US Dollar"),
+        ("GBP-USD", "GBP", "USD", "British Pound / US Dollar"),
+        ("USD-JPY", "USD", "JPY", "US Dollar / Japanese Yen"),
+        ("USD-CHF", "USD", "CHF", "US Dollar / Swiss Franc"),
+        ("AUD-USD", "AUD", "USD", "Australian Dollar / US Dollar"),
+        ("USD-CAD", "USD", "CAD", "US Dollar / Canadian Dollar"),
+        ("NZD-USD", "NZD", "USD", "New Zealand Dollar / US Dollar"),
+        ("EUR-CAD", "EUR", "CAD", "Euro / Canadian Dollar"),
+    )
+    for canon, base, quote, name in pairs:
+        instrument_registry.register(
+            Instrument(
+                canonical_symbol=canon,
+                asset_class=AssetClass.FOREX,
+                base_asset=base,
+                quote_asset=quote,
+                display_name=name,
+                timezone="UTC",
+                market_calendar=MarketCalendarPolicy.FOREX_WEEK,
+                volume_semantics=VolumeSemantics.UNKNOWN,
+                price_precision=None,
+                tick_size=None,
+            )
+        )
+
+
+MASSIVE_FOREX_PROFILE = ProviderProfile(
+    name="massive",
+    capabilities_by_asset_class={
+        AssetClass.FOREX: {
+            Capability.CANDLES_REST,
+            Capability.HISTORY_INTRADAY,
+            Capability.HISTORY_DAILY,
+            Capability.BID_ASK,
+        },
+    },
+    granularities_by_asset_class={AssetClass.FOREX: set(MASSIVE_FOREX_GRANULARITIES)},
+)
+
+
+def register_massive_forex_symbol(canonical: str, provider_ticker: str) -> None:
+    """Register a Massive forex mapping ONLY after official verification via
+    /v3/reference/tickers. Never called at import (unverified -> NOT_MAPPED)."""
+    provider_symbol_map.add("massive", canonical, provider_ticker)
+
+
+# Candidate provider tickers per canonical (naming convention only). A mapping is
+# activated ONLY if the exact ticker is really present in the official Massive
+# response (activate_massive_forex_mappings) -> never a deduction.
+EXPECTED_MASSIVE_FOREX: Dict[str, str] = {
+    "EUR-USD": "C:EURUSD",
+    "GBP-USD": "C:GBPUSD",
+    "USD-JPY": "C:USDJPY",
+    "USD-CHF": "C:USDCHF",
+    "AUD-USD": "C:AUDUSD",
+    "USD-CAD": "C:USDCAD",
+    "NZD-USD": "C:NZDUSD",
+    "EUR-CAD": "C:EURCAD",
+}
+MASSIVE_XAU_TICKER = "C:XAUUSD"  # only DETECTED/reported; never auto-integrated in 6B-1A
+
+_APIKEY_RE = re.compile(r"(apikey=)[^&\s]+", re.IGNORECASE)
+
+
+def _redact_secret(text: str) -> str:
+    """Mask an apiKey=... query value in any string before logging (defence in
+    depth; header auth already keeps the key out of URLs)."""
+    return _APIKEY_RE.sub(r"\1REDACTED", text)
+
+
+class ForexMappingActivation:
+    """Explicit, key-free diagnostic of the runtime mapping activation."""
+
+    def __init__(self) -> None:
+        self.attempted = False
+        self.activated = False
+        self.reason: Optional[str] = None
+        self.confirmed: Dict[str, str] = {}
+        self.xau: Optional[Dict[str, str]] = None
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "attempted": self.attempted,
+            "activated": self.activated,
+            "reason": self.reason,
+            "confirmed_count": len(self.confirmed),
+            "xau": self.xau,  # {"ticker": "C:XAUUSD"} or None (reported, NOT integrated)
+        }
+
+
+massive_forex_activation = ForexMappingActivation()
+
+
+async def activate_massive_forex_mappings() -> Dict[str, object]:
+    """Runtime activation. No MASSIVE_API_KEY -> no call, mappings stay NOT_MAPPED,
+    backend stays healthy. With a key -> query the official ticker reference and
+    register ONLY the symbols really returned. Any failure (network/401/403/429/
+    timeout/invalid) is caught: explicit diagnostic, no mapping, never a crash. The
+    key is never logged (header auth + redaction)."""
+    state = massive_forex_activation
+    state.attempted = True
+    if not settings.massive_api_key:
+        state.reason = "MASSIVE_API_KEY not set; Massive forex mappings remain NOT_MAPPED"
+        return state.to_dict()
+    try:
+        tickers = await massive_forex_provider.list_forex_tickers()
+    except Exception as exc:  # noqa: BLE001 - must never fail the whole backend
+        state.reason = _redact_secret(str(exc))[:200] or "activation failed"
+        log.warning("Massive forex mapping activation failed: %s", _redact_secret(str(exc)))
+        return state.to_dict()
+    ticker_set = set(tickers)
+    for canonical, expected in EXPECTED_MASSIVE_FOREX.items():
+        if expected in ticker_set:  # verified present in the OFFICIAL response
+            register_massive_forex_symbol(canonical, expected)
+            state.confirmed[canonical] = expected
+    if MASSIVE_XAU_TICKER in ticker_set:
+        state.xau = {"ticker": MASSIVE_XAU_TICKER}  # reported only; NOT wired to Metal
+    state.activated = True
+    state.reason = (
+        f"activated {len(state.confirmed)}/{len(EXPECTED_MASSIVE_FOREX)} forex mappings"
+    )
+    return state.to_dict()
+
+
+@api_router.get("/market/forex/mappings")
+async def market_forex_mappings() -> dict:
+    mappings = []
+    for canonical in EXPECTED_MASSIVE_FOREX:
+        provider_symbol = provider_symbol_map.to_provider("massive", canonical)
+        mappings.append(
             {
-                "ev": "AM", "sym": "I:SPX", "o": "10", "h": "9",
-                "l": "8", "c": "9", "s": 1788285600000,
+                "canonical": canonical,
+                "provider_symbol": provider_symbol,
+                "status": "MAPPED" if provider_symbol else "NOT_MAPPED",
             }
         )
-        self.assertIsNone(result)
-
-    def test_index_ws_start_endpoint_present(self):
-        self.assertIn("/market/index/websocket/start", self.main_src)
-
-    def test_index_realtime_endpoint_present(self):
-        self.assertIn("/market/index/{symbol}/realtime", self.main_src)
-
-    def test_index_feed_is_explicitly_delayed(self):
-        self.assertIn('FEED_RECENCY = "15_MIN_DELAYED"', self.main_src)
-
-    def test_frontend_starts_index_realtime(self):
-        self.assertIn("startIndexRealtime", self.html)
-
-    def test_frontend_reads_index_realtime(self):
-        marker = '/api/v1/market/index/"+encodeURIComponent(sym)+"/realtime'
-        self.assertIn(marker, self.html)
-
-    def test_frontend_never_labels_delayed_indices_live(self):
-        self.assertIn("15M DELAYED · MASSIVE WS", self.html)
-        self.assertNotIn("LIVE INDEX · MASSIVE WS", self.html)
-
-
-class TestChartEngineV4BOS(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_bos_detector_present(self):
-        self.assertIn("function detectConfirmedBOS", self.html)
-
-    def test_bos_uses_confirmed_swing_delay(self):
-        self.assertIn("if(s.index+n!==i)return", self.html)
-
-    def test_bos_bull_requires_close_above(self):
-        self.assertIn("close>latestHigh.price", self.html)
-
-    def test_bos_bear_requires_close_below(self):
-        self.assertIn("close<latestLow.price", self.html)
-
-    def test_bos_strict_comparison_rejects_equal(self):
-        self.assertNotIn("close>=latestHigh.price", self.html)
-        self.assertNotIn("close<=latestLow.price", self.html)
-
-    def test_bos_does_not_use_wick_for_break(self):
-        self.assertNotIn("Number(cs[i].high)>latestHigh.price", self.html)
-        self.assertNotIn("Number(cs[i].low)<latestLow.price", self.html)
-
-    def test_bos_excludes_latest_potentially_open_candle(self):
-        self.assertIn("i<Math.max(0,cs.length-1)", self.html)
-
-    def test_bos_deduplicates_broken_high(self):
-        self.assertIn("!brokenHigh[latestHigh.index]", self.html)
-
-    def test_bos_deduplicates_broken_low(self):
-        self.assertIn("!brokenLow[latestLow.index]", self.html)
-
-    def test_bos_renders_bull_and_bear_labels(self):
-        self.assertIn('lab.textContent=bull?"BOS ↑":"BOS ↓"', self.html)
-
-    def test_bos_ui_is_active(self):
-        self.assertIn("BOS ACTIF", self.html)
-
-    def test_choch_no_longer_marked_next_step(self):
-        self.assertNotIn("CHoCH/MSS · prochaine étape", self.html)
-
-
-class TestChartEngineV5CHOCHMSS(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_choch_detector_present(self):
-        self.assertIn("function detectConfirmedCHOCH", self.html)
-
-    def test_choch_uses_confirmed_swing_delay(self):
-        self.assertIn("if(s.index+n===i)confirmed.push(s)", self.html)
-
-    def test_choch_requires_bull_structure_pair(self):
-        self.assertIn('if(s.structure==="HH")bullHigh=s', self.html)
-        self.assertIn('if(s.structure==="HL")bullLow=s', self.html)
-
-    def test_choch_requires_bear_structure_pair(self):
-        self.assertIn('if(s.structure==="LH")bearHigh=s', self.html)
-        self.assertIn('if(s.structure==="LL")bearLow=s', self.html)
-
-    def test_bearish_choch_requires_close_below_last_low(self):
-        self.assertIn('bias==="BULLISH"&&latestLow&&close<latestLow.price', self.html)
-
-    def test_bullish_choch_requires_close_above_last_high(self):
-        self.assertIn('bias==="BEARISH"&&latestHigh&&close>latestHigh.price', self.html)
-
-    def test_choch_uses_strict_close_not_equal(self):
-        self.assertNotIn("close<=latestLow.price", self.html)
-        self.assertNotIn("close>=latestHigh.price", self.html)
-
-    def test_choch_excludes_latest_potentially_open_candle(self):
-        self.assertIn("i<Math.max(0,cs.length-1)", self.html)
-
-    def test_choch_resets_bias_after_event(self):
-        self.assertIn("brokenLow[latestLow.index]=true;bias=null", self.html)
-        self.assertIn("brokenHigh[latestHigh.index]=true;bias=null", self.html)
-
-    def test_choch_renders_both_directions(self):
-        self.assertIn('label:"CHoCH/MSS ↓"', self.html)
-        self.assertIn('label:"CHoCH/MSS ↑"', self.html)
-
-    def test_choch_ui_is_active(self):
-        self.assertIn("CHoCH/MSS ACTIF", self.html)
-
-    def test_choch_counter_is_visible(self):
-        self.assertIn('" · CHoCH/MSS ↑ "+chochBull', self.html)
-        self.assertIn('" · CHoCH/MSS ↓ "+chochBear', self.html)
-
-
-class TestChartEngineV6LiquiditySweep(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_liquidity_sweep_detector_present(self):
-        self.assertIn("function detectLiquiditySweeps", self.html)
-
-    def test_sweep_uses_confirmed_swings(self):
-        self.assertIn("if(s.index+n!==i)return", self.html)
-
-    def test_swing_is_activated_after_sweep_evaluation(self):
-        start = self.html.index("function detectLiquiditySweeps")
-        end = self.html.index("function detectConfirmedCHOCH", start)
-        detector = self.html[start:end]
-        sweep_check = detector.index("high>latestHigh.price&&close<latestHigh.price")
-        activation = detector.index("if(s.index+n!==i)return")
-        self.assertLess(sweep_check, activation)
-
-    def test_buy_side_sweep_requires_wick_above_and_close_below(self):
-        self.assertIn("high>latestHigh.price&&close<latestHigh.price", self.html)
-
-    def test_sell_side_sweep_requires_wick_below_and_close_above(self):
-        self.assertIn("low<latestLow.price&&close>latestLow.price", self.html)
-
-    def test_sweep_uses_strict_inequalities(self):
-        self.assertNotIn("high>=latestHigh.price", self.html)
-        self.assertNotIn("low<=latestLow.price", self.html)
-
-    def test_sweep_excludes_latest_potentially_open_candle(self):
-        self.assertIn("i<Math.max(0,cs.length-1)", self.html)
-
-    def test_one_buy_side_sweep_per_reference_level(self):
-        self.assertIn("!sweptHigh[latestHigh.index]", self.html)
-        self.assertIn("sweptHigh[latestHigh.index]=true", self.html)
-
-    def test_one_sell_side_sweep_per_reference_level(self):
-        self.assertIn("!sweptLow[latestLow.index]", self.html)
-        self.assertIn("sweptLow[latestLow.index]=true", self.html)
-
-    def test_sweep_labels_are_rendered(self):
-        self.assertIn('label:"BSL SWEEP"', self.html)
-        self.assertIn('label:"SSL SWEEP"', self.html)
-
-    def test_liquidity_sweep_ui_is_active(self):
-        self.assertIn("LIQUIDITY SWEEP ACTIF", self.html)
-
-    def test_sweep_counters_are_visible(self):
-        self.assertIn('" · BSL Sweep "+buySweeps', self.html)
-        self.assertIn('" · SSL Sweep "+sellSweeps', self.html)
-
-
-class TestChartEngineV7Displacement(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_displacement_detector_present(self):
-        self.assertIn("function detectDisplacement", self.html)
-
-    def test_displacement_lookback_is_explicit(self):
-        self.assertIn("const DISPLACEMENT_LOOKBACK=20", self.html)
-
-    def test_displacement_body_multiplier_is_explicit(self):
-        self.assertIn("const DISPLACEMENT_BODY_MULTIPLIER=1.5", self.html)
-
-    def test_displacement_body_range_ratio_is_explicit(self):
-        self.assertIn("const DISPLACEMENT_MIN_BODY_RANGE_RATIO=0.7", self.html)
-
-    def test_displacement_close_extreme_fraction_is_explicit(self):
-        self.assertIn("const DISPLACEMENT_CLOSE_EXTREME_FRACTION=0.2", self.html)
-
-    def test_displacement_uses_only_prior_bodies_for_baseline(self):
-        self.assertIn("for(var j=i-lookback;j<i;j++)", self.html)
-
-    def test_displacement_requires_large_and_strong_body(self):
-        self.assertIn("largeBody&&strongBody&&(bullish||bearish)", self.html)
-
-    def test_bullish_displacement_requires_directional_close(self):
-        self.assertIn("close>open&&(high-close)/range", self.html)
-
-    def test_bearish_displacement_requires_directional_close(self):
-        self.assertIn("close<open&&(close-low)/range", self.html)
-
-    def test_displacement_excludes_potentially_open_last_candle(self):
-        self.assertIn("i<Math.max(0,cs.length-1)", self.html)
-
-    def test_displacement_labels_and_ui_are_present(self):
-        self.assertIn('label:bullish?"DISP ↑":"DISP ↓"', self.html)
-        self.assertIn("DISPLACEMENT ACTIF", self.html)
-
-    def test_displacement_methodology_warns_backtest_required(self):
-        self.assertIn("Seuils à valider par backtest/OOS", self.html)
-
-
-class TestChartEngineV8FVG(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_fvg_detector_present(self):
-        self.assertIn("function detectFairValueGaps", self.html)
-
-    def test_bullish_fvg_is_strict_three_candle_gap(self):
-        self.assertIn('if(cLow>aHigh){type="BULLISH"', self.html)
-
-    def test_bearish_fvg_is_strict_three_candle_gap(self):
-        self.assertIn('else if(cHigh<aLow){type="BEARISH"', self.html)
-
-    def test_fvg_equality_does_not_count(self):
-        self.assertNotIn("cLow>=aHigh", self.html)
-        self.assertNotIn("cHigh<=aLow", self.html)
-
-    def test_fvg_excludes_latest_potentially_open_candle(self):
-        self.assertIn("i<Math.max(0,cs.length-1)", self.html)
-
-    def test_fvg_followup_uses_only_closed_candles(self):
-        self.assertIn("j<Math.max(0,cs.length-1)", self.html)
-
-    def test_bullish_fvg_mitigation_is_tracked(self):
-        self.assertIn('if(l<=lower){state="MITIGATED"', self.html)
-
-    def test_bearish_fvg_mitigation_is_tracked(self):
-        self.assertIn('if(h>=upper){state="MITIGATED"', self.html)
-
-    def test_partial_mitigation_state_is_present(self):
-        self.assertIn('state="PARTIALLY_MITIGATED"', self.html)
-
-    def test_fvg_displacement_link_is_explicit(self):
-        self.assertIn("displacementConfirmed:Boolean(dispByIndex[i-1])", self.html)
-
-    def test_fvg_ui_is_active(self):
-        self.assertIn("FVG ACTIF", self.html)
-
-    def test_fvg_methodology_says_not_entry_signal(self):
-        self.assertIn("un FVG isolé n’est pas un signal d’entrée", self.html)
-
-
-class TestChartEngineV9OrderBlocks(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_order_block_detector_present(self):
-        self.assertIn("function detectOrderBlocks", self.html)
-
-    def test_order_block_requires_displacement(self):
-        self.assertIn("ds.forEach(function(d)", self.html)
-
-    def test_order_block_requires_structure_confirmation(self):
-        self.assertIn("if(!structural)return", self.html)
-
-    def test_order_block_accepts_bos_or_choch_source(self):
-        self.assertIn("bs.concat(ch).forEach", self.html)
-
-    def test_order_block_requires_same_direction_structure(self):
-        self.assertIn('bullish&&e.type==="BULLISH"', self.html)
-        self.assertIn('!bullish&&e.type==="BEARISH"', self.html)
-
-    def test_order_block_search_is_bounded_to_five_prior_candles(self):
-        self.assertIn("j>=Math.max(0,d.index-5)", self.html)
-
-    def test_bullish_order_block_uses_opposite_bearish_candle(self):
-        self.assertIn("(bullish&&c<o)", self.html)
-
-    def test_bearish_order_block_uses_opposite_bullish_candle(self):
-        self.assertIn("(!bullish&&c>o)", self.html)
-
-    def test_order_block_uses_real_high_low_zone(self):
-        self.assertIn("low=Number(ob.low),high=Number(ob.high)", self.html)
-
-    def test_order_block_states_are_explicit(self):
-        for token in ['state="FRESH"', 'state="RETESTED"', 'state="INVALIDATED"']:
-            self.assertIn(token, self.html)
-
-    def test_bullish_invalidation_requires_close_below_zone(self):
-        self.assertIn("bullish&&close<low", self.html)
-
-    def test_bearish_invalidation_requires_close_above_zone(self):
-        self.assertIn("!bullish&&close>high", self.html)
-
-    def test_sweep_and_fvg_are_separate_confirmations(self):
-        self.assertIn("sweepConfirmed:sweepConfirmed", self.html)
-        self.assertIn("fvgConfirmed:fvgConfirmed", self.html)
-
-    def test_order_block_ui_and_methodology_are_present(self):
-        self.assertIn("ORDER BLOCK ACTIF", self.html)
-        self.assertIn("pas comme obligations ni comme signal d’entrée", self.html)
-
-
-class TestChartEngineV10OrderBlockRetestQuality(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_order_block_width_is_explicit(self):
-        self.assertIn("width=high-low", self.html)
-
-    def test_order_block_tracks_deepest_retest_fraction(self):
-        self.assertIn("deepestRetestFraction=0", self.html)
-
-    def test_retest_penetration_is_clamped_zero_to_one(self):
-        self.assertIn("Math.max(0,Math.min(1,penetration/width))", self.html)
-
-    def test_bullish_retest_penetration_uses_zone_from_high_down(self):
-        self.assertIn("high-Math.max(l,low)", self.html)
-
-    def test_bearish_retest_penetration_uses_zone_from_low_up(self):
-        self.assertIn("Math.min(h,high)-low", self.html)
-
-    def test_first_retest_timestamp_is_retained(self):
-        self.assertIn("if(mitigatedAt===null)mitigatedAt=k", self.html)
-
-    def test_invalidation_stops_followup(self):
-        self.assertIn('state="INVALIDATED";invalidatedAt=k;break', self.html)
-
-    def test_evidence_count_has_two_required_components(self):
-        self.assertIn("var evidenceCount=2+", self.html)
-
-    def test_quality_core_tier_is_explicit(self):
-        self.assertIn('"CORE"', self.html)
-
-    def test_quality_confirmed_tier_is_explicit(self):
-        self.assertIn('"CONFIRMED"', self.html)
-
-    def test_quality_confluent_tier_is_explicit(self):
-        self.assertIn('"CONFLUENT"', self.html)
-
-    def test_invalidated_order_block_quality_is_invalid(self):
-        self.assertIn('if(state==="INVALIDATED")qualityTier="INVALID"', self.html)
-
-    def test_quality_methodology_disclaims_profit_probability(self):
-        self.assertIn("pas une probabilité de gain", self.html)
-
-    def test_order_block_retest_quality_ui_is_active(self):
-        self.assertIn("OB RETEST / QUALITY ACTIF", self.html)
-
-
-class TestChartEngineV11SmcStateMachine(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_smc_state_machine_present(self):
-        self.assertIn("function buildSmcSetupStates", self.html)
-
-    def test_sweep_to_displacement_window_is_explicit(self):
-        self.assertIn("SMC_SWEEP_TO_DISPLACEMENT_MAX_BARS=12", self.html)
-
-    def test_displacement_to_structure_window_is_explicit(self):
-        self.assertIn("SMC_DISPLACEMENT_TO_STRUCTURE_MAX_BARS=6", self.html)
-
-    def test_ssl_sweep_maps_to_bullish_direction(self):
-        self.assertIn('s.type==="SELL_SIDE"?"BULLISH":"BEARISH"', self.html)
-
-    def test_state_machine_starts_waiting_after_liquidity_sweep(self):
-        self.assertIn('state="WAIT",reason="WAIT_DISPLACEMENT"', self.html)
-
-    def test_displacement_advances_wait_reason_to_structure(self):
-        self.assertIn('if(disp){state="WAIT";reason="WAIT_STRUCTURE"}', self.html)
-
-    def test_structure_advances_wait_reason_to_entry_zone(self):
-        self.assertIn('reason="WAIT_ENTRY_ZONE"', self.html)
-
-    def test_entry_lifecycle_requires_order_block(self):
-        self.assertIn("if(ob){", self.html)
-        self.assertIn('reason="WAIT_ENTRY_ZONE"', self.html)
-
-    def test_retest_becomes_entry_now_only_on_closed_zone_touch(self):
-        self.assertIn('state="ENTRY_NOW";reason="OB_RETEST_CONFIRMED"', self.html)
-        self.assertIn("entryIndex=q", self.html)
-
-    def test_invalidated_state_still_comes_from_order_block_state(self):
-        self.assertIn('if(ob.state==="INVALIDATED")', self.html)
-        self.assertIn('state="INVALIDATED";reason="OB_INVALIDATED"', self.html)
-
-    def test_state_machine_excludes_latest_potentially_open_candle(self):
-        self.assertIn("closedEnd=Math.max(0,cs.length-1)", self.html)
-
-    def test_fvg_is_recorded_as_optional_confirmation(self):
-        self.assertIn("fvgConfirmed:Boolean(fvg)", self.html)
-
-    def test_methodology_says_entry_now_is_not_execution(self):
-        self.assertIn("aucun ordre n’est envoyé", self.html)
-
-    def test_smc_state_machine_ui_is_active(self):
-        self.assertIn("SMC STATE MACHINE ACTIF", self.html)
-
-
-class TestChartEngineV12EntryLifecycle(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_entry_zone_window_is_explicit(self):
-        self.assertIn("SMC_ENTRY_ZONE_MAX_BARS=12", self.html)
-
-    def test_setup_lifecycle_starts_waiting(self):
-        self.assertIn('state="WAIT",reason="WAIT_DISPLACEMENT"', self.html)
-
-    def test_wait_structure_reason_is_explicit(self):
-        self.assertIn('reason="WAIT_STRUCTURE"', self.html)
-
-    def test_wait_entry_zone_reason_is_explicit(self):
-        self.assertIn('reason="WAIT_ENTRY_ZONE"', self.html)
-
-    def test_entry_now_requires_zone_touch(self):
-        self.assertIn('state="ENTRY_NOW";reason="OB_RETEST_CONFIRMED"', self.html)
-
-    def test_entry_now_records_closed_candle_index(self):
-        self.assertIn("entryIndex=q", self.html)
-
-    def test_bullish_close_below_ob_invalidates(self):
-        self.assertIn('direction==="BULLISH"&&c<ob.low', self.html)
-
-    def test_bearish_close_above_ob_invalidates(self):
-        self.assertIn('direction==="BEARISH"&&c>ob.high', self.html)
-
-    def test_close_beyond_ob_reason_is_explicit(self):
-        self.assertIn('reason="CLOSE_BEYOND_OB"', self.html)
-
-    def test_entry_window_can_expire(self):
-        self.assertIn('state="EXPIRED";reason="ENTRY_WINDOW_EXPIRED"', self.html)
-
-    def test_expiry_records_deadline_index(self):
-        self.assertIn("expiredAt=structure.index+SMC_ENTRY_ZONE_MAX_BARS", self.html)
-
-    def test_lifecycle_excludes_potentially_open_last_candle(self):
-        self.assertIn("zoneDeadline=Math.min(closedEnd-1", self.html)
-
-    def test_entry_now_does_not_claim_order_execution(self):
-        self.assertIn("aucun ordre n’est envoyé", self.html)
-
-    def test_entry_lifecycle_ui_is_active(self):
-        self.assertIn("ENTRY LIFECYCLE ACTIF", self.html)
-
-
-class TestChartEngineV13StructuralTradePlan(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_trade_plan_builder_present(self):
-        self.assertIn("function buildSmcTradePlans", self.html)
-
-    def test_trade_plan_requires_entry_now(self):
-        self.assertIn('if(s.state!=="ENTRY_NOW"', self.html)
-
-    def test_entry_uses_closed_retest_candle_close(self):
-        self.assertIn("entry=Number(entryCandle.close)", self.html)
-
-    def test_bullish_stop_uses_order_block_low(self):
-        self.assertIn("stop=bullish?obLow:obHigh", self.html)
-
-    def test_stop_source_is_structural_order_block_invalidation(self):
-        self.assertIn('stopSource:"ORDER_BLOCK_INVALIDATION"', self.html)
-
-    def test_bullish_target_requires_prior_confirmed_swing_high(self):
-        self.assertIn('w.kind==="HIGH"&&p>entry', self.html)
-
-    def test_bearish_target_requires_prior_confirmed_swing_low(self):
-        self.assertIn('w.kind==="LOW"&&p<entry', self.html)
-
-    def test_target_must_precede_entry(self):
-        self.assertIn("w.index>=s.entryIndex", self.html)
-
-    def test_missing_target_is_explicitly_unavailable(self):
-        self.assertIn('target===null?"UNAVAILABLE"', self.html)
-
-    def test_risk_reward_is_reward_over_risk(self):
-        self.assertIn("rr=reward===null?null:reward/risk", self.html)
-
-    def test_nonpositive_risk_is_rejected(self):
-        self.assertIn("risk<=0)return", self.html)
-
-    def test_trade_plan_never_executes_order(self):
-        self.assertIn("execution:false", self.html)
-
-    def test_methodology_forbids_invented_rr(self):
-        self.assertIn("aucun RR n’est inventé", self.html)
-
-    def test_trade_plan_ui_is_active(self):
-        self.assertIn("SL / TP / RR ACTIF", self.html)
-
-
-class TestChartEngineV131VisibilityLayers(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_chart_layers_state_present(self):
-        self.assertIn("const chartLayers=", self.html)
-
-    def test_clean_preset_present(self):
-        self.assertIn('name==="CLEAN"', self.html)
-
-    def test_all_preset_present(self):
-        self.assertIn('name==="ALL"', self.html)
-
-    def test_clean_keeps_structure_visible(self):
-        self.assertIn("structure:true,events:true,sweeps:true", self.html)
-
-    def test_clean_hides_displacement_and_fvg(self):
-        self.assertIn("displacement:false,fvg:false,ob:true", self.html)
-
-    def test_structure_render_is_visibility_gated(self):
-        self.assertIn('chartLayerEnabled("structure")', self.html)
-
-    def test_events_render_is_visibility_gated(self):
-        self.assertIn('chartLayerEnabled("events")', self.html)
-
-    def test_sweeps_render_is_visibility_gated(self):
-        self.assertIn('chartLayerEnabled("sweeps")', self.html)
-
-    def test_displacement_render_is_visibility_gated(self):
-        self.assertIn('chartLayerEnabled("displacement")', self.html)
-
-    def test_fvg_render_hides_mitigated_zones(self):
-        self.assertIn('e.state!=="MITIGATED"', self.html)
-
-    def test_ob_render_hides_invalidated_zones(self):
-        self.assertIn('e.state!=="INVALIDATED"', self.html)
-
-    def test_visibility_does_not_disable_detection(self):
-        self.assertIn("masquer une couche ne désactive jamais sa détection", self.html)
-
-
-class TestChartEngineV14SignalEngine(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_signal_engine_present(self):
-        self.assertIn("function buildSmcSignals", self.html)
-
-    def test_signal_defaults_to_wait(self):
-        self.assertIn('decision="WAIT"', self.html)
-
-    def test_signal_requires_entry_now(self):
-        self.assertIn('s.state!=="ENTRY_NOW"', self.html)
-
-    def test_signal_requires_trade_plan(self):
-        self.assertIn('reason="TRADE_PLAN_UNAVAILABLE"', self.html)
-
-    def test_signal_requires_target(self):
-        self.assertIn('plan.takeProfit===null', self.html)
-
-    def test_signal_requires_risk_reward(self):
-        self.assertIn('plan.riskReward===null', self.html)
-
-    def test_invalid_rr_stays_wait(self):
-        self.assertIn('reason="RR_INVALID"', self.html)
-
-    def test_bullish_confirmed_setup_becomes_long(self):
-        self.assertIn('s.direction==="BULLISH"?"LONG":"SHORT"', self.html)
-
-    def test_confirmed_signal_reason_is_explicit(self):
-        self.assertIn('reason="SETUP_AND_TRADE_PLAN_CONFIRMED"', self.html)
-
-    def test_invalidated_setup_is_not_signal(self):
-        self.assertIn('reason="SETUP_INVALIDATED"', self.html)
-
-    def test_expired_setup_is_not_signal(self):
-        self.assertIn('reason="SETUP_EXPIRED"', self.html)
-
-    def test_signal_exposes_entry_stop_target_rr(self):
-        tokens = [
-            "entry:plan?plan.entry:null",
-            "stopLoss:plan?plan.stopLoss:null",
-            "takeProfit:plan?plan.takeProfit:null",
-            "riskReward:plan?plan.riskReward:null",
-        ]
-        for token in tokens:
-            self.assertIn(token, self.html)
-
-    def test_signal_never_executes_order(self):
-        token = "qualityTier:s.qualityTier||null,execution:false"
-        self.assertIn(token, self.html)
-
-    def test_signal_engine_ui_is_active(self):
-        self.assertIn("SIGNAL ENGINE ACTIF", self.html)
-
-
-class TestChartEngineV15SignalQuality(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_quality_engine_present(self):
-        self.assertIn("function scoreSmcSignalQuality", self.html)
-
-    def test_displacement_weight_is_explicit(self):
-        self.assertIn('score+=20;evidence.push("DISPLACEMENT")', self.html)
-
-    def test_structure_weight_is_explicit(self):
-        self.assertIn('score+=20;evidence.push("STRUCTURE")', self.html)
-
-    def test_order_block_weight_is_explicit(self):
-        self.assertIn('score+=20;evidence.push("ORDER_BLOCK")', self.html)
-
-    def test_fvg_weight_is_explicit(self):
-        self.assertIn('score+=10;evidence.push("FVG")', self.html)
-
-    def test_entry_now_weight_is_explicit(self):
-        self.assertIn('score+=20;evidence.push("ENTRY_NOW")', self.html)
-
-    def test_valid_rr_weight_is_explicit(self):
-        self.assertIn('score+=10;evidence.push("VALID_RR")', self.html)
-
-    def test_quality_grades_are_explicit(self):
-        self.assertIn('score>=80?"A":score>=60?"B":score>=40?"C":"D"', self.html)
-
-    def test_quality_version_is_recorded(self):
-        self.assertIn('qualityVersion:"SMC_QUALITY_V1"', self.html)
-
-    def test_quality_preserves_signal_object(self):
-        self.assertIn("Object.assign({},sig", self.html)
-
-    def test_quality_does_not_replace_signal_decision(self):
-        self.assertIn("ils ne modifient pas LONG/SHORT/WAIT", self.html)
-
-    def test_quality_requires_backtest_oos_validation(self):
-        self.assertIn("à valider par backtest/OOS", self.html)
-
-    def test_quality_has_no_performance_promise(self):
-        self.assertIn("ne promettent aucune performance", self.html)
-
-    def test_quality_ui_is_active(self):
-        self.assertIn("SIGNAL QUALITY V1 ACTIF", self.html)
-
-
-class TestChartEngineV16PaperRisk(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_paper_default_capital_is_explicit(self):
-        self.assertIn("PAPER_DEFAULT_CAPITAL_USD=1000", self.html)
-
-    def test_paper_default_risk_percent_is_explicit(self):
-        self.assertIn("PAPER_DEFAULT_RISK_PERCENT=1", self.html)
-
-    def test_paper_candidate_builder_present(self):
-        self.assertIn("function buildPaperTradeCandidates", self.html)
-
-    def test_wait_signal_is_blocked(self):
-        self.assertIn('reason:"SIGNAL_WAIT"', self.html)
-
-    def test_incomplete_plan_is_blocked(self):
-        self.assertIn('reason:"PLAN_INCOMPLETE"', self.html)
-
-    def test_risk_money_uses_capital_times_percent(self):
-        self.assertIn("riskMoney=capital*(riskPct/100)", self.html)
-
-    def test_risk_distance_uses_entry_stop(self):
-        self.assertIn("riskPerUnit=Math.abs(entry-stop)", self.html)
-
-    def test_raw_units_use_risk_money_over_distance(self):
-        self.assertIn("units=riskMoney/riskPerUnit", self.html)
-
-    def test_invalid_risk_distance_is_blocked(self):
-        self.assertIn('reason:"RISK_DISTANCE_INVALID"', self.html)
-
-    def test_invalid_size_is_blocked(self):
-        self.assertIn('reason:"SIZE_INVALID"', self.html)
-
-    def test_instrument_specs_are_explicitly_unvalidated(self):
-        self.assertIn('sizeStatus:"UNVALIDATED_INSTRUMENT_SPECS"', self.html)
-
-    def test_paper_candidate_never_executes(self):
-        self.assertIn('sizeStatus:"UNVALIDATED_INSTRUMENT_SPECS",execution:false', self.html)
-
-    def test_methodology_requires_verified_instrument_specs(self):
-        self.assertIn("sans spécifications instrument vérifiées", self.html)
-
-    def test_paper_risk_ui_is_active(self):
-        self.assertIn("PAPER RISK V1 ACTIF", self.html)
-
-
-class TestChartEngineV16BInstrumentSpecs(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_instrument_spec_validator_present(self):
-        self.assertIn("function validatePaperInstrumentSpecs", self.html)
-
-    def test_specs_require_source(self):
-        self.assertIn('"source","sourceTimestamp","assetClass","sizeMode"', self.html)
-
-    def test_missing_spec_field_is_unavailable(self):
-        self.assertIn('reason:"SPEC_FIELD_MISSING"', self.html)
-
-    def test_units_mode_requires_volume_rules(self):
-        self.assertIn('reason:"VOLUME_RULES_MISSING"', self.html)
-
-    def test_contract_mode_requires_tick_size(self):
-        self.assertIn("var tickSize=Number(s.tickSize)", self.html)
-
-    def test_contract_mode_requires_tick_value(self):
-        self.assertIn("tickValue=Number(s.tickValue)", self.html)
-
-    def test_contract_mode_requires_contract_size(self):
-        self.assertIn("contractSize=Number(s.contractSize)", self.html)
-
-    def test_contract_missing_specs_are_unavailable(self):
-        self.assertIn('reason:"CONTRACT_SPEC_MISSING"', self.html)
-
-    def test_contract_invalid_specs_are_unavailable(self):
-        self.assertIn('reason:"CONTRACT_SPEC_INVALID"', self.html)
-
-    def test_unsupported_size_mode_is_unavailable(self):
-        self.assertIn('reason:"SIZE_MODE_UNSUPPORTED"', self.html)
-
-    def test_size_normalizer_present(self):
-        self.assertIn("function normalizePaperSize", self.html)
-
-    def test_size_is_rounded_down_to_step(self):
-        self.assertIn("Math.floor(raw/step)*step", self.html)
-
-    def test_below_minimum_volume_is_unavailable(self):
-        self.assertIn('reason:"BELOW_MINIMUM_VOLUME"', self.html)
-
-    def test_instrument_specs_ui_is_active(self):
-        self.assertIn("INSTRUMENT SPECS V1 ACTIF", self.html)
-
-
-class TestChartEngineV16CPaperPosition(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_paper_position_opener_present(self):
-        self.assertIn("function openPaperPosition", self.html)
-
-    def test_candidate_must_be_ready(self):
-        self.assertIn('reason:"CANDIDATE_NOT_READY"', self.html)
-
-    def test_size_must_be_validated(self):
-        self.assertIn('reason:"SIZE_NOT_VALIDATED"', self.html)
-
-    def test_instrument_identity_is_required(self):
-        self.assertIn('reason:"INSTRUMENT_IDENTITY_MISSING"', self.html)
-
-    def test_open_timestamp_is_required(self):
-        self.assertIn('reason:"OPEN_TIMESTAMP_MISSING"', self.html)
-
-    def test_long_levels_are_structurally_validated(self):
-        self.assertIn('reason:"LONG_LEVELS_INVALID"', self.html)
-
-    def test_short_levels_are_structurally_validated(self):
-        self.assertIn('reason:"SHORT_LEVELS_INVALID"', self.html)
-
-    def test_open_position_is_explicitly_paper_only(self):
-        self.assertIn('status:"OPEN",paperOnly:true', self.html)
-
-    def test_open_position_never_executes_broker_order(self):
-        self.assertIn("closeReason:null,closedAt:null,execution:false", self.html)
-
-    def test_position_marker_present(self):
-        self.assertIn("function markPaperPosition", self.html)
-
-    def test_stop_loss_close_is_supported(self):
-        self.assertIn('closeReason:"STOP_LOSS"', self.html)
-
-    def test_take_profit_close_is_supported(self):
-        self.assertIn('closeReason:"TAKE_PROFIT"', self.html)
-
-    def test_ambiguous_sl_tp_is_conflict(self):
-        self.assertIn('closeReason:"SL_TP_CONFLICT"', self.html)
-
-    def test_paper_position_ui_is_active(self):
-        self.assertIn("PAPER POSITION V1 ACTIF", self.html)
-
-
-class TestPaperPersistenceV16D(unittest.TestCase):
-    def test_paper_positions_table_exists(self):
-        self.assertIn("paper_positions", main.paper_positions_table.name)
-
-    def test_paper_position_primary_key(self):
-        self.assertTrue(main.paper_positions_table.c.position_id.primary_key)
-
-    def test_paper_prices_use_numeric(self):
-        for name in ("entry", "stop_loss", "take_profit", "size", "risk_money"):
-            self.assertIsInstance(main.paper_positions_table.c[name].type, main.Numeric)
-
-    def test_paper_create_model_uses_decimal(self):
-        fields = main.PaperPositionCreate.model_fields
-        self.assertIs(fields["entry"].annotation, Decimal)
-        self.assertIs(fields["size"].annotation, Decimal)
-
-    def test_paper_create_route_exists(self):
-        paths = {route.path for route in main.api_router.routes}
-        self.assertIn("/paper/positions", paths)
-
-    def test_paper_list_route_exists(self):
-        paths = {route.path for route in main.api_router.routes}
-        self.assertIn("/paper/positions", paths)
-
-    def test_paper_validation_rejects_bad_side(self):
-        req = main.PaperPositionCreate(
-            position_id="p1", symbol="BTC-USD", side="BUY",
-            entry="100", stop_loss="90", take_profit="120", size="1",
-            size_unit="UNITS", risk_money="10", risk_percent="1",
-            capital_before="1000", source="coinbase",
-            source_timestamp=main.utcnow(), opened_at=main.utcnow(),
+    return {
+        "provider": "massive",
+        "asset_class": "FOREX",
+        "mappings": mappings,
+        "activation": massive_forex_activation.to_dict(),
+    }
+
+
+@api_router.get("/market/forex/market-state")
+async def market_forex_state() -> dict:
+    """Forex market open/closed + indicative sessions. Market state (NY-anchored
+    weekly hours) is independent from data quality: OPEN never implies LIVE, and a
+    normal CLOSED never implies a provider outage."""
+    return forex_market_state()
+
+
+
+
+# ============================ Massive Forex realtime WebSocket (V2-A) ===========
+# Official Massive protocol: wss://socket.massive.com/forex, auth action,
+# C.<PAIR> BBO quotes and CA.<PAIR> per-minute quote-derived OHLC.
+# No synthetic midpoint and no synthetic missing bars.
+@dataclass(frozen=True)
+class ForexRealtimeQuote:
+    canonical_symbol: str
+    bid: Decimal
+    ask: Decimal
+    source_timestamp: datetime
+    received_at: datetime
+    quality: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        return {"source": "massive", "canonical_symbol": self.canonical_symbol,
+                "bid": str(self.bid), "ask": str(self.ask),
+                "source_timestamp": self.source_timestamp.isoformat(),
+                "received_at": self.received_at.isoformat(), "quality": self.quality.value}
+
+
+@dataclass(frozen=True)
+class ForexRealtimeCandle:
+    canonical_symbol: str
+    start: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+    received_at: datetime
+    quality: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        return {"source": "massive", "canonical_symbol": self.canonical_symbol,
+                "granularity": "1m", "start": self.start.isoformat(),
+                "open": str(self.open), "high": str(self.high), "low": str(self.low),
+                "close": str(self.close), "volume": str(self.volume),
+                "received_at": self.received_at.isoformat(), "quality": self.quality.value}
+
+
+def _positive_decimal(value: Any) -> Optional[Decimal]:
+    try:
+        d = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return d if d > 0 and d.is_finite() else None
+
+
+def _massive_pair_to_canonical(pair: Any) -> Optional[str]:
+    if not isinstance(pair, str) or "/" not in pair:
+        return None
+    canonical = pair.replace("/", "-").upper()
+    mapped = provider_symbol_map.to_provider("massive", canonical)
+    return canonical if mapped is not None else None
+
+
+def parse_massive_forex_quote(
+    item: Any, received_at: Optional[datetime] = None
+) -> Optional[ForexRealtimeQuote]:
+    if not isinstance(item, dict) or item.get("ev") != "C":
+        return None
+    canonical = _massive_pair_to_canonical(item.get("p"))
+    bid, ask = _positive_decimal(item.get("b")), _positive_decimal(item.get("a"))
+    ts = _unix_ms_to_dt(item.get("t"))
+    if canonical is None or bid is None or ask is None or ts is None or ask < bid:
+        return None
+    recv = received_at or utcnow()
+    return ForexRealtimeQuote(canonical, bid, ask, ts, recv,
+                              classify_freshness(ts, settings.ticker_max_age_seconds, now=recv))
+
+
+def parse_massive_forex_minute(
+    item: Any, received_at: Optional[datetime] = None
+) -> Optional[ForexRealtimeCandle]:
+    if not isinstance(item, dict) or item.get("ev") != "CA":
+        return None
+    canonical = _massive_pair_to_canonical(item.get("pair"))
+    start = _unix_ms_to_dt(item.get("s"))
+    vals = [_positive_decimal(item.get(k)) for k in ("o", "h", "l", "c", "v")]
+    if canonical is None or start is None or any(v is None for v in vals):
+        return None
+    open_, high, low, close, volume = vals
+    assert (
+        open_ is not None
+        and high is not None
+        and low is not None
+        and close is not None
+        and volume is not None
+    )
+    if high < low or not (low <= open_ <= high) or not (low <= close <= high):
+        return None
+    recv = received_at or utcnow()
+    return ForexRealtimeCandle(canonical, start, open_, high, low, close, volume, recv,
+                               classify_freshness(start, 120.0, now=recv))
+
+
+class MassiveForexWsManager:
+    SOURCE = "massive"
+
+    def __init__(self, url: Optional[str] = None, api_key: Optional[str] = None) -> None:
+        self.url = url or settings.massive_forex_ws_url
+        self.api_key = settings.massive_api_key if api_key is None else api_key
+        self.running = False
+        self.websocket: Any = None
+        self.authenticated = False
+        self.last_message_at: Optional[datetime] = None
+        self.last_error: Optional[str] = None
+        self._task: Optional[asyncio.Task] = None
+        self.quotes: Dict[str, ForexRealtimeQuote] = {}
+        self.candles: Dict[str, ForexRealtimeCandle] = {}
+
+    def _topics(self) -> List[str]:
+        topics: List[str] = []
+        for canonical in EXPECTED_MASSIVE_FOREX:
+            if provider_symbol_map.to_provider("massive", canonical) is not None:
+                pair = canonical.replace("-", "/")
+                topics.extend((f"C.{pair}", f"CA.{pair}"))
+        return topics
+
+    async def start(self) -> None:
+        if not self.api_key:
+            raise RuntimeError("MASSIVE_API_KEY not set")
+        if websockets is None:
+            raise RuntimeError("websockets dependency is not installed")
+        if self.running:
+            return
+        if not self._topics():
+            raise RuntimeError("no verified Massive forex mappings available")
+        self.running = True
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self) -> None:
+        self.running = False
+        self.authenticated = False
+        if self.websocket is not None:
+            try:
+                await self.websocket.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.websocket = None
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def _run_loop(self) -> None:  # pragma: no cover - live provider socket
+        attempt = 0
+        while self.running:
+            try:
+                async with websockets.connect(
+                    self.url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                ) as ws:
+                    self.websocket = ws
+                    self.authenticated = False
+                    attempt = 0
+                    await ws.send(json.dumps({"action": "auth", "params": self.api_key}))
+                    async for raw in ws:
+                        self.last_message_at = utcnow()
+                        await self._handle(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.websocket = None
+                self.authenticated = False
+                self.last_error = _redact_secret(str(exc))[:200]
+                if not self.running:
+                    break
+                attempt += 1
+                await asyncio.sleep(ws_backoff(attempt))
+
+    async def _handle(self, raw: str | bytes) -> None:
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            return
+        items = payload if isinstance(payload, list) else [payload]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("ev") == "status":
+                status_value = str(item.get("status", ""))
+                if status_value == "auth_success":
+                    self.authenticated = True
+                    topics = self._topics()
+                    if self.websocket is not None and topics:
+                        await self.websocket.send(
+                            json.dumps(
+                                {"action": "subscribe", "params": ",".join(topics)}
+                            )
+                        )
+                elif status_value in {"auth_failed", "error"}:
+                    self.last_error = str(item.get("message") or status_value)[:200]
+                continue
+            q = parse_massive_forex_quote(item, self.last_message_at)
+            if q is not None:
+                old = self.quotes.get(q.canonical_symbol)
+                if old is None or q.source_timestamp >= old.source_timestamp:
+                    self.quotes[q.canonical_symbol] = q
+                continue
+            c = parse_massive_forex_minute(item, self.last_message_at)
+            if c is not None:
+                oldc = self.candles.get(c.canonical_symbol)
+                if oldc is None or c.start >= oldc.start:
+                    self.candles[c.canonical_symbol] = c
+
+    def realtime(self, canonical_symbol: str) -> Dict[str, object]:
+        canonical = canonical_symbol.upper()
+        q, c = self.quotes.get(canonical), self.candles.get(canonical)
+        transport = (
+            "WEBSOCKET"
+            if self.authenticated
+            else ("CONNECTING" if self.running else "STOPPED")
         )
-        with self.assertRaises(main.HTTPException):
-            main.validate_paper_position_create(req)
-
-    def test_paper_validation_accepts_long_levels(self):
-        req = main.PaperPositionCreate(
-            position_id="p1", symbol="BTC-USD", side="LONG",
-            entry="100", stop_loss="90", take_profit="120", size="1",
-            size_unit="UNITS", risk_money="10", risk_percent="1",
-            capital_before="1000", source="coinbase",
-            source_timestamp=main.utcnow(), opened_at=main.utcnow(),
-        )
-        self.assertIsNone(main.validate_paper_position_create(req))
-
-    def test_paper_validation_accepts_short_levels(self):
-        req = main.PaperPositionCreate(
-            position_id="p2", symbol="BTC-USD", side="SHORT",
-            entry="100", stop_loss="110", take_profit="80", size="1",
-            size_unit="UNITS", risk_money="10", risk_percent="1",
-            capital_before="1000", source="coinbase",
-            source_timestamp=main.utcnow(), opened_at=main.utcnow(),
-        )
-        self.assertIsNone(main.validate_paper_position_create(req))
-
-    def test_paper_payload_is_explicitly_paper_only(self):
-        source = inspect.getsource(main.create_paper_position)
-        self.assertIn('"paper_only": True', source)
-
-    def test_paper_payload_never_executes_broker_order(self):
-        source = inspect.getsource(main.create_paper_position)
-        self.assertIn('"execution": False', source)
-
-    def test_duplicate_position_id_is_conflict(self):
-        source = inspect.getsource(main.create_paper_position)
-        self.assertIn("POSITION_ID_EXISTS", source)
-
-    def test_persistence_unavailable_is_fail_safe(self):
-        source = inspect.getsource(main.create_paper_position)
-        self.assertIn("persistence not ready", source)
-
-    def test_paper_persistence_ui_is_active(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("PAPER PERSISTENCE V1 ACTIF", html)
-
-
-class TestPaperMarkV16E(unittest.TestCase):
-    def test_mark_model_uses_decimal_price(self):
-        field = main.PaperPositionMark.model_fields["current_price"]
-        self.assertIs(field.annotation, Decimal)
-
-    def test_mark_model_requires_source_timestamp(self):
-        fields = main.PaperPositionMark.model_fields
-        self.assertIn("source", fields)
-        self.assertIn("source_timestamp", fields)
-
-    def test_close_evaluator_long_stop(self):
-        result = main.evaluate_paper_close("LONG", Decimal("89"), Decimal("90"), Decimal("120"))
-        self.assertEqual(result, ("STOP_LOSS", Decimal("90")))
-
-    def test_close_evaluator_long_target(self):
-        result = main.evaluate_paper_close("LONG", Decimal("121"), Decimal("90"), Decimal("120"))
-        self.assertEqual(result, ("TAKE_PROFIT", Decimal("120")))
-
-    def test_close_evaluator_short_stop(self):
-        result = main.evaluate_paper_close("SHORT", Decimal("111"), Decimal("110"), Decimal("80"))
-        self.assertEqual(result, ("STOP_LOSS", Decimal("110")))
-
-    def test_close_evaluator_short_target(self):
-        result = main.evaluate_paper_close("SHORT", Decimal("79"), Decimal("110"), Decimal("80"))
-        self.assertEqual(result, ("TAKE_PROFIT", Decimal("80")))
-
-    def test_close_evaluator_no_hit(self):
-        result = main.evaluate_paper_close("LONG", Decimal("105"), Decimal("90"), Decimal("120"))
-        self.assertIsNone(result)
-
-    def test_long_pnl(self):
-        pnl = main.calculate_paper_pnl("LONG", Decimal("100"), Decimal("110"), Decimal("2"))
-        self.assertEqual(pnl, Decimal("20"))
-
-    def test_short_pnl(self):
-        pnl = main.calculate_paper_pnl("SHORT", Decimal("100"), Decimal("90"), Decimal("2"))
-        self.assertEqual(pnl, Decimal("20"))
-
-    def test_mark_route_exists(self):
-        paths = {route.path for route in main.api_router.routes}
-        self.assertIn("/paper/positions/{position_id}/mark", paths)
-
-    def test_mark_uses_row_lock(self):
-        source = inspect.getsource(main.mark_paper_position)
-        self.assertIn("FOR UPDATE", source)
-
-    def test_mark_closes_only_open_position(self):
-        source = inspect.getsource(main.mark_paper_position)
-        self.assertIn("AND status='OPEN'", source)
-
-    def test_mark_exposes_unrealized_and_realized_pnl(self):
-        source = inspect.getsource(main.mark_paper_position)
-        self.assertIn('"unrealized_pnl"', source)
-        self.assertIn('"realized_pnl"', source)
-
-    def test_paper_pnl_ui_is_active(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("PAPER P&L V1 ACTIF", html)
-
-
-class TestPaperRealtimeMonitorV16F(unittest.TestCase):
-    def test_realtime_mark_builder_present(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("await market_store.get_ticker", source)
-
-    def test_realtime_mark_requires_registered_instrument(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("instrument is None", source)
-
-    def test_realtime_mark_supports_crypto(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("AssetClass.CRYPTO", source)
-
-    def test_realtime_mark_requires_valid_quality(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("datum.status != DataQualityStatus.VALID", source)
-
-    def test_realtime_mark_rejects_missing_datum(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("datum is None", source)
-
-    def test_realtime_mark_rejects_nonpositive_price(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("datum.value <= 0", source)
-
-    def test_realtime_mark_preserves_source_timestamp(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("source_timestamp = datum.source_timestamp", source)
-        self.assertIn("source_timestamp=source_timestamp", source)
-
-    def test_monitor_reads_only_open_positions(self):
-        source = inspect.getsource(main.monitor_open_paper_positions_once)
-        self.assertIn("WHERE status='OPEN'", source)
-
-    def test_monitor_counts_unavailable_marks(self):
-        source = inspect.getsource(main.monitor_open_paper_positions_once)
-        self.assertIn("unavailable += 1", source)
-
-    def test_monitor_uses_existing_mark_logic(self):
-        source = inspect.getsource(main.monitor_open_paper_positions_once)
-        self.assertIn("await mark_paper_position", source)
-
-    def test_monitor_is_fail_safe_when_persistence_not_ready(self):
-        source = inspect.getsource(main.monitor_open_paper_positions_once)
-        self.assertIn("if not persistence_state.ready", source)
-
-    def test_monitor_does_not_synthesize_price(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertNotIn("random", source.lower())
-
-    def test_monitor_ui_is_active(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("PAPER REALTIME MONITOR V1 ACTIF", html)
-
-    def test_monitor_ui_states_multi_asset_scope(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("Crypto/Coinbase", html)
-        self.assertIn("Forex/Massive BBO", html)
-        self.assertIn("Gold/Twelve Data", html)
-        self.assertIn("Indices/Massive Value", html)
-
-
-class TestPaperAutoLoopV16G(unittest.TestCase):
-    def test_monitor_interval_setting_exists(self):
-        self.assertTrue(hasattr(main.settings, "paper_monitor_interval_seconds"))
-
-    def test_monitor_interval_default_is_one_second(self):
-        self.assertEqual(main.Settings().paper_monitor_interval_seconds, 1.0)
-
-    def test_monitor_loop_present(self):
-        source = inspect.getsource(main.paper_monitor_loop)
-        self.assertIn("monitor_open_paper_positions_once", source)
-
-    def test_monitor_loop_has_one_second_floor(self):
-        source = inspect.getsource(main.paper_monitor_loop)
-        self.assertIn("max(settings.paper_monitor_interval_seconds, 1.0)", source)
-
-    def test_monitor_loop_waits_on_stop_event(self):
-        source = inspect.getsource(main.paper_monitor_loop)
-        self.assertIn("await asyncio.wait_for(stop_event.wait()", source)
-
-    def test_monitor_loop_preserves_cancellation(self):
-        source = inspect.getsource(main.paper_monitor_loop)
-        self.assertIn("except asyncio.CancelledError", source)
-        self.assertIn("raise", source)
-
-    def test_monitor_loop_iteration_failure_is_fail_safe(self):
-        source = inspect.getsource(main.paper_monitor_loop)
-        self.assertIn("Paper monitor iteration failed", source)
-
-    def test_lifespan_creates_monitor_task(self):
-        source = inspect.getsource(main.lifespan)
-        self.assertIn('name="paper-monitor"', source)
-
-    def test_lifespan_signals_monitor_stop(self):
-        source = inspect.getsource(main.lifespan)
-        self.assertIn("paper_monitor_stop.set()", source)
-
-    def test_lifespan_awaits_monitor_before_market_disconnect(self):
-        source = inspect.getsource(main.lifespan)
-        self.assertLess(
-            source.index("await paper_monitor_task"),
-            source.index("await market_provider.disconnect()"),
-        )
-
-    def test_auto_loop_does_not_enable_live_trading(self):
-        source = inspect.getsource(main.paper_monitor_loop)
-        self.assertNotIn("live_trading_enabled = True", source)
-
-    def test_auto_loop_uses_existing_one_shot_monitor(self):
-        source = inspect.getsource(main.paper_monitor_loop)
-        self.assertIn("await monitor_open_paper_positions_once()", source)
-
-    def test_auto_loop_ui_is_active(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("PAPER AUTO LOOP V1 ACTIF", html)
-
-    def test_auto_loop_ui_documents_fail_safe_behavior(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("aucun prix n’est inventé", html)
-
-
-class TestPaperMultiAssetMonitorV16H(unittest.TestCase):
-    def test_multi_asset_supports_forex(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("AssetClass.FOREX", source)
-        self.assertIn("massive_forex_ws.quotes.get", source)
-
-    def test_forex_requires_valid_quality(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("quote.quality != DataQualityStatus.VALID", source)
-
-    def test_forex_rejects_crossed_bbo(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("quote.bid > quote.ask", source)
-
-    def test_forex_mark_uses_real_bbo_midpoint(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn('(quote.bid + quote.ask) / Decimal("2")', source)
-
-    def test_multi_asset_supports_gold(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("AssetClass.METAL", source)
-        self.assertIn("twelvedata_gold_ws.last_price", source)
-
-    def test_gold_requires_valid_quality(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("gold.quality != DataQualityStatus.VALID", source)
-
-    def test_gold_is_xau_usd_only(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn('canonical != "XAU-USD"', source)
-
-    def test_multi_asset_supports_indices(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("AssetClass.INDEX", source)
-        self.assertIn("massive_indices_ws.values.get", source)
-
-    def test_indices_require_valid_quality(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("value.quality != DataQualityStatus.VALID", source)
-
-    def test_indices_use_value_not_synthetic_candle(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("price = value.value", source)
-        self.assertNotIn("massive_indices_ws.candles.get", source)
-
-    def test_all_marks_require_source_timestamp(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("source_timestamp is None", source)
-
-    def test_multi_asset_ui_is_active(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("PAPER MULTI-ASSET V1 ACTIF", html)
-
-    def test_ui_documents_delayed_indices(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("15 minutes delayed", html)
-
-    def test_multi_asset_monitor_does_not_enable_live_trading(self):
-        source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertNotIn("live_trading_enabled", source)
-
-
-class TestPaperTradingUiV16I(unittest.TestCase):
-    def test_paper_account_route_exists(self):
-        paths = {route.path for route in main.api_router.routes}
-        self.assertIn("/paper/account", paths)
-
-    def test_paper_account_is_read_only(self):
-        route = next(r for r in main.api_router.routes if r.path == "/paper/account")
-        self.assertIn("GET", route.methods)
-
-    def test_paper_account_uses_persisted_positions(self):
-        source = inspect.getsource(main.get_paper_account)
-        self.assertIn("FROM paper_positions", source)
-        self.assertIn("FROM paper_account", source)
-
-    def test_paper_account_calculates_realized_pnl(self):
-        source = inspect.getsource(main.get_paper_account)
-        self.assertIn("calculate_paper_pnl", source)
-
-    def test_paper_account_is_paper_only(self):
-        source = inspect.getsource(main.get_paper_account)
-        self.assertIn('"paper_only": True', source)
-        self.assertIn('"execution": False', source)
-
-    def test_paper_ui_fetches_account(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('api("/api/v1/paper/account/live")', html)
-
-    def test_paper_ui_fetches_positions(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('api("/api/v1/paper/positions")', html)
-
-    def test_paper_ui_has_real_positions_section(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('modCard("Positions ouvertes",open.length+" OPEN"', html)
-
-    def test_paper_ui_has_history_section(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('modCard("Historique",closed.length+" CLOSED"', html)
-
-    def test_paper_ui_shows_entry_sl_tp(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('["Entry"]', html)
-        self.assertIn('["SL"]', html)
-        self.assertIn('["TP"]', html)
-
-    def test_paper_ui_does_not_invent_unrealized_pnl(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('p.mark_status==="VALID"?paperMoney(p.unrealized_pnl):"—"', html)
-
-    def test_paper_ui_marks_broker_execution_disabled(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('["Exécution broker / MT5"]', html)
-        self.assertIn('["DÉSACTIVÉE"]', html)
-
-    def test_paper_ui_poll_refreshes_trading(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('current==="trading")refreshPaperTrading()', html)
-
-    def test_paper_ui_help_is_present(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("Paper Trading UI V1", html)
-
-
-class TestPaperLivePnlV16J(unittest.TestCase):
-    def test_live_positions_route_exists(self):
-        paths = {route.path for route in main.api_router.routes}
-        self.assertIn("/paper/positions/live", paths)
-
-    def test_live_positions_route_is_get(self):
-        route = next(r for r in main.api_router.routes if r.path == "/paper/positions/live")
-        self.assertIn("GET", route.methods)
-
-    def test_live_positions_reads_only_open_positions(self):
-        source = inspect.getsource(main.get_live_paper_positions)
-        self.assertIn("WHERE status='OPEN'", source)
-
-    def test_live_positions_reuses_multi_asset_mark_builder(self):
-        source = inspect.getsource(main.get_live_paper_positions)
-        self.assertIn("await paper_mark_from_realtime", source)
-
-    def test_live_positions_defaults_mark_to_unavailable(self):
-        source = inspect.getsource(main.get_live_paper_positions)
-        self.assertIn('payload["mark_status"] = "UNAVAILABLE"', source)
-
-    def test_live_positions_exposes_mark_only_when_available(self):
-        source = inspect.getsource(main.get_live_paper_positions)
-        self.assertIn('payload["mark_status"] = "VALID"', source)
-        self.assertIn('payload["mark_price"] = str(mark.current_price)', source)
-
-    def test_live_positions_calculates_unrealized_pnl(self):
-        source = inspect.getsource(main.get_live_paper_positions)
-        self.assertIn("calculate_paper_pnl", source)
-        self.assertIn('payload["unrealized_pnl"]', source)
-
-    def test_live_positions_preserves_mark_source_timestamp(self):
-        source = inspect.getsource(main.get_live_paper_positions)
-        self.assertIn("mark.source_timestamp.isoformat()", source)
-
-    def test_live_positions_is_paper_only(self):
-        source = inspect.getsource(main.get_live_paper_positions)
-        self.assertIn('"paper_only": True', source)
-        self.assertIn('"execution": False', source)
-
-    def test_ui_fetches_live_positions(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('api("/api/v1/paper/positions/live")', html)
-
-    def test_ui_shows_current_price(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('["Prix actuel"]', html)
-        self.assertIn("p.mark_price", html)
-
-    def test_ui_shows_live_unrealized_pnl(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("p.unrealized_pnl", html)
-
-    def test_ui_shows_mark_status(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('["Mark"]', html)
-        self.assertIn("UNAVAILABLE", html)
-
-    def test_ui_help_documents_valid_mark_gate(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("vrai mark multi-actifs qualifié VALID", html)
-
-
-class TestPaperTradingMobileRenderV16J1(unittest.TestCase):
-    def test_trading_renderer_has_safe_wrapper(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("function renderTradingContent()", html)
-        self.assertIn("function renderTrading()", html)
-        self.assertIn("var a=paperUiState.account;", html)
-        self.assertNotIn("clear(v),a=paperUiState.account", html)
-
-    def test_trading_renderer_catches_local_render_error(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("Affichage Paper Trading indisponible", html)
-
-    def test_trading_renderer_never_fails_to_blank_silently(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("Aucune donnée n’a été inventée", html)
-
-    def test_trading_view_gets_render_marker(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('data-paper-rendered","true"', html)
-
-    def test_workspace_mode_exists(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("workspace-mode", html)
-
-    def test_workspace_mode_hides_market_tabs(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("body.workspace-mode .market-tabs-wrap{display:none}", html)
-
-    def test_trading_is_classified_as_workspace(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('"signals","trading","strategies","intelligence","settings"', html)
-
-    def test_set_view_toggles_workspace_mode(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('document.body.classList.toggle("workspace-mode",workspace)', html)
-
-    def test_paper_shell_has_mobile_minimum_height(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn(".paper-shell{min-height:320px}", html)
-
-    def test_bottom_nav_still_targets_trading(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('{id:"trading",label:"Trading"', html)
-
-    def test_live_pnl_endpoint_remains_used(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('api("/api/v1/paper/positions/live")', html)
-
-    def test_backend_is_unchanged_for_ui_fix(self):
-        paths = {route.path for route in main.api_router.routes}
-        self.assertIn("/paper/positions/live", paths)
-
-
-class TestPaperAccountInitializationV16K(unittest.TestCase):
-    def test_account_table_exists(self):
-        self.assertEqual(main.paper_account_table.name, "paper_account")
-
-    def test_account_has_stable_default_id(self):
-        self.assertEqual(main.PAPER_ACCOUNT_ID, "default")
-
-    def test_account_currency_is_usd(self):
-        self.assertEqual(main.PAPER_ACCOUNT_CURRENCY, "USD")
-
-    def test_initial_capital_is_decimal_1000(self):
-        self.assertEqual(main.PAPER_INITIAL_CAPITAL, Decimal("1000"))
-
-    def test_schema_initializes_account(self):
-        source = inspect.getsource(main.init_candle_schema)
-        self.assertIn("pg_insert(paper_account_table)", source)
-
-    def test_account_initialization_is_idempotent(self):
-        source = inspect.getsource(main.init_candle_schema)
-        self.assertIn("on_conflict_do_nothing", source)
-
-    def test_account_initialization_does_not_reset_existing_capital(self):
-        source = inspect.getsource(main.init_candle_schema)
-        self.assertNotIn("on_conflict_do_update", source)
-
-    def test_account_endpoint_reads_persisted_initial_capital(self):
-        source = inspect.getsource(main.get_paper_account)
-        self.assertIn("initial_capital FROM paper_account", source)
-
-    def test_account_endpoint_has_no_position_capital_fallback(self):
-        source = inspect.getsource(main.get_paper_account)
-        self.assertNotIn('data["capital_before"]', source)
-
-    def test_current_capital_adds_realized_pnl(self):
-        source = inspect.getsource(main.get_paper_account)
-        self.assertIn("current_capital = initial_capital + realized", source)
-
-    def test_empty_account_is_fail_safe(self):
-        source = inspect.getsource(main.get_paper_account)
-        self.assertIn("paper account not initialized", source)
-
-    def test_account_response_exposes_currency(self):
-        source = inspect.getsource(main.get_paper_account)
-        self.assertIn('"currency": account._mapping["currency"]', source)
-
-    def test_ui_documents_persistent_1000_usd_account(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("initialisé une seule fois en PostgreSQL avec 1 000 USD", html)
-
-    def test_account_remains_paper_only(self):
-        source = inspect.getsource(main.get_paper_account)
-        self.assertIn('"paper_only": True', source)
-        self.assertIn('"execution": False', source)
-
-
-class TestPaperLiveEquityV16L(unittest.TestCase):
-    def test_live_account_route_exists(self):
-        paths = {route.path for route in main.api_router.routes}
-        self.assertIn("/paper/account/live", paths)
-
-    def test_live_account_route_is_get(self):
-        route = next(r for r in main.api_router.routes if r.path == "/paper/account/live")
-        self.assertIn("GET", route.methods)
-
-    def test_live_account_reuses_persisted_account(self):
-        source = inspect.getsource(main.get_live_paper_account)
-        self.assertIn("account = await get_paper_account()", source)
-
-    def test_live_account_reads_only_open_positions(self):
-        source = inspect.getsource(main.get_live_paper_account)
-        self.assertIn("WHERE status='OPEN'", source)
-
-    def test_live_account_reuses_multi_asset_mark_builder(self):
-        source = inspect.getsource(main.get_live_paper_account)
-        self.assertIn("await paper_mark_from_realtime", source)
-
-    def test_live_account_calculates_unrealized_pnl(self):
-        source = inspect.getsource(main.get_live_paper_account)
-        self.assertIn("calculate_paper_pnl", source)
-
-    def test_live_equity_adds_unrealized_to_realized_capital(self):
-        source = inspect.getsource(main.get_live_paper_account)
-        self.assertIn("live_equity = current_capital + unrealized", source)
-
-    def test_missing_mark_makes_global_equity_partial(self):
-        source = inspect.getsource(main.get_live_paper_account)
-        self.assertIn('live_equity_status": "VALID" if complete else "PARTIAL"', source)
-
-    def test_partial_equity_does_not_publish_fake_total(self):
-        source = inspect.getsource(main.get_live_paper_account)
-        self.assertIn('"live_equity": str(live_equity) if complete else None', source)
-
-    def test_partial_unrealized_does_not_publish_fake_total(self):
-        source = inspect.getsource(main.get_live_paper_account)
-        self.assertIn('"unrealized_pnl": str(unrealized) if complete else None', source)
-
-    def test_live_account_remains_paper_only(self):
-        source = inspect.getsource(main.get_live_paper_account)
-        self.assertIn('"paper_only": True', source)
-        self.assertIn('"execution": False', source)
-
-    def test_ui_fetches_live_account(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('api("/api/v1/paper/account/live")', html)
-
-    def test_ui_shows_live_equity_and_latent_pnl(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('["Équité live"]', html)
-        self.assertIn('["P&L latent"]', html)
-
-    def test_ui_hides_partial_live_equity(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('a.live_equity_status==="VALID"?paperMoney(a.live_equity):"—"', html)
-
-
-class TestPaperAutoEntryGateV16M1(unittest.TestCase):
-    def test_gate_route_exists(self):
-        paths = {route.path for route in main.api_router.routes}
-        self.assertIn("/paper/auto-entry/gate", paths)
-
-    def test_gate_route_is_post(self):
-        route = next(r for r in main.api_router.routes if r.path == "/paper/auto-entry/gate")
-        self.assertIn("POST", route.methods)
-
-    def test_gate_request_requires_symbol(self):
-        fields = main.PaperAutoEntryGateRequest.model_fields
-        self.assertIn("symbol", fields)
-
-    def test_gate_request_has_signal_decision(self):
-        fields = main.PaperAutoEntryGateRequest.model_fields
-        self.assertIn("signal_decision", fields)
-
-    def test_gate_normalizes_symbol(self):
-        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn('req.symbol.upper().replace("/", "-")', source)
-
-    def test_gate_rejects_invalid_signal_decision(self):
-        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn("SIGNAL_DECISION_INVALID", source)
-
-    def test_gate_blocks_wait(self):
-        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn("SIGNAL_WAIT", source)
-
-    def test_gate_requires_registered_instrument(self):
-        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn("INSTRUMENT_NOT_REGISTERED", source)
-
-    def test_gate_requires_complete_trade_plan(self):
-        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn("TRADE_PLAN_INCOMPLETE", source)
-
-    def test_gate_rejects_invalid_rr(self):
-        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn("RR_INVALID", source)
-
-    def test_gate_checks_long_level_order(self):
-        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn("LONG_LEVELS_INVALID", source)
-
-    def test_gate_checks_short_level_order(self):
-        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn("SHORT_LEVELS_INVALID", source)
-
-    def test_gate_documents_server_signal_boundary(self):
-        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn("server-authoritative signal evaluator", source)
-
-    def test_gate_blocks_until_server_specs_exist(self):
-        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn("SERVER_INSTRUMENT_SPECS_NOT_IMPLEMENTED", source)
-
-    def test_gate_never_auto_creates_position_in_m1(self):
-        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn('"auto_create_position": False', source)
-
-    def test_ui_marks_auto_entry_gate_blocked(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("AUTO ENTRY · SPECS BLOCKED", html)
-        self.assertIn("Aucun trade n’est créé par M1", html)
-
-
-class TestServerSignalEngineV16M2(unittest.TestCase):
-    def make_request(self, **overrides):
-        data = {
-            "symbol": "BTC-USD",
-            "setup_state": "ENTRY_NOW",
-            "direction": "BULLISH",
-            "entry": Decimal("100"),
-            "stop_loss": Decimal("95"),
-            "take_profit": Decimal("110"),
-            "risk_reward": Decimal("2"),
-            "structure_confirmed": True,
-            "displacement_confirmed": True,
-            "order_block_confirmed": True,
-            "source_timestamp": main.utcnow(),
+        return {
+            "source": "massive",
+            "canonical_symbol": canonical,
+            "status": "OK" if (q or c) else "MISSING",
+            "transport": transport,
+            "quote": q.to_dict() if q else None,
+            "candle": c.to_dict() if c else None,
         }
-        data.update(overrides)
-        return main.ServerSignalRequest(**data)
 
-    def test_server_signal_route_exists(self):
-        paths = {route.path for route in main.api_router.routes}
-        self.assertIn("/paper/signal/evaluate", paths)
+    def health(self) -> Dict[str, object]:
+        return {
+            "source": "massive",
+            "running": self.running,
+            "connected": self.websocket is not None,
+            "authenticated": self.authenticated,
+            "last_message_at": (
+                self.last_message_at.isoformat() if self.last_message_at else None
+            ),
+            "last_error": self.last_error,
+        }
 
-    def test_server_signal_is_authoritative(self):
-        result = main.evaluate_server_signal(self.make_request())
-        self.assertTrue(result["authoritative"])
 
-    def test_bullish_ready_becomes_long(self):
-        result = main.evaluate_server_signal(self.make_request())
-        self.assertEqual(result["decision"], "LONG")
+massive_forex_ws = MassiveForexWsManager()
 
-    def test_bearish_ready_becomes_short(self):
-        req = self.make_request(
-            direction="BEARISH", stop_loss=Decimal("105"), take_profit=Decimal("90")
+
+@api_router.post("/market/forex/websocket/start")
+async def market_forex_ws_start() -> dict:
+    try:
+        await massive_forex_ws.start()
+    except RuntimeError as exc:
+        reason = str(exc)
+        code = 503 if "API_KEY" in reason else 409
+        raise HTTPException(
+            status_code=code,
+            detail={"status": "UNAVAILABLE", "reason": reason},
+        ) from exc
+    return {"status": "started", "source": "massive", "transport": "WEBSOCKET"}
+
+
+@api_router.post("/market/forex/websocket/stop")
+async def market_forex_ws_stop() -> dict:
+    await massive_forex_ws.stop()
+    return {"status": "stopped", "source": "massive"}
+
+
+@api_router.get("/market/forex/websocket/health")
+async def market_forex_ws_health() -> dict:
+    return massive_forex_ws.health()
+
+
+@api_router.get("/market/forex/{symbol}/realtime")
+async def market_forex_realtime(symbol: str) -> dict:
+    canonical = symbol.upper()
+    inst = instrument_registry.get(canonical)
+    if inst is None or inst.asset_class != AssetClass.FOREX:
+        raise HTTPException(
+            status_code=404,
+            detail={"status": "NOT_SUPPORTED", "reason": "unknown forex instrument"},
         )
-        result = main.evaluate_server_signal(req)
-        self.assertEqual(result["decision"], "SHORT")
-
-    def test_non_entry_now_waits(self):
-        result = main.evaluate_server_signal(self.make_request(setup_state="WAIT"))
-        self.assertEqual(result["decision"], "WAIT")
-
-    def test_missing_structure_waits(self):
-        result = main.evaluate_server_signal(self.make_request(structure_confirmed=False))
-        self.assertIn("STRUCTURE_NOT_CONFIRMED", result["reasons"])
-
-    def test_missing_displacement_waits(self):
-        result = main.evaluate_server_signal(self.make_request(displacement_confirmed=False))
-        self.assertIn("DISPLACEMENT_NOT_CONFIRMED", result["reasons"])
-
-    def test_missing_order_block_waits(self):
-        result = main.evaluate_server_signal(self.make_request(order_block_confirmed=False))
-        self.assertIn("ORDER_BLOCK_NOT_CONFIRMED", result["reasons"])
-
-    def test_incomplete_plan_waits(self):
-        result = main.evaluate_server_signal(self.make_request(take_profit=None))
-        self.assertIn("TRADE_PLAN_INCOMPLETE", result["reasons"])
-
-    def test_invalid_rr_waits(self):
-        result = main.evaluate_server_signal(self.make_request(risk_reward=Decimal("0")))
-        self.assertIn("RR_INVALID", result["reasons"])
-
-    def test_invalid_long_levels_wait(self):
-        result = main.evaluate_server_signal(self.make_request(stop_loss=Decimal("101")))
-        self.assertIn("LONG_LEVELS_INVALID", result["reasons"])
-
-    def test_invalid_short_levels_wait(self):
-        req = self.make_request(
-            direction="BEARISH", stop_loss=Decimal("90"), take_profit=Decimal("110")
+    if provider_symbol_map.to_provider("massive", canonical) is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"status": "NOT_MAPPED", "reason": "no verified Massive mapping"},
         )
-        result = main.evaluate_server_signal(req)
-        self.assertIn("SHORT_LEVELS_INVALID", result["reasons"])
+    return massive_forex_ws.realtime(canonical)
 
-    def test_signal_never_executes(self):
-        result = main.evaluate_server_signal(self.make_request())
-        self.assertFalse(result["execution"])
 
-    def test_gate_still_blocks_server_specs(self):
-        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn("SERVER_INSTRUMENT_SPECS_NOT_IMPLEMENTED", source)
+# ==================== Twelve Data REST — Gold XAU/USD (sub-increment 1/3) ======
+# First metal connector foundation: Twelve Data /time_series for XAU/USD (SPOT,
+# officially catalogued as "Gold Spot / Precious Metal"). This sub-increment adds
+# ONLY the REST provider + strict Decimal parsing. No METAL instrument, no public
+# endpoint, no persistence, no UI yet (later sub-increments).
+#
+# Verified officially (twelvedata.com/docs): symbol "XAU/USD"; /time_series returns
+# {values:[{datetime, open, high, low, close, volume}]} as STRINGS; intraday
+# datetime honours timezone=UTC; header auth "Authorization: apikey <key>"; errors
+# may arrive as HTTP 4xx/5xx OR as HTTP 200 with body {"status":"error","code":...}.
+# OHLC parsed strictly to Decimal (never float). Volume optional for spot metal.
 
-    def test_ui_marks_server_signal_active(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("SERVER SIGNAL V1 ACTIF", html)
+TWELVEDATA_REST_URL = "https://api.twelvedata.com"
+# Only officially-verified intraday intervals for this sub-increment. 6h and 1d are
+# intentionally excluded: 6h is NOT_SUPPORTED by the provider; 1d has a different
+# timezone semantic (daily ignores timezone=UTC) and is left NOT_IMPLEMENTED here.
+TWELVEDATA_GRANULARITIES: Dict[str, str] = {
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1h",
+    "2h": "2h",
+    "4h": "4h",
+}
 
-    def test_ui_keeps_auto_entry_specs_blocked(self):
-        html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("AUTO ENTRY · SPECS BLOCKED", html)
+
+@dataclass(frozen=True)
+class TwelveDataBar:
+    """A parsed Twelve Data time-series bar. OHLC are exact Decimals (never float);
+    volume is Optional (spot metal may omit it)."""
+    datetime_utc: Optional[datetime]
+    open: Optional[Decimal]
+    high: Optional[Decimal]
+    low: Optional[Decimal]
+    close: Optional[Decimal]
+    volume: Optional[Decimal]
+    status: DataQualityStatus
+
+
+@dataclass(frozen=True)
+class TwelveDataResult:
+    """Explicit outcome of a Twelve Data request. status is a business state; bars
+    are only meaningful for OK. reason is a CLEAN message (no key, no raw URL)."""
+    status: str  # OK | EMPTY | NOT_MAPPED | NOT_SUPPORTED | NO_KEY |
+    #              ACCESS_DENIED | RATE_LIMITED | UNAVAILABLE
+    bars: List[TwelveDataBar]
+    reason: Optional[str] = None
+
+
+def _td_parse_dt(value: Any) -> Optional[datetime]:
+    """Parse an intraday Twelve Data `datetime` string requested with timezone=UTC.
+    Returns an aware UTC datetime, or None. Date-only (daily) is intentionally NOT
+    parsed here (daily is NOT_IMPLEMENTED in this sub-increment)."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def twelvedata_bar_from_value(
+    item: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> TwelveDataBar:
+    """Parse one time-series value into a qualified TwelveDataBar. OHLC via Decimal
+    only; missing/non-numeric/negative OHLC or timestamp -> INVALID (never faked)."""
+    if not isinstance(item, dict):
+        return TwelveDataBar(None, None, None, None, None, None, DataQualityStatus.INVALID)
+    dt = _td_parse_dt(item.get("datetime"))
+    open_ = _to_decimal(item.get("open"))
+    high = _to_decimal(item.get("high"))
+    low = _to_decimal(item.get("low"))
+    close = _to_decimal(item.get("close"))
+    volume = _to_decimal(item.get("volume"))  # optional for spot metal
+    if dt is None or open_ is None or high is None or low is None or close is None:
+        return TwelveDataBar(dt, open_, high, low, close, volume, DataQualityStatus.INVALID)
+    if open_ < 0 or high < 0 or low < 0 or close < 0 or (volume is not None and volume < 0):
+        return TwelveDataBar(dt, open_, high, low, close, volume, DataQualityStatus.INVALID)
+    status = classify_freshness(dt, max_age_seconds, now=now)
+    return TwelveDataBar(dt, open_, high, low, close, volume, status)
+
+
+def parse_twelvedata_time_series(
+    payload: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> TwelveDataResult:
+    """Parse a /time_series response body. CRITICAL: Twelve Data may return HTTP 200
+    with {"status":"error", ...}; that is a provider error, never a success."""
+    if not isinstance(payload, dict):
+        return TwelveDataResult("UNAVAILABLE", [], "malformed provider response")
+    if payload.get("status") == "error":
+        code = payload.get("code")
+        if code == 429:
+            return TwelveDataResult("RATE_LIMITED", [], "rate limited by provider (429)")
+        if code in (401, 403):
+            return TwelveDataResult("ACCESS_DENIED", [], f"access denied by provider ({code})")
+        return TwelveDataResult("UNAVAILABLE", [], "provider returned an error status")
+    values = payload.get("values")
+    if not isinstance(values, list) or not values:
+        return TwelveDataResult("EMPTY", [], None)
+    bars = [twelvedata_bar_from_value(v, max_age_seconds, now=now) for v in values]
+    return TwelveDataResult("OK", bars, None)
+
+
+@dataclass(frozen=True)
+class TwelveDataQuoteResult:
+    """Latest /quote outcome. price is an exact Decimal (never float); is_market_open
+    is a provider flag (NOT a Gold calendar, NOT a data-quality decision by itself)."""
+    status: str  # OK | NOT_MAPPED | NO_KEY | ACCESS_DENIED | RATE_LIMITED | UNAVAILABLE
+    price: Optional[Decimal]
+    is_market_open: Optional[bool]
+    timestamp_utc: Optional[datetime]
+    reason: Optional[str] = None
+
+
+def parse_twelvedata_quote(payload: Any) -> TwelveDataQuoteResult:
+    """Parse a /quote body. HTTP 200 + {status:error} is a provider error. Price from
+    `close` parsed to Decimal directly. is_market_open kept as a provider boolean."""
+    if not isinstance(payload, dict):
+        return TwelveDataQuoteResult("UNAVAILABLE", None, None, None, "malformed provider response")
+    if payload.get("status") == "error":
+        code = payload.get("code")
+        if code == 429:
+            return TwelveDataQuoteResult("RATE_LIMITED", None, None, None, "rate limited (429)")
+        if code in (401, 403):
+            return TwelveDataQuoteResult(
+                "ACCESS_DENIED", None, None, None, f"access denied by provider ({code})")
+        return TwelveDataQuoteResult("UNAVAILABLE", None, None, None, "provider error status")
+    price = _to_decimal(payload.get("close"))
+    if price is None or price < 0:
+        return TwelveDataQuoteResult("UNAVAILABLE", None, None, None, "no usable price in quote")
+    raw_open = payload.get("is_market_open")
+    is_open = raw_open if isinstance(raw_open, bool) else None
+    ts = payload.get("timestamp")
+    ts_utc: Optional[datetime] = None
+    if isinstance(ts, int) and ts > 0:
+        try:
+            ts_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            ts_utc = None
+    return TwelveDataQuoteResult("OK", price, is_open, ts_utc, None)
+
+
+class TwelveDataProvider:
+    """Twelve Data REST adapter (Gold XAU/USD spot). Header auth; the key is never
+    placed in the URL/query, never logged, never returned. No network without a key.
+    Availability on the plan is decided by the provider response, never assumed."""
+
+    SOURCE = "twelvedata"
+
+    def __init__(self, rest_url: Optional[str] = None, api_key: Optional[str] = None) -> None:
+        self.rest_url = (rest_url or settings.twelvedata_rest_url).rstrip("/")
+        self.api_key = api_key if api_key is not None else settings.twelvedata_api_key
+        self.client: Optional[httpx.AsyncClient] = None
+
+    async def connect(self) -> None:
+        if self.client is None:
+            headers = {"Accept": "application/json"}
+            if self.api_key:
+                # Header auth keeps the key OUT of the URL (no leak via exceptions).
+                headers["Authorization"] = f"apikey {self.api_key}"
+            self.client = httpx.AsyncClient(
+                base_url=self.rest_url,
+                timeout=settings.twelvedata_request_timeout_seconds,
+                headers=headers,
+            )
+
+    async def disconnect(self) -> None:
+        if self.client is not None:
+            await self.client.aclose()
+            self.client = None
+
+    async def get_time_series(
+        self, canonical_symbol: str, granularity: str, outputsize: int = 30,
+        start: Optional[str] = None, end: Optional[str] = None,
+    ) -> TwelveDataResult:
+        """Fetch XAU/USD (or any mapped twelvedata symbol) intraday bars. Returns an
+        explicit TwelveDataResult; never raises for provider/HTTP errors."""
+        symbol = provider_symbol_map.to_provider(self.SOURCE, canonical_symbol)
+        if symbol is None:
+            return TwelveDataResult(
+                "NOT_MAPPED", [], f"no verified twelvedata symbol for {canonical_symbol}"
+            )
+        if granularity not in TWELVEDATA_GRANULARITIES:
+            return TwelveDataResult(
+                "NOT_SUPPORTED", [], f"granularity {granularity} not supported (twelvedata)"
+            )
+        if not self.api_key:
+            return TwelveDataResult("NO_KEY", [], "TWELVEDATA_API_KEY not set")
+        if self.client is None:
+            await self.connect()
+        assert self.client is not None
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "interval": TWELVEDATA_GRANULARITIES[granularity],
+            "timezone": "UTC",       # intraday honours UTC (verified)
+            "order": "asc",
+            "outputsize": outputsize,
+        }
+        if start is not None:
+            params["start_date"] = start
+        if end is not None:
+            params["end_date"] = end
+        try:
+            resp = await self.client.get("/time_series", params=params)
+        except httpx.TimeoutException:
+            return TwelveDataResult("UNAVAILABLE", [], "provider timeout")
+        except httpx.HTTPError:
+            return TwelveDataResult("UNAVAILABLE", [], "provider unreachable")
+        code = resp.status_code
+        if code in (401, 403):
+            return TwelveDataResult("ACCESS_DENIED", [], f"access denied by provider ({code})")
+        if code == 429:
+            return TwelveDataResult("RATE_LIMITED", [], "rate limited by provider (429)")
+        if code >= 500:
+            return TwelveDataResult("UNAVAILABLE", [], f"provider server error ({code})")
+        try:
+            payload = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            return TwelveDataResult("UNAVAILABLE", [], "malformed provider response")
+        # max_age off for explicit history; freshness re-derived by callers later.
+        return parse_twelvedata_time_series(payload, max_age_seconds=float("inf"))
+
+    async def get_quote(self, canonical_symbol: str) -> "TwelveDataQuoteResult":
+        """Fetch the latest /quote (price + is_market_open). Price parsed to Decimal
+        (never float). Same explicit statuses as get_time_series."""
+        symbol = provider_symbol_map.to_provider(self.SOURCE, canonical_symbol)
+        if symbol is None:
+            return TwelveDataQuoteResult("NOT_MAPPED", None, None, None,
+                                         f"no verified twelvedata symbol for {canonical_symbol}")
+        if not self.api_key:
+            return TwelveDataQuoteResult("NO_KEY", None, None, None, "TWELVEDATA_API_KEY not set")
+        if self.client is None:
+            await self.connect()
+        assert self.client is not None
+        try:
+            resp = await self.client.get("/quote", params={"symbol": symbol, "timezone": "UTC"})
+        except httpx.TimeoutException:
+            return TwelveDataQuoteResult("UNAVAILABLE", None, None, None, "provider timeout")
+        except httpx.HTTPError:
+            return TwelveDataQuoteResult("UNAVAILABLE", None, None, None, "provider unreachable")
+        code = resp.status_code
+        if code in (401, 403):
+            return TwelveDataQuoteResult(
+                "ACCESS_DENIED", None, None, None, f"access denied by provider ({code})")
+        if code == 429:
+            return TwelveDataQuoteResult(
+                "RATE_LIMITED", None, None, None, "rate limited by provider (429)")
+        if code >= 500:
+            return TwelveDataQuoteResult(
+                "UNAVAILABLE", None, None, None, f"provider server error ({code})")
+        try:
+            payload = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            return TwelveDataQuoteResult(
+                "UNAVAILABLE", None, None, None, "malformed provider response")
+        return parse_twelvedata_quote(payload)
+
+
+# Officially-catalogued Twelve Data symbol for gold spot -> verified provider
+# mapping (a mapping is not an entitlement: MAPPED can coexist with NOT_ENTITLED).
+provider_symbol_map.add("twelvedata", "XAU-USD", "XAU/USD")
+
+twelvedata_provider = TwelveDataProvider()
+
+# Twelve Data WebSocket price stream for Gold Spot. Officially, /v1/quotes/price
+# emits price ticks only: it does NOT provide OHLC or bid/ask. Historical/chart
+# OHLC therefore remains sourced from the verified REST /time_series endpoint.
+TWELVEDATA_WS_PRICE_MAX_AGE_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class TwelveDataRealtimePrice:
+    canonical_symbol: str
+    provider_symbol: str
+    price: Decimal
+    source_timestamp: datetime
+    received_at: datetime
+    quality: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "source": "twelvedata",
+            "canonical_symbol": self.canonical_symbol,
+            "provider_symbol": self.provider_symbol,
+            "price": str(self.price),
+            "source_timestamp": self.source_timestamp.isoformat(),
+            "received_at": self.received_at.isoformat(),
+            "quality": self.quality.value,
+        }
+
+
+def parse_twelvedata_ws_price(
+    item: Any,
+    canonical_symbol: str,
+    received_at: Optional[datetime] = None,
+) -> Optional[TwelveDataRealtimePrice]:
+    """Parse one official Twelve Data `price` WebSocket event without synthesis."""
+    if not isinstance(item, dict) or item.get("event") != "price":
+        return None
+    provider_symbol = item.get("symbol")
+    expected = provider_symbol_map.to_provider("twelvedata", canonical_symbol)
+    if not isinstance(provider_symbol, str) or provider_symbol != expected:
+        return None
+    price = _to_decimal(item.get("price"))
+    if price is None or price <= 0:
+        return None
+    raw_ts = item.get("timestamp")
+    if not isinstance(raw_ts, (int, float)) or isinstance(raw_ts, bool) or raw_ts <= 0:
+        return None
+    try:
+        source_timestamp = datetime.fromtimestamp(float(raw_ts), tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    observed = received_at or datetime.now(timezone.utc)
+    quality = classify_freshness(
+        source_timestamp,
+        TWELVEDATA_WS_PRICE_MAX_AGE_SECONDS,
+        now=observed,
+    )
+    return TwelveDataRealtimePrice(
+        canonical_symbol=canonical_symbol,
+        provider_symbol=provider_symbol,
+        price=price,
+        source_timestamp=source_timestamp,
+        received_at=observed,
+        quality=quality,
+    )
+
+
+class TwelveDataGoldWsManager:
+    """Server-side XAU/USD price stream. API key never reaches the frontend."""
+
+    def __init__(self) -> None:
+        self.running = False
+        self.connected = False
+        self.subscribed = False
+        self.task: Optional[asyncio.Task[None]] = None
+        self.websocket: Any = None
+        self.last_price: Optional[TwelveDataRealtimePrice] = None
+        self.last_message_at: Optional[datetime] = None
+        self.last_error: Optional[str] = None
+
+    async def start(self) -> None:
+        if self.running:
+            return
+        if not settings.twelvedata_api_key:
+            raise RuntimeError("TWELVEDATA_API_KEY not set")
+        if provider_symbol_map.to_provider("twelvedata", "XAU-USD") != "XAU/USD":
+            raise RuntimeError("XAU-USD has no verified Twelve Data mapping")
+        self.running = True
+        self.last_error = None
+        self.task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        self.running = False
+        if self.websocket is not None:
+            await self.websocket.close()
+        if self.task is not None:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+        self.task = None
+        self.websocket = None
+        self.connected = False
+        self.subscribed = False
+
+    async def _run(self) -> None:
+        delay = 1.0
+        while self.running:
+            try:
+                key = url_quote(settings.twelvedata_api_key, safe="")
+                connect_url = f"{settings.twelvedata_ws_url}?apikey={key}"
+                async with websockets.connect(
+                    connect_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                ) as ws:
+                    self.websocket = ws
+                    self.connected = True
+                    self.subscribed = False
+                    self.last_error = None
+                    await ws.send(json.dumps({
+                        "action": "subscribe",
+                        "params": {"symbols": "XAU/USD"},
+                    }))
+                    delay = 1.0
+                    while self.running:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                        except asyncio.TimeoutError:
+                            await ws.send(json.dumps({"action": "heartbeat"}))
+                            continue
+                        self.last_message_at = datetime.now(timezone.utc)
+                        await self._handle(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - provider transport boundary
+                # Do not retain str(exc): WebSocket connection exceptions can include
+                # the URI, and the Twelve Data URI contains the server-side API key.
+                self.last_error = f"websocket {type(exc).__name__}"
+            finally:
+                self.websocket = None
+                self.connected = False
+                self.subscribed = False
+            if self.running:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2.0, 30.0)
+
+    async def _handle(self, raw: Any) -> None:
+        try:
+            item = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if not isinstance(item, dict):
+            return
+        if item.get("event") == "subscribe-status":
+            status_value = str(item.get("status") or "").lower()
+            if status_value in {"ok", "success"}:
+                self.subscribed = True
+            elif status_value in {"error", "failed"}:
+                self.last_error = "subscription rejected by provider"
+            return
+        parsed = parse_twelvedata_ws_price(item, "XAU-USD")
+        if parsed is not None:
+            self.last_price = parsed
+
+    def realtime(self) -> Dict[str, object]:
+        transport = "STOPPED"
+        if self.running:
+            transport = "WEBSOCKET" if self.connected else "CONNECTING"
+        return {
+            "source": "twelvedata",
+            "canonical_symbol": "XAU-USD",
+            "status": "OK" if self.last_price is not None else "MISSING",
+            "transport": transport,
+            "subscribed": self.subscribed,
+            "price": self.last_price.to_dict() if self.last_price else None,
+            "ohlc_transport": "REST",
+            "last_error": self.last_error,
+        }
+
+    def health(self) -> Dict[str, object]:
+        return {
+            "source": "twelvedata",
+            "running": self.running,
+            "connected": self.connected,
+            "subscribed": self.subscribed,
+            "last_message_at": (
+                self.last_message_at.isoformat() if self.last_message_at else None
+            ),
+            "last_error": self.last_error,
+        }
+
+
+twelvedata_gold_ws = TwelveDataGoldWsManager()
+
+
+@api_router.post("/market/metal/websocket/start")
+async def market_metal_ws_start() -> dict:
+    try:
+        await twelvedata_gold_ws.start()
+    except RuntimeError as exc:
+        reason = str(exc)
+        code = 503 if "API_KEY" in reason else 409
+        raise HTTPException(
+            status_code=code,
+            detail={"status": "UNAVAILABLE", "reason": reason},
+        ) from exc
+    return {
+        "status": "started",
+        "source": "twelvedata",
+        "transport": "WEBSOCKET_PRICE_ONLY",
+        "ohlc_transport": "REST",
+    }
+
+
+@api_router.post("/market/metal/websocket/stop")
+async def market_metal_ws_stop() -> dict:
+    await twelvedata_gold_ws.stop()
+    return {"status": "stopped", "source": "twelvedata"}
+
+
+@api_router.get("/market/metal/websocket/health")
+async def market_metal_ws_health() -> dict:
+    return twelvedata_gold_ws.health()
+
+
+@api_router.get("/market/metal/{symbol}/realtime")
+async def market_metal_realtime(symbol: str) -> dict:
+    canonical = symbol.upper().replace("/", "-")
+    if canonical != "XAU-USD":
+        raise HTTPException(
+            status_code=404,
+            detail={"status": "NOT_SUPPORTED", "reason": "unknown metal instrument"},
+        )
+    return twelvedata_gold_ws.realtime()
+
+
+def _register_metal_instruments() -> None:
+    """Register the canonical Gold Spot instrument. Calendar NOT_CONFIGURED (no Gold
+    calendar invented in this increment); volume UNKNOWN; precision/tick None."""
+    instrument_registry.register(
+        Instrument(
+            canonical_symbol="XAU-USD",
+            asset_class=AssetClass.METAL,
+            base_asset="XAU",
+            quote_asset="USD",
+            display_name="Gold Spot",
+            timezone="UTC",
+            market_calendar=MarketCalendarPolicy.NOT_CONFIGURED,
+            volume_semantics=VolumeSemantics.UNKNOWN,
+            price_precision=None,
+            tick_size=None,
+        )
+    )
+
+
+_register_metal_instruments()
+
+
+@dataclass(frozen=True)
+class MetalHistory:
+    """Assembled metal history: the JSON-serialisable `result` for the API, and the
+    Decimal-exact `rows` ready for persistence (never routed through float)."""
+    result: Dict[str, object]
+    rows: List[CandleRow]
+
+
+def _td_bar_dict(bar: TwelveDataBar) -> Dict[str, object]:
+    """JSON-safe view of a bar: Decimals as strings (exact), datetime as ISO UTC."""
+    def s(v: Optional[Decimal]) -> Optional[str]:
+        return str(v) if v is not None else None
+    return {
+        "start": bar.datetime_utc.isoformat() if bar.datetime_utc else None,
+        "open": s(bar.open), "high": s(bar.high), "low": s(bar.low),
+        "close": s(bar.close), "volume": s(bar.volume), "quality": bar.status.value,
+    }
+
+
+def _metal_latest_quality(
+    bars: List[TwelveDataBar], granularity: str, now: Optional[datetime] = None
+) -> str:
+    """Freshness of the MOST RECENT bar (market state is separate). MISSING if none."""
+    dts = [b.datetime_utc for b in bars if b.datetime_utc is not None]
+    if not dts:
+        return DataQualityStatus.MISSING.value
+    bucket = GRANULARITIES[granularity][1] if granularity in GRANULARITIES else 3600
+    return classify_freshness(max(dts), bucket * 2, now=now).value
+
+
+def _metal_bars_to_rows(
+    source: str, product_id: Optional[str], granularity: str, bars: List[TwelveDataBar],
+    observed_at: datetime,
+) -> List[CandleRow]:
+    """Build Decimal-exact CandleRows from parsed bars. A bar without a provider
+    volume is NOT persisted (the column is NOT NULL and we never fabricate a 0)."""
+    rows: List[CandleRow] = []
+    if product_id is None:
+        return rows
+    for b in bars:
+        if b.status == DataQualityStatus.INVALID or b.datetime_utc is None:
+            continue
+        if b.open is None or b.high is None or b.low is None or b.close is None:
+            continue
+        if b.volume is None:  # cannot persist without a volume; never fabricate one
+            continue
+        rows.append(
+            CandleRow(
+                source=source, product_id=product_id, granularity=granularity,
+                bucket_start=b.datetime_utc,
+                open=b.open, high=b.high, low=b.low, close=b.close, volume=b.volume,
+                quality=b.status, origin="rest", source_timestamp=None,
+                observed_at=observed_at,
+            )
+        )
+    return rows
+
+
+async def fetch_metal_history(
+    canonical_symbol: str, granularity: str, start: int, end: int
+) -> MetalHistory:
+    """Assemble Gold XAU/USD history from Twelve Data. [start, end) half-open, dedup
+    by timestamp, ascending, INVALID excluded. Gaps stay UNKNOWN (no Gold calendar):
+    a missing bar is never a gap. Provider/business status is surfaced explicitly."""
+    inst = instrument_registry.get(canonical_symbol)
+    if inst is None or inst.asset_class != AssetClass.METAL:
+        raise ValueError(f"unknown metal instrument: {canonical_symbol}")
+    if start >= end:
+        raise ValueError("start must be strictly before end")
+    provider_symbol = provider_symbol_map.to_provider("twelvedata", canonical_symbol)
+    start_s = datetime.fromtimestamp(int(start), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    end_s = datetime.fromtimestamp(int(end), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    tdr = await twelvedata_provider.get_time_series(
+        canonical_symbol, granularity, outputsize=5000, start=start_s, end=end_s
+    )
+    base: Dict[str, object] = {
+        "source": "twelvedata",
+        "canonical_symbol": canonical_symbol,
+        "provider_symbol": provider_symbol,
+        "granularity": granularity,
+        "requested_range": {"start": start, "end": end},
+        "timezone_internal": "UTC",
+        "display_timezone": "America/Toronto",
+        "market_timezone": inst.timezone,
+        "market_calendar": inst.market_calendar.value,
+        "volume_semantics": inst.volume_semantics.value,  # UNKNOWN (never invented)
+    }
+    if tdr.status != "OK":
+        base.update({"status": tdr.status, "reason": tdr.reason, "count": 0, "candles": []})
+        return MetalHistory(base, [])
+    collected: Dict[int, TwelveDataBar] = {}
+    invalid = 0
+    for bar in tdr.bars:
+        if bar.datetime_utc is None or bar.status == DataQualityStatus.INVALID:
+            invalid += 1
+            continue
+        key = int(bar.datetime_utc.timestamp())
+        if key < start or key >= end:
+            continue
+        collected[key] = bar
+    kept = [collected[k] for k in sorted(collected)]
+    rows = _metal_bars_to_rows("twelvedata", provider_symbol, granularity, kept, utcnow())
+    base.update({
+        "status": "EMPTY" if not kept else "OK",
+        "count": len(kept),
+        "invalid_candles_count": invalid,
+        "latest_quality": _metal_latest_quality(kept, granularity),
+        "gaps_status": "UNKNOWN",   # no Gold calendar -> absence is not a gap
+        "candles": [_td_bar_dict(b) for b in kept],
+    })
+    return MetalHistory(base, rows)
+
+
+_METAL_HTTP_STATUS = {
+    "NOT_MAPPED": 409, "NOT_SUPPORTED": 409, "NO_KEY": 503, "ACCESS_DENIED": 403,
+    "RATE_LIMITED": 429, "UNAVAILABLE": 503,
+}
+
+
+@api_router.get("/market/metal/{symbol}/history")
+async def market_metal_history(
+    symbol: str, start: int, end: int, granularity: str = "1h"
+) -> dict:
+    try:
+        hist = await fetch_metal_history(symbol.upper(), granularity, start, end)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": str(exc)}
+        ) from exc
+    status = str(hist.result.get("status"))
+    if status == "OK" and persistence_state.ready and hist.rows:
+        try:
+            await persist_candles(hist.rows)  # source="twelvedata"; INVALID never sent
+        except Exception as exc:  # noqa: BLE001 - a read must never fail on a write error
+            log.warning("Metal persistence error: %s", exc)
+    http = _METAL_HTTP_STATUS.get(status)
+    if http is not None:
+        raise HTTPException(
+            status_code=http, detail={"status": status, "reason": hist.result.get("reason")}
+        )
+    return hist.result
+
+
+async def fetch_metal_quote(canonical_symbol: str) -> Dict[str, object]:
+    """Latest Gold quote from Twelve Data. price is Decimal (serialised as string);
+    is_market_open is a provider flag, kept SEPARATE from data quality and from any
+    (future) Gold calendar. Quality here is the freshness of the quote timestamp."""
+    inst = instrument_registry.get(canonical_symbol)
+    if inst is None or inst.asset_class != AssetClass.METAL:
+        raise ValueError(f"unknown metal instrument: {canonical_symbol}")
+    q = await twelvedata_provider.get_quote(canonical_symbol)
+    provider_symbol = provider_symbol_map.to_provider("twelvedata", canonical_symbol)
+    base: Dict[str, object] = {
+        "source": "twelvedata",
+        "canonical_symbol": canonical_symbol,
+        "provider_symbol": provider_symbol,
+        "timezone_internal": "UTC",
+        "display_timezone": "America/Toronto",
+    }
+    if q.status != "OK":
+        base.update({"status": q.status, "reason": q.reason, "price": None,
+                     "is_market_open": None, "quality": DataQualityStatus.MISSING.value})
+        return base
+    # Quality = freshness of the quote's OWN provider timestamp, judged against the
+    # ticker freshness budget (ticker_max_age_seconds). It is deliberately NOT driven
+    # by is_market_open: a spot-metal /quote can be legitimately STALE while the market
+    # is open (sparse ticks and/or a delayed data plan return an old timestamp). We do
+    # NOT relax the threshold to force LIVE; STALE truthfully reflects an old timestamp.
+    # quote_age_seconds is exposed so the reason (e.g. "il y a 144 min") is transparent.
+    age = compute_age_seconds(q.timestamp_utc) if q.timestamp_utc is not None else None
+    quality = (
+        classify_freshness(q.timestamp_utc, settings.ticker_max_age_seconds).value
+        if q.timestamp_utc is not None else DataQualityStatus.UNKNOWN.value
+    )
+    base.update({
+        "status": "OK",
+        "price": str(q.price) if q.price is not None else None,  # Decimal -> string
+        "is_market_open": q.is_market_open,        # provider flag, informational only
+        "quote_time": q.timestamp_utc.isoformat() if q.timestamp_utc else None,
+        "quote_age_seconds": age,                  # transparency for the STALE reason
+        "quality": quality,
+        "volume_semantics": inst.volume_semantics.value,
+    })
+    return base
+
+
+@api_router.get("/market/metal/{symbol}/quote")
+async def market_metal_quote(symbol: str) -> dict:
+    try:
+        result = await fetch_metal_quote(symbol.upper())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": str(exc)}
+        ) from exc
+    status = str(result.get("status"))
+    http = _METAL_HTTP_STATUS.get(status)
+    if http is not None:
+        raise HTTPException(
+            status_code=http, detail={"status": status, "reason": result.get("reason")}
+        )
+    return result
+
+
+# ==================== Massive US Cash Indices REST ============================
+# Official cash indices (I: prefix), verified (massive.com/docs/rest/indices):
+# I:SPX (S&P 500), I:NDX (Nasdaq-100), I:DJI (Dow). NOT ETFs (SPY/QQQ/DIA), NOT
+# futures (ES/NQ/YM), NOT CFDs. GET /v2/aggs/ticker/{I:XXX}/range/{mult}/{timespan}
+# /{from}/{to} -> results[{o,h,l,c,t}] with NO volume (index aggregates are derived
+# from index VALUES, not trades); t = Unix ms, bars aligned in Eastern Time; no bar
+# when no index update (absence != gap). Same account/key as Massive Forex (Bearer),
+# but Indices is a SEPARATE entitlement: MAPPED != entitlement (403 -> NOT_ENTITLED).
+# D2: indices are served/qualified live only; NOT persisted (candles.volume is NOT
+# NULL and indices have no volume; no volume=0 sentinel is ever written).
+
+MASSIVE_INDEX_GRANULARITIES: Dict[str, tuple] = {
+    "1m": (1, "minute"),
+    "5m": (5, "minute"),
+    "15m": (15, "minute"),
+    "30m": (30, "minute"),
+    "1h": (1, "hour"),
+    "2h": (2, "hour"),
+    "4h": (4, "hour"),
+    "6h": (6, "hour"),
+    "1d": (1, "day"),
+}
+
+
+@dataclass(frozen=True)
+class IndexBar:
+    """A parsed index aggregate. OHLC are exact Decimals (never float). Indices have
+    NO volume (aggregates are derived from index values, not trades)."""
+    datetime_utc: Optional[datetime]
+    open: Optional[Decimal]
+    high: Optional[Decimal]
+    low: Optional[Decimal]
+    close: Optional[Decimal]
+    status: DataQualityStatus
+
+
+@dataclass(frozen=True)
+class MassiveIndexResult:
+    status: str  # OK | EMPTY | NOT_MAPPED | NOT_SUPPORTED | NO_KEY |
+    #              ACCESS_DENIED | RATE_LIMITED | UNAVAILABLE
+    bars: List[IndexBar]
+    reason: Optional[str] = None
+
+
+def index_bar_from_agg(
+    item: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> IndexBar:
+    """Parse one index aggregate (t ms + o/h/l/c). OHLC via Decimal only; no volume.
+    Missing/non-numeric/negative OHLC or timestamp -> INVALID (never fabricated)."""
+    if not isinstance(item, dict):
+        return IndexBar(None, None, None, None, None, DataQualityStatus.INVALID)
+    dt = _unix_ms_to_dt(item.get("t"))
+    open_ = _to_decimal(item.get("o"))
+    high = _to_decimal(item.get("h"))
+    low = _to_decimal(item.get("l"))
+    close = _to_decimal(item.get("c"))
+    if dt is None or open_ is None or high is None or low is None or close is None:
+        return IndexBar(dt, open_, high, low, close, DataQualityStatus.INVALID)
+    if open_ < 0 or high < 0 or low < 0 or close < 0:
+        return IndexBar(dt, open_, high, low, close, DataQualityStatus.INVALID)
+    return IndexBar(dt, open_, high, low, close, classify_freshness(dt, max_age_seconds, now=now))
+
+
+def parse_massive_index_aggs(
+    payload: Any, max_age_seconds: float, now: Optional[datetime] = None
+) -> MassiveIndexResult:
+    """Parse an index aggregates body. Empty results -> EMPTY (a legitimate no-update
+    period, never a gap). Malformed -> UNAVAILABLE."""
+    if not isinstance(payload, dict):
+        return MassiveIndexResult("UNAVAILABLE", [], "malformed provider response")
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        return MassiveIndexResult("EMPTY", [], None)
+    bars = [index_bar_from_agg(x, max_age_seconds, now=now) for x in results]
+    return MassiveIndexResult("OK", bars, None)
+
+
+class MassiveIndicesProvider:
+    """Massive Indices REST adapter. Same account/key as Forex (auth header, never
+    in URL/logs/response); no network without a key. OHLC decoded with
+    parse_float=Decimal so index values are exact (never float)."""
+
+    SOURCE = "massive"
+
+    def __init__(self, rest_url: Optional[str] = None, api_key: Optional[str] = None) -> None:
+        self.rest_url = (rest_url or settings.massive_rest_url).rstrip("/")
+        self.api_key = api_key if api_key is not None else settings.massive_api_key
+        self.client: Optional[httpx.AsyncClient] = None
+
+    async def connect(self) -> None:
+        if self.client is None:
+            headers = {"Accept": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            self.client = httpx.AsyncClient(
+                base_url=self.rest_url,
+                timeout=settings.massive_request_timeout_seconds,
+                headers=headers,
+            )
+
+    async def disconnect(self) -> None:
+        if self.client is not None:
+            await self.client.aclose()
+            self.client = None
+
+    async def get_index_aggregates(
+        self, canonical_symbol: str, granularity: str, start: int, end: int
+    ) -> MassiveIndexResult:
+        """Fetch index aggregates over [start, end] UNIX seconds. Returns an explicit
+        MassiveIndexResult; never raises for provider/HTTP errors."""
+        ticker = provider_symbol_map.to_provider(self.SOURCE, canonical_symbol)
+        if ticker is None:
+            return MassiveIndexResult(
+                "NOT_MAPPED", [], f"no verified Massive index symbol for {canonical_symbol}")
+        if granularity not in MASSIVE_INDEX_GRANULARITIES:
+            return MassiveIndexResult(
+                "NOT_SUPPORTED", [], f"granularity {granularity} not supported (massive indices)")
+        if not self.api_key:
+            return MassiveIndexResult("NO_KEY", [], "MASSIVE_API_KEY not set")
+        if self.client is None:
+            await self.connect()
+        assert self.client is not None
+        multiplier, timespan = MASSIVE_INDEX_GRANULARITIES[granularity]
+        start_ms = int(start) * 1000
+        end_ms = int(end) * 1000
+        try:
+            resp = await self.client.get(
+                f"/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{start_ms}/{end_ms}",
+                params={"adjusted": "true", "sort": "asc", "limit": 50000},
+            )
+        except httpx.TimeoutException:
+            return MassiveIndexResult("UNAVAILABLE", [], "provider timeout")
+        except httpx.HTTPError:
+            return MassiveIndexResult("UNAVAILABLE", [], "provider unreachable")
+        code = resp.status_code
+        if code in (401, 403):
+            return MassiveIndexResult(
+                "ACCESS_DENIED", [], f"access denied by provider ({code})")
+        if code == 429:
+            return MassiveIndexResult("RATE_LIMITED", [], "rate limited by provider (429)")
+        if code >= 500:
+            return MassiveIndexResult("UNAVAILABLE", [], f"provider server error ({code})")
+        try:
+            # parse_float=Decimal -> exact index OHLC, no intermediate float
+            payload = json.loads(resp.text, parse_float=Decimal)
+        except (ValueError, json.JSONDecodeError):
+            return MassiveIndexResult("UNAVAILABLE", [], "malformed provider response")
+        return parse_massive_index_aggs(payload, max_age_seconds=float("inf"))
+
+
+def _register_index_instruments() -> None:
+    """Register the 3 canonical US cash indices. INDEX class, quote in USD points,
+    volume NOT_AVAILABLE (indices have no volume), documented U.S. equity RTH baseline
+    calendar (holidays/early closes intentionally not inferred), precision/tick None.
+    Mappings are documentation-verified -> MAPPED (independent of entitlement)."""
+    indices = (
+        ("SPX", "I:SPX", "S&P 500"),
+        ("NDX", "I:NDX", "Nasdaq-100"),
+        ("US30", "I:DJI", "Dow Jones Industrial Average"),
+    )
+    for canonical, provider_ticker, name in indices:
+        instrument_registry.register(
+            Instrument(
+                canonical_symbol=canonical,
+                asset_class=AssetClass.INDEX,
+                base_asset=None,
+                quote_asset="USD",
+                display_name=name,
+                timezone="America/New_York",  # US cash index (points); internal stays UTC
+                market_calendar=MarketCalendarPolicy.US_EQUITY_RTH,
+                volume_semantics=VolumeSemantics.NOT_AVAILABLE,
+                price_precision=None,
+                tick_size=None,
+            )
+        )
+        provider_symbol_map.add("massive", canonical, provider_ticker)
+
+
+massive_indices_provider = MassiveIndicesProvider()
+_register_index_instruments()
+
+
+def _index_bar_dict(bar: IndexBar) -> Dict[str, object]:
+    """JSON-safe index bar: Decimals as strings, datetime ISO UTC. No volume key."""
+    def s(v: Optional[Decimal]) -> Optional[str]:
+        return str(v) if v is not None else None
+    return {
+        "start": bar.datetime_utc.isoformat() if bar.datetime_utc else None,
+        "open": s(bar.open), "high": s(bar.high), "low": s(bar.low),
+        "close": s(bar.close), "quality": bar.status.value,
+    }
+
+
+async def fetch_index_history(
+    canonical_symbol: str, granularity: str, start: int, end: int
+) -> Dict[str, object]:
+    """Assemble US cash index history from Massive (live only, NOT persisted). Half-open
+    [start, end), dedup by timestamp, ascending, INVALID excluded. Gaps UNKNOWN (no
+    RTH calendar): a missing bar is never a gap. No volume (NOT_AVAILABLE)."""
+    inst = instrument_registry.get(canonical_symbol)
+    if inst is None or inst.asset_class != AssetClass.INDEX:
+        raise ValueError(f"unknown index instrument: {canonical_symbol}")
+    if start >= end:
+        raise ValueError("start must be strictly before end")
+    provider_symbol = provider_symbol_map.to_provider("massive", canonical_symbol)
+    res = await massive_indices_provider.get_index_aggregates(
+        canonical_symbol, granularity, start, end)
+    base: Dict[str, object] = {
+        "source": "massive",
+        "canonical_symbol": canonical_symbol,
+        "provider_symbol": provider_symbol,
+        "granularity": granularity,
+        "requested_range": {"start": start, "end": end},
+        "timezone_internal": "UTC",
+        "display_timezone": "America/Toronto",
+        "market_timezone": inst.timezone,
+        "market_calendar": inst.market_calendar.value,
+        "volume_semantics": inst.volume_semantics.value,  # NOT_AVAILABLE
+        "persisted": False,  # D2: indices are never written to candles this increment
+    }
+    if res.status != "OK":
+        base.update({"status": res.status, "reason": res.reason, "count": 0, "candles": []})
+        return base
+    collected: Dict[int, IndexBar] = {}
+    invalid = 0
+    for bar in res.bars:
+        if bar.datetime_utc is None or bar.status == DataQualityStatus.INVALID:
+            invalid += 1
+            continue
+        key = int(bar.datetime_utc.timestamp())
+        if key < start or key >= end:
+            continue
+        collected[key] = bar
+    kept = [collected[k] for k in sorted(collected)]
+    dts = [b.datetime_utc for b in kept if b.datetime_utc is not None]
+    bucket = GRANULARITIES[granularity][1] if granularity in GRANULARITIES else 86400
+    latest_quality = (
+        classify_freshness(max(dts), bucket * 2).value if dts
+        else DataQualityStatus.MISSING.value
+    )
+    base.update({
+        "status": "EMPTY" if not kept else "OK",
+        "count": len(kept),
+        "invalid_candles_count": invalid,
+        "latest_quality": latest_quality,   # never forced LIVE; EOD data is often STALE
+        "gaps_status": calendar_for(inst.market_calendar).analyze_gaps([], bucket).status,
+        "candles": [_index_bar_dict(b) for b in kept],
+    })
+    return base
+
+
+
+
+@dataclass(frozen=True)
+class IndexRealtimeValue:
+    canonical_symbol: str
+    value: Decimal
+    source_timestamp: datetime
+    received_at: datetime
+    quality: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "canonical_symbol": self.canonical_symbol,
+            "value": str(self.value),
+            "source_timestamp": self.source_timestamp.isoformat(),
+            "received_at": self.received_at.isoformat(),
+            "quality": self.quality.value,
+        }
+
+
+@dataclass(frozen=True)
+class IndexRealtimeCandle:
+    canonical_symbol: str
+    start: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    received_at: datetime
+    quality: DataQualityStatus
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "canonical_symbol": self.canonical_symbol,
+            "granularity": "1m",
+            "start": self.start.isoformat(),
+            "open": str(self.open),
+            "high": str(self.high),
+            "low": str(self.low),
+            "close": str(self.close),
+            "received_at": self.received_at.isoformat(),
+            "quality": self.quality.value,
+        }
+
+
+def _massive_index_to_canonical(provider_symbol: Any) -> Optional[str]:
+    if not isinstance(provider_symbol, str):
+        return None
+    for canonical in ("SPX", "NDX", "US30"):
+        if provider_symbol_map.to_provider("massive", canonical) == provider_symbol:
+            return canonical
+    return None
+
+
+def parse_massive_index_value(
+    item: Any, received_at: Optional[datetime] = None
+) -> Optional[IndexRealtimeValue]:
+    if not isinstance(item, dict) or item.get("ev") != "V":
+        return None
+    canonical = _massive_index_to_canonical(item.get("T"))
+    value = _positive_decimal(item.get("val"))
+    ts = _unix_ms_to_dt(item.get("t"))
+    if canonical is None or value is None or ts is None:
+        return None
+    recv = received_at or utcnow()
+    quality = classify_freshness(ts, 16 * 60.0, now=recv)
+    return IndexRealtimeValue(canonical, value, ts, recv, quality)
+
+
+def parse_massive_index_minute(
+    item: Any, received_at: Optional[datetime] = None
+) -> Optional[IndexRealtimeCandle]:
+    if not isinstance(item, dict) or item.get("ev") != "AM":
+        return None
+    canonical = _massive_index_to_canonical(item.get("sym"))
+    start = _unix_ms_to_dt(item.get("s"))
+    vals = [_positive_decimal(item.get(k)) for k in ("o", "h", "l", "c")]
+    if canonical is None or start is None or any(v is None for v in vals):
+        return None
+    open_, high, low, close = vals
+    assert open_ is not None and high is not None and low is not None and close is not None
+    if high < low or not (low <= open_ <= high) or not (low <= close <= high):
+        return None
+    recv = received_at or utcnow()
+    quality = classify_freshness(start, 17 * 60.0, now=recv)
+    return IndexRealtimeCandle(canonical, start, open_, high, low, close, recv, quality)
+
+
+class MassiveIndicesWsManager:
+    SOURCE = "massive"
+    FEED_RECENCY = "15_MIN_DELAYED"
+
+    def __init__(self, url: Optional[str] = None, api_key: Optional[str] = None) -> None:
+        self.url = url or settings.massive_indices_ws_url
+        self.api_key = settings.massive_api_key if api_key is None else api_key
+        self.running = False
+        self.websocket: Any = None
+        self.authenticated = False
+        self.last_message_at: Optional[datetime] = None
+        self.last_error: Optional[str] = None
+        self._task: Optional[asyncio.Task] = None
+        self.values: Dict[str, IndexRealtimeValue] = {}
+        self.candles: Dict[str, IndexRealtimeCandle] = {}
+
+    def _topics(self) -> List[str]:
+        tickers = [
+            provider_symbol_map.to_provider("massive", canonical)
+            for canonical in ("SPX", "NDX", "US30")
+        ]
+        verified = [ticker for ticker in tickers if ticker is not None]
+        return [f"{channel}.{ticker}" for ticker in verified for channel in ("V", "AM")]
+
+    async def start(self) -> None:
+        if not self.api_key:
+            raise RuntimeError("MASSIVE_API_KEY not set")
+        if websockets is None:
+            raise RuntimeError("websockets dependency is not installed")
+        if self.running:
+            return
+        if not self._topics():
+            raise RuntimeError("no verified Massive index mappings available")
+        self.running = True
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self) -> None:
+        self.running = False
+        self.authenticated = False
+        if self.websocket is not None:
+            try:
+                await self.websocket.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.websocket = None
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def _run_loop(self) -> None:  # pragma: no cover - live provider socket
+        attempt = 0
+        while self.running:
+            try:
+                async with websockets.connect(
+                    self.url, ping_interval=20, ping_timeout=20, close_timeout=5
+                ) as ws:
+                    self.websocket = ws
+                    self.authenticated = False
+                    attempt = 0
+                    await ws.send(json.dumps({"action": "auth", "params": self.api_key}))
+                    async for raw in ws:
+                        self.last_message_at = utcnow()
+                        await self._handle(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.websocket = None
+                self.authenticated = False
+                self.last_error = _redact_secret(str(exc))[:200]
+                if not self.running:
+                    break
+                attempt += 1
+                await asyncio.sleep(ws_backoff(attempt))
+
+    async def _handle(self, raw: str | bytes) -> None:
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            return
+        items = payload if isinstance(payload, list) else [payload]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("ev") == "status":
+                status_value = str(item.get("status", ""))
+                if status_value == "auth_success":
+                    self.authenticated = True
+                    if self.websocket is not None:
+                        await self.websocket.send(
+                            json.dumps({"action": "subscribe", "params": ",".join(self._topics())})
+                        )
+                elif status_value in {"auth_failed", "error"}:
+                    self.last_error = str(item.get("message") or status_value)[:200]
+                continue
+            value = parse_massive_index_value(item, self.last_message_at)
+            if value is not None:
+                old = self.values.get(value.canonical_symbol)
+                if old is None or value.source_timestamp >= old.source_timestamp:
+                    self.values[value.canonical_symbol] = value
+                continue
+            candle = parse_massive_index_minute(item, self.last_message_at)
+            if candle is not None:
+                oldc = self.candles.get(candle.canonical_symbol)
+                if oldc is None or candle.start >= oldc.start:
+                    self.candles[candle.canonical_symbol] = candle
+
+    def realtime(self, canonical_symbol: str) -> Dict[str, object]:
+        canonical = canonical_symbol.upper()
+        value = self.values.get(canonical)
+        candle = self.candles.get(canonical)
+        transport = (
+            "WEBSOCKET" if self.authenticated else ("CONNECTING" if self.running else "STOPPED")
+        )
+        return {
+            "source": "massive",
+            "canonical_symbol": canonical,
+            "status": "OK" if (value or candle) else "MISSING",
+            "transport": transport,
+            "feed_recency": self.FEED_RECENCY,
+            "value": value.to_dict() if value else None,
+            "candle": candle.to_dict() if candle else None,
+        }
+
+    def health(self) -> Dict[str, object]:
+        return {
+            "source": "massive",
+            "running": self.running,
+            "connected": self.websocket is not None,
+            "authenticated": self.authenticated,
+            "feed_recency": self.FEED_RECENCY,
+            "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
+            "last_error": self.last_error,
+        }
+
+
+massive_indices_ws = MassiveIndicesWsManager()
+
+
+@api_router.post("/market/index/websocket/start")
+async def market_index_ws_start() -> dict:
+    try:
+        await massive_indices_ws.start()
+    except RuntimeError as exc:
+        reason = str(exc)
+        code = 503 if "API_KEY" in reason else 409
+        raise HTTPException(
+            status_code=code, detail={"status": "UNAVAILABLE", "reason": reason}
+        ) from exc
+    return {
+        "status": "started",
+        "source": "massive",
+        "transport": "WEBSOCKET",
+        "feed_recency": massive_indices_ws.FEED_RECENCY,
+    }
+
+
+@api_router.post("/market/index/websocket/stop")
+async def market_index_ws_stop() -> dict:
+    await massive_indices_ws.stop()
+    return {"status": "stopped", "source": "massive"}
+
+
+@api_router.get("/market/index/websocket/health")
+async def market_index_ws_health() -> dict:
+    return massive_indices_ws.health()
+
+
+@api_router.get("/market/index/{symbol}/realtime")
+async def market_index_realtime(symbol: str) -> dict:
+    canonical = symbol.upper()
+    inst = instrument_registry.get(canonical)
+    if inst is None or inst.asset_class != AssetClass.INDEX:
+        raise HTTPException(
+            status_code=404,
+            detail={"status": "NOT_MAPPED", "reason": "unknown index instrument"},
+        )
+    return massive_indices_ws.realtime(canonical)
+
+
+@api_router.get("/market/index/{symbol}/history")
+async def market_index_history(
+    symbol: str, start: int, end: int, granularity: str = "1d"
+) -> dict:
+    try:
+        result = await fetch_index_history(symbol.upper(), granularity, start, end)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": str(exc)}
+        ) from exc
+    status = str(result.get("status"))
+    http = _METAL_HTTP_STATUS.get(status)  # same status->HTTP mapping
+    if http is not None:
+        raise HTTPException(
+            status_code=http, detail={"status": status, "reason": result.get("reason")}
+        )
+    return result
+
+
+massive_forex_provider = MassiveForexProvider()
+_register_massive_forex_instruments()
+
+
+async def fetch_forex_history(
+    canonical_symbol: str, granularity: str, start: int, end: int
+) -> dict:
+    """Assemble Massive forex history for a CANONICAL symbol. Reuses the 6A calendar
+    for gap semantics: forex is NOT_CONFIGURED -> gaps UNKNOWN, and a missing bar is
+    NEVER turned into a gap/MISSING (Massive emits no bar without a new quote)."""
+    inst = instrument_registry.get(canonical_symbol)
+    if inst is None or inst.asset_class != AssetClass.FOREX:
+        raise ValueError(f"unknown forex instrument: {canonical_symbol}")
+    provider_ticker = provider_symbol_map.to_provider("massive", canonical_symbol)
+    if provider_ticker is None:
+        return {
+            "source": "massive", "canonical_symbol": canonical_symbol, "provider_symbol": None,
+            "granularity": granularity, "status": "NOT_MAPPED",
+            "reason": "Massive symbol not officially verified/mapped",
+            "count": 0, "candles": [],
+        }
+    if granularity not in MASSIVE_FOREX_GRANULARITIES:
+        raise ValueError(f"NOT_SUPPORTED granularity for Massive forex: {granularity}")
+    if start >= end:
+        raise ValueError("start must be strictly before end")
+    bucket = GRANULARITIES[granularity][1] if granularity in GRANULARITIES else 60
+    try:
+        candles, _status = await massive_forex_provider.get_candles_range(
+            canonical_symbol, granularity, start, end
+        )
+    except httpx.HTTPStatusError as exc:
+        # Map the provider HTTP status to a CLEAN status/reason. Never expose the
+        # raw exception, request URL, MDN link or the API key. Mapping is kept.
+        code = exc.response.status_code if exc.response is not None else 0
+        if code in (401, 403):
+            status_val, reason = "ACCESS_DENIED", f"access denied by provider ({code})"
+        elif code == 429:
+            status_val, reason = "RATE_LIMITED", "provider rate limit reached (429)"
+        else:
+            status_val, reason = "UNAVAILABLE", f"provider error ({code})"
+        return {
+            "source": "massive", "canonical_symbol": canonical_symbol,
+            "provider_symbol": provider_ticker, "granularity": granularity,
+            "status": status_val, "reason": reason, "http_status": code,
+            "count": 0, "candles": [],
+        }
+    except httpx.HTTPError:
+        return {
+            "source": "massive", "canonical_symbol": canonical_symbol,
+            "provider_symbol": provider_ticker, "granularity": granularity,
+            "status": "UNAVAILABLE", "reason": "provider unreachable",
+            "count": 0, "candles": [],
+        }
+    collected: Dict[int, Candle] = {}
+    invalid = 0
+    for candle in candles:
+        if candle.start is None or candle.status == DataQualityStatus.INVALID:
+            invalid += 1
+            continue
+        key = int(candle.start.timestamp())
+        if key < start or key >= end:
+            continue
+        collected[key] = candle
+    starts = sorted(collected)
+    kept = [collected[k] for k in starts]
+    # Forex calendar NOT_CONFIGURED -> gaps UNKNOWN (absence of a bar is legitimate).
+    report = calendar_for(inst.market_calendar).analyze_gaps(starts, bucket)
+    return {
+        "source": "massive",
+        "canonical_symbol": canonical_symbol,
+        "provider_symbol": provider_ticker,
+        "granularity": granularity,
+        "status": "EMPTY" if not kept else "OK",
+        "requested_range": {"start": start, "end": end},
+        "count": len(kept),
+        "invalid_candles_count": invalid,
+        "latest_quality": _latest_quality(kept),
+        "gaps_status": report.status,   # "UNKNOWN" for forex (no verified calendar)
+        "gaps": report.missing,          # [] when UNKNOWN
+        "data_complete": False,          # gap analysis unavailable -> never assert complete
+        "timezone": inst.timezone,       # UTC internal; ET bar-alignment is a provider detail
+        "volume_semantics": inst.volume_semantics.value,  # UNKNOWN (never invented)
+        "candles": [c.to_dict() for c in kept],
+    }
+
+
+async def persist_forex_result(result: Dict[str, object]) -> int:
+    """Persist a fetch_forex_history result's VALID candles under source='massive',
+    product_id=provider_symbol. Reuses the generic history->rows + persist_candles."""
+    if result.get("status") != "OK" or not result.get("provider_symbol"):
+        return 0
+    rows = _history_dicts_to_rows(
+        "massive", str(result["provider_symbol"]), str(result["granularity"]),
+        result.get("candles"), utcnow(),
+    )
+    return await persist_candles(rows)
+
+
+@api_router.get("/market/forex/{symbol}/history")
+async def market_forex_history(
+    symbol: str, start: int, end: int, granularity: str = "1h"
+) -> dict:
+    try:
+        result = await fetch_forex_history(symbol.upper(), granularity, start, end)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": str(exc)}
+        ) from exc
+    status = result.get("status")
+    if status == "NOT_MAPPED":
+        raise HTTPException(
+            status_code=409,
+            detail={"status": "NOT_MAPPED", "reason": result.get("reason")},
+        )
+    if status == "ACCESS_DENIED":
+        raise HTTPException(
+            status_code=403,
+            detail={"status": "ACCESS_DENIED", "reason": result.get("reason")},
+        )
+    if status == "RATE_LIMITED":
+        raise HTTPException(
+            status_code=429,
+            detail={"status": "RATE_LIMITED", "reason": result.get("reason")},
+        )
+    if status == "UNAVAILABLE":
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": result.get("reason")},
+        )
+    return result
+
+
+# ============================ frontend serving ============================
+def _frontend_dir(cfg: Settings) -> Path:
+    """Resolve the frontend directory. FRONTEND_DIR overrides; otherwise the
+    repo's frontend/ (main.py lives at backend/main.py -> parents[1] = repo)."""
+    if cfg.frontend_dir:
+        return Path(cfg.frontend_dir)
+    return Path(__file__).resolve().parents[1] / "frontend"
+
+
+def _mount_frontend(app: FastAPI, cfg: Settings) -> None:
+    """Serve the single-file frontend at GET /. No-op (API-only) if absent,
+    so the Docker image / API-only deployments keep working unchanged."""
+    frontend = _frontend_dir(cfg)
+    index = frontend / "index.html"
+    if not index.exists():
+        log.info("Frontend not found at %s - serving API only.", frontend)
+        return
+    for sub in ("css", "js", "assets"):
+        directory = frontend / sub
+        if directory.is_dir():
+            app.mount(f"/{sub}", StaticFiles(directory=str(directory)), name=f"static-{sub}")
+
+    @app.get("/", include_in_schema=False)
+    async def serve_index() -> FileResponse:
+        return FileResponse(str(index), media_type="text/html")
+
+    log.info("Serving frontend from %s", frontend)
+
+
+# ============================ app factory ============================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("Starting %s (env=%s)", settings.app_name, settings.environment)
+    if settings.is_production and settings.live_trading_enabled:
+        raise RuntimeError(
+            "live_trading_enabled=True but this build supports paper trading only."
+        )
+    await market_provider.connect()
+    await massive_forex_provider.connect()
+    await twelvedata_provider.connect()
+    await massive_indices_provider.connect()
+    activation = await activate_massive_forex_mappings()
+    log.info("Massive forex mapping activation: %s", activation)
+    try:
+        await init_candle_schema()
+        persistence_state.mark_ready()
+        market_bus.subscribe(persistence_consumer)
+    except Exception as exc:  # noqa: BLE001 - explicit, never a silent false success
+        persistence_state.mark_init_failed(str(exc))
+        log.error("Candle schema init failed; persistence UNAVAILABLE: %s", exc)
+    paper_monitor_stop = asyncio.Event()
+    paper_monitor_task = asyncio.create_task(
+        paper_monitor_loop(paper_monitor_stop), name="paper-monitor"
+    )
+    try:
+        yield
+    finally:
+        paper_monitor_stop.set()
+        try:
+            await paper_monitor_task
+        except asyncio.CancelledError:
+            pass
+        await massive_indices_ws.stop()
+        await twelvedata_gold_ws.stop()
+        await massive_forex_ws.stop()
+        await market_ws.stop()
+        await market_provider.disconnect()
+        await massive_forex_provider.disconnect()
+        await twelvedata_provider.disconnect()
+        await massive_indices_provider.disconnect()
+        log.info("Shutting down %s", settings.app_name)
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title=settings.app_name,
+        version="0.2.0",
+        description="Real-time crypto intelligence & paper-trading platform (single-file build).",
+        lifespan=lifespan,
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    app.include_router(health_router)
+    app.include_router(api_router, prefix=settings.api_prefix)
+    _mount_frontend(app, settings)
+    return app
+
+
+app = create_app()

@@ -1357,6 +1357,31 @@ async def market_candles_history(
 
 metadata = MetaData()
 
+paper_positions_table = Table(
+    "paper_positions",
+    metadata,
+    Column("position_id", String, primary_key=True),
+    Column("symbol", String, nullable=False),
+    Column("side", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("entry", Numeric(38, 18), nullable=False),
+    Column("stop_loss", Numeric(38, 18), nullable=False),
+    Column("take_profit", Numeric(38, 18), nullable=False),
+    Column("size", Numeric(38, 18), nullable=False),
+    Column("size_unit", String, nullable=False),
+    Column("risk_money", Numeric(38, 18), nullable=False),
+    Column("risk_percent", Numeric(18, 8), nullable=False),
+    Column("capital_before", Numeric(38, 18), nullable=False),
+    Column("source", String, nullable=False),
+    Column("source_timestamp", DateTime(timezone=True), nullable=False),
+    Column("opened_at", DateTime(timezone=True), nullable=False),
+    Column("close_reason", String, nullable=True),
+    Column("close_price", Numeric(38, 18), nullable=True),
+    Column("closed_at", DateTime(timezone=True), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
 candles_table = Table(
     "candles",
     metadata,
@@ -1440,8 +1465,135 @@ def is_candle_closed(
     return reference >= end
 
 
+class PaperPositionCreate(BaseModel):
+    position_id: str = Field(min_length=1, max_length=128)
+    symbol: str = Field(min_length=1, max_length=64)
+    side: str
+    entry: Decimal
+    stop_loss: Decimal
+    take_profit: Decimal
+    size: Decimal
+    size_unit: str = Field(min_length=1, max_length=32)
+    risk_money: Decimal
+    risk_percent: Decimal
+    capital_before: Decimal
+    source: str = Field(min_length=1, max_length=64)
+    source_timestamp: datetime
+    opened_at: datetime
+
+
+def validate_paper_position_create(req: PaperPositionCreate) -> None:
+    if req.side not in {"LONG", "SHORT"}:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "SIDE_INVALID"}
+        )
+    positive = (req.entry, req.stop_loss, req.take_profit, req.size, req.risk_money)
+    if any(value <= Decimal("0") for value in positive):
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "VALUE_INVALID"}
+        )
+    if req.risk_percent <= Decimal("0") or req.risk_percent > Decimal("100"):
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "RISK_INVALID"}
+        )
+    if req.capital_before <= Decimal("0"):
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "CAPITAL_INVALID"}
+        )
+    if req.side == "LONG" and not (req.stop_loss < req.entry < req.take_profit):
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "LONG_LEVELS_INVALID"},
+        )
+    if req.side == "SHORT" and not (req.take_profit < req.entry < req.stop_loss):
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "SHORT_LEVELS_INVALID"},
+        )
+
+
+def paper_position_to_dict(row: Any) -> Dict[str, object]:
+    data = dict(row._mapping)
+    for key in ("entry", "stop_loss", "take_profit", "size", "risk_money",
+                "risk_percent", "capital_before", "close_price"):
+        if data.get(key) is not None:
+            data[key] = str(data[key])
+    for key in ("source_timestamp", "opened_at", "closed_at", "created_at", "updated_at"):
+        if data.get(key) is not None:
+            data[key] = data[key].isoformat()
+    data["paper_only"] = True
+    data["execution"] = False
+    return data
+
+
+@api_router.post("/paper/positions", status_code=201)
+async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
+        )
+    validate_paper_position_create(req)
+    now = utcnow()
+    values = {
+        "position_id": req.position_id, "symbol": req.symbol.upper(), "side": req.side,
+        "status": "OPEN", "entry": req.entry, "stop_loss": req.stop_loss,
+        "take_profit": req.take_profit, "size": req.size, "size_unit": req.size_unit,
+        "risk_money": req.risk_money, "risk_percent": req.risk_percent,
+        "capital_before": req.capital_before, "source": req.source,
+        "source_timestamp": req.source_timestamp, "opened_at": req.opened_at,
+        "close_reason": None, "close_price": None, "closed_at": None,
+        "created_at": now, "updated_at": now,
+    }
+    try:
+        async with engine.begin() as conn:
+            stmt = pg_insert(paper_positions_table).values(values)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["position_id"])
+            result = await conn.execute(stmt)
+            if result.rowcount != 1:
+                raise HTTPException(
+                    status_code=409, detail={"status": "CONFLICT", "reason": "POSITION_ID_EXISTS"}
+                )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"}
+        ) from exc
+    persistence_state.mark_write_ok()
+    return {**values, "paper_only": True, "execution": False}
+
+
+@api_router.get("/paper/positions")
+async def list_paper_positions(status_filter: Optional[str] = None) -> Dict[str, object]:
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
+        )
+    sql = "SELECT * FROM paper_positions"
+    params: Dict[str, object] = {}
+    if status_filter is not None:
+        if status_filter not in {"OPEN", "CLOSED", "CONFLICT"}:
+            raise HTTPException(
+                status_code=400, detail={"status": "INVALID", "reason": "STATUS_INVALID"}
+            )
+        sql += " WHERE status = :status"
+        params["status"] = status_filter
+    sql += " ORDER BY opened_at DESC, position_id DESC"
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(text(sql), params)
+            rows = [paper_position_to_dict(row) for row in result.fetchall()]
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"}
+        ) from exc
+    return {"status": "OK", "positions": rows, "count": len(rows), "paper_only": True}
+
+
 async def init_candle_schema() -> None:
-    """Create the candles table if absent (idempotent). Raises on real DDL failure
+    """Create persistence tables if absent (idempotent). Raises on real DDL failure
     so it is NEVER swallowed into a silent false success."""
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)

@@ -1871,6 +1871,7 @@ SERVER_DISPLACEMENT_LOOKBACK = 20
 SERVER_DISPLACEMENT_BODY_MULTIPLIER = 1.5
 SERVER_DISPLACEMENT_MIN_BODY_RANGE_RATIO = 0.70
 SERVER_DISPLACEMENT_CLOSE_EXTREME_FRACTION = 0.20
+SERVER_ORDER_BLOCK_LOOKBACK = 5
 SERVER_FVG_MIN_GAP = 0.0
 
 
@@ -2209,6 +2210,85 @@ def latest_confirmed_fvg(
     return events[-1] if events else None
 
 
+def latest_confirmed_order_block(
+    candles: List[Candle],
+    displacement: Optional[Dict[str, object]] = None,
+    lookback: int = SERVER_ORDER_BLOCK_LOOKBACK,
+) -> Optional[Dict[str, object]]:
+    """Return the last opposite candle before a confirmed displacement.
+
+    A bullish OB is the latest bearish candle before bullish displacement; a
+    bearish OB is the latest bullish candle before bearish displacement. The
+    search is bounded to the preceding five closed VALID candles. The full
+    candle low/high defines the zone. Later closed candles move FRESH to
+    RETESTED on overlap, or INVALIDATED when close crosses beyond the far edge.
+    An Order Block alone never authorizes an entry.
+    """
+    if lookback < 1 or not candles:
+        return None
+    event = displacement or latest_confirmed_displacement(candles)
+    if event is None:
+        return None
+    raw_index = event.get("candle_index")
+    direction = event.get("direction")
+    if not isinstance(raw_index, int) or raw_index <= 0 or raw_index >= len(candles):
+        return None
+    if direction not in {"BULLISH", "BEARISH"}:
+        return None
+
+    start = max(0, raw_index - lookback)
+    ob_index: Optional[int] = None
+    for index in range(raw_index - 1, start - 1, -1):
+        candle = candles[index]
+        if candle.open is None or candle.close is None:
+            continue
+        is_opposite = (
+            direction == "BULLISH" and candle.close < candle.open
+        ) or (direction == "BEARISH" and candle.close > candle.open)
+        if is_opposite:
+            ob_index = index
+            break
+    if ob_index is None:
+        return None
+
+    ob = candles[ob_index]
+    if ob.low is None or ob.high is None or ob.low >= ob.high:
+        return None
+    zone_low = ob.low
+    zone_high = ob.high
+    state = "FRESH"
+    retest_index: Optional[int] = None
+    invalidation_index: Optional[int] = None
+    for index in range(raw_index + 1, len(candles)):
+        candle = candles[index]
+        if candle.low is None or candle.high is None or candle.close is None:
+            continue
+        if direction == "BULLISH" and candle.close < zone_low:
+            state = "INVALIDATED"
+            invalidation_index = index
+            break
+        if direction == "BEARISH" and candle.close > zone_high:
+            state = "INVALIDATED"
+            invalidation_index = index
+            break
+        overlaps = candle.low <= zone_high and candle.high >= zone_low
+        if overlaps and state == "FRESH":
+            state = "RETESTED"
+            retest_index = index
+
+    return {
+        "event": "ORDER_BLOCK",
+        "direction": direction,
+        "order_block_index": ob_index,
+        "displacement_index": raw_index,
+        "zone_low": zone_low,
+        "zone_high": zone_high,
+        "state": state,
+        "retest_index": retest_index,
+        "invalidation_index": invalidation_index,
+    }
+
+
 def structure_from_confirmed_swings(
     candles: List[Candle],
     swing_highs: List[int],
@@ -2310,6 +2390,7 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
     liquidity_sweep = latest_confirmed_liquidity_sweep(closed, highs, lows)
     displacement = latest_confirmed_displacement(closed)
     fvg = latest_confirmed_fvg(closed)
+    order_block = latest_confirmed_order_block(closed, displacement)
     latest = closed[-1]
     return {
         "status": "READY",
@@ -2321,10 +2402,11 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
         "setup_state": "WAIT",
         "auto_queue": False,
-        "smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_V1",
+        "smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_V1",
         "liquidity_sweep": liquidity_sweep or {"event": "NONE", "direction": None},
         "displacement": displacement or {"event": "NONE", "direction": None},
         "fvg": fvg or {"event": "NONE", "direction": None},
+        "order_block": order_block or {"event": "NONE", "direction": None},
     }
 
 
@@ -2482,6 +2564,7 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "liquidity_sweep_detection": "SERVER_LIQUIDITY_SWEEP_V1",
         "displacement_detection": "SERVER_DISPLACEMENT_V1",
         "fvg_detection": "SERVER_FVG_V1",
+        "order_block_detection": "SERVER_ORDER_BLOCK_V1",
         "smc_auto_candidate_generation": "NOT_IMPLEMENTED",
         "paper_only": True,
         "execution": False,

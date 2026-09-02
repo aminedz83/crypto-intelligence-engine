@@ -5298,7 +5298,11 @@ class TestServerMarketSetupDetectorV16M5B1(unittest.TestCase):
 
     def test_full_smc_is_explicitly_not_implemented(self):
         source = inspect.getsource(main.detect_server_market_structure)
-        self.assertIn('"liquidity_sweep": "NOT_IMPLEMENTED"', source)
+        self.assertIn('"smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_V1"', source)
+        self.assertIn('"liquidity_sweep": liquidity_sweep', source)
+        self.assertNotIn('"liquidity_sweep": "NOT_IMPLEMENTED"', source)
+        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"auto_queue": False', source)
 
     def test_non_crypto_is_not_supported(self):
         source = inspect.getsource(main.get_server_market_setup_detector)

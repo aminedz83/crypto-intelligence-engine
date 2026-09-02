@@ -4184,11 +4184,11 @@ class TestPaperPersistenceV16D(unittest.TestCase):
 
     def test_paper_create_route_exists(self):
         paths = {route.path for route in main.api_router.routes}
-        self.assertIn("/api/v1/paper/positions", paths)
+        self.assertIn("/paper/positions", paths)
 
     def test_paper_list_route_exists(self):
         paths = {route.path for route in main.api_router.routes}
-        self.assertIn("/api/v1/paper/positions", paths)
+        self.assertIn("/paper/positions", paths)
 
     def test_paper_validation_rejects_bad_side(self):
         req = main.PaperPositionCreate(

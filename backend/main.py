@@ -1901,17 +1901,20 @@ def confirmed_swing_indexes(
         if high is None or low is None:
             continue
         neighbors = range(index - strength, index + strength + 1)
-        if all(
-            offset == index
-            or (candles[offset].high is not None and high > candles[offset].high)
-            for offset in neighbors
-        ):
+        is_swing_high = True
+        is_swing_low = True
+        for offset in neighbors:
+            if offset == index:
+                continue
+            neighbor_high = candles[offset].high
+            neighbor_low = candles[offset].low
+            if neighbor_high is None or high <= neighbor_high:
+                is_swing_high = False
+            if neighbor_low is None or low >= neighbor_low:
+                is_swing_low = False
+        if is_swing_high:
             highs.append(index)
-        if all(
-            offset == index
-            or (candles[offset].low is not None and low < candles[offset].low)
-            for offset in neighbors
-        ):
+        if is_swing_low:
             lows.append(index)
     return highs, lows
 

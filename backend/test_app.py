@@ -4311,7 +4311,7 @@ class TestPaperRealtimeMonitorV16F(unittest.TestCase):
         source = inspect.getsource(main.paper_mark_from_realtime)
         self.assertIn("instrument is None", source)
 
-    def test_realtime_mark_v1_is_crypto_only(self):
+    def test_realtime_mark_supports_crypto(self):
         source = inspect.getsource(main.paper_mark_from_realtime)
         self.assertIn("AssetClass.CRYPTO", source)
 
@@ -4355,9 +4355,12 @@ class TestPaperRealtimeMonitorV16F(unittest.TestCase):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("PAPER REALTIME MONITOR V1 ACTIF", html)
 
-    def test_monitor_ui_states_crypto_v1_scope(self):
+    def test_monitor_ui_states_multi_asset_scope(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("V1 branche d’abord Crypto/Coinbase", html)
+        self.assertIn("Crypto/Coinbase", html)
+        self.assertIn("Forex/Massive BBO", html)
+        self.assertIn("Gold/Twelve Data", html)
+        self.assertIn("Indices/Massive Value", html)
 
 
 class TestPaperAutoLoopV16G(unittest.TestCase):
@@ -4418,3 +4421,65 @@ class TestPaperAutoLoopV16G(unittest.TestCase):
     def test_auto_loop_ui_documents_fail_safe_behavior(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("aucun prix n’est inventé", html)
+
+
+class TestPaperMultiAssetMonitorV16H(unittest.TestCase):
+    def test_multi_asset_supports_forex(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("AssetClass.FOREX", source)
+        self.assertIn("massive_forex_ws.quotes.get", source)
+
+    def test_forex_requires_valid_quality(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("quote.quality != DataQualityStatus.VALID", source)
+
+    def test_forex_rejects_crossed_bbo(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("quote.bid > quote.ask", source)
+
+    def test_forex_mark_uses_real_bbo_midpoint(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn('(quote.bid + quote.ask) / Decimal("2")', source)
+
+    def test_multi_asset_supports_gold(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("AssetClass.METAL", source)
+        self.assertIn("twelvedata_gold_ws.last_price", source)
+
+    def test_gold_requires_valid_quality(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("gold.quality != DataQualityStatus.VALID", source)
+
+    def test_gold_is_xau_usd_only(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn('canonical != "XAU-USD"', source)
+
+    def test_multi_asset_supports_indices(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("AssetClass.INDEX", source)
+        self.assertIn("massive_indices_ws.values.get", source)
+
+    def test_indices_require_valid_quality(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("value.quality != DataQualityStatus.VALID", source)
+
+    def test_indices_use_value_not_synthetic_candle(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("price = value.value", source)
+        self.assertNotIn("massive_indices_ws.candles.get", source)
+
+    def test_all_marks_require_source_timestamp(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("source_timestamp is None", source)
+
+    def test_multi_asset_ui_is_active(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("PAPER MULTI-ASSET V1 ACTIF", html)
+
+    def test_ui_documents_delayed_indices(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("15 minutes delayed", html)
+
+    def test_multi_asset_monitor_does_not_enable_live_trading(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertNotIn("live_trading_enabled", source)

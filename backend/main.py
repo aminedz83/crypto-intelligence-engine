@@ -1564,6 +1564,105 @@ async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
     return {**values, "paper_only": True, "execution": False}
 
 
+class PaperPositionMark(BaseModel):
+    current_price: Decimal
+    observed_at: datetime
+    source: str = Field(min_length=1, max_length=64)
+    source_timestamp: datetime
+
+
+def evaluate_paper_close(side: str, price: Decimal, stop_loss: Decimal,
+                         take_profit: Decimal) -> Optional[Tuple[str, Decimal]]:
+    if side == "LONG":
+        if price <= stop_loss:
+            return ("STOP_LOSS", stop_loss)
+        if price >= take_profit:
+            return ("TAKE_PROFIT", take_profit)
+    elif side == "SHORT":
+        if price >= stop_loss:
+            return ("STOP_LOSS", stop_loss)
+        if price <= take_profit:
+            return ("TAKE_PROFIT", take_profit)
+    return None
+
+
+def calculate_paper_pnl(side: str, entry: Decimal, exit_price: Decimal,
+                        size: Decimal) -> Decimal:
+    delta = exit_price - entry if side == "LONG" else entry - exit_price
+    return delta * size
+
+
+@api_router.post("/paper/positions/{position_id}/mark")
+async def mark_paper_position(position_id: str, req: PaperPositionMark) -> Dict[str, object]:
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
+        )
+    if req.current_price <= Decimal("0"):
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": "PRICE_INVALID"}
+        )
+    try:
+        async with engine.begin() as conn:
+            result = await conn.execute(
+                text("SELECT * FROM paper_positions WHERE position_id = :position_id FOR UPDATE"),
+                {"position_id": position_id},
+            )
+            row = result.fetchone()
+            if row is None:
+                raise HTTPException(
+                    status_code=404, detail={"status": "NOT_FOUND", "reason": "POSITION_NOT_FOUND"}
+                )
+            data = dict(row._mapping)
+            if data["status"] != "OPEN":
+                return paper_position_to_dict(row)
+            outcome = evaluate_paper_close(
+                data["side"], req.current_price, data["stop_loss"], data["take_profit"]
+            )
+            if outcome is None:
+                payload = paper_position_to_dict(row)
+                payload["mark_price"] = str(req.current_price)
+                payload["mark_observed_at"] = req.observed_at.isoformat()
+                payload["mark_source"] = req.source
+                payload["mark_source_timestamp"] = req.source_timestamp.isoformat()
+                payload["unrealized_pnl"] = str(
+                    calculate_paper_pnl(
+                        data["side"], data["entry"], req.current_price, data["size"]
+                    )
+                )
+                return payload
+            reason, close_price = outcome
+            pnl = calculate_paper_pnl(data["side"], data["entry"], close_price, data["size"])
+            now = utcnow()
+            await conn.execute(
+                text(
+                    "UPDATE paper_positions SET status='CLOSED', close_reason=:reason, "
+                    "close_price=:close_price, closed_at=:closed_at, updated_at=:updated_at "
+                    "WHERE position_id=:position_id AND status='OPEN'"
+                ),
+                {
+                    "reason": reason, "close_price": close_price, "closed_at": req.observed_at,
+                    "updated_at": now, "position_id": position_id,
+                },
+            )
+            data.update(
+                status="CLOSED", close_reason=reason, close_price=close_price,
+                closed_at=req.observed_at, updated_at=now,
+            )
+            payload = paper_position_to_dict(type("Row", (), {"_mapping": data})())
+            payload["realized_pnl"] = str(pnl)
+            payload["close_source"] = req.source
+            payload["close_source_timestamp"] = req.source_timestamp.isoformat()
+            return payload
+    except HTTPException:
+        raise
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "paper mark failed"}
+        ) from exc
+
+
 @api_router.get("/paper/positions")
 async def list_paper_positions(status_filter: Optional[str] = None) -> Dict[str, object]:
     if not persistence_state.ready:

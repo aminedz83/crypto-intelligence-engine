@@ -1923,21 +1923,32 @@ def latest_confirmed_break(
     candles: List[Candle],
     swing_highs: List[int],
     swing_lows: List[int],
+    strength: int = SERVER_SWING_STRENGTH,
 ) -> Optional[Dict[str, object]]:
-    if not candles:
+    """Return the latest close-confirmed break with no swing look-ahead.
+
+    A swing at index ``i`` with strength ``n`` only becomes knowable once candle
+    ``i + n`` is closed. A structural break is therefore eligible strictly after
+    that confirmation candle, starting at ``i + n + 1``.
+    """
+    if not candles or strength < 1:
         return None
     events: List[Dict[str, object]] = []
     for swing_index in swing_highs:
+        if swing_index < 0 or swing_index >= len(candles):
+            continue
         level = candles[swing_index].high
         if level is None:
             continue
-        for index in range(swing_index + 1, len(candles)):
+        first_eligible_break = swing_index + strength + 1
+        for index in range(first_eligible_break, len(candles)):
             close = candles[index].close
             if close is not None and close > level:
                 events.append(
                     {
                         "direction": "BULLISH",
                         "swing_index": swing_index,
+                        "confirmation_index": swing_index + strength,
                         "break_index": index,
                         "level": level,
                         "close": close,
@@ -1945,16 +1956,20 @@ def latest_confirmed_break(
                 )
                 break
     for swing_index in swing_lows:
+        if swing_index < 0 or swing_index >= len(candles):
+            continue
         level = candles[swing_index].low
         if level is None:
             continue
-        for index in range(swing_index + 1, len(candles)):
+        first_eligible_break = swing_index + strength + 1
+        for index in range(first_eligible_break, len(candles)):
             close = candles[index].close
             if close is not None and close < level:
                 events.append(
                     {
                         "direction": "BEARISH",
                         "swing_index": swing_index,
+                        "confirmation_index": swing_index + strength,
                         "break_index": index,
                         "level": level,
                         "close": close,
@@ -1963,11 +1978,56 @@ def latest_confirmed_break(
                 break
     if not events:
         return None
+
     def break_index_value(event: Dict[str, object]) -> int:
         value = event.get("break_index")
         return value if isinstance(value, int) else -1
 
     return max(events, key=break_index_value)
+
+
+def structure_from_confirmed_swings(
+    candles: List[Candle],
+    swing_highs: List[int],
+    swing_lows: List[int],
+) -> str:
+    """Classify structure from already-confirmed swing indexes only."""
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return "RANGE"
+    high_a = candles[swing_highs[-2]].high
+    high_b = candles[swing_highs[-1]].high
+    low_a = candles[swing_lows[-2]].low
+    low_b = candles[swing_lows[-1]].low
+    if high_a is None or high_b is None or low_a is None or low_b is None:
+        return "RANGE"
+    if high_b > high_a and low_b > low_a:
+        return "BULLISH"
+    if high_b < high_a and low_b < low_a:
+        return "BEARISH"
+    return "RANGE"
+
+
+def structure_before_break(
+    candles: List[Candle],
+    swing_highs: List[int],
+    swing_lows: List[int],
+    break_index: int,
+    strength: int = SERVER_SWING_STRENGTH,
+) -> str:
+    """Return structure using only swings confirmed before the break candle.
+
+    A swing can contribute only when ``swing_index + strength < break_index``.
+    This prevents a later-confirmed swing from reclassifying an older event.
+    """
+    if break_index <= 0 or strength < 1:
+        return "RANGE"
+    eligible_highs = [
+        index for index in swing_highs if index + strength < break_index
+    ]
+    eligible_lows = [
+        index for index in swing_lows if index + strength < break_index
+    ]
+    return structure_from_confirmed_swings(candles, eligible_highs, eligible_lows)
 
 
 def classify_bos_choch(
@@ -2014,7 +2074,16 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
         structure = "RANGE"
 
     break_event = latest_confirmed_break(closed, highs, lows)
-    structure_event = classify_bos_choch(structure, break_event)
+    if break_event is None:
+        prior_structure = "RANGE"
+    else:
+        raw_break_index = break_event.get("break_index")
+        break_index = raw_break_index if isinstance(raw_break_index, int) else -1
+        prior_structure = structure_before_break(
+            closed, highs, lows, break_index
+        )
+    structure_event = classify_bos_choch(prior_structure, break_event)
+    structure_event["prior_structure"] = prior_structure
     latest = closed[-1]
     return {
         "status": "READY",

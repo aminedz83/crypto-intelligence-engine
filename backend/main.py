@@ -1571,6 +1571,48 @@ class PaperPositionMark(BaseModel):
     source_timestamp: datetime
 
 
+def paper_mark_from_realtime(symbol: str) -> Optional[PaperPositionMark]:
+    canonical = canonical_symbol(symbol)
+    instrument = instrument_registry.get(canonical)
+    if instrument is None:
+        return None
+    datum: Optional[RealtimeDatum] = None
+    if instrument.asset_class == AssetClass.CRYPTO:
+        datum = market_state.get_latest_ticker(instrument.provider_symbol)
+    if datum is None:
+        return None
+    if datum.quality != DataQualityStatus.VALID:
+        return None
+    if datum.value is None or datum.value <= Decimal("0"):
+        return None
+    return PaperPositionMark(
+        current_price=datum.value,
+        observed_at=datum.received_at,
+        source=datum.source,
+        source_timestamp=datum.source_timestamp,
+    )
+
+
+async def monitor_open_paper_positions_once() -> Dict[str, int]:
+    if not persistence_state.ready:
+        return {"checked": 0, "marked": 0, "unavailable": 0}
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text("SELECT position_id, symbol FROM paper_positions WHERE status='OPEN'")
+        )
+        rows = result.fetchall()
+    marked = 0
+    unavailable = 0
+    for row in rows:
+        mark = paper_mark_from_realtime(row._mapping["symbol"])
+        if mark is None:
+            unavailable += 1
+            continue
+        await mark_paper_position(row._mapping["position_id"], mark)
+        marked += 1
+    return {"checked": len(rows), "marked": marked, "unavailable": unavailable}
+
+
 def evaluate_paper_close(side: str, price: Decimal, stop_loss: Decimal,
                          take_profit: Decimal) -> Optional[Tuple[str, Decimal]]:
     if side == "LONG":

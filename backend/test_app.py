@@ -4835,7 +4835,7 @@ class TestPaperAutoEntryGateV16M1(unittest.TestCase):
 
     def test_gate_blocks_until_server_specs_exist(self):
         source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn("SERVER_INSTRUMENT_SPECS_NOT_IMPLEMENTED", source)
+        self.assertIn("SERVER_INSTRUMENT_SPECS_REQUIRED", source)
 
     def test_gate_never_auto_creates_position_in_m1(self):
         source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
@@ -4843,7 +4843,7 @@ class TestPaperAutoEntryGateV16M1(unittest.TestCase):
 
     def test_ui_marks_auto_entry_gate_blocked(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("AUTO ENTRY · SPECS BLOCKED", html)
+        self.assertIn("COINBASE SPECS V1 ACTIF", html)
         self.assertIn("Aucun trade n’est créé par M1", html)
 
 
@@ -4925,7 +4925,7 @@ class TestServerSignalEngineV16M2(unittest.TestCase):
 
     def test_gate_still_blocks_server_specs(self):
         source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn("SERVER_INSTRUMENT_SPECS_NOT_IMPLEMENTED", source)
+        self.assertIn("SERVER_INSTRUMENT_SPECS_REQUIRED", source)
 
     def test_ui_marks_server_signal_active(self):
         html = INDEX.read_text(encoding="utf-8")
@@ -4933,4 +4933,87 @@ class TestServerSignalEngineV16M2(unittest.TestCase):
 
     def test_ui_keeps_auto_entry_specs_blocked(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("AUTO ENTRY · SPECS BLOCKED", html)
+        self.assertIn("COINBASE SPECS V1 ACTIF", html)
+
+
+class TestServerInstrumentSpecsV16M3(unittest.TestCase):
+    def valid_payload(self):
+        return {
+            "base_increment": "0.00000001",
+            "quote_increment": "0.01",
+            "base_min_size": "0.00001",
+            "base_max_size": "100",
+            "quote_min_size": "1",
+            "quote_max_size": "1000000",
+        }
+
+    def test_specs_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/paper/instrument-specs/{symbol}", paths)
+
+    def test_coinbase_provider_has_product_specs_method(self):
+        self.assertTrue(hasattr(main.CoinbaseProvider, "get_product_specs"))
+
+    def test_product_specs_uses_public_product_path(self):
+        source = inspect.getsource(main.CoinbaseProvider.get_product_specs)
+        self.assertIn('/market/products/{symbol}', source)
+
+    def test_valid_specs_are_valid(self):
+        result = main.parse_coinbase_spot_specs("BTC-USD", self.valid_payload())
+        self.assertEqual(result["status"], "VALID")
+
+    def test_specs_use_base_units(self):
+        result = main.parse_coinbase_spot_specs("BTC-USD", self.valid_payload())
+        self.assertEqual(result["sizing_mode"], "BASE_UNITS")
+
+    def test_specs_preserve_decimal_strings(self):
+        result = main.parse_coinbase_spot_specs("BTC-USD", self.valid_payload())
+        self.assertEqual(result["base_increment"], "1E-8")
+
+    def test_missing_field_is_invalid(self):
+        payload = self.valid_payload()
+        del payload["base_increment"]
+        result = main.parse_coinbase_spot_specs("BTC-USD", payload)
+        self.assertEqual(result["status"], "INVALID")
+
+    def test_zero_field_is_invalid(self):
+        payload = self.valid_payload()
+        payload["base_increment"] = "0"
+        result = main.parse_coinbase_spot_specs("BTC-USD", payload)
+        self.assertEqual(result["status"], "INVALID")
+
+    def test_negative_field_is_invalid(self):
+        payload = self.valid_payload()
+        payload["base_min_size"] = "-1"
+        result = main.parse_coinbase_spot_specs("BTC-USD", payload)
+        self.assertEqual(result["status"], "INVALID")
+
+    def test_non_numeric_field_is_invalid(self):
+        payload = self.valid_payload()
+        payload["quote_increment"] = "bad"
+        result = main.parse_coinbase_spot_specs("BTC-USD", payload)
+        self.assertEqual(result["status"], "INVALID")
+
+    def test_specs_have_source(self):
+        result = main.parse_coinbase_spot_specs("BTC-USD", self.valid_payload())
+        self.assertEqual(result["source"], "coinbase_public_product")
+
+    def test_specs_do_not_invent_source_timestamp(self):
+        result = main.parse_coinbase_spot_specs("BTC-USD", self.valid_payload())
+        self.assertIsNone(result["source_timestamp"])
+
+    def test_non_crypto_is_explicitly_not_supported(self):
+        source = inspect.getsource(main.get_paper_instrument_specs)
+        self.assertIn("VERIFIED_SIZING_SOURCE_NOT_IMPLEMENTED", source)
+
+    def test_provider_failure_is_unavailable(self):
+        source = inspect.getsource(main.get_paper_instrument_specs)
+        self.assertIn("PROVIDER_UNAVAILABLE", source)
+
+    def test_auto_gate_requires_specs_snapshot(self):
+        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
+        self.assertIn("SERVER_INSTRUMENT_SPECS_REQUIRED", source)
+
+    def test_ui_marks_coinbase_specs_active(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("COINBASE SPECS V1 ACTIF", html)

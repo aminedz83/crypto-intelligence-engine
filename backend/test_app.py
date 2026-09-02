@@ -5299,7 +5299,7 @@ class TestServerMarketSetupDetectorV16M5B1(unittest.TestCase):
     def test_full_smc_is_explicitly_not_implemented(self):
         source = inspect.getsource(main.detect_server_market_structure)
         self.assertIn(
-            '"smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_V1"',
+            '"smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_V1"',
             source,
         )
         self.assertIn('"liquidity_sweep": liquidity_sweep', source)
@@ -5753,3 +5753,93 @@ class TestServerDisplacementV16M5B4(unittest.TestCase):
         self.assertIn("SERVER DETECTOR · DISPLACEMENT V1", html)
 
 # V16-M5B4-FIX2 — fresh synchronized copy
+
+# ---------------- V16-M5B5 server FVG detector ----------------
+class TestServerFvgV16M5B5(unittest.TestCase):
+    def candle(self, index, open_, high, low, close):
+        return main.Candle(
+            start=datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=index * 5),
+            low=float(low), high=float(high), open=float(open_), close=float(close),
+            volume=1.0, status=main.DataQualityStatus.VALID,
+        )
+
+    def test_bullish_fvg_detected_with_zone(self):
+        candles = [self.candle(0, 100, 101, 99, 100.5), self.candle(1, 100.5, 103, 100, 102.5), self.candle(2, 102.5, 104, 102, 103)]
+        event = main.latest_confirmed_fvg(candles)
+        self.assertEqual(event["direction"], "BULLISH")
+        self.assertEqual((event["zone_low"], event["zone_high"]), (101.0, 102.0))
+
+    def test_bearish_fvg_detected_with_zone(self):
+        candles = [self.candle(0, 100, 101, 99, 99.5), self.candle(1, 99.5, 100, 96, 96.5), self.candle(2, 96.5, 98, 95, 96)]
+        event = main.latest_confirmed_fvg(candles)
+        self.assertEqual(event["direction"], "BEARISH")
+        self.assertEqual((event["zone_low"], event["zone_high"]), (98.0, 99.0))
+
+    def test_bullish_equal_boundary_is_not_fvg(self):
+        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 100, 102, 99, 101), self.candle(2, 101, 103, 101, 102)]
+        self.assertIsNone(main.latest_confirmed_fvg(candles))
+
+    def test_bearish_equal_boundary_is_not_fvg(self):
+        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 100, 101, 97, 98), self.candle(2, 98, 99, 96, 97)]
+        self.assertIsNone(main.latest_confirmed_fvg(candles))
+
+    def test_requires_three_closed_candles(self):
+        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 101, 103, 100, 102)]
+        self.assertIsNone(main.latest_confirmed_fvg(candles))
+
+    def test_missing_outer_ohlc_is_ignored(self):
+        first = main.Candle(
+            start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            low=99.0, high=None, open=100.0, close=100.0, volume=1.0,
+            status=main.DataQualityStatus.VALID,
+        )
+        candles = [first, self.candle(1, 101, 103, 100, 102), self.candle(2, 102, 104, 102, 103)]
+        self.assertIsNone(main.latest_confirmed_fvg(candles))
+
+    def test_latest_fvg_wins(self):
+        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 100, 103, 100, 102), self.candle(2, 102, 104, 102, 103), self.candle(3, 103, 104, 101.5, 102), self.candle(4, 102, 102.5, 100, 100.5), self.candle(5, 100, 100.5, 98, 98.5)]
+        event = main.latest_confirmed_fvg(candles)
+        self.assertEqual(event["formation_index"], 5)
+
+    def test_new_bullish_fvg_starts_open(self):
+        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 100, 103, 100, 102), self.candle(2, 102, 104, 102, 103)]
+        self.assertEqual(main.latest_confirmed_fvg(candles)["state"], "OPEN")
+
+    def test_bullish_partial_mitigation(self):
+        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 100, 103, 100, 102), self.candle(2, 102, 104, 102, 103), self.candle(3, 103, 104, 101.5, 103)]
+        event = main.latest_confirmed_fvg(candles)
+        self.assertEqual(event["state"], "PARTIALLY_MITIGATED")
+        self.assertEqual(event["mitigation_index"], 3)
+
+    def test_bullish_full_mitigation(self):
+        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 100, 103, 100, 102), self.candle(2, 102, 104, 102, 103), self.candle(3, 103, 104, 100.9, 101)]
+        self.assertEqual(main.latest_confirmed_fvg(candles)["state"], "MITIGATED")
+
+    def test_bearish_partial_mitigation(self):
+        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 99, 100, 96, 97), self.candle(2, 97, 98, 95, 96), self.candle(3, 96, 98.5, 95, 97)]
+        event = main.latest_confirmed_fvg(candles)
+        self.assertEqual(event["state"], "PARTIALLY_MITIGATED")
+        self.assertEqual(event["mitigation_index"], 3)
+
+    def test_bearish_full_mitigation(self):
+        candles = [self.candle(0, 100, 101, 99, 100), self.candle(1, 99, 100, 96, 97), self.candle(2, 97, 98, 95, 96), self.candle(3, 96, 99.1, 95, 98)]
+        self.assertEqual(main.latest_confirmed_fvg(candles)["state"], "MITIGATED")
+
+    def test_detector_exposes_server_fvg(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn("latest_confirmed_fvg", source)
+        self.assertIn('"fvg": fvg', source)
+
+    def test_orchestrator_status_names_server_fvg(self):
+        source = inspect.getsource(main.get_auto_entry_orchestrator_status)
+        self.assertIn('"fvg_detection": "SERVER_FVG_V1"', source)
+
+    def test_fvg_does_not_enable_auto_entry(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"auto_queue": False', source)
+
+    def test_ui_marks_server_fvg_detector(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("SERVER DETECTOR · FVG V1", html)
+

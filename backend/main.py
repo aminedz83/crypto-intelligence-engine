@@ -15,6 +15,7 @@ No fabricated data. No real order/withdrawal capability exists anywhere.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -24,7 +25,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -1500,6 +1501,10 @@ class ServerSignalRequest(BaseModel):
     source_timestamp: datetime
 
 
+class VerifiedAutoPaperEntryRequest(ServerSignalRequest):
+    risk_percent: Decimal = Decimal("1")
+
+
 class PaperAutoEntryGateRequest(BaseModel):
     symbol: str = Field(min_length=1, max_length=64)
     signal_decision: str
@@ -1699,6 +1704,150 @@ def evaluate_server_signal(req: ServerSignalRequest) -> Dict[str, object]:
 @api_router.post("/paper/signal/evaluate")
 async def evaluate_paper_server_signal(req: ServerSignalRequest) -> Dict[str, object]:
     return evaluate_server_signal(req)
+
+
+def floor_to_increment(value: Decimal, increment: Decimal) -> Decimal:
+    if value <= 0 or increment <= 0:
+        return Decimal("0")
+    units = (value / increment).to_integral_value(rounding=ROUND_DOWN)
+    return units * increment
+
+
+def build_auto_paper_position_id(
+    symbol: str, decision: str, source_timestamp: datetime
+) -> str:
+    raw = f"{symbol}|{decision}|{source_timestamp.isoformat()}".encode()
+    digest = hashlib.sha256(raw).hexdigest()[:24]
+    return f"auto-{symbol.lower()}-{digest}"
+
+
+def calculate_verified_crypto_size(
+    capital: Decimal,
+    risk_percent: Decimal,
+    entry: Decimal,
+    stop_loss: Decimal,
+    specs: Dict[str, object],
+) -> Dict[str, object]:
+    if capital <= 0 or risk_percent <= 0 or risk_percent > Decimal("100"):
+        return {"status": "BLOCKED", "reason": "RISK_INVALID"}
+    distance = abs(entry - stop_loss)
+    if distance <= 0 or entry <= 0:
+        return {"status": "BLOCKED", "reason": "STOP_DISTANCE_INVALID"}
+    try:
+        increment = Decimal(str(specs["base_increment"]))
+        base_min = Decimal(str(specs["base_min_size"]))
+        base_max = Decimal(str(specs["base_max_size"]))
+        quote_min = Decimal(str(specs["quote_min_size"]))
+        quote_max = Decimal(str(specs["quote_max_size"]))
+    except (KeyError, ValueError, InvalidOperation):
+        return {"status": "BLOCKED", "reason": "SPECS_INVALID"}
+
+    risk_money = capital * risk_percent / Decimal("100")
+    risk_size = risk_money / distance
+    cash_size = capital / entry
+    raw_size = min(risk_size, cash_size, base_max)
+    size = floor_to_increment(raw_size, increment)
+    notional = size * entry
+    if size < base_min or size <= 0:
+        return {"status": "BLOCKED", "reason": "SIZE_BELOW_MIN"}
+    if size > base_max:
+        return {"status": "BLOCKED", "reason": "SIZE_ABOVE_MAX"}
+    if notional < quote_min:
+        return {"status": "BLOCKED", "reason": "NOTIONAL_BELOW_MIN"}
+    if notional > quote_max:
+        return {"status": "BLOCKED", "reason": "NOTIONAL_ABOVE_MAX"}
+    actual_risk = distance * size
+    return {
+        "status": "VALID",
+        "size": size,
+        "size_unit": "BASE_UNITS",
+        "risk_money": actual_risk,
+        "risk_percent": actual_risk / capital * Decimal("100"),
+        "notional": notional,
+    }
+
+
+@api_router.post("/paper/auto-entry/verified", status_code=201)
+async def verified_auto_paper_entry(
+    req: VerifiedAutoPaperEntryRequest,
+) -> Dict[str, object]:
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+
+    signal = evaluate_server_signal(req)
+    if signal["status"] != "READY":
+        return {
+            "status": "BLOCKED",
+            "reason": "SERVER_SIGNAL_NOT_READY",
+            "signal": signal,
+            "paper_only": True,
+            "execution": False,
+        }
+
+    specs = await get_paper_instrument_specs(req.symbol)
+    if specs.get("status") != "VALID":
+        return {
+            "status": "BLOCKED",
+            "reason": "SERVER_INSTRUMENT_SPECS_NOT_VALID",
+            "specs": specs,
+            "paper_only": True,
+            "execution": False,
+        }
+
+    account = await get_paper_account()
+    capital = Decimal(str(account["current_capital"]))
+    if req.entry is None or req.stop_loss is None or req.take_profit is None:
+        return {
+            "status": "BLOCKED",
+            "reason": "TRADE_PLAN_INCOMPLETE",
+            "paper_only": True,
+            "execution": False,
+        }
+    sizing = calculate_verified_crypto_size(
+        capital, req.risk_percent, req.entry, req.stop_loss, specs
+    )
+    if sizing["status"] != "VALID":
+        return {
+            "status": "BLOCKED",
+            "reason": sizing["reason"],
+            "sizing": sizing,
+            "paper_only": True,
+            "execution": False,
+        }
+
+    canonical = req.symbol.upper().replace("/", "-")
+    decision = str(signal["decision"])
+    position_id = build_auto_paper_position_id(
+        canonical, decision, req.source_timestamp
+    )
+    position = PaperPositionCreate(
+        position_id=position_id,
+        symbol=canonical,
+        side=decision,
+        entry=req.entry,
+        stop_loss=req.stop_loss,
+        take_profit=req.take_profit,
+        size=Decimal(str(sizing["size"])),
+        size_unit="BASE_UNITS",
+        risk_money=Decimal(str(sizing["risk_money"])),
+        risk_percent=Decimal(str(sizing["risk_percent"])),
+        capital_before=capital,
+        source="server_signal+coinbase_public_product",
+        source_timestamp=req.source_timestamp,
+        opened_at=utcnow(),
+    )
+    created = await create_paper_position(position)
+    return {
+        "status": "OPENED",
+        "position": created,
+        "specs_source": specs["source"],
+        "sizing": {key: str(value) for key, value in sizing.items()},
+        "paper_only": True,
+        "execution": False,
+    }
 
 
 @api_router.post("/paper/auto-entry/gate")

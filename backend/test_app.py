@@ -3825,3 +3825,51 @@ class TestChartEngineV12EntryLifecycle(unittest.TestCase):
 
     def test_entry_lifecycle_ui_is_active(self):
         self.assertIn("ENTRY LIFECYCLE ACTIF", self.html)
+
+
+class TestChartEngineV13StructuralTradePlan(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_trade_plan_builder_present(self):
+        self.assertIn("function buildSmcTradePlans", self.html)
+
+    def test_trade_plan_requires_entry_now(self):
+        self.assertIn('if(s.state!=="ENTRY_NOW"', self.html)
+
+    def test_entry_uses_closed_retest_candle_close(self):
+        self.assertIn("entry=Number(entryCandle.close)", self.html)
+
+    def test_bullish_stop_uses_order_block_low(self):
+        self.assertIn("stop=bullish?obLow:obHigh", self.html)
+
+    def test_stop_source_is_structural_order_block_invalidation(self):
+        self.assertIn('stopSource:"ORDER_BLOCK_INVALIDATION"', self.html)
+
+    def test_bullish_target_requires_prior_confirmed_swing_high(self):
+        self.assertIn('w.kind==="HIGH"&&p>entry', self.html)
+
+    def test_bearish_target_requires_prior_confirmed_swing_low(self):
+        self.assertIn('w.kind==="LOW"&&p<entry', self.html)
+
+    def test_target_must_precede_entry(self):
+        self.assertIn("w.index>=s.entryIndex", self.html)
+
+    def test_missing_target_is_explicitly_unavailable(self):
+        self.assertIn('target===null?"UNAVAILABLE"', self.html)
+
+    def test_risk_reward_is_reward_over_risk(self):
+        self.assertIn("rr=reward===null?null:reward/risk", self.html)
+
+    def test_nonpositive_risk_is_rejected(self):
+        self.assertIn("risk<=0)return", self.html)
+
+    def test_trade_plan_never_executes_order(self):
+        self.assertIn("execution:false", self.html)
+
+    def test_methodology_forbids_invented_rr(self):
+        self.assertIn("aucun RR n’est inventé", self.html)
+
+    def test_trade_plan_ui_is_active(self):
+        self.assertIn("SL / TP / RR ACTIF", self.html)

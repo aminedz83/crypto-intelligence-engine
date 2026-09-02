@@ -4532,7 +4532,7 @@ class TestPaperTradingUiV16I(unittest.TestCase):
 
     def test_paper_ui_does_not_invent_unrealized_pnl(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('closed&&pnl!==null?paperMoney(pnl):"—"', html)
+        self.assertIn('p.mark_status==="VALID"?paperMoney(p.unrealized_pnl):"—"', html)
 
     def test_paper_ui_marks_broker_execution_disabled(self):
         html = INDEX.read_text(encoding="utf-8")
@@ -4546,3 +4546,66 @@ class TestPaperTradingUiV16I(unittest.TestCase):
     def test_paper_ui_help_is_present(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("Paper Trading UI V1", html)
+
+
+class TestPaperLivePnlV16J(unittest.TestCase):
+    def test_live_positions_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/paper/positions/live", paths)
+
+    def test_live_positions_route_is_get(self):
+        route = next(r for r in main.api_router.routes if r.path == "/paper/positions/live")
+        self.assertIn("GET", route.methods)
+
+    def test_live_positions_reads_only_open_positions(self):
+        source = inspect.getsource(main.get_live_paper_positions)
+        self.assertIn("WHERE status='OPEN'", source)
+
+    def test_live_positions_reuses_multi_asset_mark_builder(self):
+        source = inspect.getsource(main.get_live_paper_positions)
+        self.assertIn("await paper_mark_from_realtime", source)
+
+    def test_live_positions_defaults_mark_to_unavailable(self):
+        source = inspect.getsource(main.get_live_paper_positions)
+        self.assertIn('payload["mark_status"] = "UNAVAILABLE"', source)
+
+    def test_live_positions_exposes_mark_only_when_available(self):
+        source = inspect.getsource(main.get_live_paper_positions)
+        self.assertIn('payload["mark_status"] = "VALID"', source)
+        self.assertIn('payload["mark_price"] = str(mark.current_price)', source)
+
+    def test_live_positions_calculates_unrealized_pnl(self):
+        source = inspect.getsource(main.get_live_paper_positions)
+        self.assertIn("calculate_paper_pnl", source)
+        self.assertIn('payload["unrealized_pnl"]', source)
+
+    def test_live_positions_preserves_mark_source_timestamp(self):
+        source = inspect.getsource(main.get_live_paper_positions)
+        self.assertIn("mark.source_timestamp.isoformat()", source)
+
+    def test_live_positions_is_paper_only(self):
+        source = inspect.getsource(main.get_live_paper_positions)
+        self.assertIn('"paper_only": True', source)
+        self.assertIn('"execution": False', source)
+
+    def test_ui_fetches_live_positions(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('api("/api/v1/paper/positions/live")', html)
+
+    def test_ui_shows_current_price(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('["Prix actuel"]', html)
+        self.assertIn("p.mark_price", html)
+
+    def test_ui_shows_live_unrealized_pnl(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("p.unrealized_pnl", html)
+
+    def test_ui_shows_mark_status(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('["Mark"]', html)
+        self.assertIn("UNAVAILABLE", html)
+
+    def test_ui_help_documents_valid_mark_gate(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("vrai mark multi-actifs qualifié VALID", html)

@@ -1593,7 +1593,11 @@ def evaluate_server_signal(req: ServerSignalRequest) -> Dict[str, object]:
         if req.direction == "BEARISH" and not req.take_profit < req.entry < req.stop_loss:
             reasons.append("SHORT_LEVELS_INVALID")
 
-    quality = classify_freshness(req.source_timestamp, utcnow())
+    quality = classify_freshness(
+        req.source_timestamp,
+        settings.ticker_max_age_seconds,
+        now=utcnow(),
+    )
     if quality != DataQualityStatus.VALID:
         reasons.append("SOURCE_NOT_VALID")
 

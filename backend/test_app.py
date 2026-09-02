@@ -4115,3 +4115,51 @@ class TestChartEngineV16BInstrumentSpecs(unittest.TestCase):
 
     def test_instrument_specs_ui_is_active(self):
         self.assertIn("INSTRUMENT SPECS V1 ACTIF", self.html)
+
+
+class TestChartEngineV16CPaperPosition(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_paper_position_opener_present(self):
+        self.assertIn("function openPaperPosition", self.html)
+
+    def test_candidate_must_be_ready(self):
+        self.assertIn('reason:"CANDIDATE_NOT_READY"', self.html)
+
+    def test_size_must_be_validated(self):
+        self.assertIn('reason:"SIZE_NOT_VALIDATED"', self.html)
+
+    def test_instrument_identity_is_required(self):
+        self.assertIn('reason:"INSTRUMENT_IDENTITY_MISSING"', self.html)
+
+    def test_open_timestamp_is_required(self):
+        self.assertIn('reason:"OPEN_TIMESTAMP_MISSING"', self.html)
+
+    def test_long_levels_are_structurally_validated(self):
+        self.assertIn('reason:"LONG_LEVELS_INVALID"', self.html)
+
+    def test_short_levels_are_structurally_validated(self):
+        self.assertIn('reason:"SHORT_LEVELS_INVALID"', self.html)
+
+    def test_open_position_is_explicitly_paper_only(self):
+        self.assertIn('status:"OPEN",paperOnly:true', self.html)
+
+    def test_open_position_never_executes_broker_order(self):
+        self.assertIn("closeReason:null,closedAt:null,execution:false", self.html)
+
+    def test_position_marker_present(self):
+        self.assertIn("function markPaperPosition", self.html)
+
+    def test_stop_loss_close_is_supported(self):
+        self.assertIn('closeReason:"STOP_LOSS"', self.html)
+
+    def test_take_profit_close_is_supported(self):
+        self.assertIn('closeReason:"TAKE_PROFIT"', self.html)
+
+    def test_ambiguous_sl_tp_is_conflict(self):
+        self.assertIn('closeReason:"SL_TP_CONFLICT"', self.html)
+
+    def test_paper_position_ui_is_active(self):
+        self.assertIn("PAPER POSITION V1 ACTIF", self.html)

@@ -1919,6 +1919,69 @@ def confirmed_swing_indexes(
     return highs, lows
 
 
+def detect_structure_breaks(
+    candles: List[Candle],
+    highs: List[int],
+    lows: List[int],
+) -> Dict[str, object]:
+    if not candles or not highs or not lows:
+        return {
+            "bos": None,
+            "choch": None,
+            "mss": None,
+            "break_timestamp": None,
+        }
+
+    latest = candles[-1]
+    close = latest.close
+    last_high = candles[highs[-1]].high
+    last_low = candles[lows[-1]].low
+    if close is None or last_high is None or last_low is None:
+        return {
+            "bos": None,
+            "choch": None,
+            "mss": None,
+            "break_timestamp": None,
+        }
+
+    prior_highs = highs[:-1]
+    prior_lows = lows[:-1]
+    bullish_context = False
+    bearish_context = False
+    if prior_highs and prior_lows:
+        previous_high = candles[prior_highs[-1]].high
+        previous_low = candles[prior_lows[-1]].low
+        if previous_high is not None and previous_low is not None:
+            bullish_context = last_high > previous_high and last_low > previous_low
+            bearish_context = last_high < previous_high and last_low < previous_low
+
+    bullish_break = close > last_high
+    bearish_break = close < last_low
+    bos: Optional[str] = None
+    choch: Optional[str] = None
+    if bullish_break:
+        if bearish_context:
+            choch = "BULLISH"
+        else:
+            bos = "BULLISH"
+    elif bearish_break:
+        if bullish_context:
+            choch = "BEARISH"
+        else:
+            bos = "BEARISH"
+
+    return {
+        "bos": bos,
+        "choch": choch,
+        "mss": choch,
+        "break_timestamp": (
+            latest.start.isoformat()
+            if (bos is not None or choch is not None) and latest.start is not None
+            else None
+        ),
+    }
+
+
 def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict[str, object]:
     closed = closed_valid_candles(candles, now)
     if len(closed) < SERVER_SWING_STRENGTH * 2 + 3:
@@ -1934,29 +1997,29 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
     if high_a is None or high_b is None or low_a is None or low_b is None:
         return {"status": "WAIT", "reason": "SWING_VALUE_MISSING"}
 
-    high_a_value: float = float(high_a)
-    high_b_value: float = float(high_b)
-    low_a_value: float = float(low_a)
-    low_b_value: float = float(low_b)
-
-    if high_b_value > high_a_value and low_b_value > low_a_value:
+    if high_b > high_a and low_b > low_a:
         structure = "BULLISH"
-    elif high_b_value < high_a_value and low_b_value < low_a_value:
+    elif high_b < high_a and low_b < low_a:
         structure = "BEARISH"
     else:
         structure = "RANGE"
 
     latest = closed[-1]
+    breaks = detect_structure_breaks(closed, highs, lows)
     return {
         "status": "READY",
         "structure": structure,
+        "bos": breaks["bos"],
+        "choch": breaks["choch"],
+        "mss": breaks["mss"],
+        "break_timestamp": breaks["break_timestamp"],
         "closed_candles": len(closed),
         "confirmed_swing_highs": len(highs),
         "confirmed_swing_lows": len(lows),
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
         "setup_state": "WAIT",
         "auto_queue": False,
-        "smc_confirmation": "NOT_IMPLEMENTED",
+        "smc_confirmation": "STRUCTURE_BREAKS_V1",
     }
 
 
@@ -2112,6 +2175,7 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "interval_seconds": AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS,
         "market_setup_detection": "STRUCTURE_V1",
         "smc_auto_candidate_generation": "NOT_IMPLEMENTED",
+        "structure_break_detection": "BOS_CHOCH_MSS_V1",
         "paper_only": True,
         "execution": False,
     }

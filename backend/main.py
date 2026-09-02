@@ -28,7 +28,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote as url_quote
 
 import httpx

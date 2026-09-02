@@ -4843,7 +4843,7 @@ class TestPaperAutoEntryGateV16M1(unittest.TestCase):
 
     def test_ui_marks_auto_entry_gate_blocked(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("AUTO PAPER VERIFIED V1", html)
+        self.assertIn("AUTO ORCHESTRATOR V1", html)
         self.assertIn("Aucun trade n’est créé par M1", html)
 
 
@@ -4933,7 +4933,7 @@ class TestServerSignalEngineV16M2(unittest.TestCase):
 
     def test_ui_keeps_auto_entry_specs_blocked(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("AUTO PAPER VERIFIED V1", html)
+        self.assertIn("AUTO ORCHESTRATOR V1", html)
 
 
 class TestServerInstrumentSpecsV16M3(unittest.TestCase):
@@ -5016,7 +5016,7 @@ class TestServerInstrumentSpecsV16M3(unittest.TestCase):
 
     def test_ui_marks_coinbase_specs_active(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("AUTO PAPER VERIFIED V1", html)
+        self.assertIn("AUTO ORCHESTRATOR V1", html)
 
 
 class TestServerInstrumentSpecsV16M3Fix(unittest.TestCase):
@@ -5145,4 +5145,69 @@ class TestVerifiedAutoPaperEntryV16M4(unittest.TestCase):
 
     def test_ui_marks_verified_auto_paper_active(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("AUTO PAPER VERIFIED V1", html)
+        self.assertIn("AUTO ORCHESTRATOR V1", html)
+
+
+class TestAutoEntryOrchestratorV16M5A(unittest.TestCase):
+    def test_candidate_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/paper/auto-entry/candidates", paths)
+
+    def test_orchestrator_status_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/paper/auto-entry/orchestrator/status", paths)
+
+    def test_orchestrator_interval_is_five_seconds(self):
+        self.assertEqual(main.AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS, 5.0)
+
+    def test_candidate_state_starts_pending(self):
+        fields = main.AutoEntryCandidateState.__dataclass_fields__
+        self.assertEqual(fields["last_status"].default, "PENDING")
+
+    def test_candidate_requires_server_signal(self):
+        source = inspect.getsource(main.register_auto_entry_candidate)
+        self.assertIn("evaluate_server_signal(req)", source)
+
+    def test_candidate_is_paper_only(self):
+        source = inspect.getsource(main.register_auto_entry_candidate)
+        self.assertIn('"execution": False', source)
+
+    def test_orchestrator_calls_m4(self):
+        source = inspect.getsource(main.run_auto_entry_orchestrator_once)
+        self.assertIn("verified_auto_paper_entry(state.request)", source)
+
+    def test_opened_candidate_is_removed(self):
+        source = inspect.getsource(main.run_auto_entry_orchestrator_once)
+        self.assertIn("auto_entry_candidates.pop(candidate_id, None)", source)
+
+    def test_duplicate_conflict_is_explicit(self):
+        source = inspect.getsource(main.run_auto_entry_orchestrator_once)
+        self.assertIn('"DUPLICATE_POSITION"', source)
+
+    def test_http_errors_fail_closed(self):
+        source = inspect.getsource(main.run_auto_entry_orchestrator_once)
+        self.assertIn('"HTTP_ERROR"', source)
+
+    def test_loop_handles_cancellation(self):
+        source = inspect.getsource(main.auto_entry_orchestrator_loop)
+        self.assertIn("except asyncio.CancelledError", source)
+
+    def test_detector_gap_is_explicit(self):
+        source = inspect.getsource(main.get_auto_entry_orchestrator_status)
+        self.assertIn('"market_setup_detection": "NOT_IMPLEMENTED"', source)
+
+    def test_lifespan_starts_orchestrator(self):
+        source = inspect.getsource(main.lifespan)
+        self.assertIn("auto_entry_orchestrator_loop()", source)
+
+    def test_lifespan_cancels_orchestrator(self):
+        source = inspect.getsource(main.lifespan)
+        self.assertIn("auto_entry_orchestrator_task.cancel()", source)
+
+    def test_status_is_paper_only(self):
+        source = inspect.getsource(main.get_auto_entry_orchestrator_status)
+        self.assertIn('"paper_only": True', source)
+
+    def test_ui_marks_orchestrator_active(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("AUTO ORCHESTRATOR V1", html)

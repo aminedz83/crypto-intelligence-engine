@@ -4358,3 +4358,63 @@ class TestPaperRealtimeMonitorV16F(unittest.TestCase):
     def test_monitor_ui_states_crypto_v1_scope(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("V1 branche d’abord Crypto/Coinbase", html)
+
+
+class TestPaperAutoLoopV16G(unittest.TestCase):
+    def test_monitor_interval_setting_exists(self):
+        self.assertTrue(hasattr(main.settings, "paper_monitor_interval_seconds"))
+
+    def test_monitor_interval_default_is_one_second(self):
+        self.assertEqual(main.Settings().paper_monitor_interval_seconds, 1.0)
+
+    def test_monitor_loop_present(self):
+        source = inspect.getsource(main.paper_monitor_loop)
+        self.assertIn("monitor_open_paper_positions_once", source)
+
+    def test_monitor_loop_has_one_second_floor(self):
+        source = inspect.getsource(main.paper_monitor_loop)
+        self.assertIn("max(settings.paper_monitor_interval_seconds, 1.0)", source)
+
+    def test_monitor_loop_waits_on_stop_event(self):
+        source = inspect.getsource(main.paper_monitor_loop)
+        self.assertIn("await asyncio.wait_for(stop_event.wait()", source)
+
+    def test_monitor_loop_preserves_cancellation(self):
+        source = inspect.getsource(main.paper_monitor_loop)
+        self.assertIn("except asyncio.CancelledError", source)
+        self.assertIn("raise", source)
+
+    def test_monitor_loop_iteration_failure_is_fail_safe(self):
+        source = inspect.getsource(main.paper_monitor_loop)
+        self.assertIn("Paper monitor iteration failed", source)
+
+    def test_lifespan_creates_monitor_task(self):
+        source = inspect.getsource(main.lifespan)
+        self.assertIn('name="paper-monitor"', source)
+
+    def test_lifespan_signals_monitor_stop(self):
+        source = inspect.getsource(main.lifespan)
+        self.assertIn("paper_monitor_stop.set()", source)
+
+    def test_lifespan_awaits_monitor_before_market_disconnect(self):
+        source = inspect.getsource(main.lifespan)
+        self.assertLess(
+            source.index("await paper_monitor_task"),
+            source.index("await market_provider.disconnect()"),
+        )
+
+    def test_auto_loop_does_not_enable_live_trading(self):
+        source = inspect.getsource(main.paper_monitor_loop)
+        self.assertNotIn("live_trading_enabled = True", source)
+
+    def test_auto_loop_uses_existing_one_shot_monitor(self):
+        source = inspect.getsource(main.paper_monitor_loop)
+        self.assertIn("await monitor_open_paper_positions_once()", source)
+
+    def test_auto_loop_ui_is_active(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("PAPER AUTO LOOP V1 ACTIF", html)
+
+    def test_auto_loop_ui_documents_fail_safe_behavior(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("aucun prix n’est inventé", html)

@@ -5298,9 +5298,14 @@ class TestServerMarketSetupDetectorV16M5B1(unittest.TestCase):
 
     def test_full_smc_is_explicitly_not_implemented(self):
         source = inspect.getsource(main.detect_server_market_structure)
-        self.assertIn('"smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_V1"', source)
+        self.assertIn(
+            '"smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_V1"',
+            source,
+        )
         self.assertIn('"liquidity_sweep": liquidity_sweep', source)
+        self.assertIn('"displacement": displacement', source)
         self.assertNotIn('"liquidity_sweep": "NOT_IMPLEMENTED"', source)
+        self.assertNotIn('"displacement": "NOT_IMPLEMENTED"', source)
         self.assertIn('"setup_state": "WAIT"', source)
         self.assertIn('"auto_queue": False', source)
 
@@ -5746,3 +5751,5 @@ class TestServerDisplacementV16M5B4(unittest.TestCase):
     def test_ui_marks_server_displacement_detector(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("SERVER DETECTOR · DISPLACEMENT V1", html)
+
+# V16-M5B4-FIX2 — fresh synchronized copy

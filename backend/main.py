@@ -1482,6 +1482,20 @@ def is_candle_closed(
     return reference >= end
 
 
+class ServerSignalRequest(BaseModel):
+    symbol: str = Field(min_length=1, max_length=64)
+    setup_state: str
+    direction: Optional[str] = None
+    entry: Optional[Decimal] = None
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+    risk_reward: Optional[Decimal] = None
+    structure_confirmed: bool = False
+    displacement_confirmed: bool = False
+    order_block_confirmed: bool = False
+    source_timestamp: datetime
+
+
 class PaperAutoEntryGateRequest(BaseModel):
     symbol: str = Field(min_length=1, max_length=64)
     signal_decision: str
@@ -1552,6 +1566,57 @@ def paper_position_to_dict(row: Any) -> Dict[str, object]:
     return data
 
 
+def evaluate_server_signal(req: ServerSignalRequest) -> Dict[str, object]:
+    canonical = req.symbol.upper().replace("/", "-")
+    reasons: List[str] = []
+    decision = "WAIT"
+
+    if req.setup_state != "ENTRY_NOW":
+        reasons.append("SETUP_NOT_ENTRY_NOW")
+    if req.direction not in {"BULLISH", "BEARISH"}:
+        reasons.append("DIRECTION_INVALID")
+    if not req.structure_confirmed:
+        reasons.append("STRUCTURE_NOT_CONFIRMED")
+    if not req.displacement_confirmed:
+        reasons.append("DISPLACEMENT_NOT_CONFIRMED")
+    if not req.order_block_confirmed:
+        reasons.append("ORDER_BLOCK_NOT_CONFIRMED")
+
+    levels = (req.entry, req.stop_loss, req.take_profit, req.risk_reward)
+    if any(value is None for value in levels):
+        reasons.append("TRADE_PLAN_INCOMPLETE")
+    elif req.risk_reward is not None and req.risk_reward <= Decimal("0"):
+        reasons.append("RR_INVALID")
+    elif req.entry is not None and req.stop_loss is not None and req.take_profit is not None:
+        if req.direction == "BULLISH" and not req.stop_loss < req.entry < req.take_profit:
+            reasons.append("LONG_LEVELS_INVALID")
+        if req.direction == "BEARISH" and not req.take_profit < req.entry < req.stop_loss:
+            reasons.append("SHORT_LEVELS_INVALID")
+
+    quality = classify_freshness(req.source_timestamp, utcnow())
+    if quality != DataQualityStatus.VALID:
+        reasons.append("SOURCE_NOT_VALID")
+
+    if not reasons:
+        decision = "LONG" if req.direction == "BULLISH" else "SHORT"
+
+    return {
+        "status": "READY" if decision in {"LONG", "SHORT"} else "WAIT",
+        "symbol": canonical,
+        "decision": decision,
+        "reasons": reasons,
+        "source_timestamp": req.source_timestamp.isoformat(),
+        "quality": quality.value,
+        "authoritative": True,
+        "execution": False,
+    }
+
+
+@api_router.post("/paper/signal/evaluate")
+async def evaluate_paper_server_signal(req: ServerSignalRequest) -> Dict[str, object]:
+    return evaluate_server_signal(req)
+
+
 @api_router.post("/paper/auto-entry/gate")
 async def evaluate_paper_auto_entry_gate(
     req: PaperAutoEntryGateRequest,
@@ -1583,9 +1648,9 @@ async def evaluate_paper_auto_entry_gate(
         ):
             blockers.append("SHORT_LEVELS_INVALID")
 
-    # V16-M1 safety boundary: chart signals are still calculated in the browser.
-    # They are not authoritative enough for unattended server-side creation.
-    blockers.append("SERVER_SIGNAL_NOT_IMPLEMENTED")
+    # V16-M2 provides a server-authoritative signal evaluator. This gate request still
+    # carries a decision field for compatibility; unattended creation must call the
+    # server evaluator first and use its derived decision, never trust browser voting.
 
     # The backend registry intentionally contains no invented broker sizing rules.
     # Auto entry stays blocked until source/timestamp + volume/tick/contract rules

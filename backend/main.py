@@ -1963,7 +1963,11 @@ def latest_confirmed_break(
                 break
     if not events:
         return None
-    return max(events, key=lambda event: int(event["break_index"]))
+    def break_index_value(event: Dict[str, object]) -> int:
+        value = event.get("break_index")
+        return value if isinstance(value, int) else -1
+
+    return max(events, key=break_index_value)
 
 
 def classify_bos_choch(

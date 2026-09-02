@@ -3915,3 +3915,59 @@ class TestChartEngineV131VisibilityLayers(unittest.TestCase):
 
     def test_visibility_does_not_disable_detection(self):
         self.assertIn("masquer une couche ne désactive jamais sa détection", self.html)
+
+
+class TestChartEngineV14SignalEngine(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_signal_engine_present(self):
+        self.assertIn("function buildSmcSignals", self.html)
+
+    def test_signal_defaults_to_wait(self):
+        self.assertIn('decision="WAIT"', self.html)
+
+    def test_signal_requires_entry_now(self):
+        self.assertIn('s.state!=="ENTRY_NOW"', self.html)
+
+    def test_signal_requires_trade_plan(self):
+        self.assertIn('reason="TRADE_PLAN_UNAVAILABLE"', self.html)
+
+    def test_signal_requires_target(self):
+        self.assertIn('plan.takeProfit===null', self.html)
+
+    def test_signal_requires_risk_reward(self):
+        self.assertIn('plan.riskReward===null', self.html)
+
+    def test_invalid_rr_stays_wait(self):
+        self.assertIn('reason="RR_INVALID"', self.html)
+
+    def test_bullish_confirmed_setup_becomes_long(self):
+        self.assertIn('s.direction==="BULLISH"?"LONG":"SHORT"', self.html)
+
+    def test_confirmed_signal_reason_is_explicit(self):
+        self.assertIn('reason="SETUP_AND_TRADE_PLAN_CONFIRMED"', self.html)
+
+    def test_invalidated_setup_is_not_signal(self):
+        self.assertIn('reason="SETUP_INVALIDATED"', self.html)
+
+    def test_expired_setup_is_not_signal(self):
+        self.assertIn('reason="SETUP_EXPIRED"', self.html)
+
+    def test_signal_exposes_entry_stop_target_rr(self):
+        tokens = [
+            "entry:plan?plan.entry:null",
+            "stopLoss:plan?plan.stopLoss:null",
+            "takeProfit:plan?plan.takeProfit:null",
+            "riskReward:plan?plan.riskReward:null",
+        ]
+        for token in tokens:
+            self.assertIn(token, self.html)
+
+    def test_signal_never_executes_order(self):
+        token = "qualityTier:s.qualityTier||null,execution:false"
+        self.assertIn(token, self.html)
+
+    def test_signal_engine_ui_is_active(self):
+        self.assertIn("SIGNAL ENGINE ACTIF", self.html)

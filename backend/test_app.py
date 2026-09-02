@@ -4829,9 +4829,9 @@ class TestPaperAutoEntryGateV16M1(unittest.TestCase):
         source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
         self.assertIn("SHORT_LEVELS_INVALID", source)
 
-    def test_gate_blocks_until_server_signal_exists(self):
+    def test_gate_documents_server_signal_boundary(self):
         source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
-        self.assertIn("SERVER_SIGNAL_NOT_IMPLEMENTED", source)
+        self.assertIn("server-authoritative signal evaluator", source)
 
     def test_gate_blocks_until_server_specs_exist(self):
         source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
@@ -4843,5 +4843,94 @@ class TestPaperAutoEntryGateV16M1(unittest.TestCase):
 
     def test_ui_marks_auto_entry_gate_blocked(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("AUTO ENTRY GATE · BLOCKED", html)
+        self.assertIn("AUTO ENTRY · SPECS BLOCKED", html)
         self.assertIn("Aucun trade n’est créé par M1", html)
+
+
+class TestServerSignalEngineV16M2(unittest.TestCase):
+    def make_request(self, **overrides):
+        data = {
+            "symbol": "BTC-USD",
+            "setup_state": "ENTRY_NOW",
+            "direction": "BULLISH",
+            "entry": Decimal("100"),
+            "stop_loss": Decimal("95"),
+            "take_profit": Decimal("110"),
+            "risk_reward": Decimal("2"),
+            "structure_confirmed": True,
+            "displacement_confirmed": True,
+            "order_block_confirmed": True,
+            "source_timestamp": main.utcnow(),
+        }
+        data.update(overrides)
+        return main.ServerSignalRequest(**data)
+
+    def test_server_signal_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/paper/signal/evaluate", paths)
+
+    def test_server_signal_is_authoritative(self):
+        result = main.evaluate_server_signal(self.make_request())
+        self.assertTrue(result["authoritative"])
+
+    def test_bullish_ready_becomes_long(self):
+        result = main.evaluate_server_signal(self.make_request())
+        self.assertEqual(result["decision"], "LONG")
+
+    def test_bearish_ready_becomes_short(self):
+        req = self.make_request(
+            direction="BEARISH", stop_loss=Decimal("105"), take_profit=Decimal("90")
+        )
+        result = main.evaluate_server_signal(req)
+        self.assertEqual(result["decision"], "SHORT")
+
+    def test_non_entry_now_waits(self):
+        result = main.evaluate_server_signal(self.make_request(setup_state="WAIT"))
+        self.assertEqual(result["decision"], "WAIT")
+
+    def test_missing_structure_waits(self):
+        result = main.evaluate_server_signal(self.make_request(structure_confirmed=False))
+        self.assertIn("STRUCTURE_NOT_CONFIRMED", result["reasons"])
+
+    def test_missing_displacement_waits(self):
+        result = main.evaluate_server_signal(self.make_request(displacement_confirmed=False))
+        self.assertIn("DISPLACEMENT_NOT_CONFIRMED", result["reasons"])
+
+    def test_missing_order_block_waits(self):
+        result = main.evaluate_server_signal(self.make_request(order_block_confirmed=False))
+        self.assertIn("ORDER_BLOCK_NOT_CONFIRMED", result["reasons"])
+
+    def test_incomplete_plan_waits(self):
+        result = main.evaluate_server_signal(self.make_request(take_profit=None))
+        self.assertIn("TRADE_PLAN_INCOMPLETE", result["reasons"])
+
+    def test_invalid_rr_waits(self):
+        result = main.evaluate_server_signal(self.make_request(risk_reward=Decimal("0")))
+        self.assertIn("RR_INVALID", result["reasons"])
+
+    def test_invalid_long_levels_wait(self):
+        result = main.evaluate_server_signal(self.make_request(stop_loss=Decimal("101")))
+        self.assertIn("LONG_LEVELS_INVALID", result["reasons"])
+
+    def test_invalid_short_levels_wait(self):
+        req = self.make_request(
+            direction="BEARISH", stop_loss=Decimal("90"), take_profit=Decimal("110")
+        )
+        result = main.evaluate_server_signal(req)
+        self.assertIn("SHORT_LEVELS_INVALID", result["reasons"])
+
+    def test_signal_never_executes(self):
+        result = main.evaluate_server_signal(self.make_request())
+        self.assertFalse(result["execution"])
+
+    def test_gate_still_blocks_server_specs(self):
+        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
+        self.assertIn("SERVER_INSTRUMENT_SPECS_NOT_IMPLEMENTED", source)
+
+    def test_ui_marks_server_signal_active(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("SERVER SIGNAL V1 ACTIF", html)
+
+    def test_ui_keeps_auto_entry_specs_blocked(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("AUTO ENTRY · SPECS BLOCKED", html)

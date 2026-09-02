@@ -5658,3 +5658,91 @@ class TestServerLiquiditySweepV16M5B3(unittest.TestCase):
     def test_ui_marks_server_liquidity_sweep_detector(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("SERVER DETECTOR · LIQUIDITY SWEEP V1", html)
+
+
+# ---------------- V16-M5B4 server displacement detector ----------------
+class TestServerDisplacementV16M5B4(unittest.TestCase):
+    def candle(self, index, open_, high, low, close):
+        return main.Candle(
+            start=datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=index * 5),
+            low=float(low), high=float(high), open=float(open_), close=float(close),
+            volume=1.0, status=main.DataQualityStatus.VALID,
+        )
+
+    def baseline(self):
+        return [self.candle(i, 100, 101, 99, 101) for i in range(20)]
+
+    def test_bullish_displacement_detected(self):
+        candles = self.baseline() + [self.candle(20, 100, 103, 99.5, 102.8)]
+        event = main.latest_confirmed_displacement(candles)
+        self.assertEqual(event["direction"], "BULLISH")
+
+    def test_bearish_displacement_detected(self):
+        candles = self.baseline() + [self.candle(20, 103, 103.5, 100, 100.2)]
+        event = main.latest_confirmed_displacement(candles)
+        self.assertEqual(event["direction"], "BEARISH")
+
+    def test_requires_twenty_reference_candles(self):
+        candles = self.baseline()[:19] + [self.candle(19, 100, 103, 99.5, 102.8)]
+        self.assertIsNone(main.latest_confirmed_displacement(candles))
+
+    def test_body_below_multiplier_rejected(self):
+        candles = self.baseline() + [self.candle(20, 100, 101.6, 99.9, 101.4)]
+        self.assertIsNone(main.latest_confirmed_displacement(candles))
+
+    def test_body_range_ratio_below_seventy_percent_rejected(self):
+        candles = self.baseline() + [self.candle(20, 100, 104, 98, 102)]
+        self.assertIsNone(main.latest_confirmed_displacement(candles))
+
+    def test_bullish_close_not_near_high_rejected(self):
+        candles = self.baseline() + [self.candle(20, 100, 104, 99, 102.5)]
+        self.assertIsNone(main.latest_confirmed_displacement(candles))
+
+    def test_bearish_close_not_near_low_rejected(self):
+        candles = self.baseline() + [self.candle(20, 103, 104, 99, 100.5)]
+        self.assertIsNone(main.latest_confirmed_displacement(candles))
+
+    def test_doji_rejected(self):
+        candles = self.baseline() + [self.candle(20, 100, 103, 97, 100)]
+        self.assertIsNone(main.latest_confirmed_displacement(candles))
+
+    def test_zero_range_rejected(self):
+        candles = self.baseline() + [self.candle(20, 100, 100, 100, 100)]
+        self.assertIsNone(main.latest_confirmed_displacement(candles))
+
+    def test_zero_average_reference_body_rejected(self):
+        candles = [self.candle(i, 100, 101, 99, 100) for i in range(20)]
+        candles.append(self.candle(20, 100, 103, 99.5, 102.8))
+        self.assertIsNone(main.latest_confirmed_displacement(candles))
+
+    def test_latest_displacement_wins(self):
+        candles = self.baseline() + [self.candle(20, 100, 103, 99.5, 102.8)]
+        candles += [self.candle(i, 100, 101, 99, 101) for i in range(21, 41)]
+        candles.append(self.candle(41, 103, 103.5, 100, 100.2))
+        event = main.latest_confirmed_displacement(candles)
+        self.assertEqual(event["candle_index"], 41)
+        self.assertEqual(event["direction"], "BEARISH")
+
+    def test_metrics_are_exposed(self):
+        candles = self.baseline() + [self.candle(20, 100, 103, 99.5, 102.8)]
+        event = main.latest_confirmed_displacement(candles)
+        self.assertGreaterEqual(event["body_multiple"], 1.5)
+        self.assertGreaterEqual(event["body_range_ratio"], 0.70)
+
+    def test_detector_exposes_server_displacement(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn("latest_confirmed_displacement", source)
+        self.assertIn('"displacement": displacement', source)
+
+    def test_orchestrator_status_names_server_displacement(self):
+        source = inspect.getsource(main.get_auto_entry_orchestrator_status)
+        self.assertIn('"displacement_detection": "SERVER_DISPLACEMENT_V1"', source)
+
+    def test_displacement_does_not_enable_auto_entry(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"auto_queue": False', source)
+
+    def test_ui_marks_server_displacement_detector(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("SERVER DETECTOR · DISPLACEMENT V1", html)

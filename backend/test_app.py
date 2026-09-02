@@ -3774,3 +3774,51 @@ class TestChartEngineV11SmcStateMachine(unittest.TestCase):
 
     def test_smc_state_machine_ui_is_active(self):
         self.assertIn("SMC STATE MACHINE ACTIF", self.html)
+
+
+class TestChartEngineV12EntryLifecycle(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_entry_zone_window_is_explicit(self):
+        self.assertIn("SMC_ENTRY_ZONE_MAX_BARS=12", self.html)
+
+    def test_setup_lifecycle_starts_waiting(self):
+        self.assertIn('state="WAIT",reason="WAIT_DISPLACEMENT"', self.html)
+
+    def test_wait_structure_reason_is_explicit(self):
+        self.assertIn('reason="WAIT_STRUCTURE"', self.html)
+
+    def test_wait_entry_zone_reason_is_explicit(self):
+        self.assertIn('reason="WAIT_ENTRY_ZONE"', self.html)
+
+    def test_entry_now_requires_zone_touch(self):
+        self.assertIn('state="ENTRY_NOW";reason="OB_RETEST_CONFIRMED"', self.html)
+
+    def test_entry_now_records_closed_candle_index(self):
+        self.assertIn("entryIndex=q", self.html)
+
+    def test_bullish_close_below_ob_invalidates(self):
+        self.assertIn('direction==="BULLISH"&&c<ob.low', self.html)
+
+    def test_bearish_close_above_ob_invalidates(self):
+        self.assertIn('direction==="BEARISH"&&c>ob.high', self.html)
+
+    def test_close_beyond_ob_reason_is_explicit(self):
+        self.assertIn('reason="CLOSE_BEYOND_OB"', self.html)
+
+    def test_entry_window_can_expire(self):
+        self.assertIn('state="EXPIRED";reason="ENTRY_WINDOW_EXPIRED"', self.html)
+
+    def test_expiry_records_deadline_index(self):
+        self.assertIn("expiredAt=structure.index+SMC_ENTRY_ZONE_MAX_BARS", self.html)
+
+    def test_lifecycle_excludes_potentially_open_last_candle(self):
+        self.assertIn("zoneDeadline=Math.min(closedEnd-1", self.html)
+
+    def test_entry_now_does_not_claim_order_execution(self):
+        self.assertIn("aucun ordre n’est envoyé", self.html)
+
+    def test_entry_lifecycle_ui_is_active(self):
+        self.assertIn("ENTRY LIFECYCLE ACTIF", self.html)

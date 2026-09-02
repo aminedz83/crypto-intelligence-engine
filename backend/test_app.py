@@ -4305,7 +4305,7 @@ class TestPaperMarkV16E(unittest.TestCase):
 class TestPaperRealtimeMonitorV16F(unittest.TestCase):
     def test_realtime_mark_builder_present(self):
         source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("get_latest_ticker", source)
+        self.assertIn("await market_store.get_ticker", source)
 
     def test_realtime_mark_requires_registered_instrument(self):
         source = inspect.getsource(main.paper_mark_from_realtime)
@@ -4317,7 +4317,7 @@ class TestPaperRealtimeMonitorV16F(unittest.TestCase):
 
     def test_realtime_mark_requires_valid_quality(self):
         source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("DataQualityStatus.VALID", source)
+        self.assertIn("datum.status != DataQualityStatus.VALID", source)
 
     def test_realtime_mark_rejects_missing_datum(self):
         source = inspect.getsource(main.paper_mark_from_realtime)
@@ -4325,7 +4325,7 @@ class TestPaperRealtimeMonitorV16F(unittest.TestCase):
 
     def test_realtime_mark_rejects_nonpositive_price(self):
         source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn('datum.value <= Decimal("0")', source)
+        self.assertIn("datum.value <= 0", source)
 
     def test_realtime_mark_preserves_source_timestamp(self):
         source = inspect.getsource(main.paper_mark_from_realtime)

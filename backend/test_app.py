@@ -4843,7 +4843,7 @@ class TestPaperAutoEntryGateV16M1(unittest.TestCase):
 
     def test_ui_marks_auto_entry_gate_blocked(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("COINBASE SPECS V1 ACTIF", html)
+        self.assertIn("AUTO PAPER VERIFIED V1", html)
         self.assertIn("Aucun trade n’est créé par M1", html)
 
 
@@ -4933,7 +4933,7 @@ class TestServerSignalEngineV16M2(unittest.TestCase):
 
     def test_ui_keeps_auto_entry_specs_blocked(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("COINBASE SPECS V1 ACTIF", html)
+        self.assertIn("AUTO PAPER VERIFIED V1", html)
 
 
 class TestServerInstrumentSpecsV16M3(unittest.TestCase):
@@ -5016,7 +5016,7 @@ class TestServerInstrumentSpecsV16M3(unittest.TestCase):
 
     def test_ui_marks_coinbase_specs_active(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn("COINBASE SPECS V1 ACTIF", html)
+        self.assertIn("AUTO PAPER VERIFIED V1", html)
 
 
 class TestServerInstrumentSpecsV16M3Fix(unittest.TestCase):
@@ -5024,3 +5024,125 @@ class TestServerInstrumentSpecsV16M3Fix(unittest.TestCase):
         source = inspect.getsource(main.get_paper_instrument_specs)
         self.assertIn("market_provider.get_product_specs", source)
         self.assertNotIn("coinbase.get_product_specs", source)
+
+
+class TestVerifiedAutoPaperEntryV16M4(unittest.TestCase):
+    def specs(self):
+        return {
+            "base_increment": "0.001",
+            "base_min_size": "0.001",
+            "base_max_size": "100",
+            "quote_min_size": "1",
+            "quote_max_size": "1000000",
+        }
+
+    def test_verified_auto_entry_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/paper/auto-entry/verified", paths)
+
+    def test_floor_to_increment(self):
+        self.assertEqual(
+            main.floor_to_increment(Decimal("1.2349"), Decimal("0.001")),
+            Decimal("1.234"),
+        )
+
+    def test_floor_rejects_non_positive_increment(self):
+        self.assertEqual(
+            main.floor_to_increment(Decimal("1"), Decimal("0")),
+            Decimal("0"),
+        )
+
+    def test_sizing_is_valid(self):
+        result = main.calculate_verified_crypto_size(
+            Decimal("1000"), Decimal("1"), Decimal("100"), Decimal("95"), self.specs()
+        )
+        self.assertEqual(result["status"], "VALID")
+
+    def test_sizing_uses_base_units(self):
+        result = main.calculate_verified_crypto_size(
+            Decimal("1000"), Decimal("1"), Decimal("100"), Decimal("95"), self.specs()
+        )
+        self.assertEqual(result["size_unit"], "BASE_UNITS")
+
+    def test_sizing_risk_is_bounded(self):
+        result = main.calculate_verified_crypto_size(
+            Decimal("1000"), Decimal("1"), Decimal("100"), Decimal("95"), self.specs()
+        )
+        self.assertLessEqual(result["risk_money"], Decimal("10"))
+
+    def test_sizing_notional_is_bounded_by_capital(self):
+        result = main.calculate_verified_crypto_size(
+            Decimal("1000"), Decimal("50"), Decimal("100"), Decimal("99"), self.specs()
+        )
+        self.assertLessEqual(result["notional"], Decimal("1000"))
+
+    def test_invalid_risk_blocks(self):
+        result = main.calculate_verified_crypto_size(
+            Decimal("1000"), Decimal("0"), Decimal("100"), Decimal("95"), self.specs()
+        )
+        self.assertEqual(result["reason"], "RISK_INVALID")
+
+    def test_zero_stop_distance_blocks(self):
+        result = main.calculate_verified_crypto_size(
+            Decimal("1000"), Decimal("1"), Decimal("100"), Decimal("100"), self.specs()
+        )
+        self.assertEqual(result["reason"], "STOP_DISTANCE_INVALID")
+
+    def test_missing_specs_block(self):
+        result = main.calculate_verified_crypto_size(
+            Decimal("1000"), Decimal("1"), Decimal("100"), Decimal("95"), {}
+        )
+        self.assertEqual(result["reason"], "SPECS_INVALID")
+
+    def test_below_min_blocks(self):
+        specs = self.specs()
+        specs["base_min_size"] = "10"
+        result = main.calculate_verified_crypto_size(
+            Decimal("1000"), Decimal("1"), Decimal("100"), Decimal("95"), specs
+        )
+        self.assertEqual(result["reason"], "SIZE_BELOW_MIN")
+
+    def test_notional_below_min_blocks(self):
+        specs = self.specs()
+        specs["quote_min_size"] = "10000"
+        result = main.calculate_verified_crypto_size(
+            Decimal("1000"), Decimal("1"), Decimal("100"), Decimal("95"), specs
+        )
+        self.assertEqual(result["reason"], "NOTIONAL_BELOW_MIN")
+
+    def test_position_id_is_deterministic(self):
+        ts = main.utcnow()
+        a = main.build_auto_paper_position_id("BTC-USD", "LONG", ts)
+        b = main.build_auto_paper_position_id("BTC-USD", "LONG", ts)
+        self.assertEqual(a, b)
+
+    def test_position_id_changes_with_signal(self):
+        ts = main.utcnow()
+        a = main.build_auto_paper_position_id("BTC-USD", "LONG", ts)
+        b = main.build_auto_paper_position_id("BTC-USD", "SHORT", ts)
+        self.assertNotEqual(a, b)
+
+    def test_auto_entry_calls_server_signal(self):
+        source = inspect.getsource(main.verified_auto_paper_entry)
+        self.assertIn("evaluate_server_signal(req)", source)
+
+    def test_auto_entry_calls_server_specs(self):
+        source = inspect.getsource(main.verified_auto_paper_entry)
+        self.assertIn("get_paper_instrument_specs(req.symbol)", source)
+
+    def test_auto_entry_uses_persisted_account(self):
+        source = inspect.getsource(main.verified_auto_paper_entry)
+        self.assertIn("get_paper_account()", source)
+
+    def test_auto_entry_uses_existing_position_creation(self):
+        source = inspect.getsource(main.verified_auto_paper_entry)
+        self.assertIn("create_paper_position(position)", source)
+
+    def test_auto_entry_is_paper_only(self):
+        source = inspect.getsource(main.verified_auto_paper_entry)
+        self.assertIn('"paper_only": True', source)
+        self.assertIn('"execution": False', source)
+
+    def test_ui_marks_verified_auto_paper_active(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("AUTO PAPER VERIFIED V1", html)

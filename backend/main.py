@@ -1871,6 +1871,7 @@ SERVER_DISPLACEMENT_LOOKBACK = 20
 SERVER_DISPLACEMENT_BODY_MULTIPLIER = 1.5
 SERVER_DISPLACEMENT_MIN_BODY_RANGE_RATIO = 0.70
 SERVER_DISPLACEMENT_CLOSE_EXTREME_FRACTION = 0.20
+SERVER_FVG_MIN_GAP = 0.0
 
 
 def closed_valid_candles(candles: List[Candle], now: datetime) -> List[Candle]:
@@ -2132,6 +2133,82 @@ def latest_confirmed_displacement(
         })
     return events[-1] if events else None
 
+
+def latest_confirmed_fvg(
+    candles: List[Candle],
+) -> Optional[Dict[str, object]]:
+    """Return the latest strict 3-candle Fair Value Gap from closed VALID input.
+
+    Bullish FVG: candle[i-2].high < candle[i].low.
+    Bearish FVG: candle[i-2].low > candle[i].high.
+    The gap is confirmed only when candle i is closed. Later closed candles can
+    move the zone state OPEN -> PARTIALLY_MITIGATED -> MITIGATED. A FVG alone
+    never authorizes an entry.
+    """
+    if len(candles) < 3:
+        return None
+    events: List[Dict[str, object]] = []
+    for index in range(2, len(candles)):
+        first = candles[index - 2]
+        third = candles[index]
+        if (first.high is None or first.low is None
+                or third.high is None or third.low is None):
+            continue
+
+        direction: Optional[str] = None
+        zone_low: Optional[float] = None
+        zone_high: Optional[float] = None
+        if third.low - first.high > SERVER_FVG_MIN_GAP:
+            direction = "BULLISH"
+            zone_low = first.high
+            zone_high = third.low
+        elif first.low - third.high > SERVER_FVG_MIN_GAP:
+            direction = "BEARISH"
+            zone_low = third.high
+            zone_high = first.low
+        if direction is None or zone_low is None or zone_high is None:
+            continue
+
+        state = "OPEN"
+        mitigation_index: Optional[int] = None
+        for later_index in range(index + 1, len(candles)):
+            later = candles[later_index]
+            if direction == "BULLISH":
+                if later.low is None:
+                    continue
+                if later.low <= zone_low:
+                    state = "MITIGATED"
+                    mitigation_index = later_index
+                    break
+                if later.low < zone_high:
+                    state = "PARTIALLY_MITIGATED"
+                    mitigation_index = later_index
+            else:
+                if later.high is None:
+                    continue
+                if later.high >= zone_high:
+                    state = "MITIGATED"
+                    mitigation_index = later_index
+                    break
+                if later.high > zone_low:
+                    state = "PARTIALLY_MITIGATED"
+                    mitigation_index = later_index
+
+        events.append({
+            "event": "FVG",
+            "direction": direction,
+            "formation_index": index,
+            "first_index": index - 2,
+            "middle_index": index - 1,
+            "zone_low": zone_low,
+            "zone_high": zone_high,
+            "gap_size": zone_high - zone_low,
+            "state": state,
+            "mitigation_index": mitigation_index,
+        })
+    return events[-1] if events else None
+
+
 def structure_from_confirmed_swings(
     candles: List[Candle],
     swing_highs: List[int],
@@ -2232,6 +2309,7 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
     structure_event["prior_structure"] = prior_structure
     liquidity_sweep = latest_confirmed_liquidity_sweep(closed, highs, lows)
     displacement = latest_confirmed_displacement(closed)
+    fvg = latest_confirmed_fvg(closed)
     latest = closed[-1]
     return {
         "status": "READY",
@@ -2243,9 +2321,10 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
         "setup_state": "WAIT",
         "auto_queue": False,
-        "smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_V1",
+        "smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_V1",
         "liquidity_sweep": liquidity_sweep or {"event": "NONE", "direction": None},
         "displacement": displacement or {"event": "NONE", "direction": None},
+        "fvg": fvg or {"event": "NONE", "direction": None},
     }
 
 
@@ -2402,6 +2481,7 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "market_setup_detection": "STRUCTURE_BOS_CHOCH_V1",
         "liquidity_sweep_detection": "SERVER_LIQUIDITY_SWEEP_V1",
         "displacement_detection": "SERVER_DISPLACEMENT_V1",
+        "fvg_detection": "SERVER_FVG_V1",
         "smc_auto_candidate_generation": "NOT_IMPLEMENTED",
         "paper_only": True,
         "execution": False,

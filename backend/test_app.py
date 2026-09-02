@@ -4300,3 +4300,61 @@ class TestPaperMarkV16E(unittest.TestCase):
     def test_paper_pnl_ui_is_active(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("PAPER P&L V1 ACTIF", html)
+
+
+class TestPaperRealtimeMonitorV16F(unittest.TestCase):
+    def test_realtime_mark_builder_present(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("get_latest_ticker", source)
+
+    def test_realtime_mark_requires_registered_instrument(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("instrument is None", source)
+
+    def test_realtime_mark_v1_is_crypto_only(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("AssetClass.CRYPTO", source)
+
+    def test_realtime_mark_requires_valid_quality(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("DataQualityStatus.VALID", source)
+
+    def test_realtime_mark_rejects_missing_datum(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("datum is None", source)
+
+    def test_realtime_mark_rejects_nonpositive_price(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn('datum.value <= Decimal("0")', source)
+
+    def test_realtime_mark_preserves_source_timestamp(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("source_timestamp=datum.source_timestamp", source)
+
+    def test_monitor_reads_only_open_positions(self):
+        source = inspect.getsource(main.monitor_open_paper_positions_once)
+        self.assertIn("WHERE status='OPEN'", source)
+
+    def test_monitor_counts_unavailable_marks(self):
+        source = inspect.getsource(main.monitor_open_paper_positions_once)
+        self.assertIn("unavailable += 1", source)
+
+    def test_monitor_uses_existing_mark_logic(self):
+        source = inspect.getsource(main.monitor_open_paper_positions_once)
+        self.assertIn("await mark_paper_position", source)
+
+    def test_monitor_is_fail_safe_when_persistence_not_ready(self):
+        source = inspect.getsource(main.monitor_open_paper_positions_once)
+        self.assertIn("if not persistence_state.ready", source)
+
+    def test_monitor_does_not_synthesize_price(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertNotIn("random", source.lower())
+
+    def test_monitor_ui_is_active(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("PAPER REALTIME MONITOR V1 ACTIF", html)
+
+    def test_monitor_ui_states_crypto_v1_scope(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("V1 branche d’abord Crypto/Coinbase", html)

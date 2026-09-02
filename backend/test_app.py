@@ -6062,3 +6062,137 @@ class TestServerOrderBlockV16M5B6(unittest.TestCase):
     def test_ui_marks_server_order_block_detector(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("SERVER DETECTOR · ORDER BLOCK V1", html)
+
+
+# ---------------- V16-M5B7 server Retest/Revalidation engine ----------------
+class TestServerRetestRevalidationV16M5B7(unittest.TestCase):
+    def candle(self, index, open_, high, low, close):
+        return main.Candle(
+            start=datetime(2026, 1, 1, tzinfo=timezone.utc)
+            + timedelta(minutes=index * 5),
+            low=float(low),
+            high=float(high),
+            open=float(open_),
+            close=float(close),
+            volume=1.0,
+            status=main.DataQualityStatus.VALID,
+        )
+
+    def ob(self, direction, state="RETESTED", retest_index=2):
+        return {
+            "event": "ORDER_BLOCK",
+            "direction": direction,
+            "state": state,
+            "retest_index": retest_index,
+            "zone_low": 99.0,
+            "zone_high": 103.0,
+        }
+
+    def test_missing_order_block_waits(self):
+        event = main.latest_confirmed_revalidation([], None)
+        self.assertEqual(event["state"], "WAITING_RETEST")
+
+    def test_fresh_order_block_waits_for_retest(self):
+        order_block = self.ob("BULLISH", "FRESH")
+        event = main.latest_confirmed_revalidation([], order_block)
+        self.assertEqual(event["state"], "WAITING_RETEST")
+
+    def test_invalidated_order_block_stays_invalidated(self):
+        event = main.latest_confirmed_revalidation(
+            [], self.ob("BULLISH", "INVALIDATED")
+        )
+        self.assertEqual(event["state"], "INVALIDATED")
+
+    def test_bullish_midpoint_rejection_revalidates(self):
+        candles = [
+            self.candle(0, 100, 101, 99, 100),
+            self.candle(1, 100, 105, 100, 104),
+            self.candle(2, 104, 104, 100, 102),
+        ]
+        event = main.latest_confirmed_revalidation(candles, self.ob("BULLISH"))
+        self.assertEqual(event["state"], "REVALIDATED")
+        self.assertEqual(event["revalidation_index"], 2)
+
+    def test_bearish_midpoint_rejection_revalidates(self):
+        candles = [
+            self.candle(0, 100, 101, 99, 100),
+            self.candle(1, 100, 105, 100, 104),
+            self.candle(2, 98, 102, 98, 100),
+        ]
+        event = main.latest_confirmed_revalidation(candles, self.ob("BEARISH"))
+        self.assertEqual(event["state"], "REVALIDATED")
+
+    def test_bullish_close_at_midpoint_is_unconfirmed(self):
+        candles = [self.candle(0, 100, 101, 99, 100)] * 2
+        candles.append(self.candle(2, 102, 103, 99, 101))
+        event = main.latest_confirmed_revalidation(candles, self.ob("BULLISH"))
+        self.assertEqual(event["state"], "RETESTED_UNCONFIRMED")
+
+    def test_bearish_close_at_midpoint_is_unconfirmed(self):
+        candles = [self.candle(0, 100, 101, 99, 100)] * 2
+        candles.append(self.candle(2, 100, 103, 99, 101))
+        event = main.latest_confirmed_revalidation(candles, self.ob("BEARISH"))
+        self.assertEqual(event["state"], "RETESTED_UNCONFIRMED")
+
+    def test_invalid_retest_index_is_invalidated(self):
+        event = main.latest_confirmed_revalidation([], self.ob("BULLISH"))
+        self.assertEqual(event["state"], "INVALIDATED")
+
+    def test_invalid_zone_is_invalidated(self):
+        order_block = self.ob("BULLISH", retest_index=0)
+        order_block["zone_low"] = 103.0
+        event = main.latest_confirmed_revalidation(
+            [self.candle(0, 100, 103, 99, 102)], order_block
+        )
+        self.assertEqual(event["state"], "INVALIDATED")
+
+    def test_unknown_direction_is_invalidated(self):
+        event = main.latest_confirmed_revalidation([], self.ob("RANGE"))
+        self.assertEqual(event["state"], "INVALIDATED")
+
+    def test_same_direction_active_fvg_is_confluence(self):
+        candles = [self.candle(0, 100, 101, 99, 100)] * 2
+        candles.append(self.candle(2, 102, 103, 99, 102))
+        fvg = {"event": "FVG", "direction": "BULLISH", "state": "OPEN"}
+        event = main.latest_confirmed_revalidation(
+            candles, self.ob("BULLISH"), fvg
+        )
+        self.assertTrue(event["fvg_confluence"])
+
+    def test_mitigated_fvg_is_not_confluence(self):
+        candles = [self.candle(0, 100, 101, 99, 100)] * 2
+        candles.append(self.candle(2, 102, 103, 99, 102))
+        fvg = {
+            "event": "FVG",
+            "direction": "BULLISH",
+            "state": "MITIGATED",
+        }
+        event = main.latest_confirmed_revalidation(
+            candles, self.ob("BULLISH"), fvg
+        )
+        self.assertFalse(event["fvg_confluence"])
+
+    def test_detector_exposes_revalidation(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn("latest_confirmed_revalidation", source)
+        self.assertIn('"revalidation": revalidation', source)
+
+    def test_detector_contract_names_retest(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn(
+            "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_RETEST_V1",
+            source,
+        )
+
+    def test_revalidation_does_not_enable_auto_entry(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"auto_queue": False', source)
+
+    def test_orchestrator_and_ui_mark_revalidation(self):
+        source = inspect.getsource(main.get_auto_entry_orchestrator_status)
+        self.assertIn(
+            '"retest_revalidation": "SERVER_RETEST_REVALIDATION_V1"', source
+        )
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("SERVER DETECTOR · RETEST REVALIDATION V1", html)

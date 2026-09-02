@@ -5335,7 +5335,8 @@ class TestServerStructureEventsV16M5B2(unittest.TestCase):
             self.candle(0, 10, 5, 8),
             self.candle(5, 15, 7, 10),
             self.candle(10, 11, 6, 10),
-            self.candle(15, 16, 8, 16),
+            self.candle(15, 12, 8, 11),
+            self.candle(20, 16, 9, 16),
         ]
         event = main.latest_confirmed_break(candles, [1], [])
         self.assertEqual(event["direction"], "BULLISH")
@@ -5353,7 +5354,8 @@ class TestServerStructureEventsV16M5B2(unittest.TestCase):
             self.candle(0, 10, 5, 8),
             self.candle(5, 9, 3, 6),
             self.candle(10, 8, 4, 5),
-            self.candle(15, 7, 2, 2),
+            self.candle(15, 7, 4, 5),
+            self.candle(20, 7, 2, 2),
         ]
         event = main.latest_confirmed_break(candles, [], [1])
         self.assertEqual(event["direction"], "BEARISH")
@@ -5410,8 +5412,9 @@ class TestServerStructureEventsV16M5B2(unittest.TestCase):
             self.candle(0, 10, 5, 8),
             self.candle(5, 15, 7, 10),
             self.candle(10, 11, 4, 10),
-            self.candle(15, 16, 3, 16),
-            self.candle(20, 14, 2, 2),
+            self.candle(15, 14, 5, 12),
+            self.candle(20, 16, 6, 16),
+            self.candle(25, 14, 3, 3),
         ]
         event = main.latest_confirmed_break(candles, [1], [2])
         self.assertEqual(event["direction"], "BEARISH")
@@ -5435,3 +5438,114 @@ class TestServerStructureEventsV16M5B2(unittest.TestCase):
     def test_ui_marks_bos_choch_detector(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("SERVER DETECTOR · BOS/CHoCH V1", html)
+
+
+# ---------------- V16-M5B2 no-look-ahead corrective tests ----------------
+class TestServerStructureNoLookAheadV16M5B2Fix(unittest.TestCase):
+    def candle(self, index, high, low, close):
+        return main.Candle(
+            start=datetime(2026, 1, 1, 0, index * 5, tzinfo=timezone.utc),
+            low=float(low),
+            high=float(high),
+            open=float(close),
+            close=float(close),
+            volume=1.0,
+            status=main.DataQualityStatus.VALID,
+        )
+
+    def test_high_break_at_i_plus_1_is_rejected(self):
+        candles = [self.candle(0, 10, 5, 8), self.candle(1, 15, 7, 10),
+                   self.candle(2, 16, 8, 16), self.candle(3, 11, 8, 10)]
+        self.assertIsNone(main.latest_confirmed_break(candles, [1], []))
+
+    def test_high_break_at_i_plus_2_is_rejected(self):
+        candles = [self.candle(0, 10, 5, 8), self.candle(1, 15, 7, 10),
+                   self.candle(2, 11, 8, 10), self.candle(3, 16, 8, 16)]
+        self.assertIsNone(main.latest_confirmed_break(candles, [1], []))
+
+    def test_high_break_at_i_plus_3_is_accepted(self):
+        candles = [self.candle(0, 10, 5, 8), self.candle(1, 15, 7, 10),
+                   self.candle(2, 11, 8, 10), self.candle(3, 12, 8, 10),
+                   self.candle(4, 16, 9, 16)]
+        event = main.latest_confirmed_break(candles, [1], [])
+        self.assertEqual(event["break_index"], 4)
+
+    def test_low_break_at_i_plus_1_is_rejected(self):
+        candles = [self.candle(0, 10, 5, 8), self.candle(1, 9, 3, 6),
+                   self.candle(2, 8, 2, 2), self.candle(3, 8, 4, 5)]
+        self.assertIsNone(main.latest_confirmed_break(candles, [], [1]))
+
+    def test_low_break_at_i_plus_2_is_rejected(self):
+        candles = [self.candle(0, 10, 5, 8), self.candle(1, 9, 3, 6),
+                   self.candle(2, 8, 4, 5), self.candle(3, 8, 2, 2)]
+        self.assertIsNone(main.latest_confirmed_break(candles, [], [1]))
+
+    def test_low_break_at_i_plus_3_is_accepted(self):
+        candles = [self.candle(0, 10, 5, 8), self.candle(1, 9, 3, 6),
+                   self.candle(2, 8, 4, 5), self.candle(3, 8, 4, 5),
+                   self.candle(4, 7, 2, 2)]
+        event = main.latest_confirmed_break(candles, [], [1])
+        self.assertEqual(event["break_index"], 4)
+
+    def test_wick_above_after_confirmation_without_close_is_rejected(self):
+        candles = [self.candle(0, 10, 5, 8), self.candle(1, 15, 7, 10),
+                   self.candle(2, 11, 8, 10), self.candle(3, 12, 8, 10),
+                   self.candle(4, 16, 9, 14)]
+        self.assertIsNone(main.latest_confirmed_break(candles, [1], []))
+
+    def test_wick_below_after_confirmation_without_close_is_rejected(self):
+        candles = [self.candle(0, 10, 5, 8), self.candle(1, 9, 3, 6),
+                   self.candle(2, 8, 4, 5), self.candle(3, 8, 4, 5),
+                   self.candle(4, 7, 2, 4)]
+        self.assertIsNone(main.latest_confirmed_break(candles, [], [1]))
+
+    def test_future_confirmed_swing_cannot_change_prior_structure(self):
+        candles = [
+            self.candle(0, 10, 5, 8), self.candle(1, 12, 6, 10),
+            self.candle(2, 11, 4, 8), self.candle(3, 14, 7, 12),
+            self.candle(4, 13, 6, 10), self.candle(5, 16, 8, 14),
+            self.candle(6, 15, 7, 13), self.candle(7, 18, 9, 17),
+            self.candle(8, 17, 8, 16), self.candle(9, 19, 10, 18),
+        ]
+        highs = [1, 3, 7]
+        lows = [2, 4, 8]
+        without_future = main.structure_before_break(candles, highs[:2], lows[:2], 7)
+        with_future = main.structure_before_break(candles, highs, lows, 7)
+        self.assertEqual(without_future, with_future)
+        self.assertEqual(with_future, "BULLISH")
+
+    def test_bullish_prior_structure_bearish_break_is_choch(self):
+        result = main.classify_bos_choch(
+            "BULLISH", {"direction": "BEARISH", "level": 5.0, "break_index": 9}
+        )
+        self.assertEqual(result["event"], "CHOCH_MSS")
+
+    def test_bearish_prior_structure_bullish_break_is_choch(self):
+        result = main.classify_bos_choch(
+            "BEARISH", {"direction": "BULLISH", "level": 10.0, "break_index": 9}
+        )
+        self.assertEqual(result["event"], "CHOCH_MSS")
+
+    def test_bullish_continuation_is_bos(self):
+        result = main.classify_bos_choch(
+            "BULLISH", {"direction": "BULLISH", "level": 10.0, "break_index": 9}
+        )
+        self.assertEqual(result["event"], "BOS")
+
+    def test_bearish_continuation_is_bos(self):
+        result = main.classify_bos_choch(
+            "BEARISH", {"direction": "BEARISH", "level": 5.0, "break_index": 9}
+        )
+        self.assertEqual(result["event"], "BOS")
+
+    def test_detector_remains_auto_queue_false(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn('"auto_queue": False', source)
+
+    def test_detector_remains_setup_state_wait(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn('"setup_state": "WAIT"', source)
+
+    def test_liquidity_sweep_still_not_implemented(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn('"liquidity_sweep": "NOT_IMPLEMENTED"', source)

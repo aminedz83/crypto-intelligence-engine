@@ -1919,66 +1919,71 @@ def confirmed_swing_indexes(
     return highs, lows
 
 
-def detect_structure_breaks(
+def latest_confirmed_break(
     candles: List[Candle],
-    highs: List[int],
-    lows: List[int],
+    swing_highs: List[int],
+    swing_lows: List[int],
+) -> Optional[Dict[str, object]]:
+    if not candles:
+        return None
+    events: List[Dict[str, object]] = []
+    for swing_index in swing_highs:
+        level = candles[swing_index].high
+        if level is None:
+            continue
+        for index in range(swing_index + 1, len(candles)):
+            close = candles[index].close
+            if close is not None and close > level:
+                events.append(
+                    {
+                        "direction": "BULLISH",
+                        "swing_index": swing_index,
+                        "break_index": index,
+                        "level": level,
+                        "close": close,
+                    }
+                )
+                break
+    for swing_index in swing_lows:
+        level = candles[swing_index].low
+        if level is None:
+            continue
+        for index in range(swing_index + 1, len(candles)):
+            close = candles[index].close
+            if close is not None and close < level:
+                events.append(
+                    {
+                        "direction": "BEARISH",
+                        "swing_index": swing_index,
+                        "break_index": index,
+                        "level": level,
+                        "close": close,
+                    }
+                )
+                break
+    if not events:
+        return None
+    return max(events, key=lambda event: int(event["break_index"]))
+
+
+def classify_bos_choch(
+    prior_structure: str,
+    break_event: Optional[Dict[str, object]],
 ) -> Dict[str, object]:
-    if not candles or not highs or not lows:
-        return {
-            "bos": None,
-            "choch": None,
-            "mss": None,
-            "break_timestamp": None,
-        }
-
-    latest = candles[-1]
-    close = latest.close
-    last_high = candles[highs[-1]].high
-    last_low = candles[lows[-1]].low
-    if close is None or last_high is None or last_low is None:
-        return {
-            "bos": None,
-            "choch": None,
-            "mss": None,
-            "break_timestamp": None,
-        }
-
-    prior_highs = highs[:-1]
-    prior_lows = lows[:-1]
-    bullish_context = False
-    bearish_context = False
-    if prior_highs and prior_lows:
-        previous_high = candles[prior_highs[-1]].high
-        previous_low = candles[prior_lows[-1]].low
-        if previous_high is not None and previous_low is not None:
-            bullish_context = last_high > previous_high and last_low > previous_low
-            bearish_context = last_high < previous_high and last_low < previous_low
-
-    bullish_break = close > last_high
-    bearish_break = close < last_low
-    bos: Optional[str] = None
-    choch: Optional[str] = None
-    if bullish_break:
-        if bearish_context:
-            choch = "BULLISH"
-        else:
-            bos = "BULLISH"
-    elif bearish_break:
-        if bullish_context:
-            choch = "BEARISH"
-        else:
-            bos = "BEARISH"
-
+    if break_event is None:
+        return {"event": "NONE", "direction": None}
+    direction = str(break_event["direction"])
+    if prior_structure == "BULLISH":
+        event = "BOS" if direction == "BULLISH" else "CHOCH_MSS"
+    elif prior_structure == "BEARISH":
+        event = "BOS" if direction == "BEARISH" else "CHOCH_MSS"
+    else:
+        event = "BOS"
     return {
-        "bos": bos,
-        "choch": choch,
-        "mss": choch,
-        "break_timestamp": (
-            latest.start.isoformat()
-            if (bos is not None or choch is not None) and latest.start is not None
-            else None
-        ),
+        "event": event,
+        "direction": direction,
+        "level": break_event["level"],
+        "break_index": break_event["break_index"],
     }
 
 
@@ -2004,22 +2009,21 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
     else:
         structure = "RANGE"
 
+    break_event = latest_confirmed_break(closed, highs, lows)
+    structure_event = classify_bos_choch(structure, break_event)
     latest = closed[-1]
-    breaks = detect_structure_breaks(closed, highs, lows)
     return {
         "status": "READY",
         "structure": structure,
-        "bos": breaks["bos"],
-        "choch": breaks["choch"],
-        "mss": breaks["mss"],
-        "break_timestamp": breaks["break_timestamp"],
+        "structure_event": structure_event,
         "closed_candles": len(closed),
         "confirmed_swing_highs": len(highs),
         "confirmed_swing_lows": len(lows),
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
         "setup_state": "WAIT",
         "auto_queue": False,
-        "smc_confirmation": "STRUCTURE_BREAKS_V1",
+        "smc_confirmation": "STRUCTURE_EVENTS_V1",
+        "liquidity_sweep": "NOT_IMPLEMENTED",
     }
 
 
@@ -2173,9 +2177,8 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "status": "RUNNING" if task is not None and not task.done() else "STOPPED",
         "queued_candidates": len(auto_entry_candidates),
         "interval_seconds": AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS,
-        "market_setup_detection": "STRUCTURE_V1",
+        "market_setup_detection": "STRUCTURE_BOS_CHOCH_V1",
         "smc_auto_candidate_generation": "NOT_IMPLEMENTED",
-        "structure_break_detection": "BOS_CHOCH_MSS_V1",
         "paper_only": True,
         "execution": False,
     }

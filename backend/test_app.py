@@ -5427,9 +5427,9 @@ class TestServerStructureEventsV16M5B2(unittest.TestCase):
         source = inspect.getsource(main.get_auto_entry_orchestrator_status)
         self.assertIn("STRUCTURE_BOS_CHOCH_V1", source)
 
-    def test_liquidity_sweep_remains_not_implemented(self):
+    def test_liquidity_sweep_is_server_implemented(self):
         source = inspect.getsource(main.detect_server_market_structure)
-        self.assertIn('"liquidity_sweep": "NOT_IMPLEMENTED"', source)
+        self.assertIn('"liquidity_sweep": liquidity_sweep', source)
 
     def test_structure_events_do_not_auto_queue(self):
         source = inspect.getsource(main.detect_server_market_structure)
@@ -5546,6 +5546,111 @@ class TestServerStructureNoLookAheadV16M5B2Fix(unittest.TestCase):
         source = inspect.getsource(main.detect_server_market_structure)
         self.assertIn('"setup_state": "WAIT"', source)
 
-    def test_liquidity_sweep_still_not_implemented(self):
+    def test_liquidity_sweep_preserves_wait_and_no_auto_queue(self):
         source = inspect.getsource(main.detect_server_market_structure)
-        self.assertIn('"liquidity_sweep": "NOT_IMPLEMENTED"', source)
+        self.assertIn('"liquidity_sweep": liquidity_sweep', source)
+        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"auto_queue": False', source)
+
+
+# ---------------- V16-M5B3 server liquidity sweep detector ----------------
+class TestServerLiquiditySweepV16M5B3(unittest.TestCase):
+    def candle(self, index, high, low, close):
+        return main.Candle(
+            start=datetime(2026, 1, 1, 0, index * 5, tzinfo=timezone.utc),
+            low=float(low), high=float(high), open=float(close), close=float(close),
+            volume=1.0, status=main.DataQualityStatus.VALID,
+        )
+
+    def test_bsl_sweep_after_confirmation(self):
+        candles = [self.candle(0,10,5,8), self.candle(1,15,7,10),
+                   self.candle(2,11,8,10), self.candle(3,12,8,10),
+                   self.candle(4,16,9,14)]
+        event = main.latest_confirmed_liquidity_sweep(candles, [1], [])
+        self.assertEqual(event["type"], "BSL_SWEEP")
+        self.assertEqual(event["direction"], "BEARISH")
+        self.assertEqual(event["sweep_index"], 4)
+
+    def test_ssl_sweep_after_confirmation(self):
+        candles = [self.candle(0,10,5,8), self.candle(1,9,3,6),
+                   self.candle(2,8,4,5), self.candle(3,8,4,5),
+                   self.candle(4,7,2,4)]
+        event = main.latest_confirmed_liquidity_sweep(candles, [], [1])
+        self.assertEqual(event["type"], "SSL_SWEEP")
+        self.assertEqual(event["direction"], "BULLISH")
+        self.assertEqual(event["sweep_index"], 4)
+
+    def test_bsl_at_i_plus_1_rejected(self):
+        candles = [self.candle(0,10,5,8), self.candle(1,15,7,10),
+                   self.candle(2,16,8,14), self.candle(3,11,8,10)]
+        self.assertIsNone(main.latest_confirmed_liquidity_sweep(candles, [1], []))
+
+    def test_bsl_at_i_plus_2_rejected(self):
+        candles = [self.candle(0,10,5,8), self.candle(1,15,7,10),
+                   self.candle(2,11,8,10), self.candle(3,16,8,14)]
+        self.assertIsNone(main.latest_confirmed_liquidity_sweep(candles, [1], []))
+
+    def test_ssl_at_i_plus_1_rejected(self):
+        candles = [self.candle(0,10,5,8), self.candle(1,9,3,6),
+                   self.candle(2,8,2,4), self.candle(3,8,4,5)]
+        self.assertIsNone(main.latest_confirmed_liquidity_sweep(candles, [], [1]))
+
+    def test_ssl_at_i_plus_2_rejected(self):
+        candles = [self.candle(0,10,5,8), self.candle(1,9,3,6),
+                   self.candle(2,8,4,5), self.candle(3,8,2,4)]
+        self.assertIsNone(main.latest_confirmed_liquidity_sweep(candles, [], [1]))
+
+    def test_high_beyond_but_close_equal_level_rejected(self):
+        candles = [self.candle(0,10,5,8), self.candle(1,15,7,10),
+                   self.candle(2,11,8,10), self.candle(3,12,8,10),
+                   self.candle(4,16,9,15)]
+        self.assertIsNone(main.latest_confirmed_liquidity_sweep(candles, [1], []))
+
+    def test_low_beyond_but_close_equal_level_rejected(self):
+        candles = [self.candle(0,10,5,8), self.candle(1,9,3,6),
+                   self.candle(2,8,4,5), self.candle(3,8,4,5),
+                   self.candle(4,7,2,3)]
+        self.assertIsNone(main.latest_confirmed_liquidity_sweep(candles, [], [1]))
+
+    def test_close_above_high_is_break_not_bsl_sweep(self):
+        candles = [self.candle(0,10,5,8), self.candle(1,15,7,10),
+                   self.candle(2,11,8,10), self.candle(3,12,8,10),
+                   self.candle(4,16,9,16)]
+        self.assertIsNone(main.latest_confirmed_liquidity_sweep(candles, [1], []))
+
+    def test_close_below_low_is_break_not_ssl_sweep(self):
+        candles = [self.candle(0,10,5,8), self.candle(1,9,3,6),
+                   self.candle(2,8,4,5), self.candle(3,8,4,5),
+                   self.candle(4,7,2,2)]
+        self.assertIsNone(main.latest_confirmed_liquidity_sweep(candles, [], [1]))
+
+    def test_latest_sweep_wins(self):
+        candles = [self.candle(0,10,5,8), self.candle(1,15,7,10),
+                   self.candle(2,11,4,10), self.candle(3,12,5,10),
+                   self.candle(4,16,5,14), self.candle(5,14,3,5)]
+        event = main.latest_confirmed_liquidity_sweep(candles, [1], [2])
+        self.assertEqual(event["type"], "SSL_SWEEP")
+        self.assertEqual(event["sweep_index"], 5)
+
+    def test_invalid_swing_index_ignored(self):
+        candles = [self.candle(0,10,5,8), self.candle(1,11,6,9),
+                   self.candle(2,12,7,10), self.candle(3,13,8,11)]
+        self.assertIsNone(main.latest_confirmed_liquidity_sweep(candles, [-1, 99], []))
+
+    def test_detector_exposes_server_sweep(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn("latest_confirmed_liquidity_sweep", source)
+        self.assertIn('"liquidity_sweep": liquidity_sweep', source)
+
+    def test_orchestrator_status_names_server_sweep(self):
+        source = inspect.getsource(main.get_auto_entry_orchestrator_status)
+        self.assertIn('"liquidity_sweep_detection": "SERVER_LIQUIDITY_SWEEP_V1"', source)
+
+    def test_sweep_does_not_enable_auto_entry(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"auto_queue": False', source)
+
+    def test_ui_marks_server_liquidity_sweep_detector(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("SERVER DETECTOR · LIQUIDITY SWEEP V1", html)

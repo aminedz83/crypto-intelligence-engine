@@ -3873,3 +3873,45 @@ class TestChartEngineV13StructuralTradePlan(unittest.TestCase):
 
     def test_trade_plan_ui_is_active(self):
         self.assertIn("SL / TP / RR ACTIF", self.html)
+
+
+class TestChartEngineV131VisibilityLayers(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_chart_layers_state_present(self):
+        self.assertIn("const chartLayers=", self.html)
+
+    def test_clean_preset_present(self):
+        self.assertIn('name==="CLEAN"', self.html)
+
+    def test_all_preset_present(self):
+        self.assertIn('name==="ALL"', self.html)
+
+    def test_clean_keeps_structure_visible(self):
+        self.assertIn("structure:true,events:true,sweeps:true", self.html)
+
+    def test_clean_hides_displacement_and_fvg(self):
+        self.assertIn("displacement:false,fvg:false,ob:true", self.html)
+
+    def test_structure_render_is_visibility_gated(self):
+        self.assertIn('chartLayerEnabled("structure")', self.html)
+
+    def test_events_render_is_visibility_gated(self):
+        self.assertIn('chartLayerEnabled("events")', self.html)
+
+    def test_sweeps_render_is_visibility_gated(self):
+        self.assertIn('chartLayerEnabled("sweeps")', self.html)
+
+    def test_displacement_render_is_visibility_gated(self):
+        self.assertIn('chartLayerEnabled("displacement")', self.html)
+
+    def test_fvg_render_hides_mitigated_zones(self):
+        self.assertIn('e.state!=="MITIGATED"', self.html)
+
+    def test_ob_render_hides_invalidated_zones(self):
+        self.assertIn('e.state!=="INVALIDATED"', self.html)
+
+    def test_visibility_does_not_disable_detection(self):
+        self.assertIn("masquer une couche ne désactive jamais sa détection", self.html)

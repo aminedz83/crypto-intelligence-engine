@@ -5017,3 +5017,10 @@ class TestServerInstrumentSpecsV16M3(unittest.TestCase):
     def test_ui_marks_coinbase_specs_active(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("COINBASE SPECS V1 ACTIF", html)
+
+
+class TestServerInstrumentSpecsV16M3Fix(unittest.TestCase):
+    def test_specs_endpoint_uses_existing_market_provider(self):
+        source = inspect.getsource(main.get_paper_instrument_specs)
+        self.assertIn("market_provider.get_product_specs", source)
+        self.assertNotIn("coinbase.get_product_specs", source)

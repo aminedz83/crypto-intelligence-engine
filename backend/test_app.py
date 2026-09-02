@@ -4329,7 +4329,8 @@ class TestPaperRealtimeMonitorV16F(unittest.TestCase):
 
     def test_realtime_mark_preserves_source_timestamp(self):
         source = inspect.getsource(main.paper_mark_from_realtime)
-        self.assertIn("source_timestamp=datum.source_timestamp", source)
+        self.assertIn("source_timestamp = datum.source_timestamp", source)
+        self.assertIn("source_timestamp=source_timestamp", source)
 
     def test_monitor_reads_only_open_positions(self):
         source = inspect.getsource(main.monitor_open_paper_positions_once)

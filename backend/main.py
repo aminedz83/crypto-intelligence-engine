@@ -1771,6 +1771,59 @@ async def mark_paper_position(position_id: str, req: PaperPositionMark) -> Dict[
         ) from exc
 
 
+@api_router.get("/paper/positions/live")
+async def get_live_paper_positions() -> Dict[str, object]:
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
+        )
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT * FROM paper_positions WHERE status='OPEN' "
+                    "ORDER BY opened_at DESC, position_id DESC"
+                )
+            )
+            rows = result.fetchall()
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"}
+        ) from exc
+
+    positions: List[Dict[str, object]] = []
+    for row in rows:
+        payload = paper_position_to_dict(row)
+        mark = await paper_mark_from_realtime(str(row._mapping["symbol"]))
+        payload["mark_status"] = "UNAVAILABLE"
+        payload["mark_price"] = None
+        payload["mark_source"] = None
+        payload["mark_source_timestamp"] = None
+        payload["unrealized_pnl"] = None
+        if mark is not None:
+            payload["mark_status"] = "VALID"
+            payload["mark_price"] = str(mark.current_price)
+            payload["mark_source"] = mark.source
+            payload["mark_source_timestamp"] = mark.source_timestamp.isoformat()
+            payload["unrealized_pnl"] = str(
+                calculate_paper_pnl(
+                    row._mapping["side"],
+                    row._mapping["entry"],
+                    mark.current_price,
+                    row._mapping["size"],
+                )
+            )
+        positions.append(payload)
+    return {
+        "status": "OK",
+        "positions": positions,
+        "count": len(positions),
+        "paper_only": True,
+        "execution": False,
+    }
+
+
 @api_router.get("/paper/account")
 async def get_paper_account() -> Dict[str, object]:
     if not persistence_state.ready:

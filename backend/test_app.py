@@ -4778,3 +4778,70 @@ class TestPaperLiveEquityV16L(unittest.TestCase):
     def test_ui_hides_partial_live_equity(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn('a.live_equity_status==="VALID"?paperMoney(a.live_equity):"—"', html)
+
+
+class TestPaperAutoEntryGateV16M1(unittest.TestCase):
+    def test_gate_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/paper/auto-entry/gate", paths)
+
+    def test_gate_route_is_post(self):
+        route = next(r for r in main.api_router.routes if r.path == "/paper/auto-entry/gate")
+        self.assertIn("POST", route.methods)
+
+    def test_gate_request_requires_symbol(self):
+        fields = main.PaperAutoEntryGateRequest.model_fields
+        self.assertIn("symbol", fields)
+
+    def test_gate_request_has_signal_decision(self):
+        fields = main.PaperAutoEntryGateRequest.model_fields
+        self.assertIn("signal_decision", fields)
+
+    def test_gate_normalizes_symbol(self):
+        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
+        self.assertIn('req.symbol.upper().replace("/", "-")', source)
+
+    def test_gate_rejects_invalid_signal_decision(self):
+        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
+        self.assertIn("SIGNAL_DECISION_INVALID", source)
+
+    def test_gate_blocks_wait(self):
+        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
+        self.assertIn("SIGNAL_WAIT", source)
+
+    def test_gate_requires_registered_instrument(self):
+        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
+        self.assertIn("INSTRUMENT_NOT_REGISTERED", source)
+
+    def test_gate_requires_complete_trade_plan(self):
+        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
+        self.assertIn("TRADE_PLAN_INCOMPLETE", source)
+
+    def test_gate_rejects_invalid_rr(self):
+        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
+        self.assertIn("RR_INVALID", source)
+
+    def test_gate_checks_long_level_order(self):
+        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
+        self.assertIn("LONG_LEVELS_INVALID", source)
+
+    def test_gate_checks_short_level_order(self):
+        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
+        self.assertIn("SHORT_LEVELS_INVALID", source)
+
+    def test_gate_blocks_until_server_signal_exists(self):
+        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
+        self.assertIn("SERVER_SIGNAL_NOT_IMPLEMENTED", source)
+
+    def test_gate_blocks_until_server_specs_exist(self):
+        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
+        self.assertIn("SERVER_INSTRUMENT_SPECS_NOT_IMPLEMENTED", source)
+
+    def test_gate_never_auto_creates_position_in_m1(self):
+        source = inspect.getsource(main.evaluate_paper_auto_entry_gate)
+        self.assertIn('"auto_create_position": False', source)
+
+    def test_ui_marks_auto_entry_gate_blocked(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("AUTO ENTRY GATE · BLOCKED", html)
+        self.assertIn("Aucun trade n’est créé par M1", html)

@@ -4658,5 +4658,5 @@ class TestPaperTradingMobileRenderV16J1(unittest.TestCase):
         self.assertIn('api("/api/v1/paper/positions/live")', html)
 
     def test_backend_is_unchanged_for_ui_fix(self):
-        source = MAIN.read_text(encoding="utf-8")
-        self.assertIn('@api_router.get("/paper/positions/live")', source)
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/paper/positions/live", paths)

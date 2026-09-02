@@ -38,7 +38,7 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "946"
+      EXPECTED_TESTS: "962"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -184,3 +184,5 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# V16-M5B4-FIX2 — fresh synchronized copy

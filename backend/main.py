@@ -1482,6 +1482,15 @@ def is_candle_closed(
     return reference >= end
 
 
+class PaperAutoEntryGateRequest(BaseModel):
+    symbol: str = Field(min_length=1, max_length=64)
+    signal_decision: str
+    entry: Optional[Decimal] = None
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+    risk_reward: Optional[Decimal] = None
+
+
 class PaperPositionCreate(BaseModel):
     position_id: str = Field(min_length=1, max_length=128)
     symbol: str = Field(min_length=1, max_length=64)
@@ -1541,6 +1550,57 @@ def paper_position_to_dict(row: Any) -> Dict[str, object]:
     data["paper_only"] = True
     data["execution"] = False
     return data
+
+
+@api_router.post("/paper/auto-entry/gate")
+async def evaluate_paper_auto_entry_gate(
+    req: PaperAutoEntryGateRequest,
+) -> Dict[str, object]:
+    canonical = req.symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    blockers: List[str] = []
+
+    if req.signal_decision not in {"LONG", "SHORT", "WAIT"}:
+        blockers.append("SIGNAL_DECISION_INVALID")
+    elif req.signal_decision == "WAIT":
+        blockers.append("SIGNAL_WAIT")
+
+    if instrument is None:
+        blockers.append("INSTRUMENT_NOT_REGISTERED")
+
+    levels = (req.entry, req.stop_loss, req.take_profit, req.risk_reward)
+    if any(value is None for value in levels):
+        blockers.append("TRADE_PLAN_INCOMPLETE")
+    elif req.risk_reward is not None and req.risk_reward <= Decimal("0"):
+        blockers.append("RR_INVALID")
+    elif req.entry is not None and req.stop_loss is not None and req.take_profit is not None:
+        if req.signal_decision == "LONG" and not (
+            req.stop_loss < req.entry < req.take_profit
+        ):
+            blockers.append("LONG_LEVELS_INVALID")
+        if req.signal_decision == "SHORT" and not (
+            req.take_profit < req.entry < req.stop_loss
+        ):
+            blockers.append("SHORT_LEVELS_INVALID")
+
+    # V16-M1 safety boundary: chart signals are still calculated in the browser.
+    # They are not authoritative enough for unattended server-side creation.
+    blockers.append("SERVER_SIGNAL_NOT_IMPLEMENTED")
+
+    # The backend registry intentionally contains no invented broker sizing rules.
+    # Auto entry stays blocked until source/timestamp + volume/tick/contract rules
+    # are represented and verified server-side for the selected instrument.
+    blockers.append("SERVER_INSTRUMENT_SPECS_NOT_IMPLEMENTED")
+
+    return {
+        "status": "BLOCKED",
+        "symbol": canonical,
+        "signal_decision": req.signal_decision,
+        "blockers": list(dict.fromkeys(blockers)),
+        "auto_create_position": False,
+        "paper_only": True,
+        "execution": False,
+    }
 
 
 @api_router.post("/paper/positions", status_code=201)

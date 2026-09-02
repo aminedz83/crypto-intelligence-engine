@@ -1505,6 +1505,20 @@ class VerifiedAutoPaperEntryRequest(ServerSignalRequest):
     risk_percent: Decimal = Decimal("1")
 
 
+class AutoEntryCandidateRequest(VerifiedAutoPaperEntryRequest):
+    candidate_id: str = Field(min_length=1, max_length=128)
+
+
+@dataclass
+class AutoEntryCandidateState:
+    request: VerifiedAutoPaperEntryRequest
+    candidate_id: str
+    registered_at: datetime
+    last_status: str = "PENDING"
+    last_reason: Optional[str] = None
+    attempts: int = 0
+
+
 class PaperAutoEntryGateRequest(BaseModel):
     symbol: str = Field(min_length=1, max_length=64)
     signal_decision: str
@@ -1845,6 +1859,105 @@ async def verified_auto_paper_entry(
         "position": created,
         "specs_source": specs["source"],
         "sizing": {key: str(value) for key, value in sizing.items()},
+        "paper_only": True,
+        "execution": False,
+    }
+
+
+AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS = 5.0
+auto_entry_candidates: Dict[str, AutoEntryCandidateState] = {}
+auto_entry_orchestrator_task: Optional[asyncio.Task] = None
+
+
+def register_auto_entry_candidate(
+    req: AutoEntryCandidateRequest,
+) -> Dict[str, object]:
+    signal = evaluate_server_signal(req)
+    if signal["status"] != "READY":
+        return {
+            "status": "BLOCKED",
+            "candidate_id": req.candidate_id,
+            "reason": "SERVER_SIGNAL_NOT_READY",
+            "paper_only": True,
+            "execution": False,
+        }
+    state = AutoEntryCandidateState(
+        request=VerifiedAutoPaperEntryRequest(**req.model_dump(exclude={"candidate_id"})),
+        candidate_id=req.candidate_id,
+        registered_at=utcnow(),
+    )
+    auto_entry_candidates[req.candidate_id] = state
+    return {
+        "status": "QUEUED",
+        "candidate_id": req.candidate_id,
+        "paper_only": True,
+        "execution": False,
+    }
+
+
+async def run_auto_entry_orchestrator_once() -> Dict[str, int]:
+    opened = 0
+    blocked = 0
+    conflicts = 0
+    for candidate_id, state in list(auto_entry_candidates.items()):
+        state.attempts += 1
+        try:
+            result = await verified_auto_paper_entry(state.request)
+        except HTTPException as exc:
+            if exc.status_code == 409:
+                state.last_status = "CONFLICT"
+                state.last_reason = "DUPLICATE_POSITION"
+                conflicts += 1
+                auto_entry_candidates.pop(candidate_id, None)
+                continue
+            state.last_status = "BLOCKED"
+            state.last_reason = "HTTP_ERROR"
+            blocked += 1
+            continue
+        status_value = str(result.get("status", "BLOCKED"))
+        state.last_status = status_value
+        state.last_reason = (
+            str(result.get("reason")) if result.get("reason") is not None else None
+        )
+        if status_value == "OPENED":
+            opened += 1
+            auto_entry_candidates.pop(candidate_id, None)
+        else:
+            blocked += 1
+    return {
+        "checked": opened + blocked + conflicts,
+        "opened": opened,
+        "blocked": blocked,
+        "conflicts": conflicts,
+    }
+
+
+async def auto_entry_orchestrator_loop() -> None:
+    while True:
+        try:
+            await run_auto_entry_orchestrator_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.error("Auto-entry orchestrator iteration failed: %s", exc)
+        await asyncio.sleep(AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS)
+
+
+@api_router.post("/paper/auto-entry/candidates")
+async def queue_auto_entry_candidate(
+    req: AutoEntryCandidateRequest,
+) -> Dict[str, object]:
+    return register_auto_entry_candidate(req)
+
+
+@api_router.get("/paper/auto-entry/orchestrator/status")
+async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
+    task = auto_entry_orchestrator_task
+    return {
+        "status": "RUNNING" if task is not None and not task.done() else "STOPPED",
+        "queued_candidates": len(auto_entry_candidates),
+        "interval_seconds": AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS,
+        "market_setup_detection": "NOT_IMPLEMENTED",
         "paper_only": True,
         "execution": False,
     }
@@ -5099,6 +5212,10 @@ async def lifespan(app: FastAPI):
     paper_monitor_task = asyncio.create_task(
         paper_monitor_loop(paper_monitor_stop), name="paper-monitor"
     )
+    global auto_entry_orchestrator_task
+    auto_entry_orchestrator_task = asyncio.create_task(
+        auto_entry_orchestrator_loop(), name="auto-entry-orchestrator"
+    )
     try:
         yield
     finally:
@@ -5107,6 +5224,13 @@ async def lifespan(app: FastAPI):
             await paper_monitor_task
         except asyncio.CancelledError:
             pass
+        if auto_entry_orchestrator_task is not None:
+            auto_entry_orchestrator_task.cancel()
+            try:
+                await auto_entry_orchestrator_task
+            except asyncio.CancelledError:
+                pass
+            auto_entry_orchestrator_task = None
         await massive_indices_ws.stop()
         await twelvedata_gold_ws.stop()
         await massive_forex_ws.stop()

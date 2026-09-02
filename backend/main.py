@@ -1633,7 +1633,7 @@ async def get_paper_instrument_specs(symbol: str) -> Dict[str, object]:
             "observed_at": observed_at.isoformat(),
         }
     try:
-        payload = await coinbase.get_product_specs(provider_symbol)
+        payload = await market_provider.get_product_specs(provider_symbol)
     except (httpx.HTTPError, ValueError):
         return {
             "status": "UNAVAILABLE",

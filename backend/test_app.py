@@ -5299,7 +5299,7 @@ class TestServerMarketSetupDetectorV16M5B1(unittest.TestCase):
     def test_full_smc_is_explicitly_not_implemented(self):
         source = inspect.getsource(main.detect_server_market_structure)
         self.assertIn(
-            '"smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_V1"',
+            '"smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_V1"',
             source,
         )
         self.assertIn('"liquidity_sweep": liquidity_sweep', source)
@@ -5890,3 +5890,175 @@ class TestServerFvgV16M5B5(unittest.TestCase):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("SERVER DETECTOR · FVG V1", html)
 
+
+
+# ---------------- V16-M5B6 server Order Block detector ----------------
+class TestServerOrderBlockV16M5B6(unittest.TestCase):
+    def candle(self, index, open_, high, low, close):
+        return main.Candle(
+            start=datetime(2026, 1, 1, tzinfo=timezone.utc)
+            + timedelta(minutes=index * 5),
+            low=float(low),
+            high=float(high),
+            open=float(open_),
+            close=float(close),
+            volume=1.0,
+            status=main.DataQualityStatus.VALID,
+        )
+
+    def displacement(self, index, direction):
+        return {
+            "event": "DISPLACEMENT",
+            "candle_index": index,
+            "direction": direction,
+        }
+
+    def test_bullish_ob_is_last_bearish_before_displacement(self):
+        candles = [
+            self.candle(0, 100, 102, 99, 101),
+            self.candle(1, 101, 102, 98, 99),
+            self.candle(2, 99, 105, 99, 104),
+        ]
+        event = main.latest_confirmed_order_block(
+            candles, self.displacement(2, "BULLISH")
+        )
+        self.assertEqual(event["direction"], "BULLISH")
+        self.assertEqual(event["order_block_index"], 1)
+        self.assertEqual((event["zone_low"], event["zone_high"]), (98.0, 102.0))
+
+    def test_bearish_ob_is_last_bullish_before_displacement(self):
+        candles = [
+            self.candle(0, 100, 102, 99, 99.5),
+            self.candle(1, 99.5, 103, 99, 102),
+            self.candle(2, 102, 102, 95, 96),
+        ]
+        event = main.latest_confirmed_order_block(
+            candles, self.displacement(2, "BEARISH")
+        )
+        self.assertEqual(event["direction"], "BEARISH")
+        self.assertEqual(event["order_block_index"], 1)
+
+    def test_requires_confirmed_displacement(self):
+        candles = [self.candle(0, 100, 101, 99, 100)]
+        self.assertIsNone(main.latest_confirmed_order_block(candles, {}))
+
+    def test_rejects_unknown_displacement_direction(self):
+        candles = [self.candle(0, 100, 101, 99, 100)] * 2
+        event = main.latest_confirmed_order_block(
+            candles, self.displacement(1, "RANGE")
+        )
+        self.assertIsNone(event)
+
+    def test_rejects_displacement_index_outside_candles(self):
+        candles = [self.candle(0, 100, 101, 99, 100)]
+        event = main.latest_confirmed_order_block(
+            candles, self.displacement(5, "BULLISH")
+        )
+        self.assertIsNone(event)
+
+    def test_no_opposite_candle_returns_none(self):
+        candles = [
+            self.candle(0, 100, 102, 99, 101),
+            self.candle(1, 101, 103, 100, 102),
+            self.candle(2, 102, 106, 102, 105),
+        ]
+        event = main.latest_confirmed_order_block(
+            candles, self.displacement(2, "BULLISH")
+        )
+        self.assertIsNone(event)
+
+    def test_search_is_bounded_to_five_prior_candles(self):
+        candles = [self.candle(0, 101, 102, 99, 100)]
+        candles += [self.candle(i, 100, 102, 99, 101) for i in range(1, 7)]
+        event = main.latest_confirmed_order_block(
+            candles, self.displacement(6, "BULLISH")
+        )
+        self.assertIsNone(event)
+
+    def test_new_order_block_starts_fresh(self):
+        candles = [
+            self.candle(0, 101, 102, 99, 100),
+            self.candle(1, 100, 106, 100, 105),
+        ]
+        event = main.latest_confirmed_order_block(
+            candles, self.displacement(1, "BULLISH")
+        )
+        self.assertEqual(event["state"], "FRESH")
+
+    def test_bullish_overlap_marks_retested(self):
+        candles = [
+            self.candle(0, 101, 102, 99, 100),
+            self.candle(1, 100, 106, 100, 105),
+            self.candle(2, 105, 106, 101, 104),
+        ]
+        event = main.latest_confirmed_order_block(
+            candles, self.displacement(1, "BULLISH")
+        )
+        self.assertEqual(event["state"], "RETESTED")
+        self.assertEqual(event["retest_index"], 2)
+
+    def test_bearish_overlap_marks_retested(self):
+        candles = [
+            self.candle(0, 99, 102, 98, 101),
+            self.candle(1, 101, 101, 94, 95),
+            self.candle(2, 95, 99, 94, 96),
+        ]
+        event = main.latest_confirmed_order_block(
+            candles, self.displacement(1, "BEARISH")
+        )
+        self.assertEqual(event["state"], "RETESTED")
+
+    def test_bullish_close_below_zone_invalidates(self):
+        candles = [
+            self.candle(0, 101, 102, 99, 100),
+            self.candle(1, 100, 106, 100, 105),
+            self.candle(2, 105, 106, 98, 98.5),
+        ]
+        event = main.latest_confirmed_order_block(
+            candles, self.displacement(1, "BULLISH")
+        )
+        self.assertEqual(event["state"], "INVALIDATED")
+        self.assertEqual(event["invalidation_index"], 2)
+
+    def test_bearish_close_above_zone_invalidates(self):
+        candles = [
+            self.candle(0, 99, 102, 98, 101),
+            self.candle(1, 101, 101, 94, 95),
+            self.candle(2, 95, 103, 94, 102.5),
+        ]
+        event = main.latest_confirmed_order_block(
+            candles, self.displacement(1, "BEARISH")
+        )
+        self.assertEqual(event["state"], "INVALIDATED")
+
+    def test_invalidation_has_priority_over_retest(self):
+        candles = [
+            self.candle(0, 101, 102, 99, 100),
+            self.candle(1, 100, 106, 100, 105),
+            self.candle(2, 105, 106, 98, 98.5),
+        ]
+        event = main.latest_confirmed_order_block(
+            candles, self.displacement(1, "BULLISH")
+        )
+        self.assertEqual(event["state"], "INVALIDATED")
+        self.assertIsNone(event["retest_index"])
+
+    def test_detector_exposes_server_order_block(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn("latest_confirmed_order_block", source)
+        self.assertIn('"order_block": order_block', source)
+
+    def test_orchestrator_status_names_server_order_block(self):
+        source = inspect.getsource(main.get_auto_entry_orchestrator_status)
+        self.assertIn(
+            '"order_block_detection": "SERVER_ORDER_BLOCK_V1"', source
+        )
+
+    def test_order_block_does_not_enable_auto_entry(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"auto_queue": False', source)
+
+    def test_ui_marks_server_order_block_detector(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("SERVER DETECTOR · ORDER BLOCK V1", html)

@@ -2289,6 +2289,77 @@ def latest_confirmed_order_block(
     }
 
 
+def latest_confirmed_revalidation(
+    candles: List[Candle],
+    order_block: Optional[Dict[str, object]],
+    fvg: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """Revalidate a confirmed Order Block after its first closed-candle retest.
+
+    Revalidation is deliberately conservative: the OB must already be RETESTED,
+    the retest candle must still be inside the available closed VALID sequence,
+    and its close must reject through the OB midpoint in the expected direction.
+    A same-direction, non-mitigated FVG is exposed as confluence but is not
+    mandatory. This function never authorizes or queues an entry.
+    """
+    base: Dict[str, object] = {
+        "event": "REVALIDATION",
+        "state": "WAITING_RETEST",
+        "direction": None,
+        "retest_index": None,
+        "revalidation_index": None,
+        "fvg_confluence": False,
+    }
+    if not order_block or order_block.get("event") != "ORDER_BLOCK":
+        return base
+
+    direction = order_block.get("direction")
+    base["direction"] = direction
+    if direction not in {"BULLISH", "BEARISH"}:
+        base["state"] = "INVALIDATED"
+        return base
+    if order_block.get("state") == "INVALIDATED":
+        base["state"] = "INVALIDATED"
+        return base
+    if order_block.get("state") != "RETESTED":
+        return base
+
+    raw_retest = order_block.get("retest_index")
+    zone_low = order_block.get("zone_low")
+    zone_high = order_block.get("zone_high")
+    if (
+        not isinstance(raw_retest, int)
+        or raw_retest < 0
+        or raw_retest >= len(candles)
+        or not isinstance(zone_low, (int, float))
+        or not isinstance(zone_high, (int, float))
+        or zone_low >= zone_high
+    ):
+        base["state"] = "INVALIDATED"
+        return base
+
+    base["retest_index"] = raw_retest
+    retest = candles[raw_retest]
+    if retest.close is None or retest.low is None or retest.high is None:
+        return base
+    midpoint = (float(zone_low) + float(zone_high)) / 2.0
+    overlaps = retest.low <= float(zone_high) and retest.high >= float(zone_low)
+    rejected = (
+        direction == "BULLISH" and retest.close > midpoint
+    ) or (direction == "BEARISH" and retest.close < midpoint)
+    if not overlaps or not rejected:
+        base["state"] = "RETESTED_UNCONFIRMED"
+        return base
+
+    if fvg and fvg.get("event") == "FVG":
+        same_direction = fvg.get("direction") == direction
+        active_fvg = fvg.get("state") in {"OPEN", "PARTIALLY_MITIGATED"}
+        base["fvg_confluence"] = same_direction and active_fvg
+    base["state"] = "REVALIDATED"
+    base["revalidation_index"] = raw_retest
+    return base
+
+
 def structure_from_confirmed_swings(
     candles: List[Candle],
     swing_highs: List[int],
@@ -2391,6 +2462,7 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
     displacement = latest_confirmed_displacement(closed)
     fvg = latest_confirmed_fvg(closed)
     order_block = latest_confirmed_order_block(closed, displacement)
+    revalidation = latest_confirmed_revalidation(closed, order_block, fvg)
     latest = closed[-1]
     return {
         "status": "READY",
@@ -2402,11 +2474,12 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
         "setup_state": "WAIT",
         "auto_queue": False,
-        "smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_V1",
+        "smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_RETEST_V1",
         "liquidity_sweep": liquidity_sweep or {"event": "NONE", "direction": None},
         "displacement": displacement or {"event": "NONE", "direction": None},
         "fvg": fvg or {"event": "NONE", "direction": None},
         "order_block": order_block or {"event": "NONE", "direction": None},
+        "revalidation": revalidation,
     }
 
 
@@ -2565,6 +2638,7 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "displacement_detection": "SERVER_DISPLACEMENT_V1",
         "fvg_detection": "SERVER_FVG_V1",
         "order_block_detection": "SERVER_ORDER_BLOCK_V1",
+        "retest_revalidation": "SERVER_RETEST_REVALIDATION_V1",
         "smc_auto_candidate_generation": "NOT_IMPLEMENTED",
         "paper_only": True,
         "execution": False,

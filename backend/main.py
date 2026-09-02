@@ -124,6 +124,9 @@ class Settings(BaseSettings):
     candle_finalization_margin_seconds: float = 0.0
     db_read_max_rows: int = 1000
 
+    # Paper monitor. One second matches the backend-to-frontend realtime cadence.
+    paper_monitor_interval_seconds: float = 1.0
+
     # Massive (ex-Polygon) Forex REST. api_key empty by default: no calls happen
     # until an officially-verified symbol mapping is registered (never deduced).
     massive_api_key: str = ""
@@ -1610,6 +1613,21 @@ async def monitor_open_paper_positions_once() -> Dict[str, int]:
         await mark_paper_position(row._mapping["position_id"], mark)
         marked += 1
     return {"checked": len(rows), "marked": marked, "unavailable": unavailable}
+
+
+async def paper_monitor_loop(stop_event: asyncio.Event) -> None:
+    interval = max(settings.paper_monitor_interval_seconds, 1.0)
+    while not stop_event.is_set():
+        try:
+            await monitor_open_paper_positions_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - loop must fail safe and keep serving
+            log.error("Paper monitor iteration failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
 
 
 def evaluate_paper_close(side: str, price: Decimal, stop_loss: Decimal,
@@ -4480,9 +4498,18 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001 - explicit, never a silent false success
         persistence_state.mark_init_failed(str(exc))
         log.error("Candle schema init failed; persistence UNAVAILABLE: %s", exc)
+    paper_monitor_stop = asyncio.Event()
+    paper_monitor_task = asyncio.create_task(
+        paper_monitor_loop(paper_monitor_stop), name="paper-monitor"
+    )
     try:
         yield
     finally:
+        paper_monitor_stop.set()
+        try:
+            await paper_monitor_task
+        except asyncio.CancelledError:
+            pass
         await massive_indices_ws.stop()
         await twelvedata_gold_ws.stop()
         await massive_forex_ws.stop()

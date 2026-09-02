@@ -1864,6 +1864,151 @@ async def verified_auto_paper_entry(
     }
 
 
+SERVER_SETUP_GRANULARITY = "5m"
+SERVER_SETUP_CANDLE_LIMIT = 120
+SERVER_SWING_STRENGTH = 2
+
+
+def closed_valid_candles(candles: List[Candle], now: datetime) -> List[Candle]:
+    bucket_seconds = GRANULARITIES[SERVER_SETUP_GRANULARITY][1]
+    result: List[Candle] = []
+    for candle in candles:
+        if (
+            candle.start is None
+            or candle.status != DataQualityStatus.VALID
+            or candle.open is None
+            or candle.high is None
+            or candle.low is None
+            or candle.close is None
+        ):
+            continue
+        if candle.start + timedelta(seconds=bucket_seconds) > now:
+            continue
+        result.append(candle)
+    return sorted(result, key=lambda item: item.start or datetime.min.replace(tzinfo=timezone.utc))
+
+
+def confirmed_swing_indexes(
+    candles: List[Candle], strength: int = SERVER_SWING_STRENGTH
+) -> Tuple[List[int], List[int]]:
+    highs: List[int] = []
+    lows: List[int] = []
+    if strength < 1:
+        return highs, lows
+    for index in range(strength, len(candles) - strength):
+        high = candles[index].high
+        low = candles[index].low
+        if high is None or low is None:
+            continue
+        neighbors = range(index - strength, index + strength + 1)
+        if all(
+            offset == index
+            or (candles[offset].high is not None and high > candles[offset].high)
+            for offset in neighbors
+        ):
+            highs.append(index)
+        if all(
+            offset == index
+            or (candles[offset].low is not None and low < candles[offset].low)
+            for offset in neighbors
+        ):
+            lows.append(index)
+    return highs, lows
+
+
+def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict[str, object]:
+    closed = closed_valid_candles(candles, now)
+    if len(closed) < SERVER_SWING_STRENGTH * 2 + 3:
+        return {"status": "WAIT", "reason": "INSUFFICIENT_CLOSED_CANDLES"}
+    highs, lows = confirmed_swing_indexes(closed)
+    if len(highs) < 2 or len(lows) < 2:
+        return {"status": "WAIT", "reason": "INSUFFICIENT_CONFIRMED_SWINGS"}
+
+    high_a = closed[highs[-2]].high
+    high_b = closed[highs[-1]].high
+    low_a = closed[lows[-2]].low
+    low_b = closed[lows[-1]].low
+    if high_a is None or high_b is None or low_a is None or low_b is None:
+        return {"status": "WAIT", "reason": "SWING_VALUE_MISSING"}
+
+    if high_b > high_a and low_b > low_a:
+        structure = "BULLISH"
+    elif high_b < high_a and low_b < low_a:
+        structure = "BEARISH"
+    else:
+        structure = "RANGE"
+
+    latest = closed[-1]
+    return {
+        "status": "READY",
+        "structure": structure,
+        "closed_candles": len(closed),
+        "confirmed_swing_highs": len(highs),
+        "confirmed_swing_lows": len(lows),
+        "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
+        "setup_state": "WAIT",
+        "auto_queue": False,
+        "smc_confirmation": "NOT_IMPLEMENTED",
+    }
+
+
+@api_router.get("/paper/auto-entry/detector/{symbol}")
+async def get_server_market_setup_detector(symbol: str) -> Dict[str, object]:
+    canonical = symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    if instrument is None:
+        return {
+            "status": "UNAVAILABLE",
+            "symbol": canonical,
+            "reason": "INSTRUMENT_NOT_REGISTERED",
+            "auto_queue": False,
+        }
+    if instrument.asset_class != AssetClass.CRYPTO:
+        return {
+            "status": "NOT_SUPPORTED",
+            "symbol": canonical,
+            "reason": "SERVER_CANDLE_DETECTOR_CRYPTO_ONLY",
+            "auto_queue": False,
+        }
+    provider_symbol = provider_symbol_map.to_provider("coinbase", canonical)
+    if provider_symbol is None:
+        return {
+            "status": "UNAVAILABLE",
+            "symbol": canonical,
+            "reason": "PROVIDER_SYMBOL_NOT_MAPPED",
+            "auto_queue": False,
+        }
+    try:
+        candles, quality = await market_provider.get_candles(
+            provider_symbol,
+            SERVER_SETUP_GRANULARITY,
+            SERVER_SETUP_CANDLE_LIMIT,
+        )
+    except (httpx.HTTPError, ValueError):
+        return {
+            "status": "UNAVAILABLE",
+            "symbol": canonical,
+            "reason": "CANDLES_UNAVAILABLE",
+            "auto_queue": False,
+        }
+    if quality != DataQualityStatus.VALID:
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "reason": "CANDLES_NOT_VALID",
+            "quality": quality.value,
+            "auto_queue": False,
+        }
+    result = detect_server_market_structure(candles, utcnow())
+    return {
+        **result,
+        "symbol": canonical,
+        "source": "coinbase",
+        "granularity": SERVER_SETUP_GRANULARITY,
+        "quality": quality.value,
+    }
+
+
 AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS = 5.0
 auto_entry_candidates: Dict[str, AutoEntryCandidateState] = {}
 auto_entry_orchestrator_task: Optional[asyncio.Task] = None
@@ -1957,7 +2102,8 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "status": "RUNNING" if task is not None and not task.done() else "STOPPED",
         "queued_candidates": len(auto_entry_candidates),
         "interval_seconds": AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS,
-        "market_setup_detection": "NOT_IMPLEMENTED",
+        "market_setup_detection": "STRUCTURE_V1",
+        "smc_auto_candidate_generation": "NOT_IMPLEMENTED",
         "paper_only": True,
         "execution": False,
     }

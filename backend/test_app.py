@@ -4498,6 +4498,7 @@ class TestPaperTradingUiV16I(unittest.TestCase):
     def test_paper_account_uses_persisted_positions(self):
         source = inspect.getsource(main.get_paper_account)
         self.assertIn("FROM paper_positions", source)
+        self.assertIn("FROM paper_account", source)
 
     def test_paper_account_calculates_realized_pnl(self):
         source = inspect.getsource(main.get_paper_account)
@@ -4662,3 +4663,58 @@ class TestPaperTradingMobileRenderV16J1(unittest.TestCase):
     def test_backend_is_unchanged_for_ui_fix(self):
         paths = {route.path for route in main.api_router.routes}
         self.assertIn("/paper/positions/live", paths)
+
+
+class TestPaperAccountInitializationV16K(unittest.TestCase):
+    def test_account_table_exists(self):
+        self.assertEqual(main.paper_account_table.name, "paper_account")
+
+    def test_account_has_stable_default_id(self):
+        self.assertEqual(main.PAPER_ACCOUNT_ID, "default")
+
+    def test_account_currency_is_usd(self):
+        self.assertEqual(main.PAPER_ACCOUNT_CURRENCY, "USD")
+
+    def test_initial_capital_is_decimal_1000(self):
+        self.assertEqual(main.PAPER_INITIAL_CAPITAL, Decimal("1000"))
+
+    def test_schema_initializes_account(self):
+        source = inspect.getsource(main.init_candle_schema)
+        self.assertIn("pg_insert(paper_account_table)", source)
+
+    def test_account_initialization_is_idempotent(self):
+        source = inspect.getsource(main.init_candle_schema)
+        self.assertIn("on_conflict_do_nothing", source)
+
+    def test_account_initialization_does_not_reset_existing_capital(self):
+        source = inspect.getsource(main.init_candle_schema)
+        self.assertNotIn("on_conflict_do_update", source)
+
+    def test_account_endpoint_reads_persisted_initial_capital(self):
+        source = inspect.getsource(main.get_paper_account)
+        self.assertIn("initial_capital FROM paper_account", source)
+
+    def test_account_endpoint_has_no_position_capital_fallback(self):
+        source = inspect.getsource(main.get_paper_account)
+        self.assertNotIn('data["capital_before"]', source)
+
+    def test_current_capital_adds_realized_pnl(self):
+        source = inspect.getsource(main.get_paper_account)
+        self.assertIn("current_capital = initial_capital + realized", source)
+
+    def test_empty_account_is_fail_safe(self):
+        source = inspect.getsource(main.get_paper_account)
+        self.assertIn("paper account not initialized", source)
+
+    def test_account_response_exposes_currency(self):
+        source = inspect.getsource(main.get_paper_account)
+        self.assertIn('"currency": account._mapping["currency"]', source)
+
+    def test_ui_documents_persistent_1000_usd_account(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("initialisé une seule fois en PostgreSQL avec 1 000 USD", html)
+
+    def test_account_remains_paper_only(self):
+        source = inspect.getsource(main.get_paper_account)
+        self.assertIn('"paper_only": True', source)
+        self.assertIn('"execution": False', source)

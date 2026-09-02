@@ -496,6 +496,10 @@ class CoinbaseProvider:
         payload = await self._get(f"/market/products/{symbol}/ticker")
         return ticker_datum_from_payload(symbol, payload)
 
+    async def get_product_specs(self, symbol: str) -> dict:
+        symbol = symbol.upper()
+        return await self._get(f"/market/products/{symbol}")
+
     async def get_candles(self, symbol: str, granularity: str, limit: int = CANDLE_MAX_LIMIT):
         """Fetch qualified candles from Coinbase Advanced Trade (public, no auth).
         Verified params: granularity string enum + start/end UNIX seconds, max 350."""
@@ -1566,6 +1570,82 @@ def paper_position_to_dict(row: Any) -> Dict[str, object]:
     return data
 
 
+def parse_coinbase_spot_specs(symbol: str, payload: dict) -> Dict[str, object]:
+    required = (
+        "base_increment",
+        "quote_increment",
+        "base_min_size",
+        "base_max_size",
+        "quote_min_size",
+        "quote_max_size",
+    )
+    values: Dict[str, Decimal] = {}
+    try:
+        for key in required:
+            value = Decimal(str(payload[key]))
+            if value <= 0:
+                raise ValueError(key)
+            values[key] = value
+    except (KeyError, ValueError, ArithmeticError):
+        return {
+            "status": "INVALID",
+            "symbol": symbol,
+            "source": "coinbase_public_product",
+            "source_timestamp": None,
+        }
+
+    return {
+        "status": "VALID",
+        "symbol": symbol,
+        "asset_class": "CRYPTO",
+        "sizing_mode": "BASE_UNITS",
+        **{key: str(value) for key, value in values.items()},
+        "source": "coinbase_public_product",
+        "source_timestamp": None,
+    }
+
+
+@api_router.get("/paper/instrument-specs/{symbol}")
+async def get_paper_instrument_specs(symbol: str) -> Dict[str, object]:
+    canonical = symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    observed_at = utcnow()
+    if instrument is None:
+        return {
+            "status": "UNAVAILABLE",
+            "symbol": canonical,
+            "reason": "INSTRUMENT_NOT_REGISTERED",
+            "observed_at": observed_at.isoformat(),
+        }
+    if instrument.asset_class != AssetClass.CRYPTO:
+        return {
+            "status": "NOT_SUPPORTED",
+            "symbol": canonical,
+            "reason": "VERIFIED_SIZING_SOURCE_NOT_IMPLEMENTED",
+            "observed_at": observed_at.isoformat(),
+        }
+    provider_symbol = provider_symbol_map.to_provider("coinbase", canonical)
+    if provider_symbol is None:
+        return {
+            "status": "UNAVAILABLE",
+            "symbol": canonical,
+            "reason": "PROVIDER_SYMBOL_NOT_MAPPED",
+            "observed_at": observed_at.isoformat(),
+        }
+    try:
+        payload = await coinbase.get_product_specs(provider_symbol)
+    except (httpx.HTTPError, ValueError):
+        return {
+            "status": "UNAVAILABLE",
+            "symbol": canonical,
+            "reason": "PROVIDER_UNAVAILABLE",
+            "observed_at": observed_at.isoformat(),
+        }
+    specs = parse_coinbase_spot_specs(canonical, payload)
+    specs["observed_at"] = observed_at.isoformat()
+    return specs
+
+
 def evaluate_server_signal(req: ServerSignalRequest) -> Dict[str, object]:
     canonical = req.symbol.upper().replace("/", "-")
     reasons: List[str] = []
@@ -1659,7 +1739,7 @@ async def evaluate_paper_auto_entry_gate(
     # The backend registry intentionally contains no invented broker sizing rules.
     # Auto entry stays blocked until source/timestamp + volume/tick/contract rules
     # are represented and verified server-side for the selected instrument.
-    blockers.append("SERVER_INSTRUMENT_SPECS_NOT_IMPLEMENTED")
+    blockers.append("SERVER_INSTRUMENT_SPECS_REQUIRED")
 
     return {
         "status": "BLOCKED",

@@ -47,6 +47,12 @@ button{font:inherit;color:inherit}
 /* COMMON */
 main{max-width:1180px;margin:auto;padding:11px 10px 20px}
 .view{display:none}.view.active{display:block;animation:fade .14s ease}@keyframes fade{from{opacity:.55}to{opacity:1}}
+
+body.workspace-mode .market-tabs-wrap{display:none}
+body.workspace-mode main{padding-top:14px}
+.paper-shell{min-height:320px}
+.paper-render-error{padding:18px;border:1px solid #743944;border-radius:14px;
+ background:#251017;color:#ffb4bd;font-size:11px;line-height:1.5}
 .card{background:linear-gradient(180deg,rgba(7,17,29,.98),rgba(4,11,20,.99));border:1px solid #203149;border-radius:14px;
  box-shadow:0 12px 34px rgba(0,0,0,.28);overflow:hidden}
 .section{font-size:11px;color:#aeb8c8;text-transform:uppercase;letter-spacing:.72px;margin:3px 2px 8px}
@@ -695,10 +701,11 @@ function renderSignals(){
     placeholder("Historique indisponible","Chaque signal futur conservera timestamp, stratégie/version, régime, confirmations et résultat.")));
 }
 
-function renderTrading(){
+function renderTradingContent(){
   var v=byId("view-trading");clear(v),a=paperUiState.account;
   v.appendChild(pageHead("Paper Trading",
     "Compte virtuel persistant, positions ouvertes et historique réel du moteur paper.","PAPER ONLY"));
+  v.setAttribute("data-paper-rendered","true");
   v.appendChild(h("div",{class:"subtabs"},[
     h("button",{class:"subtab active"},["Compte"]),
     h("button",{class:"subtab"},["Positions"]),
@@ -738,6 +745,25 @@ function renderTrading(){
       h("b",{},[paperUiState.updatedAt||"—"])])
   ])));
   if(!paperUiState.loading&&!paperUiState.updatedAt)refreshPaperTrading();
+}
+
+
+function renderTrading(){
+  var v=byId("view-trading");
+  if(!v)return;
+  v.classList.add("paper-shell");
+  try{
+    renderTradingContent();
+  }catch(err){
+    clear(v);
+    v.appendChild(pageHead("Paper Trading",
+      "Compte virtuel persistant et positions paper.","PAPER ONLY"));
+    v.appendChild(h("div",{class:"paper-render-error"},[
+      h("b",{},["Affichage Paper Trading indisponible"]),
+      h("div",{},["Le rendu a rencontré une erreur locale. Aucune donnée n’a été inventée."]),
+      h("div",{},[String(err&&err.message||err||"UNKNOWN")])
+    ]));
+  }
 }
 
 function renderStrategies(){
@@ -1525,7 +1551,7 @@ var BOTTOM=[
  {id:"settings",label:"Réglages",icon:"⚙"}
 ];
 function buildNav(){var n=byId("nav");clear(n);BOTTOM.forEach(function(x){n.appendChild(h("button",{"data-view":x.id,onclick:function(){setView(x.id)}},[h("span",{class:"ic"},[x.icon]),x.label]))})}
-function setView(id){current=id;document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading")renderTrading();else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
+function setView(id){current=id;var workspace=["signals","trading","strategies","intelligence","settings"].includes(id);document.body.classList.toggle("workspace-mode",workspace);document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading")renderTrading();else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
 function poll(){refreshHealth();if(current==="dashboard")refreshDashboard();else if(current==="markets")refreshMarkets();else if(current==="forex")refreshForexMarket();else if(current==="system")renderSystem();else if(current==="trading")refreshPaperTrading();else if(current==="detail")refreshDetail()}
 buildNav();refreshHealth();setView("dashboard");startCryptoRealtime();setInterval(poll,POLL_MS);setInterval(refreshCryptoRealtime,REALTIME_POLL_MS);setInterval(refreshForexRealtime,REALTIME_POLL_MS);setInterval(refreshGoldRealtime,REALTIME_POLL_MS);setInterval(refreshIndexRealtime,REALTIME_POLL_MS);
 

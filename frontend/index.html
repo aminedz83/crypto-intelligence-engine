@@ -702,7 +702,9 @@ function renderSignals(){
 }
 
 function renderTradingContent(){
-  var v=byId("view-trading");clear(v),a=paperUiState.account;
+  var v=byId("view-trading");
+  clear(v);
+  var a=paperUiState.account;
   v.appendChild(pageHead("Paper Trading",
     "Compte virtuel persistant, positions ouvertes et historique réel du moteur paper.","PAPER ONLY"));
   v.setAttribute("data-paper-rendered","true");

@@ -5194,7 +5194,7 @@ class TestAutoEntryOrchestratorV16M5A(unittest.TestCase):
 
     def test_detector_gap_is_explicit(self):
         source = inspect.getsource(main.get_auto_entry_orchestrator_status)
-        self.assertIn('"market_setup_detection": "NOT_IMPLEMENTED"', source)
+        self.assertIn('"market_setup_detection": "STRUCTURE_V1"', source)
 
     def test_lifespan_starts_orchestrator(self):
         source = inspect.getsource(main.lifespan)
@@ -5211,3 +5211,108 @@ class TestAutoEntryOrchestratorV16M5A(unittest.TestCase):
     def test_ui_marks_orchestrator_active(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("AUTO ORCHESTRATOR V1", html)
+
+
+class TestServerMarketSetupDetectorV16M5B1(unittest.TestCase):
+    def candle(self, minute, high, low, close=None):
+        start = datetime(2026, 1, 1, 0, minute, tzinfo=timezone.utc)
+        return main.Candle(
+            start=start,
+            low=float(low),
+            high=float(high),
+            open=float(close if close is not None else low),
+            close=float(close if close is not None else high),
+            volume=1.0,
+            status=main.DataQualityStatus.VALID,
+        )
+
+    def test_detector_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/paper/auto-entry/detector/{symbol}", paths)
+
+    def test_detector_uses_real_coinbase_candles(self):
+        source = inspect.getsource(main.get_server_market_setup_detector)
+        self.assertIn("market_provider.get_candles", source)
+
+    def test_detector_granularity_is_5m(self):
+        self.assertEqual(main.SERVER_SETUP_GRANULARITY, "5m")
+
+    def test_swing_strength_is_two(self):
+        self.assertEqual(main.SERVER_SWING_STRENGTH, 2)
+
+    def test_open_candle_is_excluded(self):
+        candles = [self.candle(0, 10, 5), self.candle(5, 11, 6)]
+        now = datetime(2026, 1, 1, 0, 7, tzinfo=timezone.utc)
+        closed = main.closed_valid_candles(candles, now)
+        self.assertEqual(len(closed), 1)
+
+    def test_invalid_candle_is_excluded(self):
+        candle = self.candle(0, 10, 5)
+        invalid = main.Candle(
+            start=candle.start,
+            low=candle.low,
+            high=candle.high,
+            open=candle.open,
+            close=candle.close,
+            volume=candle.volume,
+            status=main.DataQualityStatus.INVALID,
+        )
+        now = datetime(2026, 1, 1, 0, 10, tzinfo=timezone.utc)
+        self.assertEqual(main.closed_valid_candles([invalid], now), [])
+
+    def test_swing_high_requires_strict_neighbors(self):
+        candles = [
+            self.candle(0, 10, 5), self.candle(5, 11, 5),
+            self.candle(10, 15, 5), self.candle(15, 11, 5),
+            self.candle(20, 10, 5),
+        ]
+        highs, _ = main.confirmed_swing_indexes(candles)
+        self.assertEqual(highs, [2])
+
+    def test_swing_low_requires_strict_neighbors(self):
+        candles = [
+            self.candle(0, 10, 5), self.candle(5, 10, 4),
+            self.candle(10, 10, 1), self.candle(15, 10, 4),
+            self.candle(20, 10, 5),
+        ]
+        _, lows = main.confirmed_swing_indexes(candles)
+        self.assertEqual(lows, [2])
+
+    def test_equal_high_is_not_confirmed_swing(self):
+        candles = [
+            self.candle(0, 10, 5), self.candle(5, 15, 5),
+            self.candle(10, 15, 5), self.candle(15, 11, 5),
+            self.candle(20, 10, 5),
+        ]
+        highs, _ = main.confirmed_swing_indexes(candles)
+        self.assertEqual(highs, [])
+
+    def test_insufficient_candles_waits(self):
+        now = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+        result = main.detect_server_market_structure([], now)
+        self.assertEqual(result["status"], "WAIT")
+
+    def test_detector_never_auto_queues_in_b1(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn('"auto_queue": False', source)
+
+    def test_full_smc_is_explicitly_not_implemented(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn('"smc_confirmation": "NOT_IMPLEMENTED"', source)
+
+    def test_non_crypto_is_not_supported(self):
+        source = inspect.getsource(main.get_server_market_setup_detector)
+        self.assertIn("SERVER_CANDLE_DETECTOR_CRYPTO_ONLY", source)
+
+    def test_provider_failure_is_unavailable(self):
+        source = inspect.getsource(main.get_server_market_setup_detector)
+        self.assertIn("CANDLES_UNAVAILABLE", source)
+
+    def test_ui_marks_structure_detector(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("SERVER DETECTOR · STRUCTURE V1", html)
+
+    def test_ui_discloses_remaining_smc_work(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("CHoCH", html)
+        self.assertIn("Order Block", html)

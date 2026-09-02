@@ -3745,23 +3745,26 @@ class TestChartEngineV11SmcStateMachine(unittest.TestCase):
     def test_ssl_sweep_maps_to_bullish_direction(self):
         self.assertIn('s.type==="SELL_SIDE"?"BULLISH":"BEARISH"', self.html)
 
-    def test_state_machine_starts_at_liquidity_sweep(self):
-        self.assertIn('state="LIQUIDITY_SWEEP"', self.html)
+    def test_state_machine_starts_waiting_after_liquidity_sweep(self):
+        self.assertIn('state="WAIT",reason="WAIT_DISPLACEMENT"', self.html)
 
-    def test_state_machine_advances_to_displacement(self):
-        self.assertIn('if(disp)state="DISPLACEMENT"', self.html)
+    def test_displacement_advances_wait_reason_to_structure(self):
+        self.assertIn('if(disp){state="WAIT";reason="WAIT_STRUCTURE"}', self.html)
 
-    def test_state_machine_advances_to_structure_confirmation(self):
-        self.assertIn('state="STRUCTURE_CONFIRMED"', self.html)
+    def test_structure_advances_wait_reason_to_entry_zone(self):
+        self.assertIn('reason="WAIT_ENTRY_ZONE"', self.html)
 
-    def test_entry_zone_requires_order_block(self):
-        self.assertIn('else state="ENTRY_ZONE"', self.html)
+    def test_entry_lifecycle_requires_order_block(self):
+        self.assertIn("if(ob){", self.html)
+        self.assertIn('reason="WAIT_ENTRY_ZONE"', self.html)
 
-    def test_retested_state_comes_from_order_block_state(self):
-        self.assertIn('ob.state==="RETESTED")state="RETESTED"', self.html)
+    def test_retest_becomes_entry_now_only_on_closed_zone_touch(self):
+        self.assertIn('state="ENTRY_NOW";reason="OB_RETEST_CONFIRMED"', self.html)
+        self.assertIn("entryIndex=q", self.html)
 
-    def test_invalidated_state_comes_from_order_block_state(self):
-        self.assertIn('ob.state==="INVALIDATED")state="INVALIDATED"', self.html)
+    def test_invalidated_state_still_comes_from_order_block_state(self):
+        self.assertIn('if(ob.state==="INVALIDATED")', self.html)
+        self.assertIn('state="INVALIDATED";reason="OB_INVALIDATED"', self.html)
 
     def test_state_machine_excludes_latest_potentially_open_candle(self):
         self.assertIn("closedEnd=Math.max(0,cs.length-1)", self.html)
@@ -3769,8 +3772,8 @@ class TestChartEngineV11SmcStateMachine(unittest.TestCase):
     def test_fvg_is_recorded_as_optional_confirmation(self):
         self.assertIn("fvgConfirmed:Boolean(fvg)", self.html)
 
-    def test_methodology_says_entry_zone_is_not_execution(self):
-        self.assertIn("ne sont pas encore des ordres ni des signaux d’exécution", self.html)
+    def test_methodology_says_entry_now_is_not_execution(self):
+        self.assertIn("aucun ordre n’est envoyé", self.html)
 
     def test_smc_state_machine_ui_is_active(self):
         self.assertIn("SMC STATE MACHINE ACTIF", self.html)

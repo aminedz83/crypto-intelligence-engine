@@ -4609,3 +4609,54 @@ class TestPaperLivePnlV16J(unittest.TestCase):
     def test_ui_help_documents_valid_mark_gate(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("vrai mark multi-actifs qualifié VALID", html)
+
+
+class TestPaperTradingMobileRenderV16J1(unittest.TestCase):
+    def test_trading_renderer_has_safe_wrapper(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("function renderTradingContent()", html)
+        self.assertIn("function renderTrading()", html)
+
+    def test_trading_renderer_catches_local_render_error(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("Affichage Paper Trading indisponible", html)
+
+    def test_trading_renderer_never_fails_to_blank_silently(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("Aucune donnée n’a été inventée", html)
+
+    def test_trading_view_gets_render_marker(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('data-paper-rendered","true"', html)
+
+    def test_workspace_mode_exists(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("workspace-mode", html)
+
+    def test_workspace_mode_hides_market_tabs(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("body.workspace-mode .market-tabs-wrap{display:none}", html)
+
+    def test_trading_is_classified_as_workspace(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('"signals","trading","strategies","intelligence","settings"', html)
+
+    def test_set_view_toggles_workspace_mode(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('document.body.classList.toggle("workspace-mode",workspace)', html)
+
+    def test_paper_shell_has_mobile_minimum_height(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn(".paper-shell{min-height:320px}", html)
+
+    def test_bottom_nav_still_targets_trading(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('{id:"trading",label:"Trading"', html)
+
+    def test_live_pnl_endpoint_remains_used(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('api("/api/v1/paper/positions/live")', html)
+
+    def test_backend_is_unchanged_for_ui_fix(self):
+        source = MAIN.read_text(encoding="utf-8")
+        self.assertIn('@api_router.get("/paper/positions/live")', source)

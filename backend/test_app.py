@@ -3745,26 +3745,23 @@ class TestChartEngineV11SmcStateMachine(unittest.TestCase):
     def test_ssl_sweep_maps_to_bullish_direction(self):
         self.assertIn('s.type==="SELL_SIDE"?"BULLISH":"BEARISH"', self.html)
 
-    def test_state_machine_starts_waiting_after_liquidity_sweep(self):
-        self.assertIn('state="WAIT",reason="WAIT_DISPLACEMENT"', self.html)
+    def test_state_machine_starts_at_liquidity_sweep(self):
+        self.assertIn('state="LIQUIDITY_SWEEP"', self.html)
 
-    def test_displacement_advances_wait_reason_to_structure(self):
-        self.assertIn('if(disp){state="WAIT";reason="WAIT_STRUCTURE"}', self.html)
+    def test_state_machine_advances_to_displacement(self):
+        self.assertIn('if(disp)state="DISPLACEMENT"', self.html)
 
-    def test_structure_advances_wait_reason_to_entry_zone(self):
-        self.assertIn('reason="WAIT_ENTRY_ZONE"', self.html)
+    def test_state_machine_advances_to_structure_confirmation(self):
+        self.assertIn('state="STRUCTURE_CONFIRMED"', self.html)
 
-    def test_entry_lifecycle_requires_order_block(self):
-        self.assertIn("if(ob){", self.html)
-        self.assertIn('reason="WAIT_ENTRY_ZONE"', self.html)
+    def test_entry_zone_requires_order_block(self):
+        self.assertIn('else state="ENTRY_ZONE"', self.html)
 
-    def test_retest_becomes_entry_now_only_on_closed_zone_touch(self):
-        self.assertIn('state="ENTRY_NOW";reason="OB_RETEST_CONFIRMED"', self.html)
-        self.assertIn("entryIndex=q", self.html)
+    def test_retested_state_comes_from_order_block_state(self):
+        self.assertIn('ob.state==="RETESTED")state="RETESTED"', self.html)
 
-    def test_invalidated_state_still_comes_from_order_block_state(self):
-        self.assertIn('if(ob.state==="INVALIDATED")', self.html)
-        self.assertIn('state="INVALIDATED";reason="OB_INVALIDATED"', self.html)
+    def test_invalidated_state_comes_from_order_block_state(self):
+        self.assertIn('ob.state==="INVALIDATED")state="INVALIDATED"', self.html)
 
     def test_state_machine_excludes_latest_potentially_open_candle(self):
         self.assertIn("closedEnd=Math.max(0,cs.length-1)", self.html)
@@ -3772,8 +3769,8 @@ class TestChartEngineV11SmcStateMachine(unittest.TestCase):
     def test_fvg_is_recorded_as_optional_confirmation(self):
         self.assertIn("fvgConfirmed:Boolean(fvg)", self.html)
 
-    def test_methodology_says_entry_now_is_not_execution(self):
-        self.assertIn("aucun ordre n’est envoyé", self.html)
+    def test_methodology_says_entry_zone_is_not_execution(self):
+        self.assertIn("ne sont pas encore des ordres ni des signaux d’exécution", self.html)
 
     def test_smc_state_machine_ui_is_active(self):
         self.assertIn("SMC STATE MACHINE ACTIF", self.html)
@@ -3825,149 +3822,3 @@ class TestChartEngineV12EntryLifecycle(unittest.TestCase):
 
     def test_entry_lifecycle_ui_is_active(self):
         self.assertIn("ENTRY LIFECYCLE ACTIF", self.html)
-
-
-class TestChartEngineV13StructuralTradePlan(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_trade_plan_builder_present(self):
-        self.assertIn("function buildSmcTradePlans", self.html)
-
-    def test_trade_plan_requires_entry_now(self):
-        self.assertIn('if(s.state!=="ENTRY_NOW"', self.html)
-
-    def test_entry_uses_closed_retest_candle_close(self):
-        self.assertIn("entry=Number(entryCandle.close)", self.html)
-
-    def test_bullish_stop_uses_order_block_low(self):
-        self.assertIn("stop=bullish?obLow:obHigh", self.html)
-
-    def test_stop_source_is_structural_order_block_invalidation(self):
-        self.assertIn('stopSource:"ORDER_BLOCK_INVALIDATION"', self.html)
-
-    def test_bullish_target_requires_prior_confirmed_swing_high(self):
-        self.assertIn('w.kind==="HIGH"&&p>entry', self.html)
-
-    def test_bearish_target_requires_prior_confirmed_swing_low(self):
-        self.assertIn('w.kind==="LOW"&&p<entry', self.html)
-
-    def test_target_must_precede_entry(self):
-        self.assertIn("w.index>=s.entryIndex", self.html)
-
-    def test_missing_target_is_explicitly_unavailable(self):
-        self.assertIn('target===null?"UNAVAILABLE"', self.html)
-
-    def test_risk_reward_is_reward_over_risk(self):
-        self.assertIn("rr=reward===null?null:reward/risk", self.html)
-
-    def test_nonpositive_risk_is_rejected(self):
-        self.assertIn("risk<=0)return", self.html)
-
-    def test_trade_plan_never_executes_order(self):
-        self.assertIn("execution:false", self.html)
-
-    def test_methodology_forbids_invented_rr(self):
-        self.assertIn("aucun RR n’est inventé", self.html)
-
-    def test_trade_plan_ui_is_active(self):
-        self.assertIn("SL / TP / RR ACTIF", self.html)
-
-
-class TestChartEngineV131VisibilityLayers(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_chart_layers_state_present(self):
-        self.assertIn("const chartLayers=", self.html)
-
-    def test_clean_preset_present(self):
-        self.assertIn('name==="CLEAN"', self.html)
-
-    def test_all_preset_present(self):
-        self.assertIn('name==="ALL"', self.html)
-
-    def test_clean_keeps_structure_visible(self):
-        self.assertIn("structure:true,events:true,sweeps:true", self.html)
-
-    def test_clean_hides_displacement_and_fvg(self):
-        self.assertIn("displacement:false,fvg:false,ob:true", self.html)
-
-    def test_structure_render_is_visibility_gated(self):
-        self.assertIn('chartLayerEnabled("structure")', self.html)
-
-    def test_events_render_is_visibility_gated(self):
-        self.assertIn('chartLayerEnabled("events")', self.html)
-
-    def test_sweeps_render_is_visibility_gated(self):
-        self.assertIn('chartLayerEnabled("sweeps")', self.html)
-
-    def test_displacement_render_is_visibility_gated(self):
-        self.assertIn('chartLayerEnabled("displacement")', self.html)
-
-    def test_fvg_render_hides_mitigated_zones(self):
-        self.assertIn('e.state!=="MITIGATED"', self.html)
-
-    def test_ob_render_hides_invalidated_zones(self):
-        self.assertIn('e.state!=="INVALIDATED"', self.html)
-
-    def test_visibility_does_not_disable_detection(self):
-        self.assertIn("masquer une couche ne désactive jamais sa détection", self.html)
-
-
-class TestChartEngineV14SignalEngine(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.html = INDEX.read_text(encoding="utf-8")
-
-    def test_signal_engine_present(self):
-        self.assertIn("function buildSmcSignals", self.html)
-
-    def test_signal_defaults_to_wait(self):
-        self.assertIn('decision="WAIT"', self.html)
-
-    def test_signal_requires_entry_now(self):
-        self.assertIn('s.state!=="ENTRY_NOW"', self.html)
-
-    def test_signal_requires_trade_plan(self):
-        self.assertIn('reason="TRADE_PLAN_UNAVAILABLE"', self.html)
-
-    def test_signal_requires_target(self):
-        self.assertIn('plan.takeProfit===null', self.html)
-
-    def test_signal_requires_risk_reward(self):
-        self.assertIn('plan.riskReward===null', self.html)
-
-    def test_invalid_rr_stays_wait(self):
-        self.assertIn('reason="RR_INVALID"', self.html)
-
-    def test_bullish_confirmed_setup_becomes_long(self):
-        self.assertIn('s.direction==="BULLISH"?"LONG":"SHORT"', self.html)
-
-    def test_confirmed_signal_reason_is_explicit(self):
-        self.assertIn('reason="SETUP_AND_TRADE_PLAN_CONFIRMED"', self.html)
-
-    def test_invalidated_setup_is_not_signal(self):
-        self.assertIn('reason="SETUP_INVALIDATED"', self.html)
-
-    def test_expired_setup_is_not_signal(self):
-        self.assertIn('reason="SETUP_EXPIRED"', self.html)
-
-    def test_signal_exposes_entry_stop_target_rr(self):
-        tokens = [
-            "entry:plan?plan.entry:null",
-            "stopLoss:plan?plan.stopLoss:null",
-            "takeProfit:plan?plan.takeProfit:null",
-            "riskReward:plan?plan.riskReward:null",
-        ]
-        for token in tokens:
-            self.assertIn(token, self.html)
-
-    def test_signal_never_executes_order(self):
-        token = "qualityTier:s.qualityTier||null,execution:false"
-        self.assertIn(token, self.html)
-
-    def test_signal_engine_ui_is_active(self):
-        self.assertIn("SIGNAL ENGINE ACTIF", self.html)

@@ -6,6 +6,7 @@ FastAPI + httpx. No conditional skip: a missing dependency fails the run rather
 than skipping.
 """
 
+import inspect
 import asyncio
 import json
 import unittest
@@ -4163,3 +4164,79 @@ class TestChartEngineV16CPaperPosition(unittest.TestCase):
 
     def test_paper_position_ui_is_active(self):
         self.assertIn("PAPER POSITION V1 ACTIF", self.html)
+
+
+class TestPaperPersistenceV16D(unittest.TestCase):
+    def test_paper_positions_table_exists(self):
+        self.assertIn("paper_positions", main.paper_positions_table.name)
+
+    def test_paper_position_primary_key(self):
+        self.assertTrue(main.paper_positions_table.c.position_id.primary_key)
+
+    def test_paper_prices_use_numeric(self):
+        for name in ("entry", "stop_loss", "take_profit", "size", "risk_money"):
+            self.assertIsInstance(main.paper_positions_table.c[name].type, main.Numeric)
+
+    def test_paper_create_model_uses_decimal(self):
+        fields = main.PaperPositionCreate.model_fields
+        self.assertIs(fields["entry"].annotation, Decimal)
+        self.assertIs(fields["size"].annotation, Decimal)
+
+    def test_paper_create_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/api/v1/paper/positions", paths)
+
+    def test_paper_list_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/api/v1/paper/positions", paths)
+
+    def test_paper_validation_rejects_bad_side(self):
+        req = main.PaperPositionCreate(
+            position_id="p1", symbol="BTC-USD", side="BUY",
+            entry="100", stop_loss="90", take_profit="120", size="1",
+            size_unit="UNITS", risk_money="10", risk_percent="1",
+            capital_before="1000", source="coinbase",
+            source_timestamp=main.utcnow(), opened_at=main.utcnow(),
+        )
+        with self.assertRaises(main.HTTPException):
+            main.validate_paper_position_create(req)
+
+    def test_paper_validation_accepts_long_levels(self):
+        req = main.PaperPositionCreate(
+            position_id="p1", symbol="BTC-USD", side="LONG",
+            entry="100", stop_loss="90", take_profit="120", size="1",
+            size_unit="UNITS", risk_money="10", risk_percent="1",
+            capital_before="1000", source="coinbase",
+            source_timestamp=main.utcnow(), opened_at=main.utcnow(),
+        )
+        self.assertIsNone(main.validate_paper_position_create(req))
+
+    def test_paper_validation_accepts_short_levels(self):
+        req = main.PaperPositionCreate(
+            position_id="p2", symbol="BTC-USD", side="SHORT",
+            entry="100", stop_loss="110", take_profit="80", size="1",
+            size_unit="UNITS", risk_money="10", risk_percent="1",
+            capital_before="1000", source="coinbase",
+            source_timestamp=main.utcnow(), opened_at=main.utcnow(),
+        )
+        self.assertIsNone(main.validate_paper_position_create(req))
+
+    def test_paper_payload_is_explicitly_paper_only(self):
+        source = inspect.getsource(main.create_paper_position)
+        self.assertIn('"paper_only": True', source)
+
+    def test_paper_payload_never_executes_broker_order(self):
+        source = inspect.getsource(main.create_paper_position)
+        self.assertIn('"execution": False', source)
+
+    def test_duplicate_position_id_is_conflict(self):
+        source = inspect.getsource(main.create_paper_position)
+        self.assertIn("POSITION_ID_EXISTS", source)
+
+    def test_persistence_unavailable_is_fail_safe(self):
+        source = inspect.getsource(main.create_paper_position)
+        self.assertIn("persistence not ready", source)
+
+    def test_paper_persistence_ui_is_active(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("PAPER PERSISTENCE V1 ACTIF", html)

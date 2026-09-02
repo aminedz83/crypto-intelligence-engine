@@ -1571,22 +1571,21 @@ class PaperPositionMark(BaseModel):
     source_timestamp: datetime
 
 
-def paper_mark_from_realtime(symbol: str) -> Optional[PaperPositionMark]:
-    canonical = canonical_symbol(symbol)
+async def paper_mark_from_realtime(symbol: str) -> Optional[PaperPositionMark]:
+    canonical = symbol.upper()
     instrument = instrument_registry.get(canonical)
-    if instrument is None:
+    if instrument is None or instrument.asset_class != AssetClass.CRYPTO:
         return None
-    datum: Optional[RealtimeDatum] = None
-    if instrument.asset_class == AssetClass.CRYPTO:
-        datum = market_state.get_latest_ticker(instrument.provider_symbol)
-    if datum is None:
+    provider_symbol = provider_symbol_map.to_provider("coinbase", canonical)
+    if provider_symbol is None:
         return None
-    if datum.quality != DataQualityStatus.VALID:
+    datum = await market_store.get_ticker(provider_symbol)
+    if datum is None or datum.status != DataQualityStatus.VALID:
         return None
-    if datum.value is None or datum.value <= Decimal("0"):
+    if datum.value is None or datum.value <= 0 or datum.source_timestamp is None:
         return None
     return PaperPositionMark(
-        current_price=datum.value,
+        current_price=Decimal(str(datum.value)),
         observed_at=datum.received_at,
         source=datum.source,
         source_timestamp=datum.source_timestamp,
@@ -1604,7 +1603,7 @@ async def monitor_open_paper_positions_once() -> Dict[str, int]:
     marked = 0
     unavailable = 0
     for row in rows:
-        mark = paper_mark_from_realtime(row._mapping["symbol"])
+        mark = await paper_mark_from_realtime(row._mapping["symbol"])
         if mark is None:
             unavailable += 1
             continue

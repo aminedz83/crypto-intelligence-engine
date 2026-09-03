@@ -311,6 +311,56 @@ class ApiOnlyRegressionTests(unittest.TestCase):
         self.assertEqual(self.client.get("/health/live").status_code, 200)
 
 
+
+class ServerClosedCandleHistoryFreshnessFixTests(unittest.TestCase):
+    def _candle(self, minute: int, status: main.DataQualityStatus) -> main.Candle:
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=minute)
+        return main.Candle(start, 99.0, 101.0, 100.0, 100.5, 1.0, status)
+
+    def test_stale_closed_history_is_usable(self):
+        now = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+        candle = self._candle(0, main.DataQualityStatus.STALE)
+        self.assertEqual(main.closed_valid_candles([candle], now), [candle])
+
+    def test_invalid_closed_history_is_rejected(self):
+        now = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+        candle = self._candle(0, main.DataQualityStatus.INVALID)
+        self.assertEqual(main.closed_valid_candles([candle], now), [])
+
+    def test_missing_closed_history_is_rejected(self):
+        now = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+        candle = self._candle(0, main.DataQualityStatus.MISSING)
+        self.assertEqual(main.closed_valid_candles([candle], now), [])
+
+    def test_open_stale_candle_is_still_rejected(self):
+        now = datetime(2026, 1, 1, 0, 2, tzinfo=timezone.utc)
+        candle = self._candle(0, main.DataQualityStatus.STALE)
+        self.assertEqual(main.closed_valid_candles([candle], now), [])
+
+    def test_detector_has_latest_freshness_guard(self):
+        source = inspect.getsource(main.get_server_market_setup_detector)
+        self.assertIn("LATEST_CANDLE_NOT_FRESH", source)
+        self.assertIn("_latest_quality(candles)", source)
+
+    def test_regime_has_latest_freshness_guard(self):
+        source = inspect.getsource(main.get_server_market_regime)
+        self.assertIn("LATEST_CANDLE_NOT_FRESH", source)
+        self.assertIn("_latest_quality(candles)", source)
+
+    def test_historical_stale_series_can_reach_structure_analysis(self):
+        now = datetime(2026, 1, 1, 2, 0, tzinfo=timezone.utc)
+        candles = [
+            self._candle(index * 5, main.DataQualityStatus.STALE)
+            for index in range(12)
+        ]
+        result = main.detect_server_market_structure(candles, now)
+        self.assertNotEqual(result.get("reason"), "INSUFFICIENT_CLOSED_CANDLES")
+
+    def test_fix_keeps_paper_detector_non_executing(self):
+        source = inspect.getsource(main.get_server_market_setup_detector)
+        self.assertIn("auto_queue", source)
+
+
 if __name__ == "__main__":
     unittest.main()
 

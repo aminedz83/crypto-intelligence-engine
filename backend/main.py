@@ -1970,12 +1970,19 @@ SERVER_FVG_MIN_GAP = 0.0
 
 
 def closed_valid_candles(candles: List[Candle], now: datetime) -> List[Candle]:
+    """Return structurally valid closed candles for historical analysis.
+
+    ``STALE`` is a freshness state, not malformed OHLC data. Older candles in a
+    live Coinbase window are therefore usable for SMC history. Endpoint-level
+    latest-candle freshness is checked separately before analysis.
+    """
     bucket_seconds = GRANULARITIES[SERVER_SETUP_GRANULARITY][1]
     result: List[Candle] = []
+    usable_statuses = {DataQualityStatus.VALID, DataQualityStatus.STALE}
     for candle in candles:
         if (
             candle.start is None
-            or candle.status != DataQualityStatus.VALID
+            or candle.status not in usable_statuses
             or candle.open is None
             or candle.high is None
             or candle.low is None
@@ -2895,6 +2902,14 @@ async def get_server_market_regime(symbol: str) -> Dict[str, object]:
             "reason": "CANDLES_NOT_VALID",
             "quality": quality.value,
         }
+    latest_quality = _latest_quality(candles)
+    if latest_quality != DataQualityStatus.VALID.value:
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "reason": "LATEST_CANDLE_NOT_FRESH",
+            "quality": latest_quality,
+        }
     result = classify_server_market_regime(candles, utcnow())
     return {
         **result,
@@ -2952,6 +2967,15 @@ async def get_server_market_setup_detector(symbol: str) -> Dict[str, object]:
             "symbol": canonical,
             "reason": "CANDLES_NOT_VALID",
             "quality": quality.value,
+            "auto_queue": False,
+        }
+    latest_quality = _latest_quality(candles)
+    if latest_quality != DataQualityStatus.VALID.value:
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "reason": "LATEST_CANDLE_NOT_FRESH",
+            "quality": latest_quality,
             "auto_queue": False,
         }
     result = detect_server_market_structure(candles, utcnow())

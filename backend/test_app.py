@@ -7199,17 +7199,17 @@ class TestTradingOperationalAuditUiV16M5B18(unittest.TestCase):
         self.assertIn("TRADING OPERATIONAL AUDIT UI V1", self.html())
 
     def test_ui_fetches_performance_endpoint(self):
-        self.assertIn('/api/v1/paper/performance', self.html())
+        self.assertIn('/api/v1/paper/ui-snapshot', self.html())
 
     def test_ui_fetches_durable_decision_history(self):
-        self.assertIn('/api/v1/paper/auto-entry/decision-history?limit=50', self.html())
+        self.assertIn('/api/v1/paper/ui-snapshot', self.html())
 
     def test_ui_stores_performance(self):
-        self.assertIn('paperUiState.performance=performance.data||null', self.html())
+        self.assertIn('if(performance)paperUiState.performance=performance;', self.html())
 
     def test_ui_stores_decisions(self):
         self.assertIn(
-            'paperUiState.decisions=(decisions.data&&decisions.data.items)||[]',
+            'if(decisions)paperUiState.decisions=decisions.items||[];',
             self.html(),
         )
 
@@ -7246,7 +7246,7 @@ class TestTradingOperationalAuditUiV16M5B18(unittest.TestCase):
         self.assertIn('&state=', html)
 
     def test_ui_keeps_no_fabricated_decision_contract(self):
-        self.assertIn('Aucune décision persistée', self.html())
+        self.assertIn('Aucune décision correspondante', self.html())
 
 # V16-M5B18: 16 Trading operational audit UI regression tests
 
@@ -7685,3 +7685,125 @@ class TestMarketSessionsCalendarV16M5B23(unittest.TestCase):
     def test_endpoint_route_registered(self):
         paths = {getattr(route, "path", None) for route in main.api_router.routes}
         self.assertIn("/market/session-context/{symbol}", paths)
+
+
+# V16-M5B23-FIX4: runtime route-registration and synchronization audit
+
+
+class TestRuntimeRouteSynchronizationV16M5B23Fix4(unittest.TestCase):
+    def test_session_context_is_registered_on_runtime_app(self):
+        paths = {getattr(route, "path", None) for route in main.app.routes}
+        self.assertIn("/api/v1/market/session-context/{symbol}", paths)
+
+    def test_app_is_created_after_session_route_declaration(self):
+        source = Path(main.__file__).read_text()
+        self.assertLess(
+            source.index('@api_router.get("/market/session-context/{symbol}")'),
+            source.index("app = create_app()"),
+        )
+
+    def test_no_api_router_decorator_exists_after_app_creation(self):
+        source = Path(main.__file__).read_text()
+        app_index = source.index("app = create_app()")
+        self.assertNotIn("@api_router.", source[app_index:])
+
+    def test_fresh_app_contains_session_context_route(self):
+        fresh = main.create_app()
+        paths = {getattr(route, "path", None) for route in fresh.routes}
+        self.assertIn("/api/v1/market/session-context/{symbol}", paths)
+
+    def test_symbol_slash_form_is_normalized(self):
+        result = main.market_session_context("BTC/USD")
+        self.assertEqual(result["symbol"], "BTC-USD")
+
+    def test_symbol_lowercase_is_normalized(self):
+        result = main.market_session_context("btc-usd")
+        self.assertEqual(result["symbol"], "BTC-USD")
+
+    def test_runtime_route_uses_same_api_prefix(self):
+        paths = {getattr(route, "path", None) for route in main.app.routes}
+        self.assertNotIn("/market/session-context/{symbol}", paths)
+
+    def test_runtime_session_route_preserves_paper_only_contract(self):
+        result = main.market_session_context("BTC-USD")
+        self.assertTrue(result["paper_only"])
+        self.assertFalse(result["execution"])
+
+
+# V16-M5B23-FIX5: frontend runtime synchronization audit
+
+
+class TestFrontendRuntimeSynchronizationV16M5B23Fix5(unittest.TestCase):
+    def html(self):
+        return INDEX.read_text(encoding="utf-8")
+
+    def test_snapshot_route_registered_on_runtime_app(self):
+        paths = {getattr(route, "path", None) for route in main.app.routes}
+        self.assertIn("/api/v1/paper/ui-snapshot", paths)
+
+    def test_snapshot_validation_marker_present(self):
+        source = inspect.getsource(main.get_paper_ui_snapshot)
+        self.assertIn("SERVER_PAPER_UI_SNAPSHOT_V1", source)
+
+    def test_snapshot_is_paper_only(self):
+        source = inspect.getsource(main.get_paper_ui_snapshot)
+        self.assertIn('"paper_only": True', source)
+        self.assertIn('"execution": False', source)
+
+    def test_snapshot_has_server_timestamp(self):
+        source = inspect.getsource(main.get_paper_ui_snapshot)
+        self.assertIn('"snapshot_at": snapshot_at.isoformat()', source)
+
+    def test_snapshot_sections_are_fail_safe(self):
+        source = inspect.getsource(main.get_paper_ui_snapshot)
+        self.assertIn('"status": "OK" if available == len(sections) else "PARTIAL"', source)
+
+    def test_snapshot_includes_watchdog(self):
+        source = inspect.getsource(main.get_paper_ui_snapshot)
+        self.assertIn('"watchdog": watchdog', source)
+
+    def test_snapshot_includes_runtime(self):
+        source = inspect.getsource(main.get_paper_ui_snapshot)
+        self.assertIn('"runtime": runtime', source)
+
+    def test_closed_positions_expose_server_realized_pnl(self):
+        source = inspect.getsource(main.paper_position_to_dict)
+        self.assertIn('data["realized_pnl"]', source)
+        self.assertIn("calculate_paper_pnl", source)
+
+    def test_ui_uses_single_snapshot_endpoint(self):
+        self.assertIn('/api/v1/paper/ui-snapshot', self.html())
+
+    def test_ui_does_not_recalculate_closed_pnl(self):
+        html = self.html()
+        self.assertNotIn("function paperPositionPnl", html)
+        self.assertIn("p.realized_pnl", html)
+
+    def test_ui_symbol_filter_uses_all_crypto_symbols(self):
+        self.assertIn('var symbols=[""].concat(CRYPTO_SYMBOLS)', self.html())
+
+    def test_ui_exposes_server_snapshot_timestamp(self):
+        self.assertIn("Snapshot serveur", self.html())
+        self.assertIn("paperUiState.serverSnapshotAt", self.html())
+
+    def test_ui_exposes_partial_section_failures(self):
+        self.assertIn("Sections indisponibles", self.html())
+        self.assertIn("paperUiState.sectionErrors", self.html())
+
+    def test_signals_page_is_server_backed(self):
+        html = self.html()
+        self.assertIn("SERVER AUTHORITATIVE", html)
+        self.assertIn("Watchdog scanner", html)
+
+    def test_dashboard_uses_real_paper_state(self):
+        html = self.html()
+        self.assertIn("Capital virtuel", html)
+        self.assertIn("dashAccount.current_capital", html)
+        self.assertIn("dashAccount.open_positions", html)
+
+    def test_stale_signal_engine_not_implemented_text_removed(self):
+        html = self.html()
+        self.assertNotIn(
+            'modCard("Signal Engine","NOT IMPLEMENTED"',
+            html,
+        )

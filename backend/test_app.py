@@ -8052,3 +8052,168 @@ class ServerHtfContextFoundationTests(unittest.TestCase):
         source = inspect.getsource(main.get_server_market_setup_detector)
         self.assertNotIn("classify_server_htf_context", source)
         self.assertNotIn("SERVER_HTF_GRANULARITY", source)
+
+
+# ---------------- V16-M5B25A-FIX2: ENTRY_NOW execution diagnostics ----------------
+class AutoEntryExecutionDiagnosticsTests(unittest.TestCase):
+    def _entry_detector(self):
+        direction = "BULLISH"
+        return {
+            "status": "READY",
+            "setup_state": "ENTRY_NOW",
+            "entry_gate": {"state": "ENTRY_NOW", "direction": direction},
+            "trade_plan": {
+                "state": "CANDIDATE_READY",
+                "direction": direction,
+                "entry_reference": 100.0,
+                "entry_zone_low": 99.0,
+                "entry_zone_high": 101.0,
+                "stop_loss": 95.0,
+                "take_profit": 110.0,
+                "risk_reward": 2.0,
+            },
+            "structure_event": {"event": "BOS", "direction": direction},
+            "liquidity_sweep": {"event": "SSL_SWEEP", "direction": direction},
+            "displacement": {"event": "DISPLACEMENT", "direction": direction},
+            "fvg": {"event": "FVG", "direction": direction},
+            "order_block": {"event": "ORDER_BLOCK", "direction": direction},
+            "latest_closed_timestamp": NOW.isoformat(),
+        }
+
+    def _request(self):
+        return main.VerifiedAutoPaperEntryRequest(
+            symbol="LTC-USD",
+            setup_state="ENTRY_NOW",
+            direction="BULLISH",
+            entry=Decimal("100"),
+            stop_loss=Decimal("95"),
+            take_profit=Decimal("110"),
+            risk_reward=Decimal("2"),
+            structure_confirmed=True,
+            displacement_confirmed=True,
+            order_block_confirmed=True,
+            source_timestamp=NOW,
+            risk_percent=Decimal("1"),
+        )
+
+    def test_buildable_detector_reports_buildable(self):
+        reason = main.auto_entry_request_rejection_reason(self._entry_detector())
+        self.assertEqual(reason, "AUTO_ENTRY_REQUEST_BUILDABLE")
+
+    def test_missing_gate_is_explicit(self):
+        detector = self._entry_detector()
+        detector.pop("entry_gate")
+        self.assertEqual(
+            main.auto_entry_request_rejection_reason(detector),
+            "ENTRY_GATE_MISSING",
+        )
+
+    def test_missing_trade_plan_is_explicit(self):
+        detector = self._entry_detector()
+        detector.pop("trade_plan")
+        self.assertEqual(
+            main.auto_entry_request_rejection_reason(detector),
+            "TRADE_PLAN_MISSING",
+        )
+
+    def test_direction_mismatch_is_explicit(self):
+        detector = self._entry_detector()
+        detector["trade_plan"]["direction"] = "BEARISH"
+        self.assertEqual(
+            main.auto_entry_request_rejection_reason(detector),
+            "TRADE_PLAN_DIRECTION_MISMATCH",
+        )
+
+    def test_missing_structure_is_explicit(self):
+        detector = self._entry_detector()
+        detector.pop("structure_event")
+        self.assertEqual(
+            main.auto_entry_request_rejection_reason(detector),
+            "STRUCTURE_EVENT_MISSING",
+        )
+
+    def test_invalid_order_block_is_explicit(self):
+        detector = self._entry_detector()
+        detector["order_block"]["state"] = "INVALIDATED"
+        self.assertEqual(
+            main.auto_entry_request_rejection_reason(detector),
+            "ORDER_BLOCK_INVALIDATED",
+        )
+
+    def test_missing_source_timestamp_is_explicit(self):
+        detector = self._entry_detector()
+        detector.pop("latest_closed_timestamp")
+        self.assertEqual(
+            main.auto_entry_request_rejection_reason(detector),
+            "SOURCE_TIMESTAMP_MISSING",
+        )
+
+    def test_invalid_plan_number_is_explicit(self):
+        detector = self._entry_detector()
+        detector["trade_plan"]["risk_reward"] = "bad"
+        self.assertEqual(
+            main.auto_entry_request_rejection_reason(detector),
+            "TRADE_PLAN_RISK_REWARD_INVALID",
+        )
+
+    def test_valid_realtime_fill_reports_eligible(self):
+        ticker = main.MarketDatum(
+            "coinbase", "LTC-USD", 100.0, NOW, main.DataQualityStatus.VALID
+        )
+        reason = main.realtime_fill_rejection_reason(
+            self._request(), self._entry_detector(), ticker
+        )
+        self.assertEqual(reason, "REALTIME_FILL_ELIGIBLE")
+
+    def test_stale_ticker_is_explicit(self):
+        ticker = main.MarketDatum(
+            "coinbase", "LTC-USD", 100.0, NOW, main.DataQualityStatus.STALE
+        )
+        reason = main.realtime_fill_rejection_reason(
+            self._request(), self._entry_detector(), ticker
+        )
+        self.assertEqual(reason, "REALTIME_TICKER_STALE")
+
+    def test_missing_ticker_price_is_explicit(self):
+        ticker = main.MarketDatum(
+            "coinbase", "LTC-USD", None, NOW, main.DataQualityStatus.VALID
+        )
+        reason = main.realtime_fill_rejection_reason(
+            self._request(), self._entry_detector(), ticker
+        )
+        self.assertEqual(reason, "REALTIME_TICKER_PRICE_MISSING")
+
+    def test_price_outside_zone_is_explicit(self):
+        ticker = main.MarketDatum(
+            "coinbase", "LTC-USD", 102.0, NOW, main.DataQualityStatus.VALID
+        )
+        reason = main.realtime_fill_rejection_reason(
+            self._request(), self._entry_detector(), ticker
+        )
+        self.assertEqual(reason, "REALTIME_PRICE_OUTSIDE_ENTRY_ZONE")
+
+    def test_generation_uses_precise_request_reason(self):
+        source = inspect.getsource(main.run_server_auto_paper_generation_once)
+        self.assertIn("auto_entry_request_rejection_reason(detector)", source)
+        self.assertNotIn(
+            '"REALTIME_FILL_NOT_ELIGIBLE"',
+            source,
+        )
+
+    def test_generation_uses_precise_fill_reason(self):
+        source = inspect.getsource(main.run_server_auto_paper_generation_once)
+        self.assertIn(
+            "realtime_fill_rejection_reason(request, detector, ticker)",
+            source,
+        )
+
+    def test_entry_now_unbuildable_is_recorded_blocked(self):
+        source = inspect.getsource(main.run_server_auto_paper_generation_once)
+        self.assertIn('symbol, "BLOCKED", reason, detector', source)
+
+    def test_diagnostics_do_not_create_positions(self):
+        request_source = inspect.getsource(main.auto_entry_request_rejection_reason)
+        fill_source = inspect.getsource(main.realtime_fill_rejection_reason)
+        self.assertNotIn("create_paper_position", request_source)
+        self.assertNotIn("create_paper_position", fill_source)
+

@@ -4562,12 +4562,12 @@ class TestPaperTradingUiV16I(unittest.TestCase):
     def test_paper_ui_fetches_account(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn('/api/v1/paper/ui-snapshot', html)
-        self.assertIn('sectionData("account")', html)
+        self.assertIn('snapshotSection(snap,"account")', html)
 
     def test_paper_ui_fetches_positions(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn('/api/v1/paper/ui-snapshot', html)
-        self.assertIn('sectionData("positions")', html)
+        self.assertIn('snapshotSection(snap,"positions")', html)
 
     def test_paper_ui_has_real_positions_section(self):
         html = INDEX.read_text(encoding="utf-8")
@@ -4644,7 +4644,7 @@ class TestPaperLivePnlV16J(unittest.TestCase):
     def test_ui_fetches_live_positions(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn('/api/v1/paper/ui-snapshot', html)
-        self.assertIn('sectionData("live_positions")', html)
+        self.assertIn('snapshotSection(snap,"live_positions")', html)
 
     def test_ui_shows_current_price(self):
         html = INDEX.read_text(encoding="utf-8")
@@ -4712,7 +4712,7 @@ class TestPaperTradingMobileRenderV16J1(unittest.TestCase):
     def test_live_pnl_endpoint_remains_used(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn('/api/v1/paper/ui-snapshot', html)
-        self.assertIn('sectionData("live_positions")', html)
+        self.assertIn('snapshotSection(snap,"live_positions")', html)
 
     def test_backend_is_unchanged_for_ui_fix(self):
         paths = {route.path for route in main.api_router.routes}
@@ -4823,7 +4823,7 @@ class TestPaperLiveEquityV16L(unittest.TestCase):
     def test_ui_fetches_live_account(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn('/api/v1/paper/ui-snapshot', html)
-        self.assertIn('sectionData("account")', html)
+        self.assertIn('snapshotSection(snap,"account")', html)
 
     def test_ui_shows_live_equity_and_latent_pnl(self):
         html = INDEX.read_text(encoding="utf-8")

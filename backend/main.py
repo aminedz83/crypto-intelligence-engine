@@ -1594,13 +1594,36 @@ def validate_paper_position_create(req: PaperPositionCreate) -> None:
 
 def paper_position_to_dict(row: Any) -> Dict[str, object]:
     data = dict(row._mapping)
-    for key in ("entry", "stop_loss", "take_profit", "size", "risk_money",
-                "risk_percent", "capital_before", "close_price"):
+    raw_entry = data.get("entry")
+    raw_size = data.get("size")
+    raw_close = data.get("close_price")
+    raw_side = data.get("side")
+    realized_pnl: Optional[Decimal] = None
+    if (
+        data.get("status") == "CLOSED"
+        and isinstance(raw_entry, Decimal)
+        and isinstance(raw_size, Decimal)
+        and isinstance(raw_close, Decimal)
+        and isinstance(raw_side, str)
+        and raw_side in {"LONG", "SHORT"}
+    ):
+        realized_pnl = calculate_paper_pnl(raw_side, raw_entry, raw_close, raw_size)
+    for key in (
+        "entry",
+        "stop_loss",
+        "take_profit",
+        "size",
+        "risk_money",
+        "risk_percent",
+        "capital_before",
+        "close_price",
+    ):
         if data.get(key) is not None:
             data[key] = str(data[key])
     for key in ("source_timestamp", "opened_at", "closed_at", "created_at", "updated_at"):
         if data.get(key) is not None:
             data[key] = data[key].isoformat()
+    data["realized_pnl"] = str(realized_pnl) if realized_pnl is not None else None
     data["paper_only"] = True
     data["execution"] = False
     return data
@@ -4444,6 +4467,71 @@ async def list_paper_positions(status_filter: Optional[str] = None) -> Dict[str,
     return {"status": "OK", "positions": rows, "count": len(rows), "paper_only": True}
 
 
+async def _paper_ui_section(call: Any) -> Dict[str, object]:
+    try:
+        data = await call()
+        return {"status": "OK", "data": data}
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"reason": str(exc.detail)}
+        return {
+            "status": "UNAVAILABLE",
+            "http_status": exc.status_code,
+            "reason": detail.get("reason", "HTTP_ERROR"),
+            "data": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.error("Paper UI snapshot section failed: %s", exc)
+        return {
+            "status": "UNAVAILABLE",
+            "http_status": 500,
+            "reason": type(exc).__name__,
+            "data": None,
+        }
+
+
+@api_router.get("/paper/ui-snapshot")
+async def get_paper_ui_snapshot(
+    symbol: Optional[str] = None, state: Optional[str] = None
+) -> Dict[str, object]:
+    """Return one server-stamped, fail-safe snapshot for the paper UI."""
+    snapshot_at = utcnow()
+    account = await _paper_ui_section(get_live_paper_account)
+    positions = await _paper_ui_section(list_paper_positions)
+    live_positions = await _paper_ui_section(get_live_paper_positions)
+    performance = await _paper_ui_section(get_paper_performance)
+
+    async def decisions() -> Dict[str, object]:
+        return await signal_decision_history(limit=50, symbol=symbol, state=state)
+
+    decision_history = await _paper_ui_section(decisions)
+    watchdog = {
+        "status": "OK",
+        "data": auto_scan_watchdog_status(),
+    }
+    runtime = {
+        "status": "OK",
+        "data": auto_scan_runtime_status(),
+    }
+    sections = {
+        "account": account,
+        "positions": positions,
+        "live_positions": live_positions,
+        "performance": performance,
+        "decision_history": decision_history,
+        "watchdog": watchdog,
+        "runtime": runtime,
+    }
+    available = sum(1 for section in sections.values() if section["status"] == "OK")
+    return {
+        "status": "OK" if available == len(sections) else "PARTIAL",
+        "validation": "SERVER_PAPER_UI_SNAPSHOT_V1",
+        "snapshot_at": snapshot_at.isoformat(),
+        "sections": sections,
+        "paper_only": True,
+        "execution": False,
+    }
+
+
 async def init_candle_schema() -> None:
     """Create persistence tables if absent (idempotent). Raises on real DDL failure
     so it is NEVER swallowed into a silent false success."""
@@ -7256,8 +7344,6 @@ def create_app() -> FastAPI:
     return app
 
 
-app = create_app()
-
 # V16-M5B4-FIX2 — fresh synchronized copy
 
 # V16-M5B17: paper performance analytics from persisted CLOSED trades
@@ -7274,7 +7360,7 @@ def market_session_context(
     Calendar state never implies data quality or trade permission. Holiday knowledge
     is not fabricated: policies without a verified holiday calendar expose UNKNOWN.
     """
-    symbol = canonical_symbol.upper()
+    symbol = canonical_symbol.upper().replace("/", "-")
     inst = instrument_registry.get(symbol)
     if inst is None:
         return {
@@ -7360,3 +7446,7 @@ async def market_session_context_endpoint(symbol: str) -> dict:
     if result["status"] == "NOT_SUPPORTED":
         raise HTTPException(status_code=404, detail=result)
     return result
+
+
+# App must be built only after every router decorator above has executed.
+app = create_app()

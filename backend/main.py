@@ -2782,6 +2782,177 @@ def register_auto_entry_candidate(
     }
 
 
+def build_verified_auto_entry_request_from_detector(
+    symbol: str, detector: Dict[str, object]
+) -> Optional[VerifiedAutoPaperEntryRequest]:
+    """Convert a complete server ENTRY_NOW setup into a paper-only request.
+
+    The browser is not trusted. Every required SMC component must already be
+    server-confirmed and directionally coherent. This function only builds the
+    request; verified_auto_paper_entry remains authoritative for specs, sizing,
+    capital, persistence, and idempotent position creation.
+    """
+    if detector.get("status") != "READY" or detector.get("setup_state") != "ENTRY_NOW":
+        return None
+    gate = detector.get("entry_gate")
+    plan = detector.get("trade_plan")
+    if not isinstance(gate, dict) or gate.get("state") != "ENTRY_NOW":
+        return None
+    if not isinstance(plan, dict) or plan.get("state") != "CANDIDATE_READY":
+        return None
+    direction = gate.get("direction")
+    if direction not in {"BULLISH", "BEARISH"} or plan.get("direction") != direction:
+        return None
+
+    required = (
+        ("structure_event", {"BOS", "CHOCH_MSS"}),
+        ("liquidity_sweep", {"BSL_SWEEP", "SSL_SWEEP"}),
+        ("displacement", {"DISPLACEMENT"}),
+        ("fvg", {"FVG"}),
+        ("order_block", {"ORDER_BLOCK"}),
+    )
+    for key, events in required:
+        item = detector.get(key)
+        if not isinstance(item, dict):
+            return None
+        if item.get("event") not in events or item.get("direction") != direction:
+            return None
+    order_block = detector["order_block"]
+    if isinstance(order_block, dict) and order_block.get("state") == "INVALIDATED":
+        return None
+
+    raw_timestamp = detector.get("latest_closed_timestamp")
+    if not isinstance(raw_timestamp, str):
+        return None
+    try:
+        source_timestamp = datetime.fromisoformat(raw_timestamp)
+    except ValueError:
+        return None
+    if source_timestamp.tzinfo is None:
+        return None
+
+    try:
+        entry = Decimal(str(plan["entry_reference"]))
+        stop_loss = Decimal(str(plan["stop_loss"]))
+        take_profit = Decimal(str(plan["take_profit"]))
+        risk_reward = Decimal(str(plan["risk_reward"]))
+    except (KeyError, ValueError, InvalidOperation):
+        return None
+
+    return VerifiedAutoPaperEntryRequest(
+        symbol=symbol.upper().replace("/", "-"),
+        setup_state="ENTRY_NOW",
+        direction=str(direction),
+        entry=entry,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        risk_reward=risk_reward,
+        structure_confirmed=True,
+        displacement_confirmed=True,
+        order_block_confirmed=True,
+        source_timestamp=source_timestamp,
+        risk_percent=Decimal("1"),
+    )
+
+
+def apply_realtime_market_fill_to_auto_request(
+    request: VerifiedAutoPaperEntryRequest,
+    detector: Dict[str, object],
+    ticker: MarketDatum,
+) -> Optional[VerifiedAutoPaperEntryRequest]:
+    """Use a fresh real Coinbase ticker as the paper MARKET fill reference."""
+    if (
+        ticker.status != DataQualityStatus.VALID
+        or ticker.value is None
+        or ticker.timestamp is None
+        or ticker.timestamp.tzinfo is None
+    ):
+        return None
+    plan = detector.get("trade_plan")
+    if not isinstance(plan, dict):
+        return None
+    zone_low = plan.get("entry_zone_low")
+    zone_high = plan.get("entry_zone_high")
+    if not isinstance(zone_low, (int, float)) or not isinstance(zone_high, (int, float)):
+        return None
+    price = Decimal(str(ticker.value))
+    if not Decimal(str(zone_low)) <= price <= Decimal(str(zone_high)):
+        return None
+    if request.stop_loss is None or request.take_profit is None:
+        return None
+    if request.direction == "BULLISH":
+        if not request.stop_loss < price < request.take_profit:
+            return None
+    elif request.direction == "BEARISH":
+        if not request.take_profit < price < request.stop_loss:
+            return None
+    else:
+        return None
+    risk = abs(price - request.stop_loss)
+    reward = abs(request.take_profit - price)
+    if risk <= 0 or reward <= 0:
+        return None
+    return request.model_copy(
+        update={
+            "entry": price,
+            "risk_reward": reward / risk,
+            "source_timestamp": ticker.timestamp,
+        }
+    )
+
+
+async def run_server_auto_paper_generation_once() -> Dict[str, int]:
+    """Scan registered crypto instruments and consume server ENTRY_NOW once.
+
+    Duplicate deterministic position IDs are treated as already consumed. No
+    broker/MT5 path exists: verified_auto_paper_entry persists paper positions.
+    """
+    stats = {"checked": 0, "entry_now": 0, "opened": 0, "already_consumed": 0, "blocked": 0}
+    if not persistence_state.ready:
+        return stats
+    for instrument in instrument_registry.all():
+        if instrument.asset_class != AssetClass.CRYPTO:
+            continue
+        stats["checked"] += 1
+        try:
+            detector = await get_server_market_setup_detector(instrument.canonical_symbol)
+            request = build_verified_auto_entry_request_from_detector(
+                instrument.canonical_symbol, detector
+            )
+            if request is None:
+                continue
+            provider_symbol = provider_symbol_map.to_provider(
+                "coinbase", instrument.canonical_symbol
+            )
+            if provider_symbol is None:
+                stats["blocked"] += 1
+                continue
+            ticker = await market_provider.get_ticker(provider_symbol)
+            request = apply_realtime_market_fill_to_auto_request(
+                request, detector, ticker
+            )
+            if request is None:
+                stats["blocked"] += 1
+                continue
+            stats["entry_now"] += 1
+            result = await verified_auto_paper_entry(request)
+        except HTTPException as exc:
+            if exc.status_code == 409:
+                stats["already_consumed"] += 1
+            else:
+                stats["blocked"] += 1
+            continue
+        except Exception as exc:  # noqa: BLE001
+            log.error("Server auto-paper generation failed: %s", exc)
+            stats["blocked"] += 1
+            continue
+        if result.get("status") == "OPENED":
+            stats["opened"] += 1
+        else:
+            stats["blocked"] += 1
+    return stats
+
+
 async def run_auto_entry_orchestrator_once() -> Dict[str, int]:
     opened = 0
     blocked = 0
@@ -2822,6 +2993,7 @@ async def run_auto_entry_orchestrator_once() -> Dict[str, int]:
 async def auto_entry_orchestrator_loop() -> None:
     while True:
         try:
+            await run_server_auto_paper_generation_once()
             await run_auto_entry_orchestrator_once()
         except asyncio.CancelledError:
             raise
@@ -2852,7 +3024,8 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "retest_revalidation": "SERVER_RETEST_REVALIDATION_V1",
         "trade_plan_builder": "SERVER_TRADE_PLAN_V1",
         "entry_now_gate": "SERVER_ENTRY_NOW_GATE_V1",
-        "smc_auto_candidate_generation": "NOT_IMPLEMENTED",
+        "smc_auto_candidate_generation": "SERVER_AUTO_PAPER_POSITION_V1",
+        "auto_position_creation": "SERVER_AUTO_PAPER_POSITION_V1",
         "paper_only": True,
         "execution": False,
     }

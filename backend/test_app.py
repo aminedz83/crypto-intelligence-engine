@@ -6629,3 +6629,83 @@ class TestServerAutoPaperPositionV16M5B10(unittest.TestCase):
                 request, self.detector(), ticker
             )
         )
+
+
+class TestAutoPaperLifecycleHardeningV16M5B11(unittest.TestCase):
+    def mark(self, observed=NOW, source_timestamp=NOW):
+        return main.PaperPositionMark(
+            current_price=Decimal("101"),
+            observed_at=observed,
+            source="coinbase",
+            source_timestamp=source_timestamp,
+        )
+
+    def test_temporal_validator_accepts_current_mark(self):
+        opened = NOW - timedelta(seconds=1)
+        self.assertTrue(main.paper_mark_temporally_valid(self.mark(), opened))
+
+    def test_temporal_validator_rejects_source_before_open(self):
+        opened = NOW
+        mark = self.mark(source_timestamp=NOW - timedelta(seconds=1))
+        self.assertFalse(main.paper_mark_temporally_valid(mark, opened))
+
+    def test_temporal_validator_accepts_source_equal_open(self):
+        self.assertTrue(main.paper_mark_temporally_valid(self.mark(), NOW))
+
+    def test_temporal_validator_rejects_source_after_observation(self):
+        mark = self.mark(source_timestamp=NOW + timedelta(seconds=1))
+        self.assertFalse(main.paper_mark_temporally_valid(mark, NOW))
+
+    def test_temporal_validator_rejects_naive_observation(self):
+        mark = self.mark(observed=NOW.replace(tzinfo=None))
+        self.assertFalse(main.paper_mark_temporally_valid(mark, NOW))
+
+    def test_temporal_validator_rejects_naive_source_timestamp(self):
+        mark = self.mark(source_timestamp=NOW.replace(tzinfo=None))
+        self.assertFalse(main.paper_mark_temporally_valid(mark, NOW))
+
+    def test_temporal_validator_rejects_naive_opened_at(self):
+        opened = NOW.replace(tzinfo=None)
+        self.assertFalse(main.paper_mark_temporally_valid(self.mark(), opened))
+
+    def test_mark_route_uses_temporal_validator(self):
+        source = inspect.getsource(main.mark_paper_position)
+        self.assertIn("paper_mark_temporally_valid", source)
+
+    def test_stale_mark_has_explicit_conflict_reason(self):
+        source = inspect.getsource(main.mark_paper_position)
+        self.assertIn("STALE_OR_INVALID_MARK", source)
+        self.assertIn("status_code=409", source)
+
+    def test_closed_position_remains_idempotent_before_mark_validation(self):
+        source = inspect.getsource(main.mark_paper_position)
+        closed_guard = source.index('data["status"] != "OPEN"')
+        temporal_guard = source.index("paper_mark_temporally_valid")
+        self.assertLess(closed_guard, temporal_guard)
+
+    def test_database_close_remains_open_only(self):
+        source = inspect.getsource(main.mark_paper_position)
+        self.assertIn("AND status='OPEN'", source)
+
+    def test_monitor_isolates_position_failures(self):
+        source = inspect.getsource(main.monitor_open_paper_positions_once)
+        self.assertIn("errors += 1", source)
+        self.assertIn("Paper position monitor failed for %s", source)
+
+    def test_monitor_preserves_cancellation(self):
+        source = inspect.getsource(main.monitor_open_paper_positions_once)
+        self.assertIn("except asyncio.CancelledError", source)
+        self.assertIn("raise", source)
+
+    def test_monitor_reports_error_count(self):
+        source = inspect.getsource(main.monitor_open_paper_positions_once)
+        self.assertIn('"errors": errors', source)
+
+    def test_monitor_still_uses_real_market_marks(self):
+        source = inspect.getsource(main.monitor_open_paper_positions_once)
+        self.assertIn("await paper_mark_from_realtime", source)
+        self.assertIn("await mark_paper_position", source)
+
+    def test_ui_marks_lifecycle_hardening(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("PAPER LIFECYCLE HARDENING V1", html)

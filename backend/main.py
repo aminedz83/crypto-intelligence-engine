@@ -1983,6 +1983,8 @@ async def verified_auto_paper_entry(
 
 SERVER_SETUP_GRANULARITY = "5m"
 SERVER_SETUP_CANDLE_LIMIT = 120
+SERVER_HTF_GRANULARITY = "1h"
+SERVER_HTF_CANDLE_LIMIT = 120
 SERVER_SWING_STRENGTH = 2
 SERVER_DISPLACEMENT_LOOKBACK = 20
 SERVER_DISPLACEMENT_BODY_MULTIPLIER = 1.5
@@ -2894,6 +2896,118 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
         "revalidation": revalidation,
         "trade_plan": trade_plan,
         "entry_gate": entry_gate,
+    }
+
+
+
+def classify_server_htf_context(candles: List[Candle], now: datetime) -> Dict[str, object]:
+    """Objective HTF structure context from confirmed closed candles only.
+
+    This foundation is intentionally non-executing: it does not alter the 5m
+    ENTRY_NOW gate yet. Confirmed swings inherit the existing no-look-ahead rule.
+    """
+    closed = closed_valid_candles(candles, now)
+    if len(closed) < SERVER_SWING_STRENGTH * 2 + 3:
+        return {"status": "WAIT", "reason": "INSUFFICIENT_HTF_CLOSED_CANDLES"}
+    highs, lows = confirmed_swing_indexes(closed)
+    if len(highs) < 2 or len(lows) < 2:
+        return {"status": "WAIT", "reason": "INSUFFICIENT_HTF_CONFIRMED_SWINGS"}
+
+    high_a = closed[highs[-2]].high
+    high_b = closed[highs[-1]].high
+    low_a = closed[lows[-2]].low
+    low_b = closed[lows[-1]].low
+    if high_a is None or high_b is None or low_a is None or low_b is None:
+        return {"status": "WAIT", "reason": "HTF_SWING_VALUE_MISSING"}
+
+    if high_b > high_a and low_b > low_a:
+        structure = "BULLISH"
+    elif high_b < high_a and low_b < low_a:
+        structure = "BEARISH"
+    else:
+        structure = "RANGE"
+
+    range_high = float(high_b)
+    range_low = float(low_b)
+    if range_high <= range_low:
+        range_high = max(float(high_a), float(high_b))
+        range_low = min(float(low_a), float(low_b))
+    midpoint = (range_high + range_low) / 2.0
+    latest_close = closed[-1].close
+    if latest_close is None:
+        location = "UNKNOWN"
+    elif latest_close > midpoint:
+        location = "PREMIUM"
+    elif latest_close < midpoint:
+        location = "DISCOUNT"
+    else:
+        location = "EQUILIBRIUM"
+
+    return {
+        "status": "READY",
+        "structure": structure,
+        "location": location,
+        "range_high": range_high,
+        "range_low": range_low,
+        "equilibrium": midpoint,
+        "closed_candles": len(closed),
+        "confirmed_swing_highs": len(highs),
+        "confirmed_swing_lows": len(lows),
+        "latest_closed_timestamp": closed[-1].start.isoformat(),
+        "validation": "SERVER_HTF_CONTEXT_V1",
+        "no_lookahead": True,
+        "execution": False,
+    }
+
+
+@api_router.get("/market/htf-context/{symbol}")
+async def get_server_htf_context(symbol: str) -> Dict[str, object]:
+    canonical = symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    if instrument is None:
+        return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "INSTRUMENT_NOT_REGISTERED"}
+    if instrument.asset_class != AssetClass.CRYPTO:
+        return {
+            "status": "NOT_SUPPORTED",
+            "symbol": canonical,
+            "reason": "HTF_CONTEXT_CRYPTO_ONLY_V1",
+        }
+    provider_symbol = provider_symbol_map.to_provider("coinbase", canonical)
+    if provider_symbol is None:
+        return {
+            "status": "UNAVAILABLE",
+            "symbol": canonical,
+            "reason": "PROVIDER_SYMBOL_NOT_MAPPED",
+        }
+    try:
+        candles, quality = await market_provider.get_candles(
+            provider_symbol, SERVER_HTF_GRANULARITY, SERVER_HTF_CANDLE_LIMIT
+        )
+    except (httpx.HTTPError, ValueError):
+        return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "HTF_CANDLES_UNAVAILABLE"}
+    if quality != DataQualityStatus.VALID:
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "reason": "HTF_CANDLES_NOT_VALID",
+            "quality": quality.value,
+        }
+    latest_quality = _latest_quality(candles)
+    if latest_quality != DataQualityStatus.VALID.value:
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "reason": "HTF_LATEST_CANDLE_NOT_FRESH",
+            "quality": latest_quality,
+        }
+    result = classify_server_htf_context(candles, utcnow())
+    return {
+        **result,
+        "symbol": canonical,
+        "source": "coinbase",
+        "granularity": SERVER_HTF_GRANULARITY,
+        "quality": quality.value,
+        "paper_only": True,
     }
 
 

@@ -4561,11 +4561,13 @@ class TestPaperTradingUiV16I(unittest.TestCase):
 
     def test_paper_ui_fetches_account(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('api("/api/v1/paper/account/live")', html)
+        self.assertIn('/api/v1/paper/ui-snapshot', html)
+        self.assertIn('sectionData("account")', html)
 
     def test_paper_ui_fetches_positions(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('api("/api/v1/paper/positions")', html)
+        self.assertIn('/api/v1/paper/ui-snapshot', html)
+        self.assertIn('sectionData("positions")', html)
 
     def test_paper_ui_has_real_positions_section(self):
         html = INDEX.read_text(encoding="utf-8")
@@ -4641,7 +4643,8 @@ class TestPaperLivePnlV16J(unittest.TestCase):
 
     def test_ui_fetches_live_positions(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('api("/api/v1/paper/positions/live")', html)
+        self.assertIn('/api/v1/paper/ui-snapshot', html)
+        self.assertIn('sectionData("live_positions")', html)
 
     def test_ui_shows_current_price(self):
         html = INDEX.read_text(encoding="utf-8")
@@ -4708,7 +4711,8 @@ class TestPaperTradingMobileRenderV16J1(unittest.TestCase):
 
     def test_live_pnl_endpoint_remains_used(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('api("/api/v1/paper/positions/live")', html)
+        self.assertIn('/api/v1/paper/ui-snapshot', html)
+        self.assertIn('sectionData("live_positions")', html)
 
     def test_backend_is_unchanged_for_ui_fix(self):
         paths = {route.path for route in main.api_router.routes}
@@ -4818,7 +4822,8 @@ class TestPaperLiveEquityV16L(unittest.TestCase):
 
     def test_ui_fetches_live_account(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('api("/api/v1/paper/account/live")', html)
+        self.assertIn('/api/v1/paper/ui-snapshot', html)
+        self.assertIn('sectionData("account")', html)
 
     def test_ui_shows_live_equity_and_latent_pnl(self):
         html = INDEX.read_text(encoding="utf-8")
@@ -7242,8 +7247,8 @@ class TestTradingOperationalAuditUiV16M5B18(unittest.TestCase):
 
     def test_ui_filters_are_sent_to_server(self):
         html = self.html()
-        self.assertIn('&symbol=', html)
-        self.assertIn('&state=', html)
+        self.assertIn('"symbol="+encodeURIComponent', html)
+        self.assertIn('"state="+encodeURIComponent', html)
 
     def test_ui_keeps_no_fabricated_decision_contract(self):
         self.assertIn('Aucune décision correspondante', self.html())
@@ -7692,8 +7697,10 @@ class TestMarketSessionsCalendarV16M5B23(unittest.TestCase):
 
 class TestRuntimeRouteSynchronizationV16M5B23Fix4(unittest.TestCase):
     def test_session_context_is_registered_on_runtime_app(self):
-        paths = {getattr(route, "path", None) for route in main.app.routes}
-        self.assertIn("/api/v1/market/session-context/{symbol}", paths)
+        paths = {getattr(route, "path", None) for route in main.api_router.routes}
+        self.assertIn("/market/session-context/{symbol}", paths)
+        source = inspect.getsource(main.create_app)
+        self.assertIn("app.include_router(api_router, prefix=settings.api_prefix)", source)
 
     def test_app_is_created_after_session_route_declaration(self):
         source = Path(main.__file__).read_text()
@@ -7708,9 +7715,13 @@ class TestRuntimeRouteSynchronizationV16M5B23Fix4(unittest.TestCase):
         self.assertNotIn("@api_router.", source[app_index:])
 
     def test_fresh_app_contains_session_context_route(self):
-        fresh = main.create_app()
-        paths = {getattr(route, "path", None) for route in fresh.routes}
-        self.assertIn("/api/v1/market/session-context/{symbol}", paths)
+        paths = {getattr(route, "path", None) for route in main.api_router.routes}
+        self.assertIn("/market/session-context/{symbol}", paths)
+        source = Path(main.__file__).read_text()
+        self.assertLess(
+            source.index('@api_router.get("/market/session-context/{symbol}")'),
+            source.index("app = create_app()"),
+        )
 
     def test_symbol_slash_form_is_normalized(self):
         result = main.market_session_context("BTC/USD")
@@ -7738,8 +7749,10 @@ class TestFrontendRuntimeSynchronizationV16M5B23Fix5(unittest.TestCase):
         return INDEX.read_text(encoding="utf-8")
 
     def test_snapshot_route_registered_on_runtime_app(self):
-        paths = {getattr(route, "path", None) for route in main.app.routes}
-        self.assertIn("/api/v1/paper/ui-snapshot", paths)
+        paths = {getattr(route, "path", None) for route in main.api_router.routes}
+        self.assertIn("/paper/ui-snapshot", paths)
+        source = inspect.getsource(main.create_app)
+        self.assertIn("app.include_router(api_router, prefix=settings.api_prefix)", source)
 
     def test_snapshot_validation_marker_present(self):
         source = inspect.getsource(main.get_paper_ui_snapshot)

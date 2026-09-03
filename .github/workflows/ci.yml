@@ -38,7 +38,7 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "1285"
+      EXPECTED_TESTS: "1301"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -201,3 +201,5 @@ jobs:
 
 # V16-M5B23-FIX4: EXPECTED_TESTS=1269 (8 runtime route/synchronization audit tests)
 # V16-M5B23-FIX5: EXPECTED_TESTS=1285 (16 frontend runtime synchronization audit tests)
+
+# V16-M5B24A: EXPECTED_TESTS=1301 (16 autonomous paper-monitoring hardening tests)

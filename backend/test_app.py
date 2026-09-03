@@ -7564,3 +7564,74 @@ class TestMarketRegimeEngineV16M5B22(unittest.TestCase):
 
 
 # V16-M5B22: 16 objective market-regime regression tests
+
+
+class TestMarketSessionsCalendarV16M5B23(unittest.TestCase):
+    def test_marker_present(self):
+        self.assertIn("SERVER_MARKET_SESSIONS_CALENDAR_V1", inspect.getsource(main))
+
+    def test_unknown_instrument_fails_safe(self):
+        result = main.market_session_context("NOPE-USD")
+        self.assertEqual(result["status"], "NOT_SUPPORTED")
+
+    def test_naive_time_rejected(self):
+        result = main.market_session_context("BTC-USD", datetime(2026, 9, 2, 12))
+        self.assertEqual(result["status"], "INVALID_TIME")
+
+    def test_crypto_is_24_7(self):
+        now = datetime(2026, 9, 6, 12, tzinfo=timezone.utc)
+        result = main.market_session_context("BTC-USD", now)
+        self.assertEqual(result["market_state"], "OPEN")
+
+    def test_crypto_session_label(self):
+        result = main.market_session_context("BTC-USD")
+        self.assertEqual(result["current_session"], "24_7")
+
+    def test_crypto_holidays_not_applicable(self):
+        result = main.market_session_context("BTC-USD")
+        self.assertEqual(result["holidays"], "NOT_APPLICABLE")
+
+    def test_forex_weekend_closed(self):
+        now = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
+        result = main.market_session_context("EUR-USD", now)
+        self.assertEqual(result["market_state"], "CLOSED_WEEKEND")
+
+    def test_forex_sessions_are_exposed(self):
+        now = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+        result = main.market_session_context("EUR-USD", now)
+        self.assertEqual(len(result["sessions"]), 4)
+
+    def test_forex_sessions_are_indicative(self):
+        now = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+        result = main.market_session_context("EUR-USD", now)
+        self.assertTrue(all(item["indicative"] for item in result["sessions"]))
+
+    def test_forex_holidays_not_fabricated(self):
+        result = main.market_session_context("EUR-USD")
+        self.assertEqual(result["holidays"], "NOT_IMPLEMENTED")
+
+    def test_context_is_paper_only(self):
+        result = main.market_session_context("BTC-USD")
+        self.assertTrue(result["paper_only"])
+        self.assertFalse(result["execution"])
+
+    def test_context_is_not_trade_authorization(self):
+        result = main.market_session_context("BTC-USD")
+        self.assertFalse(result["trade_authorization"])
+
+    def test_quality_is_independent(self):
+        result = main.market_session_context("BTC-USD")
+        self.assertTrue(result["data_quality_independent"])
+
+    def test_internal_timezone_is_utc(self):
+        result = main.market_session_context("BTC-USD")
+        self.assertEqual(result["timezone_internal"], "UTC")
+
+    def test_observed_at_is_aware(self):
+        result = main.market_session_context("BTC-USD")
+        parsed = datetime.fromisoformat(result["observed_at"])
+        self.assertIsNotNone(parsed.tzinfo)
+
+    def test_endpoint_route_registered(self):
+        paths = {getattr(route, "path", None) for route in main.api_router.routes}
+        self.assertIn("/market/session-context/{symbol}", paths)

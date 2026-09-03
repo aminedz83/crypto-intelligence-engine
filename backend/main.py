@@ -3118,7 +3118,10 @@ async def auto_entry_orchestrator_loop() -> None:
             auto_scan_runtime["last_error"] = type(exc).__name__
             log.error("Auto-entry orchestrator iteration failed: %s", exc)
         finally:
-            auto_scan_runtime["iterations"] = int(auto_scan_runtime["iterations"]) + 1
+            iterations = auto_scan_runtime.get("iterations", 0)
+            if not isinstance(iterations, int):
+                iterations = 0
+            auto_scan_runtime["iterations"] = iterations + 1
             auto_scan_runtime["last_completed_at"] = utcnow().isoformat()
         await asyncio.sleep(AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS)
 

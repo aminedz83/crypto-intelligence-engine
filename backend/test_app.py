@@ -7463,3 +7463,104 @@ class TestPaperPerformanceBreakdownV16M5B21(unittest.TestCase):
 
 
 # V16-M5B21: 16 persisted-dimension performance breakdown regression tests
+
+
+class TestMarketRegimeEngineV16M5B22(unittest.TestCase):
+    def _candles(self, closes, ranges=None):
+        now = datetime.now(timezone.utc)
+        result = []
+        for index, close in enumerate(closes):
+            width = ranges[index] if ranges else 1.0
+            result.append(
+                main.Candle(
+                    start=now - timedelta(minutes=5 * (len(closes) - index + 1)),
+                    low=close - width / 2,
+                    high=close + width / 2,
+                    open=close,
+                    close=close,
+                    volume=1.0,
+                    status=main.DataQualityStatus.VALID,
+                )
+            )
+        return result, now
+
+    def test_constants_are_objective(self):
+        self.assertEqual(main.SERVER_REGIME_LOOKBACK, 20)
+        self.assertEqual(main.SERVER_REGIME_ATR_WINDOW, 10)
+
+    def test_insufficient_closed_candles_waits(self):
+        candles, now = self._candles([100.0] * 10)
+        result = main.classify_server_market_regime(candles, now)
+        self.assertEqual(result["status"], "WAIT")
+
+    def test_bullish_trend(self):
+        candles, now = self._candles([100.0 + i for i in range(21)])
+        result = main.classify_server_market_regime(candles, now)
+        self.assertEqual((result["regime"], result["direction"]), ("TREND", "BULLISH"))
+
+    def test_bearish_trend(self):
+        candles, now = self._candles([120.0 - i for i in range(21)])
+        result = main.classify_server_market_regime(candles, now)
+        self.assertEqual((result["regime"], result["direction"]), ("TREND", "BEARISH"))
+
+    def test_range_has_no_direction(self):
+        closes = [100.0 + (1 if i % 2 else 0) for i in range(21)]
+        candles, now = self._candles(closes)
+        result = main.classify_server_market_regime(candles, now)
+        self.assertEqual((result["regime"], result["direction"]), ("RANGE", None))
+
+    def test_expansion_volatility(self):
+        ranges = [1.0] * 11 + [2.0] * 10
+        candles, now = self._candles([100.0 + i for i in range(21)], ranges)
+        result = main.classify_server_market_regime(candles, now)
+        self.assertEqual(result["volatility"], "EXPANSION")
+
+    def test_compression_volatility(self):
+        ranges = [2.0] * 11 + [1.0] * 10
+        candles, now = self._candles([100.0 + i * 0.1 for i in range(21)], ranges)
+        result = main.classify_server_market_regime(candles, now)
+        self.assertEqual(result["volatility"], "COMPRESSION")
+
+    def test_normal_volatility(self):
+        candles, now = self._candles([100.0 + i for i in range(21)])
+        self.assertEqual(main.classify_server_market_regime(candles, now)["volatility"], "NORMAL")
+
+    def test_only_closed_valid_candles_are_used(self):
+        source = inspect.getsource(main.classify_server_market_regime)
+        self.assertIn("closed_valid_candles", source)
+
+    def test_marker_present(self):
+        candles, now = self._candles([100.0 + i for i in range(21)])
+        result = main.classify_server_market_regime(candles, now)
+        self.assertEqual(result["marker"], "SERVER_MARKET_REGIME_V1")
+
+    def test_regime_is_not_a_signal(self):
+        candles, now = self._candles([100.0 + i for i in range(21)])
+        result = main.classify_server_market_regime(candles, now)
+        self.assertFalse(result["signal"])
+        self.assertFalse(result["auto_queue"])
+
+    def test_endpoint_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/market/regime/{symbol}", paths)
+
+    def test_endpoint_uses_real_coinbase_candles(self):
+        source = inspect.getsource(main.get_server_market_regime)
+        self.assertIn("market_provider.get_candles", source)
+        self.assertIn('"coinbase"', source)
+
+    def test_endpoint_rejects_non_crypto_v1(self):
+        source = inspect.getsource(main.get_server_market_regime)
+        self.assertIn("REGIME_CRYPTO_ONLY_V1", source)
+
+    def test_endpoint_requires_valid_quality(self):
+        source = inspect.getsource(main.get_server_market_regime)
+        self.assertIn("DataQualityStatus.VALID", source)
+
+    def test_endpoint_preserves_paper_only_contract(self):
+        source = inspect.getsource(main.get_server_market_regime)
+        self.assertIn('"paper_only": True', source)
+        self.assertIn('"execution": False', source)
+
+
+# V16-M5B22: 16 objective market-regime regression tests

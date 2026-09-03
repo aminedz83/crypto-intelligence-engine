@@ -6988,7 +6988,7 @@ class TestDecisionTraceV16M5B15(unittest.TestCase):
 
     def test_generation_records_decisions(self):
         source = inspect.getsource(main.run_server_auto_paper_generation_once)
-        self.assertIn("record_auto_decision_trace", source)
+        self.assertIn("record_and_persist_auto_decision_trace", source)
 
     def test_decision_trace_endpoint_exists(self):
         source = inspect.getsource(main.get_auto_decision_trace)
@@ -7059,3 +7059,5 @@ class TestSignalDecisionHistoryV16M5B16(unittest.TestCase):
     def test_ui_marks_signal_decision_history(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("SIGNAL DECISION HISTORY V1", html)
+
+# V16-M5B16-FIX2: M5B15 regression contract follows persisted decision wrapper

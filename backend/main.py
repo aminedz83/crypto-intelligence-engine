@@ -7239,3 +7239,96 @@ app = create_app()
 # V16-M5B17: paper performance analytics from persisted CLOSED trades
 
 # V16-M5B20: UTC DAY/WEEK/MONTH/YEAR paper performance windows
+
+
+# ============================ V16-M5B23 Market Sessions & Calendar ============
+def market_session_context(
+    canonical_symbol: str, now_utc: Optional[datetime] = None
+) -> Dict[str, object]:
+    """Unified, fail-safe session/calendar context for a registered instrument.
+
+    Calendar state never implies data quality or trade permission. Holiday knowledge
+    is not fabricated: policies without a verified holiday calendar expose UNKNOWN.
+    """
+    symbol = canonical_symbol.upper()
+    inst = registry.get(symbol)
+    if inst is None:
+        return {
+            "status": "NOT_SUPPORTED",
+            "symbol": symbol,
+            "market_state": "UNKNOWN",
+            "reason": "unknown instrument",
+            "paper_only": True,
+            "execution": False,
+        }
+    now = now_utc or utcnow()
+    if now.tzinfo is None:
+        return {
+            "status": "INVALID_TIME",
+            "symbol": symbol,
+            "market_state": "UNKNOWN",
+            "reason": "timezone-aware UTC timestamp required",
+            "paper_only": True,
+            "execution": False,
+        }
+    now = now.astimezone(timezone.utc)
+    calendar = calendar_for(inst.market_calendar)
+    open_state = calendar.is_market_expected_open(int(now.timestamp())).value
+    sessions: List[Dict[str, object]] = []
+    current_session: Optional[str] = None
+    next_open: Optional[str] = None
+    next_close: Optional[str] = None
+    holidays = "NOT_IMPLEMENTED"
+
+    if inst.market_calendar == MarketCalendarPolicy.ALWAYS_OPEN_24_7:
+        market_state = "OPEN"
+        current_session = "24_7"
+        reason = "registered 24/7 market calendar"
+        holidays = "NOT_APPLICABLE"
+    elif inst.market_calendar == MarketCalendarPolicy.FOREX_WEEK:
+        state = forex_market_state(now)
+        market_state = str(state["market_state"])
+        reason = str(state["reason"])
+        sessions = list(state["sessions"])
+        value = state.get("current_session")
+        current_session = str(value) if value is not None else None
+        next_open = state.get("next_open") if isinstance(state.get("next_open"), str) else None
+        next_close = state.get("next_close") if isinstance(state.get("next_close"), str) else None
+    elif inst.market_calendar == MarketCalendarPolicy.US_EQUITY_RTH:
+        market_state = open_state
+        reason = "U.S. regular-hours baseline; holidays and early closes unknown"
+        if market_state == "OPEN":
+            current_session = "US_RTH"
+    else:
+        market_state = "UNKNOWN"
+        reason = "market calendar not configured"
+
+    return {
+        "status": "READY",
+        "symbol": symbol,
+        "asset_class": inst.asset_class.value,
+        "calendar_policy": inst.market_calendar.value,
+        "market_state": market_state,
+        "calendar_open_state": open_state,
+        "current_session": current_session,
+        "sessions": sessions,
+        "next_open": next_open,
+        "next_close": next_close,
+        "holidays": holidays,
+        "observed_at": now.isoformat(),
+        "timezone_internal": "UTC",
+        "reason": reason,
+        "data_quality_independent": True,
+        "trade_authorization": False,
+        "paper_only": True,
+        "execution": False,
+        "marker": "SERVER_MARKET_SESSIONS_CALENDAR_V1",
+    }
+
+
+@api_router.get("/market/session-context/{symbol}")
+async def market_session_context_endpoint(symbol: str) -> dict:
+    result = market_session_context(symbol)
+    if result["status"] == "NOT_SUPPORTED":
+        raise HTTPException(status_code=404, detail=result)
+    return result

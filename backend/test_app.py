@@ -6914,3 +6914,86 @@ class TestContinuousAutoScanV16M5B14(unittest.TestCase):
     def test_ui_marks_continuous_auto_scan(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("CONTINUOUS AUTO SCAN V1", html)
+
+
+class TestDecisionTraceV16M5B15(unittest.TestCase):
+    def setUp(self):
+        main.reset_auto_scan_runtime()
+
+    def test_trace_contract_version(self):
+        self.assertEqual(
+            main.auto_decision_trace_status()["validation"], "SERVER_DECISION_TRACE_V1"
+        )
+
+    def test_trace_is_paper_only(self):
+        self.assertTrue(main.auto_decision_trace_status()["paper_only"])
+
+    def test_trace_disables_broker_execution(self):
+        self.assertFalse(main.auto_decision_trace_status()["broker_execution"])
+
+    def test_trace_records_wait_reason(self):
+        detector = {"status": "READY", "setup_state": "WAIT"}
+        main.record_auto_decision_trace(
+            "BTC-USD", "WAIT", main._decision_reason_from_detector(detector), detector
+        )
+        item = main.auto_decision_trace_status()["items"][0]
+        self.assertEqual(item["reason"], "STRUCTURE_NOT_CONFIRMED")
+
+    def test_trace_records_entry_now_reason(self):
+        detector = {"status": "READY", "setup_state": "ENTRY_NOW"}
+        self.assertEqual(
+            main._decision_reason_from_detector(detector), "ALL_CONFIRMATIONS_VALID"
+        )
+
+    def test_trace_records_invalidated_reason(self):
+        detector = {"status": "READY", "setup_state": "INVALIDATED"}
+        self.assertEqual(
+            main._decision_reason_from_detector(detector), "ENTRY_GATE_INVALIDATED"
+        )
+
+    def test_trace_records_expired_reason(self):
+        detector = {"status": "READY", "setup_state": "EXPIRED"}
+        self.assertEqual(
+            main._decision_reason_from_detector(detector), "ENTRY_WINDOW_EXPIRED"
+        )
+
+    def test_trace_normalizes_symbol(self):
+        main.record_auto_decision_trace("btc/usd", "WAIT", "TEST")
+        item = main.auto_decision_trace_status()["items"][0]
+        self.assertEqual(item["symbol"], "BTC-USD")
+
+    def test_trace_is_bounded(self):
+        for index in range(main.AUTO_DECISION_TRACE_MAX + 5):
+            main.record_auto_decision_trace("BTC-USD", "WAIT", str(index))
+        self.assertEqual(len(main.auto_decision_trace), main.AUTO_DECISION_TRACE_MAX)
+
+    def test_trace_limit_is_clamped(self):
+        self.assertEqual(
+            main.auto_decision_trace_status(999)["limit"], main.AUTO_DECISION_TRACE_MAX
+        )
+
+    def test_runtime_status_exposes_trace_count(self):
+        main.record_auto_decision_trace("BTC-USD", "WAIT", "TEST")
+        self.assertEqual(main.auto_scan_runtime_status()["decision_trace_count"], 1)
+
+    def test_runtime_status_exposes_latest_decision(self):
+        main.record_auto_decision_trace("ETH-USD", "WAIT", "TEST")
+        latest = main.auto_scan_runtime_status()["latest_decision"]
+        self.assertEqual(latest["symbol"], "ETH-USD")
+
+    def test_reset_clears_decision_trace(self):
+        main.record_auto_decision_trace("BTC-USD", "WAIT", "TEST")
+        main.reset_auto_scan_runtime()
+        self.assertEqual(main.auto_decision_trace, [])
+
+    def test_generation_records_decisions(self):
+        source = inspect.getsource(main.run_server_auto_paper_generation_once)
+        self.assertIn("record_auto_decision_trace", source)
+
+    def test_decision_trace_endpoint_exists(self):
+        source = inspect.getsource(main.get_auto_decision_trace)
+        self.assertIn("auto_decision_trace_status", source)
+
+    def test_ui_marks_decision_trace(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("DECISION TRACE V1", html)

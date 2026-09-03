@@ -2457,6 +2457,101 @@ def build_server_trade_plan(
         "auto_queue": False,
     }
 
+def evaluate_server_entry_now_gate(
+    candles: List[Candle],
+    trade_plan: Dict[str, object],
+    revalidation: Dict[str, object],
+    order_block: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    """Return the paper-only lifecycle state for the current closed candle.
+
+    ENTRY_NOW is deliberately ephemeral: it is emitted only while the latest
+    closed VALID candle is the same candle that produced REVALIDATED. A setup
+    becomes EXPIRED on the next closed candle if it was not consumed. An
+    invalidated Order Block always wins. This gate never queues or executes.
+    """
+    base: Dict[str, object] = {
+        "event": "ENTRY_GATE",
+        "state": "WAIT",
+        "direction": None,
+        "revalidation_index": None,
+        "latest_closed_index": len(candles) - 1 if candles else None,
+        "reason": "SETUP_INCOMPLETE",
+        "auto_queue": False,
+    }
+    if order_block and order_block.get("state") == "INVALIDATED":
+        base["state"] = "INVALIDATED"
+        base["reason"] = "ORDER_BLOCK_INVALIDATED"
+        return base
+    if revalidation.get("state") == "INVALIDATED":
+        base["state"] = "INVALIDATED"
+        base["reason"] = "REVALIDATION_INVALIDATED"
+        return base
+    if trade_plan.get("state") != "CANDIDATE_READY":
+        return base
+    if revalidation.get("state") != "REVALIDATED":
+        return base
+
+    direction = trade_plan.get("direction")
+    if direction not in {"BULLISH", "BEARISH"}:
+        return base
+    if revalidation.get("direction") != direction:
+        base["reason"] = "DIRECTION_MISMATCH"
+        return base
+    base["direction"] = direction
+
+    entry = trade_plan.get("entry_reference")
+    stop = trade_plan.get("stop_loss")
+    target = trade_plan.get("take_profit")
+    zone_low = trade_plan.get("entry_zone_low")
+    zone_high = trade_plan.get("entry_zone_high")
+    if not (
+        isinstance(entry, (int, float))
+        and isinstance(stop, (int, float))
+        and isinstance(target, (int, float))
+        and isinstance(zone_low, (int, float))
+        and isinstance(zone_high, (int, float))
+    ):
+        base["reason"] = "TRADE_LEVELS_INVALID"
+        return base
+    entry_f = float(entry)
+    stop_f = float(stop)
+    target_f = float(target)
+    low_f = float(zone_low)
+    high_f = float(zone_high)
+    if low_f >= high_f or not low_f <= entry_f <= high_f:
+        base["reason"] = "ENTRY_ZONE_INVALID"
+        return base
+    levels_valid = (
+        direction == "BULLISH" and stop_f < entry_f < target_f
+    ) or (direction == "BEARISH" and target_f < entry_f < stop_f)
+    if not levels_valid:
+        base["reason"] = "TRADE_LEVELS_INVALID"
+        return base
+
+    raw_index = revalidation.get("revalidation_index")
+    if not isinstance(raw_index, int) or raw_index < 0:
+        base["reason"] = "REVALIDATION_INDEX_INVALID"
+        return base
+    base["revalidation_index"] = raw_index
+    if not candles or raw_index >= len(candles):
+        base["reason"] = "REVALIDATION_INDEX_INVALID"
+        return base
+
+    latest_index = len(candles) - 1
+    if raw_index < latest_index:
+        base["state"] = "EXPIRED"
+        base["reason"] = "ENTRY_WINDOW_CLOSED"
+        return base
+    if raw_index > latest_index:
+        base["reason"] = "REVALIDATION_INDEX_INVALID"
+        return base
+
+    base["state"] = "ENTRY_NOW"
+    base["reason"] = "CURRENT_CLOSED_CANDLE_REVALIDATED"
+    return base
+
+
 def structure_from_confirmed_swings(
     candles: List[Candle],
     swing_highs: List[int],
@@ -2571,6 +2666,9 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
         order_block,
         revalidation,
     )
+    entry_gate = evaluate_server_entry_now_gate(
+        closed, trade_plan, revalidation, order_block
+    )
     latest = closed[-1]
     return {
         "status": "READY",
@@ -2580,15 +2678,19 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
         "confirmed_swing_highs": len(highs),
         "confirmed_swing_lows": len(lows),
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
-        "setup_state": "WAIT",
+        "setup_state": entry_gate["state"],
         "auto_queue": False,
-        "smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_RETEST_PLAN_V1",
+        "smc_confirmation": (
+            "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_"
+            "FVG_OB_RETEST_PLAN_GATE_V1"
+        ),
         "liquidity_sweep": liquidity_sweep or {"event": "NONE", "direction": None},
         "displacement": displacement or {"event": "NONE", "direction": None},
         "fvg": fvg or {"event": "NONE", "direction": None},
         "order_block": order_block or {"event": "NONE", "direction": None},
         "revalidation": revalidation,
         "trade_plan": trade_plan,
+        "entry_gate": entry_gate,
     }
 
 
@@ -2749,6 +2851,7 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "order_block_detection": "SERVER_ORDER_BLOCK_V1",
         "retest_revalidation": "SERVER_RETEST_REVALIDATION_V1",
         "trade_plan_builder": "SERVER_TRADE_PLAN_V1",
+        "entry_now_gate": "SERVER_ENTRY_NOW_GATE_V1",
         "smc_auto_candidate_generation": "NOT_IMPLEMENTED",
         "paper_only": True,
         "execution": False,

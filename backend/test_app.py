@@ -7433,10 +7433,8 @@ class TestPaperPerformanceBreakdownV16M5B21(unittest.TestCase):
         )
 
     def test_endpoint_exists(self):
-        paths = {
-            route.path for route in main.app.routes if hasattr(route, "path")
-        }
-        self.assertIn("/api/v1/paper/performance/breakdown", paths)
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/paper/performance/breakdown", paths)
 
     def test_endpoint_defaults_to_symbol(self):
         signature = inspect.signature(main.get_paper_performance_breakdown)

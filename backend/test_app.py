@@ -8217,3 +8217,112 @@ class AutoEntryExecutionDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("create_paper_position", request_source)
         self.assertNotIn("create_paper_position", fill_source)
 
+# ---------------- V16-M5B25B: HTF -> LTF strategy integration ----------------
+class ServerHtfLtfStrategyIntegrationTests(unittest.TestCase):
+    def _ltf(self, direction="BULLISH", state="ENTRY_NOW"):
+        return {
+            "status": "READY",
+            "setup_state": state,
+            "entry_gate": {"state": state, "direction": direction},
+        }
+
+    def _htf(self, structure="BULLISH", location="DISCOUNT"):
+        return {
+            "status": "READY",
+            "structure": structure,
+            "location": location,
+            "validation": "SERVER_HTF_CONTEXT_V1",
+        }
+
+    def test_bullish_discount_entry_is_allowed(self):
+        result = main.apply_htf_context_to_ltf_setup(self._ltf(), self._htf())
+        self.assertEqual(result["setup_state"], "ENTRY_NOW")
+
+    def test_bullish_equilibrium_entry_is_allowed(self):
+        result = main.apply_htf_context_to_ltf_setup(
+            self._ltf(), self._htf(location="EQUILIBRIUM")
+        )
+        self.assertEqual(result["setup_state"], "ENTRY_NOW")
+
+    def test_bullish_premium_entry_waits(self):
+        result = main.apply_htf_context_to_ltf_setup(
+            self._ltf(), self._htf(location="PREMIUM")
+        )
+        self.assertEqual(result["reason"], "HTF_BULLISH_ENTRY_IN_PREMIUM")
+
+    def test_bullish_against_bearish_htf_waits(self):
+        result = main.apply_htf_context_to_ltf_setup(
+            self._ltf(), self._htf(structure="BEARISH")
+        )
+        self.assertEqual(result["reason"], "HTF_STRUCTURE_NOT_BULLISH")
+
+    def test_bullish_against_range_htf_waits(self):
+        result = main.apply_htf_context_to_ltf_setup(
+            self._ltf(), self._htf(structure="RANGE")
+        )
+        self.assertEqual(result["setup_state"], "WAIT")
+
+    def test_bearish_premium_entry_is_allowed(self):
+        result = main.apply_htf_context_to_ltf_setup(
+            self._ltf("BEARISH"), self._htf("BEARISH", "PREMIUM")
+        )
+        self.assertEqual(result["setup_state"], "ENTRY_NOW")
+
+    def test_bearish_equilibrium_entry_is_allowed(self):
+        result = main.apply_htf_context_to_ltf_setup(
+            self._ltf("BEARISH"), self._htf("BEARISH", "EQUILIBRIUM")
+        )
+        self.assertEqual(result["setup_state"], "ENTRY_NOW")
+
+    def test_bearish_discount_entry_waits(self):
+        result = main.apply_htf_context_to_ltf_setup(
+            self._ltf("BEARISH"), self._htf("BEARISH", "DISCOUNT")
+        )
+        self.assertEqual(result["reason"], "HTF_BEARISH_ENTRY_IN_DISCOUNT")
+
+    def test_bearish_against_bullish_htf_waits(self):
+        result = main.apply_htf_context_to_ltf_setup(
+            self._ltf("BEARISH"), self._htf("BULLISH", "PREMIUM")
+        )
+        self.assertEqual(result["reason"], "HTF_STRUCTURE_NOT_BEARISH")
+
+    def test_htf_not_ready_blocks_entry(self):
+        result = main.apply_htf_context_to_ltf_setup(
+            self._ltf(),
+            {"status": "WAIT", "reason": "INSUFFICIENT_HTF_CONFIRMED_SWINGS"},
+        )
+        self.assertEqual(result["reason"], "INSUFFICIENT_HTF_CONFIRMED_SWINGS")
+
+    def test_missing_ltf_gate_blocks_entry(self):
+        ltf = self._ltf()
+        ltf.pop("entry_gate")
+        result = main.apply_htf_context_to_ltf_setup(ltf, self._htf())
+        self.assertEqual(result["reason"], "LTF_ENTRY_GATE_MISSING")
+
+    def test_invalid_ltf_direction_blocks_entry(self):
+        result = main.apply_htf_context_to_ltf_setup(
+            self._ltf("SIDEWAYS"), self._htf()
+        )
+        self.assertEqual(result["reason"], "LTF_ENTRY_DIRECTION_INVALID")
+
+    def test_non_entry_state_is_not_promoted(self):
+        result = main.apply_htf_context_to_ltf_setup(
+            self._ltf(state="WAIT"), self._htf()
+        )
+        self.assertEqual(result["setup_state"], "WAIT")
+
+    def test_result_embeds_htf_context(self):
+        htf = self._htf()
+        result = main.apply_htf_context_to_ltf_setup(self._ltf(), htf)
+        self.assertEqual(result["htf_context"], htf)
+
+    def test_result_marks_htf_ltf_validation(self):
+        result = main.apply_htf_context_to_ltf_setup(self._ltf(), self._htf())
+        self.assertEqual(result["validation"], "SERVER_HTF_LTF_INTEGRATION_V1")
+
+    def test_setup_detector_fetches_real_htf_only_for_entry_now(self):
+        source = inspect.getsource(main.get_server_market_setup_detector)
+        self.assertIn("SERVER_HTF_GRANULARITY", source)
+        self.assertIn("classify_server_htf_context(htf_candles, utcnow())", source)
+        self.assertIn('ltf_result.get("setup_state") != "ENTRY_NOW"', source)
+

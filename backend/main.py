@@ -1988,6 +1988,85 @@ def closed_valid_candles(candles: List[Candle], now: datetime) -> List[Candle]:
     return sorted(result, key=lambda item: item.start or datetime.min.replace(tzinfo=timezone.utc))
 
 
+SERVER_REGIME_LOOKBACK = 20
+SERVER_REGIME_ATR_WINDOW = 10
+SERVER_REGIME_TREND_EFFICIENCY_MIN = 0.55
+SERVER_REGIME_RANGE_EFFICIENCY_MAX = 0.35
+SERVER_REGIME_EXPANSION_RATIO = 1.25
+SERVER_REGIME_COMPRESSION_RATIO = 0.80
+
+
+def classify_server_market_regime(candles: List[Candle], now: datetime) -> Dict[str, object]:
+    """Classify trend/range and volatility from closed VALID candles only."""
+    closed = closed_valid_candles(candles, now)
+    required = max(SERVER_REGIME_LOOKBACK + 1, SERVER_REGIME_ATR_WINDOW * 2 + 1)
+    if len(closed) < required:
+        return {"status": "WAIT", "reason": "INSUFFICIENT_CLOSED_CANDLES"}
+    sample = closed[-required:]
+    closes = [float(item.close) for item in sample if item.close is not None]
+    if len(closes) != required or any(value <= 0 for value in closes):
+        return {"status": "WAIT", "reason": "INVALID_CLOSE_SERIES"}
+
+    trend_closes = closes[-(SERVER_REGIME_LOOKBACK + 1):]
+    net_change = trend_closes[-1] - trend_closes[0]
+    path = sum(
+        abs(trend_closes[index] - trend_closes[index - 1])
+        for index in range(1, len(trend_closes))
+    )
+    efficiency = abs(net_change) / path if path > 0 else 0.0
+    if efficiency >= SERVER_REGIME_TREND_EFFICIENCY_MIN and net_change != 0:
+        structure = "TREND"
+        direction = "BULLISH" if net_change > 0 else "BEARISH"
+    elif efficiency <= SERVER_REGIME_RANGE_EFFICIENCY_MAX:
+        structure = "RANGE"
+        direction = None
+    else:
+        structure = "TRANSITION"
+        direction = "BULLISH" if net_change > 0 else "BEARISH" if net_change < 0 else None
+
+    true_ranges: List[float] = []
+    for index in range(1, len(sample)):
+        current = sample[index]
+        previous_close = sample[index - 1].close
+        if current.high is None or current.low is None or previous_close is None:
+            return {"status": "WAIT", "reason": "INVALID_RANGE_SERIES"}
+        true_ranges.append(
+            max(
+                current.high - current.low,
+                abs(current.high - previous_close),
+                abs(current.low - previous_close),
+            )
+        )
+    prior = true_ranges[-(SERVER_REGIME_ATR_WINDOW * 2):-SERVER_REGIME_ATR_WINDOW]
+    recent = true_ranges[-SERVER_REGIME_ATR_WINDOW:]
+    prior_atr = sum(prior) / len(prior)
+    recent_atr = sum(recent) / len(recent)
+    volatility_ratio = recent_atr / prior_atr if prior_atr > 0 else None
+    if volatility_ratio is None:
+        volatility = "UNKNOWN"
+    elif volatility_ratio >= SERVER_REGIME_EXPANSION_RATIO:
+        volatility = "EXPANSION"
+    elif volatility_ratio <= SERVER_REGIME_COMPRESSION_RATIO:
+        volatility = "COMPRESSION"
+    else:
+        volatility = "NORMAL"
+
+    latest = sample[-1]
+    return {
+        "status": "READY",
+        "regime": structure,
+        "direction": direction,
+        "volatility": volatility,
+        "efficiency_ratio": round(efficiency, 6),
+        "volatility_ratio": round(volatility_ratio, 6) if volatility_ratio is not None else None,
+        "closed_candles": len(closed),
+        "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
+        "marker": "SERVER_MARKET_REGIME_V1",
+        "signal": False,
+        "auto_queue": False,
+    }
+
+
 def confirmed_swing_indexes(
     candles: List[Candle], strength: int = SERVER_SWING_STRENGTH
 ) -> Tuple[List[int], List[int]]:
@@ -2785,6 +2864,46 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
         "revalidation": revalidation,
         "trade_plan": trade_plan,
         "entry_gate": entry_gate,
+    }
+
+
+@api_router.get("/market/regime/{symbol}")
+async def get_server_market_regime(symbol: str) -> Dict[str, object]:
+    canonical = symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    if instrument is None:
+        return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "INSTRUMENT_NOT_REGISTERED"}
+    if instrument.asset_class != AssetClass.CRYPTO:
+        return {"status": "NOT_SUPPORTED", "symbol": canonical, "reason": "REGIME_CRYPTO_ONLY_V1"}
+    provider_symbol = provider_symbol_map.to_provider("coinbase", canonical)
+    if provider_symbol is None:
+        return {
+            "status": "UNAVAILABLE",
+            "symbol": canonical,
+            "reason": "PROVIDER_SYMBOL_NOT_MAPPED",
+        }
+    try:
+        candles, quality = await market_provider.get_candles(
+            provider_symbol, SERVER_SETUP_GRANULARITY, SERVER_SETUP_CANDLE_LIMIT
+        )
+    except (httpx.HTTPError, ValueError):
+        return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "CANDLES_UNAVAILABLE"}
+    if quality != DataQualityStatus.VALID:
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "reason": "CANDLES_NOT_VALID",
+            "quality": quality.value,
+        }
+    result = classify_server_market_regime(candles, utcnow())
+    return {
+        **result,
+        "symbol": canonical,
+        "source": "coinbase",
+        "granularity": SERVER_SETUP_GRANULARITY,
+        "quality": quality.value,
+        "paper_only": True,
+        "execution": False,
     }
 
 

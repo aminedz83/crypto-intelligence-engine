@@ -8048,9 +8048,10 @@ class ServerHtfContextFoundationTests(unittest.TestCase):
         self.assertIn('"paper_only": True', source)
         self.assertNotIn("create_paper_position", source)
 
-    def test_ltf_detector_not_yet_gated_by_htf(self):
+    def test_ltf_detector_is_now_gated_by_htf(self):
         source = inspect.getsource(main.get_server_market_setup_detector)
-        self.assertNotIn("classify_server_htf_context", source)
+        self.assertIn("classify_server_htf_context", source)
+        self.assertIn("apply_htf_context_to_ltf_setup", source)
         self.assertNotIn("SERVER_HTF_GRANULARITY", source)
 
 

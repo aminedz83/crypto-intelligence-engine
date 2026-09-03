@@ -7371,3 +7371,95 @@ class TestPaperPerformancePeriodsV16M5B20(unittest.TestCase):
 
 
 # V16-M5B20: 16 UTC performance-period regression tests
+
+
+class TestPaperPerformanceBreakdownV16M5B21(unittest.TestCase):
+    def setUp(self):
+        self.initial = Decimal("1000")
+        self.rows = [
+            {
+                "symbol": "BTC-USD", "side": "LONG", "entry": Decimal("100"),
+                "close_price": Decimal("110"), "size": Decimal("1"),
+                "risk_money": Decimal("5"),
+            },
+            {
+                "symbol": "BTC-USD", "side": "SHORT", "entry": Decimal("100"),
+                "close_price": Decimal("105"), "size": Decimal("1"),
+                "risk_money": Decimal("5"),
+            },
+            {
+                "symbol": "ETH-USD", "side": "LONG", "entry": Decimal("50"),
+                "close_price": Decimal("55"), "size": Decimal("2"),
+                "risk_money": Decimal("10"),
+            },
+        ]
+
+    def test_supported_groups_are_exact(self):
+        self.assertEqual(main.PAPER_PERFORMANCE_BREAKDOWN_GROUPS, {"SYMBOL", "SIDE"})
+
+    def test_symbol_breakdown_has_two_groups(self):
+        groups = main.build_paper_performance_breakdown(self.rows, self.initial, "SYMBOL")
+        self.assertEqual([group["group"] for group in groups], ["BTC-USD", "ETH-USD"])
+
+    def test_symbol_breakdown_uses_real_trade_count(self):
+        groups = main.build_paper_performance_breakdown(self.rows, self.initial, "SYMBOL")
+        self.assertEqual(groups[0]["metrics"]["closed_trades"], 2)
+
+    def test_symbol_breakdown_calculates_net_pnl(self):
+        groups = main.build_paper_performance_breakdown(self.rows, self.initial, "SYMBOL")
+        self.assertEqual(groups[0]["metrics"]["net_pnl"], "5")
+
+    def test_side_breakdown_has_long_and_short(self):
+        groups = main.build_paper_performance_breakdown(self.rows, self.initial, "side")
+        self.assertEqual([group["group"] for group in groups], ["LONG", "SHORT"])
+
+    def test_side_breakdown_long_trade_count(self):
+        groups = main.build_paper_performance_breakdown(self.rows, self.initial, "SIDE")
+        self.assertEqual(groups[0]["metrics"]["closed_trades"], 2)
+
+    def test_invalid_group_is_rejected(self):
+        with self.assertRaises(ValueError):
+            main.build_paper_performance_breakdown(self.rows, self.initial, "SESSION")
+
+    def test_missing_group_value_is_rejected(self):
+        rows = [dict(self.rows[0])]
+        rows[0]["symbol"] = ""
+        with self.assertRaises(ValueError):
+            main.build_paper_performance_breakdown(rows, self.initial, "SYMBOL")
+
+    def test_empty_rows_return_empty_groups(self):
+        self.assertEqual(
+            main.build_paper_performance_breakdown([], self.initial, "SYMBOL"), []
+        )
+
+    def test_endpoint_exists(self):
+        paths = {route.path for route in main.app.routes}
+        self.assertIn("/api/v1/paper/performance/breakdown", paths)
+
+    def test_endpoint_defaults_to_symbol(self):
+        signature = inspect.signature(main.get_paper_performance_breakdown)
+        self.assertEqual(signature.parameters["group_by"].default, "SYMBOL")
+
+    def test_endpoint_defaults_to_all_period(self):
+        signature = inspect.signature(main.get_paper_performance_breakdown)
+        self.assertEqual(signature.parameters["period"].default, "ALL")
+
+    def test_endpoint_uses_period_boundary(self):
+        source = inspect.getsource(main.get_paper_performance_breakdown)
+        self.assertIn("paper_performance_period_start", source)
+
+    def test_endpoint_reads_only_closed_positions(self):
+        source = inspect.getsource(main.get_paper_performance_breakdown)
+        self.assertIn("WHERE status='CLOSED'", source)
+
+    def test_endpoint_marks_deferred_unstored_dimensions(self):
+        source = inspect.getsource(main.get_paper_performance_breakdown)
+        self.assertIn('"TIMEFRAME", "STRATEGY", "SESSION", "REGIME"', source)
+
+    def test_endpoint_is_paper_only(self):
+        source = inspect.getsource(main.get_paper_performance_breakdown)
+        self.assertIn('"paper_only": True', source)
+        self.assertIn('"execution": False', source)
+
+
+# V16-M5B21: 16 persisted-dimension performance breakdown regression tests

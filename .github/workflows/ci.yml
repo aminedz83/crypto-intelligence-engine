@@ -38,7 +38,7 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "1141"
+      EXPECTED_TESTS: "1157"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -186,3 +186,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 # V16-M5B4-FIX2 — fresh synchronized copy
+
+# V16-M5B17: EXPECTED_TESTS=1157 (16 performance analytics tests)

@@ -4504,11 +4504,11 @@ async def get_paper_ui_snapshot(
         return await signal_decision_history(limit=50, symbol=symbol, state=state)
 
     decision_history = await _paper_ui_section(decisions)
-    watchdog = {
+    watchdog: Dict[str, object] = {
         "status": "OK",
         "data": auto_scan_watchdog_status(),
     }
-    runtime = {
+    runtime: Dict[str, object] = {
         "status": "OK",
         "data": auto_scan_runtime_status(),
     }

@@ -38,7 +38,7 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "1333"
+      EXPECTED_TESTS: "1349"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -207,3 +207,5 @@ jobs:
 # V16-M5B24B: EXPECTED_TESTS=1317 (16 crypto registry/scanner alignment tests)
 
 # V16-M5B25A: EXPECTED_TESTS=1333 (16 HTF context foundation tests)
+
+# V16-M5B25A-FIX2: EXPECTED_TESTS=1349 (16 ENTRY_NOW execution diagnostics tests)

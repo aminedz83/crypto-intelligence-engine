@@ -4512,7 +4512,7 @@ async def get_paper_ui_snapshot(
         "status": "OK",
         "data": auto_scan_runtime_status(),
     }
-    sections = {
+    sections: Dict[str, Dict[str, object]] = {
         "account": account,
         "positions": positions,
         "live_positions": live_positions,
@@ -4521,7 +4521,10 @@ async def get_paper_ui_snapshot(
         "watchdog": watchdog,
         "runtime": runtime,
     }
-    available = sum(1 for section in sections.values() if section["status"] == "OK")
+    available = 0
+    for section in sections.values():
+        if section.get("status") == "OK":
+            available += 1
     return {
         "status": "OK" if available == len(sections) else "PARTIAL",
         "validation": "SERVER_PAPER_UI_SNAPSHOT_V1",

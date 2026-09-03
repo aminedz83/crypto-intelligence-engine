@@ -3079,6 +3079,44 @@ async def auto_entry_orchestrator_loop() -> None:
         await asyncio.sleep(AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS)
 
 
+def auto_paper_e2e_readiness() -> Dict[str, object]:
+    """Expose the server-side wiring required for paper auto-trading E2E.
+
+    This is a readiness/contract audit, not proof that a market setup exists.
+    A real position still requires real VALID market data and ENTRY_NOW.
+    """
+    task = auto_entry_orchestrator_task
+    orchestrator_running = task is not None and not task.done()
+    ready = persistence_state.ready and orchestrator_running
+    return {
+        "status": "READY" if ready else "NOT_READY",
+        "validation": "SERVER_AUTO_PAPER_E2E_READINESS_V1",
+        "persistence_ready": persistence_state.ready,
+        "orchestrator_running": orchestrator_running,
+        "paper_monitor_interval_seconds": max(
+            settings.paper_monitor_interval_seconds, 1.0
+        ),
+        "pipeline": [
+            "REAL_MARKET_DATA",
+            "SERVER_SMC_SETUP",
+            "ENTRY_NOW_GATE",
+            "PORTFOLIO_RISK_GUARD",
+            "PAPER_POSITION_CREATE",
+            "REALTIME_MARK",
+            "SL_TP_CLOSE",
+            "PAPER_HISTORY",
+        ],
+        "paper_only": True,
+        "broker_execution": False,
+        "live_trading_enabled": False,
+    }
+
+
+@api_router.get("/paper/auto-entry/e2e-readiness")
+async def get_auto_paper_e2e_readiness() -> Dict[str, object]:
+    return auto_paper_e2e_readiness()
+
+
 @api_router.post("/paper/auto-entry/candidates")
 async def queue_auto_entry_candidate(
     req: AutoEntryCandidateRequest,

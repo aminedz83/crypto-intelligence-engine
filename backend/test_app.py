@@ -7158,7 +7158,10 @@ class TestTradingOperationalAuditUiV16M5B18(unittest.TestCase):
         self.assertIn('paperUiState.performance=performance.data||null', self.html())
 
     def test_ui_stores_decisions(self):
-        self.assertIn('paperUiState.decisions=(decisions.data&&decisions.data.items)||[]', self.html())
+        self.assertIn(
+            'paperUiState.decisions=(decisions.data&&decisions.data.items)||[]',
+            self.html(),
+        )
 
     def test_ui_exposes_closed_trade_count(self):
         self.assertIn('Trades clôturés', self.html())

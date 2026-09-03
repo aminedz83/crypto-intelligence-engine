@@ -5299,7 +5299,8 @@ class TestServerMarketSetupDetectorV16M5B1(unittest.TestCase):
     def test_full_smc_is_explicitly_not_implemented(self):
         source = inspect.getsource(main.detect_server_market_structure)
         self.assertIn(
-            '"smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_RETEST_V1"',
+            '"smc_confirmation": '
+            '"STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_RETEST_PLAN_V1"',
             source,
         )
         self.assertIn('"liquidity_sweep": liquidity_sweep', source)
@@ -6180,7 +6181,7 @@ class TestServerRetestRevalidationV16M5B7(unittest.TestCase):
     def test_detector_contract_names_retest(self):
         source = inspect.getsource(main.detect_server_market_structure)
         self.assertIn(
-            "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_RETEST_V1",
+            "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_RETEST_PLAN_V1",
             source,
         )
 
@@ -6196,3 +6197,126 @@ class TestServerRetestRevalidationV16M5B7(unittest.TestCase):
         )
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("SERVER DETECTOR · RETEST REVALIDATION V1", html)
+
+
+class TestServerTradePlanV16M5B8(unittest.TestCase):
+    def candle(self, index, low, high, open_=100, close=100):
+        return main.Candle(
+            start=NOW + timedelta(minutes=index * 5),
+            low=float(low), high=float(high), open=float(open_), close=float(close),
+            volume=1.0, status=main.DataQualityStatus.VALID,
+        )
+
+    def chain(self, direction="BULLISH"):
+        return (
+            {"event": "BOS", "direction": direction},
+            {"event": "SSL_SWEEP", "direction": direction},
+            {"event": "DISPLACEMENT", "direction": direction},
+            {"event": "FVG", "direction": direction, "state": "OPEN"},
+            {
+                "event": "ORDER_BLOCK", "direction": direction,
+                "state": "RETESTED", "zone_low": 99.0, "zone_high": 103.0,
+            },
+            {"event": "REVALIDATION", "state": "REVALIDATED", "direction": direction},
+        )
+
+    def build(self, direction="BULLISH", highs=None, lows=None):
+        candles = [self.candle(0, 95, 110), self.candle(1, 90, 108)]
+        structure, sweep, displacement, fvg, ob, revalidation = self.chain(direction)
+        return main.build_server_trade_plan(
+            candles, highs or [0], lows or [1], structure, sweep,
+            displacement, fvg, ob, revalidation,
+        )
+
+    def test_bullish_plan_uses_ob_midpoint_and_structural_stop(self):
+        plan = self.build("BULLISH")
+        self.assertEqual(plan["state"], "CANDIDATE_READY")
+        self.assertEqual(plan["entry_reference"], 101.0)
+        self.assertEqual(plan["stop_loss"], 99.0)
+
+    def test_bearish_plan_uses_ob_midpoint_and_structural_stop(self):
+        plan = self.build("BEARISH")
+        self.assertEqual(plan["state"], "CANDIDATE_READY")
+        self.assertEqual(plan["entry_reference"], 101.0)
+        self.assertEqual(plan["stop_loss"], 103.0)
+
+    def test_bullish_target_is_nearest_confirmed_swing_high(self):
+        plan = self.build("BULLISH", highs=[0, 1])
+        self.assertEqual(plan["take_profit"], 108.0)
+
+    def test_bearish_target_is_nearest_confirmed_swing_low(self):
+        plan = self.build("BEARISH", lows=[0, 1])
+        self.assertEqual(plan["take_profit"], 95.0)
+
+    def test_risk_reward_is_derived_not_fixed(self):
+        plan = self.build("BULLISH", highs=[1])
+        self.assertEqual(plan["risk_reward"], 3.5)
+
+    def test_unrevalidated_setup_waits(self):
+        structure, sweep, displacement, fvg, ob, revalidation = self.chain()
+        revalidation["state"] = "RETESTED_UNCONFIRMED"
+        plan = main.build_server_trade_plan(
+            [], [], [], structure, sweep, displacement, fvg, ob, revalidation
+        )
+        self.assertEqual(plan["state"], "WAIT")
+
+    def test_direction_mismatch_waits(self):
+        structure, sweep, displacement, fvg, ob, revalidation = self.chain()
+        fvg["direction"] = "BEARISH"
+        plan = main.build_server_trade_plan(
+            [], [], [], structure, sweep, displacement, fvg, ob, revalidation
+        )
+        self.assertEqual(plan["state"], "WAIT")
+
+    def test_missing_confirmation_waits(self):
+        structure, sweep, displacement, fvg, ob, revalidation = self.chain()
+        plan = main.build_server_trade_plan(
+            [], [], [], structure, sweep, None, fvg, ob, revalidation
+        )
+        self.assertEqual(plan["state"], "WAIT")
+
+    def test_invalidated_order_block_waits(self):
+        structure, sweep, displacement, fvg, ob, revalidation = self.chain()
+        ob["state"] = "INVALIDATED"
+        plan = main.build_server_trade_plan(
+            [], [], [], structure, sweep, displacement, fvg, ob, revalidation
+        )
+        self.assertEqual(plan["state"], "WAIT")
+
+    def test_invalid_order_block_zone_waits(self):
+        structure, sweep, displacement, fvg, ob, revalidation = self.chain()
+        ob["zone_low"] = 104.0
+        plan = main.build_server_trade_plan(
+            [], [], [], structure, sweep, displacement, fvg, ob, revalidation
+        )
+        self.assertEqual(plan["state"], "WAIT")
+
+    def test_missing_opposite_liquidity_target_waits(self):
+        plan = self.build("BULLISH", highs=[1])
+        self.assertEqual(plan["state"], "CANDIDATE_READY")
+        candles = [self.candle(0, 95, 100)]
+        structure, sweep, displacement, fvg, ob, revalidation = self.chain()
+        plan = main.build_server_trade_plan(
+            candles, [0], [], structure, sweep, displacement, fvg, ob, revalidation
+        )
+        self.assertEqual(plan["state"], "WAIT")
+
+    def test_candidate_never_auto_queues(self):
+        self.assertFalse(self.build("BULLISH")["auto_queue"])
+
+    def test_detector_exposes_trade_plan(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn("build_server_trade_plan", source)
+        self.assertIn('"trade_plan": trade_plan', source)
+
+    def test_detector_contract_names_plan(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn("FVG_OB_RETEST_PLAN_V1", source)
+
+    def test_orchestrator_names_server_trade_plan(self):
+        source = inspect.getsource(main.get_auto_entry_orchestrator_status)
+        self.assertIn('"trade_plan_builder": "SERVER_TRADE_PLAN_V1"', source)
+
+    def test_ui_marks_server_trade_plan(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("SERVER BUILDER · TRADE PLAN V1", html)

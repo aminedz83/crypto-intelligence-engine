@@ -48,6 +48,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Table,
+    Text,
     text,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -1377,6 +1378,22 @@ paper_account_table = Table(
     Column("initial_capital", Numeric(38, 18), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+signal_decision_history_table = Table(
+    "signal_decision_history",
+    metadata,
+    Column("decision_id", String, primary_key=True),
+    Column("timestamp", DateTime(timezone=True), nullable=False),
+    Column("symbol", String, nullable=False),
+    Column("state", String, nullable=False),
+    Column("reason", String, nullable=False),
+    Column("setup_state", String, nullable=True),
+    Column("latest_closed_timestamp", String, nullable=True),
+    Column("detector_context", Text, nullable=True),
+    Column("paper_only", Boolean, nullable=False),
+    Column("execution", Boolean, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
 )
 
 paper_positions_table = Table(
@@ -2897,7 +2914,7 @@ def _decision_reason_from_detector(detector: Dict[str, object]) -> str:
 
 def record_auto_decision_trace(
     symbol: str, state: str, reason: str, detector: Optional[Dict[str, object]] = None
-) -> None:
+) -> Dict[str, object]:
     """Store a bounded, paper-only runtime explanation for one scan decision."""
     entry: Dict[str, object] = {
         "timestamp": utcnow().isoformat(),
@@ -2913,6 +2930,118 @@ def record_auto_decision_trace(
     auto_decision_trace.append(entry)
     if len(auto_decision_trace) > AUTO_DECISION_TRACE_MAX:
         del auto_decision_trace[:-AUTO_DECISION_TRACE_MAX]
+    return entry
+
+
+async def persist_auto_decision_trace(
+    entry: Dict[str, object], detector: Optional[Dict[str, object]] = None
+) -> bool:
+    """Persist one scanner decision without ever inventing market information."""
+    if not persistence_state.ready:
+        return False
+    timestamp_raw = str(entry.get("timestamp", ""))
+    try:
+        timestamp = datetime.fromisoformat(timestamp_raw)
+    except ValueError:
+        return False
+    if timestamp.tzinfo is None:
+        return False
+    symbol = str(entry.get("symbol", ""))
+    state = str(entry.get("state", ""))
+    reason = str(entry.get("reason", ""))
+    identity = f"{timestamp_raw}|{symbol}|{state}|{reason}"
+    decision_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    context = json.dumps(detector, sort_keys=True, default=str) if detector else None
+    values = {
+        "decision_id": decision_id,
+        "timestamp": timestamp,
+        "symbol": symbol,
+        "state": state,
+        "reason": reason,
+        "setup_state": str(entry.get("setup_state", "")) or None,
+        "latest_closed_timestamp": (
+            str(entry.get("latest_closed_timestamp"))
+            if entry.get("latest_closed_timestamp") is not None
+            else None
+        ),
+        "detector_context": context,
+        "paper_only": True,
+        "execution": False,
+        "created_at": utcnow(),
+    }
+    try:
+        async with engine.begin() as conn:
+            stmt = pg_insert(signal_decision_history_table).values(values)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["decision_id"])
+            await conn.execute(stmt)
+    except Exception as exc:  # noqa: BLE001
+        log.error("Decision history persistence failed: %s", exc)
+        return False
+    return True
+
+
+async def record_and_persist_auto_decision_trace(
+    symbol: str,
+    state: str,
+    reason: str,
+    detector: Optional[Dict[str, object]] = None,
+) -> None:
+    entry = record_auto_decision_trace(symbol, state, reason, detector)
+    await persist_auto_decision_trace(entry, detector)
+
+
+async def signal_decision_history(
+    limit: int = 100, symbol: Optional[str] = None, state: Optional[str] = None
+) -> Dict[str, object]:
+    """Read durable scanner decisions newest-first from PostgreSQL."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "PERSISTENCE_NOT_READY"},
+        )
+    safe_limit = max(1, min(limit, 500))
+    clauses: List[str] = []
+    params: Dict[str, object] = {"limit": safe_limit}
+    if symbol:
+        clauses.append("symbol = :symbol")
+        params["symbol"] = symbol.upper().replace("/", "-")
+    if state:
+        clauses.append("state = :state")
+        params["state"] = state.upper()
+    sql = "SELECT * FROM signal_decision_history"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY timestamp DESC, decision_id DESC LIMIT :limit"
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(text(sql), params)
+            items = [dict(row._mapping) for row in result.fetchall()]
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "decision history failed"},
+        ) from exc
+    for item in items:
+        for key in ("timestamp", "created_at"):
+            if isinstance(item.get(key), datetime):
+                item[key] = item[key].isoformat()
+        raw_context = item.get("detector_context")
+        if isinstance(raw_context, str):
+            try:
+                item["detector_context"] = json.loads(raw_context)
+            except json.JSONDecodeError:
+                item["detector_context"] = None
+    return {
+        "status": "OK",
+        "validation": "SERVER_SIGNAL_DECISION_HISTORY_V1",
+        "count": len(items),
+        "limit": safe_limit,
+        "items": items,
+        "paper_only": True,
+        "broker_execution": False,
+        "live_trading_enabled": False,
+    }
 
 
 def auto_decision_trace_status(limit: int = 50) -> Dict[str, object]:
@@ -3111,14 +3240,14 @@ async def run_server_auto_paper_generation_once() -> Dict[str, int]:
             request = build_verified_auto_entry_request_from_detector(symbol, detector)
             if request is None:
                 setup_state = str(detector.get("setup_state", "WAIT"))
-                record_auto_decision_trace(
+                await record_and_persist_auto_decision_trace(
                     symbol, setup_state, _decision_reason_from_detector(detector), detector
                 )
                 continue
             provider_symbol = provider_symbol_map.to_provider("coinbase", symbol)
             if provider_symbol is None:
                 stats["blocked"] += 1
-                record_auto_decision_trace(
+                await record_and_persist_auto_decision_trace(
                     symbol, "BLOCKED", "PROVIDER_SYMBOL_UNAVAILABLE", detector
                 )
                 continue
@@ -3126,7 +3255,7 @@ async def run_server_auto_paper_generation_once() -> Dict[str, int]:
             request = apply_realtime_market_fill_to_auto_request(request, detector, ticker)
             if request is None:
                 stats["blocked"] += 1
-                record_auto_decision_trace(
+                await record_and_persist_auto_decision_trace(
                     symbol, "BLOCKED", "REALTIME_FILL_NOT_ELIGIBLE", detector
                 )
                 continue
@@ -3139,25 +3268,25 @@ async def run_server_auto_paper_generation_once() -> Dict[str, int]:
             else:
                 stats["blocked"] += 1
                 reason = f"HTTP_{exc.status_code}"
-            record_auto_decision_trace(symbol, "BLOCKED", reason, detector)
+            await record_and_persist_auto_decision_trace(symbol, "BLOCKED", reason, detector)
             continue
         except Exception as exc:  # noqa: BLE001
             log.error("Server auto-paper generation failed: %s", exc)
             stats["blocked"] += 1
-            record_auto_decision_trace(
+            await record_and_persist_auto_decision_trace(
                 symbol, "BLOCKED", f"RUNTIME_{type(exc).__name__}", detector
             )
             continue
         if result.get("status") == "OPENED":
             stats["opened"] += 1
-            record_auto_decision_trace(
+            await record_and_persist_auto_decision_trace(
                 symbol, "ENTRY_NOW", "PAPER_POSITION_OPENED", detector
             )
         else:
             stats["blocked"] += 1
             raw_reason = result.get("reason")
             reason = str(raw_reason) if raw_reason else "VERIFIED_ENTRY_BLOCKED"
-            record_auto_decision_trace(symbol, "BLOCKED", reason, detector)
+            await record_and_persist_auto_decision_trace(symbol, "BLOCKED", reason, detector)
     return stats
 
 
@@ -3269,6 +3398,13 @@ async def get_auto_decision_trace(limit: int = 50) -> Dict[str, object]:
     return auto_decision_trace_status(limit)
 
 
+@api_router.get("/paper/auto-entry/decision-history")
+async def get_signal_decision_history(
+    limit: int = 100, symbol: Optional[str] = None, state: Optional[str] = None
+) -> Dict[str, object]:
+    return await signal_decision_history(limit=limit, symbol=symbol, state=state)
+
+
 @api_router.post("/paper/auto-entry/candidates")
 async def queue_auto_entry_candidate(
     req: AutoEntryCandidateRequest,
@@ -3294,6 +3430,7 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "smc_auto_candidate_generation": "SERVER_AUTO_PAPER_POSITION_V1",
         "auto_position_creation": "SERVER_AUTO_PAPER_POSITION_V1",
         "decision_trace": "SERVER_DECISION_TRACE_V1",
+        "decision_history": "SERVER_SIGNAL_DECISION_HISTORY_V1",
         "paper_only": True,
         "execution": False,
     }

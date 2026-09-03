@@ -7979,3 +7979,76 @@ class TestCryptoRegistryAlignmentV16M5B24B(unittest.TestCase):
         source = inspect.getsource(main._register_coinbase_instruments)
         self.assertIn("price_precision=None", source)
         self.assertIn("tick_size=None", source)
+
+
+# ---------------- V16-M5B25A: HTF context foundation ----------------
+class ServerHtfContextFoundationTests(unittest.TestCase):
+    def test_htf_granularity_is_one_hour(self):
+        self.assertEqual(main.SERVER_HTF_GRANULARITY, "1h")
+
+    def test_htf_limit_is_bounded_by_coinbase_limit(self):
+        self.assertGreater(main.SERVER_HTF_CANDLE_LIMIT, 0)
+        self.assertLessEqual(main.SERVER_HTF_CANDLE_LIMIT, main.CANDLE_MAX_LIMIT)
+
+    def test_htf_is_distinct_from_ltf_setup_granularity(self):
+        self.assertNotEqual(main.SERVER_HTF_GRANULARITY, main.SERVER_SETUP_GRANULARITY)
+
+    def test_htf_classifier_is_non_async_pure_function(self):
+        self.assertFalse(inspect.iscoroutinefunction(main.classify_server_htf_context))
+
+    def test_insufficient_htf_history_waits(self):
+        result = main.classify_server_htf_context([], NOW)
+        self.assertEqual(result["status"], "WAIT")
+        self.assertEqual(result["reason"], "INSUFFICIENT_HTF_CLOSED_CANDLES")
+
+    def test_classifier_uses_closed_candles(self):
+        source = inspect.getsource(main.classify_server_htf_context)
+        self.assertIn("closed_valid_candles(candles, now)", source)
+
+    def test_classifier_uses_confirmed_swings(self):
+        source = inspect.getsource(main.classify_server_htf_context)
+        self.assertIn("confirmed_swing_indexes(closed)", source)
+
+    def test_classifier_has_no_entry_gate(self):
+        source = inspect.getsource(main.classify_server_htf_context)
+        self.assertNotIn("evaluate_server_entry_now_gate", source)
+        self.assertNotIn("create_paper_position", source)
+
+    def test_classifier_exposes_no_lookahead_contract(self):
+        source = inspect.getsource(main.classify_server_htf_context)
+        self.assertIn('"no_lookahead": True', source)
+
+    def test_classifier_exposes_premium_discount_location(self):
+        source = inspect.getsource(main.classify_server_htf_context)
+        self.assertIn('"PREMIUM"', source)
+        self.assertIn('"DISCOUNT"', source)
+        self.assertIn('"EQUILIBRIUM"', source)
+
+    def test_endpoint_is_registered(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/market/htf-context/{symbol}", paths)
+
+    def test_endpoint_fetches_real_htf_granularity(self):
+        source = inspect.getsource(main.get_server_htf_context)
+        self.assertIn("SERVER_HTF_GRANULARITY", source)
+        self.assertIn("market_provider.get_candles", source)
+
+    def test_endpoint_has_latest_freshness_guard(self):
+        source = inspect.getsource(main.get_server_htf_context)
+        self.assertIn("HTF_LATEST_CANDLE_NOT_FRESH", source)
+        self.assertIn("_latest_quality(candles)", source)
+
+    def test_endpoint_is_crypto_only_v1(self):
+        source = inspect.getsource(main.get_server_htf_context)
+        self.assertIn("HTF_CONTEXT_CRYPTO_ONLY_V1", source)
+        self.assertIn("AssetClass.CRYPTO", source)
+
+    def test_endpoint_is_paper_only_non_executing(self):
+        source = inspect.getsource(main.get_server_htf_context)
+        self.assertIn('"paper_only": True', source)
+        self.assertNotIn("create_paper_position", source)
+
+    def test_ltf_detector_not_yet_gated_by_htf(self):
+        source = inspect.getsource(main.get_server_market_setup_detector)
+        self.assertNotIn("classify_server_htf_context", source)
+        self.assertNotIn("SERVER_HTF_GRANULARITY", source)

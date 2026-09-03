@@ -7888,3 +7888,94 @@ class TestAutonomousPaperMonitoringV16M5B24A(unittest.TestCase):
         source = inspect.getsource(main.paper_mark_from_realtime)
         fallback = source.count("paper_mark_from_coinbase_rest")
         self.assertEqual(fallback, 1)
+
+
+# V16-M5B24B: server crypto registry/scanner alignment
+class TestCryptoRegistryAlignmentV16M5B24B(unittest.TestCase):
+    EXPECTED = ("BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "LTC-USD", "ADA-USD")
+
+    def test_all_six_expected_crypto_symbols_are_registered(self):
+        for symbol in self.EXPECTED:
+            self.assertIsNotNone(main.instrument_registry.get(symbol))
+
+    def test_all_six_are_crypto(self):
+        for symbol in self.EXPECTED:
+            instrument = main.instrument_registry.get(symbol)
+            self.assertIsNotNone(instrument)
+            self.assertEqual(instrument.asset_class, main.AssetClass.CRYPTO)
+
+    def test_all_six_use_usd_quote(self):
+        for symbol in self.EXPECTED:
+            instrument = main.instrument_registry.get(symbol)
+            self.assertIsNotNone(instrument)
+            self.assertEqual(instrument.quote_asset, "USD")
+
+    def test_all_six_use_24_7_calendar(self):
+        for symbol in self.EXPECTED:
+            instrument = main.instrument_registry.get(symbol)
+            self.assertIsNotNone(instrument)
+            self.assertEqual(
+                instrument.market_calendar,
+                main.MarketCalendarPolicy.ALWAYS_OPEN_24_7,
+            )
+
+    def test_all_six_keep_base_asset_volume_semantics(self):
+        for symbol in self.EXPECTED:
+            instrument = main.instrument_registry.get(symbol)
+            self.assertIsNotNone(instrument)
+            self.assertEqual(
+                instrument.volume_semantics,
+                main.VolumeSemantics.BASE_ASSET_VOLUME,
+            )
+
+    def test_all_six_have_coinbase_provider_mapping(self):
+        for symbol in self.EXPECTED:
+            self.assertEqual(
+                main.provider_symbol_map.to_provider("coinbase", symbol),
+                symbol,
+            )
+
+    def test_sol_is_registered(self):
+        self.assertIsNotNone(main.instrument_registry.get("SOL-USD"))
+
+    def test_xrp_is_registered(self):
+        self.assertIsNotNone(main.instrument_registry.get("XRP-USD"))
+
+    def test_ltc_is_registered(self):
+        self.assertIsNotNone(main.instrument_registry.get("LTC-USD"))
+
+    def test_ada_is_registered(self):
+        self.assertIsNotNone(main.instrument_registry.get("ADA-USD"))
+
+    def test_registry_contains_six_target_crypto_symbols(self):
+        crypto = {
+            item.canonical_symbol
+            for item in main.instrument_registry.all()
+            if item.asset_class == main.AssetClass.CRYPTO
+        }
+        self.assertTrue(set(self.EXPECTED).issubset(crypto))
+
+    def test_auto_scanner_iterates_registry_not_hardcoded_pair_list(self):
+        source = inspect.getsource(main.run_server_auto_paper_generation_once)
+        self.assertIn("instrument_registry.all()", source)
+        self.assertIn("AssetClass.CRYPTO", source)
+
+    def test_auto_scanner_has_no_btc_eth_only_filter(self):
+        source = inspect.getsource(main.run_server_auto_paper_generation_once)
+        self.assertNotIn('{"BTC-USD", "ETH-USD"}', source)
+        self.assertNotIn("('BTC-USD', 'ETH-USD')", source)
+
+    def test_server_ws_uses_same_registered_crypto_population(self):
+        source = inspect.getsource(main.start_server_crypto_market_stream)
+        self.assertIn("instrument_registry.all()", source)
+        self.assertIn("AssetClass.CRYPTO", source)
+
+    def test_coinbase_registration_source_names_all_four_new_symbols(self):
+        source = inspect.getsource(main._register_coinbase_instruments)
+        for symbol in ("SOL-USD", "XRP-USD", "LTC-USD", "ADA-USD"):
+            self.assertIn(symbol, source)
+
+    def test_registry_alignment_remains_metadata_fail_safe(self):
+        source = inspect.getsource(main._register_coinbase_instruments)
+        self.assertIn("price_precision=None", source)
+        self.assertIn("tick_size=None", source)

@@ -6485,6 +6485,8 @@ class TestServerAutoPaperPositionV16M5B10(unittest.TestCase):
                 "state": "CANDIDATE_READY",
                 "direction": direction,
                 "entry_reference": entry,
+                "entry_zone_low": 100.0,
+                "entry_zone_high": 102.0,
                 "stop_loss": stop,
                 "take_profit": target,
                 "risk_reward": 3.0,

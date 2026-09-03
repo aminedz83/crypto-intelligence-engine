@@ -7251,7 +7251,7 @@ def market_session_context(
     is not fabricated: policies without a verified holiday calendar expose UNKNOWN.
     """
     symbol = canonical_symbol.upper()
-    inst = registry.get(symbol)
+    inst = instrument_registry.get(symbol)
     if inst is None:
         return {
             "status": "NOT_SUPPORTED",

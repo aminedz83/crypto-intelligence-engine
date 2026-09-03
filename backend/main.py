@@ -3561,6 +3561,105 @@ def apply_realtime_market_fill_to_auto_request(
     )
 
 
+def auto_entry_request_rejection_reason(detector: Dict[str, object]) -> str:
+    """Explain why an ENTRY_NOW detector could not become a verified request."""
+    if detector.get("status") != "READY":
+        return "DETECTOR_NOT_READY"
+    if detector.get("setup_state") != "ENTRY_NOW":
+        return "SETUP_NOT_ENTRY_NOW"
+    gate = detector.get("entry_gate")
+    if not isinstance(gate, dict):
+        return "ENTRY_GATE_MISSING"
+    if gate.get("state") != "ENTRY_NOW":
+        return "ENTRY_GATE_NOT_ENTRY_NOW"
+    plan = detector.get("trade_plan")
+    if not isinstance(plan, dict):
+        return "TRADE_PLAN_MISSING"
+    if plan.get("state") != "CANDIDATE_READY":
+        return "TRADE_PLAN_NOT_CANDIDATE_READY"
+    direction = gate.get("direction")
+    if direction not in {"BULLISH", "BEARISH"}:
+        return "ENTRY_DIRECTION_INVALID"
+    if plan.get("direction") != direction:
+        return "TRADE_PLAN_DIRECTION_MISMATCH"
+    required = (
+        ("structure_event", {"BOS", "CHOCH_MSS"}),
+        ("liquidity_sweep", {"BSL_SWEEP", "SSL_SWEEP"}),
+        ("displacement", {"DISPLACEMENT"}),
+        ("fvg", {"FVG"}),
+        ("order_block", {"ORDER_BLOCK"}),
+    )
+    for key, events in required:
+        item = detector.get(key)
+        if not isinstance(item, dict):
+            return f"{key.upper()}_MISSING"
+        if item.get("event") not in events:
+            return f"{key.upper()}_EVENT_INVALID"
+        if item.get("direction") != direction:
+            return f"{key.upper()}_DIRECTION_MISMATCH"
+    order_block = detector.get("order_block")
+    if isinstance(order_block, dict) and order_block.get("state") == "INVALIDATED":
+        return "ORDER_BLOCK_INVALIDATED"
+    raw_timestamp = detector.get("latest_closed_timestamp")
+    if not isinstance(raw_timestamp, str):
+        return "SOURCE_TIMESTAMP_MISSING"
+    try:
+        source_timestamp = datetime.fromisoformat(raw_timestamp)
+    except ValueError:
+        return "SOURCE_TIMESTAMP_INVALID"
+    if source_timestamp.tzinfo is None:
+        return "SOURCE_TIMESTAMP_NAIVE"
+    for key in ("entry_reference", "stop_loss", "take_profit", "risk_reward"):
+        try:
+            Decimal(str(plan[key]))
+        except (KeyError, ValueError, InvalidOperation):
+            return f"TRADE_PLAN_{key.upper()}_INVALID"
+    return "AUTO_ENTRY_REQUEST_BUILDABLE"
+
+
+def realtime_fill_rejection_reason(
+    request: VerifiedAutoPaperEntryRequest,
+    detector: Dict[str, object],
+    ticker: MarketDatum,
+) -> str:
+    """Explain why a real Coinbase ticker cannot be used as the paper fill."""
+    if ticker.status != DataQualityStatus.VALID:
+        return f"REALTIME_TICKER_{ticker.status.value}"
+    if ticker.value is None:
+        return "REALTIME_TICKER_PRICE_MISSING"
+    if ticker.timestamp is None:
+        return "REALTIME_TICKER_TIMESTAMP_MISSING"
+    if ticker.timestamp.tzinfo is None:
+        return "REALTIME_TICKER_TIMESTAMP_NAIVE"
+    plan = detector.get("trade_plan")
+    if not isinstance(plan, dict):
+        return "REALTIME_TRADE_PLAN_MISSING"
+    zone_low = plan.get("entry_zone_low")
+    zone_high = plan.get("entry_zone_high")
+    if not isinstance(zone_low, (int, float)) or not isinstance(zone_high, (int, float)):
+        return "REALTIME_ENTRY_ZONE_INVALID"
+    price = Decimal(str(ticker.value))
+    if not Decimal(str(zone_low)) <= price <= Decimal(str(zone_high)):
+        return "REALTIME_PRICE_OUTSIDE_ENTRY_ZONE"
+    if request.stop_loss is None or request.take_profit is None:
+        return "REALTIME_SL_TP_MISSING"
+    if request.direction == "BULLISH":
+        if not request.stop_loss < price < request.take_profit:
+            return "REALTIME_PRICE_INVALID_FOR_BULLISH_PLAN"
+    elif request.direction == "BEARISH":
+        if not request.take_profit < price < request.stop_loss:
+            return "REALTIME_PRICE_INVALID_FOR_BEARISH_PLAN"
+    else:
+        return "REALTIME_DIRECTION_INVALID"
+    risk = abs(price - request.stop_loss)
+    reward = abs(request.take_profit - price)
+    if risk <= 0:
+        return "REALTIME_RISK_NOT_POSITIVE"
+    if reward <= 0:
+        return "REALTIME_REWARD_NOT_POSITIVE"
+    return "REALTIME_FILL_ELIGIBLE"
+
+
 async def run_server_auto_paper_generation_once() -> Dict[str, int]:
     """Scan crypto instruments and record every server decision observably."""
     stats = {
@@ -3583,9 +3682,18 @@ async def run_server_auto_paper_generation_once() -> Dict[str, int]:
             request = build_verified_auto_entry_request_from_detector(symbol, detector)
             if request is None:
                 setup_state = str(detector.get("setup_state", "WAIT"))
-                await record_and_persist_auto_decision_trace(
-                    symbol, setup_state, _decision_reason_from_detector(detector), detector
-                )
+                if setup_state == "ENTRY_NOW":
+                    reason = auto_entry_request_rejection_reason(detector)
+                    await record_and_persist_auto_decision_trace(
+                        symbol, "BLOCKED", reason, detector
+                    )
+                else:
+                    await record_and_persist_auto_decision_trace(
+                        symbol,
+                        setup_state,
+                        _decision_reason_from_detector(detector),
+                        detector,
+                    )
                 continue
             provider_symbol = provider_symbol_map.to_provider("coinbase", symbol)
             if provider_symbol is None:
@@ -3595,13 +3703,17 @@ async def run_server_auto_paper_generation_once() -> Dict[str, int]:
                 )
                 continue
             ticker = await market_provider.get_ticker(provider_symbol)
-            request = apply_realtime_market_fill_to_auto_request(request, detector, ticker)
-            if request is None:
+            fill_request = apply_realtime_market_fill_to_auto_request(
+                request, detector, ticker
+            )
+            if fill_request is None:
                 stats["blocked"] += 1
+                reason = realtime_fill_rejection_reason(request, detector, ticker)
                 await record_and_persist_auto_decision_trace(
-                    symbol, "BLOCKED", "REALTIME_FILL_NOT_ELIGIBLE", detector
+                    symbol, "BLOCKED", reason, detector
                 )
                 continue
+            request = fill_request
             stats["entry_now"] += 1
             result = await verified_auto_paper_entry(request)
         except HTTPException as exc:

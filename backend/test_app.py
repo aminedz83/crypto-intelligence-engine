@@ -7292,3 +7292,82 @@ class TestAutoScanWatchdogV16M5B19(unittest.TestCase):
 
 
 # V16-M5B19: 16 continuous scanner watchdog regression tests
+
+
+class TestPaperPerformancePeriodsV16M5B20(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 9, 3, 15, 42, 17, tzinfo=timezone.utc)
+
+    def test_supported_periods(self):
+        self.assertEqual(
+            main.PAPER_PERFORMANCE_PERIODS,
+            {"ALL", "DAY", "WEEK", "MONTH", "YEAR"},
+        )
+
+    def test_all_has_no_start_boundary(self):
+        self.assertIsNone(main.paper_performance_period_start("ALL", self.now))
+
+    def test_period_is_case_insensitive(self):
+        result = main.paper_performance_period_start("day", self.now)
+        self.assertEqual(result.hour, 0)
+
+    def test_day_starts_at_utc_midnight(self):
+        result = main.paper_performance_period_start("DAY", self.now)
+        expected = datetime(2026, 9, 3, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(result, expected)
+
+    def test_week_starts_on_monday_utc(self):
+        result = main.paper_performance_period_start("WEEK", self.now)
+        expected = datetime(2026, 8, 31, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(result, expected)
+
+    def test_month_starts_on_first_utc(self):
+        result = main.paper_performance_period_start("MONTH", self.now)
+        expected = datetime(2026, 9, 1, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(result, expected)
+
+    def test_year_starts_on_january_first_utc(self):
+        result = main.paper_performance_period_start("YEAR", self.now)
+        expected = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(result, expected)
+
+    def test_invalid_period_rejected(self):
+        with self.assertRaises(ValueError):
+            main.paper_performance_period_start("QUARTER", self.now)
+
+    def test_naive_now_rejected(self):
+        naive = datetime(2026, 9, 3, 15, 42, 17)
+        with self.assertRaises(ValueError):
+            main.paper_performance_period_start("DAY", naive)
+
+    def test_endpoint_defaults_to_all(self):
+        signature = inspect.signature(main.get_paper_performance)
+        self.assertEqual(signature.parameters["period"].default, "ALL")
+
+    def test_endpoint_uses_period_helper(self):
+        source = inspect.getsource(main.get_paper_performance)
+        self.assertIn("paper_performance_period_start", source)
+
+    def test_endpoint_filters_closed_at(self):
+        source = inspect.getsource(main.get_paper_performance)
+        self.assertIn("closed_at>=:period_start", source)
+
+    def test_endpoint_keeps_symbol_filter(self):
+        source = inspect.getsource(main.get_paper_performance)
+        self.assertIn('params["symbol"] = canonical', source)
+
+    def test_endpoint_returns_period(self):
+        source = inspect.getsource(main.get_paper_performance)
+        self.assertIn('"period": normalized_period', source)
+
+    def test_new_contract_marker(self):
+        source = inspect.getsource(main.get_paper_performance)
+        self.assertIn("SERVER_PAPER_PERFORMANCE_PERIODS_V1", source)
+
+    def test_paper_only_contract_preserved(self):
+        source = inspect.getsource(main.get_paper_performance)
+        self.assertIn('"paper_only": True', source)
+        self.assertIn('"execution": False', source)
+
+
+# V16-M5B20: 16 UTC performance-period regression tests

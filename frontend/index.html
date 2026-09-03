@@ -493,7 +493,11 @@ function clear(n){while(n&&n.firstChild)n.removeChild(n.firstChild)}function byI
 function apiRequest(path,options){var ctrl=new AbortController(),to=setTimeout(function(){ctrl.abort()},8000),opts=options||{};opts.headers=Object.assign({"Accept":"application/json"},opts.headers||{});opts.signal=ctrl.signal;return fetch(path,opts).then(function(res){clearTimeout(to);return res.text().then(function(txt){var data=null;try{data=txt?JSON.parse(txt):null}catch(e){}return{ok:res.ok,status:res.status,data:data}})}).catch(function(err){clearTimeout(to);return{ok:false,status:0,data:null,netError:err&&err.name==="AbortError"?"timeout":"network"}})}
 function api(path){return apiRequest(path,{method:"GET"})}
 function apiPost(path,body){return apiRequest(path,{method:"POST",headers:{"Content-Type":"application/json"},body:body===undefined?undefined:JSON.stringify(body)})}
-var paperUiState={account:null,positions:[],error:null,loading:false,updatedAt:null};
+var paperUiState={account:null,positions:[],performance:null,decisions:[],error:null,loading:false,updatedAt:null,decisionSymbol:"",decisionState:""};
+function paperMetric(v,suffix){
+  if(v===null||v===undefined||v===""||!Number.isFinite(Number(v)))return "—";
+  return Number(v).toLocaleString("en-US",{maximumFractionDigits:2})+(suffix||"");
+}
 function paperMoney(v){
   if(v===null||v===undefined||v===""||!Number.isFinite(Number(v)))return "—";
   return Number(v).toLocaleString("en-US",{style:"currency",currency:"USD",
@@ -508,15 +512,21 @@ function paperPositionPnl(p){
 function refreshPaperTrading(){
   if(paperUiState.loading)return Promise.resolve();
   paperUiState.loading=true;
+  var decisionPath="/api/v1/paper/auto-entry/decision-history?limit=50";
+  if(paperUiState.decisionSymbol)decisionPath+="&symbol="+encodeURIComponent(paperUiState.decisionSymbol);
+  if(paperUiState.decisionState)decisionPath+="&state="+encodeURIComponent(paperUiState.decisionState);
   return Promise.all([api("/api/v1/paper/account/live"),api("/api/v1/paper/positions"),
-    api("/api/v1/paper/positions/live")])
+    api("/api/v1/paper/positions/live"),api("/api/v1/paper/performance"),api(decisionPath)])
     .then(function(results){
-      var account=results[0],positions=results[1],live=results[2];
-      if(!account.ok||!positions.ok||!live.ok){
-        paperUiState.error=errorMessage(!account.ok?account:(!positions.ok?positions:live));
+      var account=results[0],positions=results[1],live=results[2],performance=results[3],decisions=results[4];
+      if(!account.ok||!positions.ok||!live.ok||!performance.ok||!decisions.ok){
+        var failed=!account.ok?account:(!positions.ok?positions:(!live.ok?live:(!performance.ok?performance:decisions)));
+        paperUiState.error=errorMessage(failed);
         return;
       }
       paperUiState.account=account.data||null;
+      paperUiState.performance=performance.data||null;
+      paperUiState.decisions=(decisions.data&&decisions.data.items)||[];
       var persisted=(positions.data&&positions.data.positions)||[];
       var liveRows=(live.data&&live.data.positions)||[];
       var liveById={};
@@ -530,6 +540,23 @@ function refreshPaperTrading(){
       paperUiState.loading=false;
       if(current==="trading")renderTrading();
     });
+}
+
+function paperDecisionCard(d){
+  return h("div",{class:"help-card"},[
+    h("div",{class:"kv"},[h("b",{},[d.symbol||"—"]),h("b",{},[d.state||"—"])]),
+    h("p",{},[d.reason||"Aucune raison persistée"]),
+    h("div",{class:"muted"},[(d.timestamp||"—")+(d.setup_state?" · setup "+d.setup_state:"")])
+  ]);
+}
+function paperDecisionFilters(){
+  var symbols=["","BTC-USD","ETH-USD"],states=["","WAIT","ENTRY_NOW","BLOCKED","INVALIDATED","EXPIRED"];
+  var symbol=h("select",{class:"subtab","aria-label":"Filtre symbole"},symbols.map(function(x){return h("option",{value:x},[x||"Tous symboles"])}));
+  var state=h("select",{class:"subtab","aria-label":"Filtre état"},states.map(function(x){return h("option",{value:x},[x||"Tous états"])}));
+  symbol.value=paperUiState.decisionSymbol;state.value=paperUiState.decisionState;
+  symbol.addEventListener("change",function(){paperUiState.decisionSymbol=symbol.value;paperUiState.updatedAt=null;refreshPaperTrading()});
+  state.addEventListener("change",function(){paperUiState.decisionState=state.value;paperUiState.updatedAt=null;refreshPaperTrading()});
+  return h("div",{class:"subtabs"},[symbol,state]);
 }
 function paperPositionCard(p){
   var closed=p.status==="CLOSED",pnl=paperPositionPnl(p);
@@ -742,6 +769,22 @@ function renderTradingContent(){
   }
   var open=paperUiState.positions.filter(function(p){return p.status==="OPEN"});
   var closed=paperUiState.positions.filter(function(p){return p.status==="CLOSED"});
+  var perf=paperUiState.performance&&paperUiState.performance.metrics;
+  v.appendChild(modCard("Performance paper","PERSISTÉE",perf?h("div",{class:"metric-strip"},[
+    h("div",{class:"metric-mini"},[h("span",{},["Trades clôturés"]),h("b",{},[String(perf.closed_trades)])]),
+    h("div",{class:"metric-mini"},[h("span",{},["Win Rate"]),h("b",{},[paperMetric(perf.win_rate_percent," %")])]),
+    h("div",{class:"metric-mini"},[h("span",{},["Profit Factor"]),h("b",{},[paperMetric(perf.profit_factor,"")])]),
+    h("div",{class:"metric-mini"},[h("span",{},["Expectancy"]),h("b",{},[paperMoney(perf.expectancy)])]),
+    h("div",{class:"metric-mini"},[h("span",{},["P&L net"]),h("b",{},[paperMoney(perf.net_pnl)])]),
+    h("div",{class:"metric-mini"},[h("span",{},["RR réalisé moyen"]),h("b",{},[paperMetric(perf.average_realized_rr," R")])]),
+    h("div",{class:"metric-mini"},[h("span",{},["Max Drawdown"]),h("b",{},[paperMoney(perf.max_drawdown)])]),
+    h("div",{class:"metric-mini"},[h("span",{},["Max DD %"]),h("b",{},[paperMetric(perf.max_drawdown_percent," %")])])
+  ]):placeholder("Performance indisponible","Aucune métrique n’est inventée sans historique CLOSED persisté.")));
+  v.appendChild(modCard("Historique des décisions","POSTGRES · 50 DERNIÈRES",h("div",{class:"section-stack"},[
+    paperDecisionFilters(),
+    paperUiState.decisions.length?h("div",{class:"grid-2"},paperUiState.decisions.map(paperDecisionCard)):
+      placeholder("Aucune décision persistée","WAIT / ENTRY_NOW / BLOCKED / INVALIDATED / EXPIRED apparaîtront ici après le scanner réel.")
+  ])));
   v.appendChild(modCard("Positions ouvertes",open.length+" OPEN",
     open.length?h("div",{class:"grid-2"},open.map(paperPositionCard)):
       placeholder("Aucune position ouverte",
@@ -1595,6 +1638,7 @@ function renderHelpGlossary(){
   ]))
 }
 
+// V16-M5B18: TRADING OPERATIONAL AUDIT UI V1 · PERFORMANCE · DECISION HISTORY · FILTERS · REAL PERSISTED DATA ONLY
 </script>
 <!-- SERVER DETECTOR · FVG V1 -->
 </body>
@@ -1613,3 +1657,5 @@ function renderHelpGlossary(){
 <!-- CONTINUOUS AUTO SCAN V1 · HEARTBEAT · PAPER ONLY · NO BROKER EXECUTION -->
 <!-- DECISION TRACE V1 · WAIT/ENTRY_NOW/BLOCKED/INVALIDATED/EXPIRED · EXPLAINABLE -->
 <!-- SIGNAL DECISION HISTORY V1 · POSTGRES DURABLE · FILTERABLE · PAPER ONLY -->
+
+<!-- V16-M5B16-FIX2 · synchronized regression fix bundle -->

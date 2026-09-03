@@ -3929,6 +3929,133 @@ async def get_paper_account() -> Dict[str, object]:
     }
 
 
+def calculate_paper_performance_metrics(
+    closed_positions: List[Dict[str, object]], initial_capital: Decimal
+) -> Dict[str, object]:
+    """Calculate deterministic paper-only performance metrics from closed trades."""
+    if initial_capital <= 0:
+        raise ValueError("initial_capital must be positive")
+    wins = losses = breakeven = 0
+    gross_profit = Decimal("0")
+    gross_loss = Decimal("0")
+    net_pnl = Decimal("0")
+    rr_sum = Decimal("0")
+    rr_count = 0
+    equity = initial_capital
+    peak = initial_capital
+    max_drawdown = Decimal("0")
+    max_drawdown_percent = Decimal("0")
+
+    for position in closed_positions:
+        side = str(position["side"])
+        entry = Decimal(str(position["entry"]))
+        close_price = Decimal(str(position["close_price"]))
+        size = Decimal(str(position["size"]))
+        risk_money = Decimal(str(position["risk_money"]))
+        pnl = calculate_paper_pnl(side, entry, close_price, size)
+        net_pnl += pnl
+        if pnl > 0:
+            wins += 1
+            gross_profit += pnl
+        elif pnl < 0:
+            losses += 1
+            gross_loss += -pnl
+        else:
+            breakeven += 1
+        if risk_money > 0:
+            rr_sum += pnl / risk_money
+            rr_count += 1
+        equity += pnl
+        if equity > peak:
+            peak = equity
+        drawdown = peak - equity
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+        if peak > 0:
+            drawdown_percent = drawdown / peak * Decimal("100")
+            if drawdown_percent > max_drawdown_percent:
+                max_drawdown_percent = drawdown_percent
+
+    trades = len(closed_positions)
+    win_rate = Decimal(wins) / Decimal(trades) * Decimal("100") if trades else None
+    expectancy = net_pnl / Decimal(trades) if trades else None
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
+    average_realized_rr = rr_sum / Decimal(rr_count) if rr_count else None
+    return {
+        "closed_trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "win_rate_percent": str(win_rate) if win_rate is not None else None,
+        "gross_profit": str(gross_profit),
+        "gross_loss": str(gross_loss),
+        "net_pnl": str(net_pnl),
+        "profit_factor": str(profit_factor) if profit_factor is not None else None,
+        "expectancy": str(expectancy) if expectancy is not None else None,
+        "average_realized_rr": (
+            str(average_realized_rr) if average_realized_rr is not None else None
+        ),
+        "max_drawdown": str(max_drawdown),
+        "max_drawdown_percent": str(max_drawdown_percent),
+    }
+
+
+@api_router.get("/paper/performance")
+async def get_paper_performance(symbol: Optional[str] = None) -> Dict[str, object]:
+    """Return performance analytics derived only from persisted CLOSED paper trades."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
+        )
+    canonical = symbol.upper().replace("/", "-") if symbol else None
+    try:
+        async with engine.connect() as conn:
+            account_result = await conn.execute(
+                text(
+                    "SELECT initial_capital FROM paper_account "
+                    "WHERE account_id=:account_id"
+                ),
+                {"account_id": PAPER_ACCOUNT_ID},
+            )
+            account = account_result.fetchone()
+            if account is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"status": "UNAVAILABLE", "reason": "paper account not initialized"},
+                )
+            sql = (
+                "SELECT position_id, symbol, side, entry, close_price, size, risk_money, "
+                "closed_at FROM paper_positions WHERE status='CLOSED' "
+                "AND close_price IS NOT NULL"
+            )
+            params: Dict[str, object] = {}
+            if canonical is not None:
+                sql += " AND symbol=:symbol"
+                params["symbol"] = canonical
+            sql += " ORDER BY closed_at ASC, position_id ASC"
+            result = await conn.execute(text(sql), params)
+            rows = [dict(row._mapping) for row in result.fetchall()]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"},
+        ) from exc
+
+    initial_capital = Decimal(str(account._mapping["initial_capital"]))
+    metrics = calculate_paper_performance_metrics(rows, initial_capital)
+    return {
+        "status": "OK",
+        "validation": "SERVER_PAPER_PERFORMANCE_ANALYTICS_V1",
+        "symbol": canonical,
+        "metrics": metrics,
+        "paper_only": True,
+        "execution": False,
+    }
+
+
 @api_router.get("/paper/positions")
 async def list_paper_positions(status_filter: Optional[str] = None) -> Dict[str, object]:
     if not persistence_state.ready:
@@ -6772,3 +6899,5 @@ def create_app() -> FastAPI:
 app = create_app()
 
 # V16-M5B4-FIX2 — fresh synchronized copy
+
+# V16-M5B17: paper performance analytics from persisted CLOSED trades

@@ -3057,6 +3057,67 @@ def auto_decision_trace_status(limit: int = 50) -> Dict[str, object]:
     }
 
 
+AUTO_SCAN_WATCHDOG_STALE_AFTER_SECONDS = max(
+    15.0, AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS * 3
+)
+
+
+def evaluate_auto_scan_watchdog(
+    runtime: Dict[str, object],
+    task_running: bool,
+    now: Optional[datetime] = None,
+) -> Dict[str, object]:
+    """Evaluate scanner liveness from its real heartbeat without fabricating activity."""
+    current = now or utcnow()
+    if current.tzinfo is None:
+        raise ValueError("watchdog now must be timezone-aware")
+    completed_raw = runtime.get("last_completed_at")
+    last_error = runtime.get("last_error")
+    age_seconds: Optional[float] = None
+    heartbeat_valid = False
+    if isinstance(completed_raw, str) and completed_raw:
+        try:
+            completed = datetime.fromisoformat(completed_raw)
+        except ValueError:
+            completed = None
+        if completed is not None and completed.tzinfo is not None:
+            age_seconds = max(0.0, (current - completed).total_seconds())
+            heartbeat_valid = True
+    if not task_running:
+        state = "STOPPED"
+        reason = "ORCHESTRATOR_TASK_NOT_RUNNING"
+    elif last_error:
+        state = "ERROR"
+        reason = f"LAST_SCAN_ERROR:{last_error}"
+    elif not heartbeat_valid:
+        state = "STARTING"
+        reason = "WAITING_FOR_FIRST_COMPLETED_SCAN"
+    elif age_seconds is not None and age_seconds > AUTO_SCAN_WATCHDOG_STALE_AFTER_SECONDS:
+        state = "STALE"
+        reason = "SCAN_HEARTBEAT_STALE"
+    else:
+        state = "HEALTHY"
+        reason = "SCAN_HEARTBEAT_FRESH"
+    return {
+        "status": state,
+        "reason": reason,
+        "validation": "SERVER_AUTO_SCAN_WATCHDOG_V1",
+        "heartbeat_age_seconds": age_seconds,
+        "stale_after_seconds": AUTO_SCAN_WATCHDOG_STALE_AFTER_SECONDS,
+        "iterations": runtime.get("iterations", 0),
+        "last_completed_at": completed_raw,
+        "paper_only": True,
+        "broker_execution": False,
+        "live_trading_enabled": False,
+    }
+
+
+def auto_scan_watchdog_status() -> Dict[str, object]:
+    task = auto_entry_orchestrator_task
+    task_running = task is not None and not task.done()
+    return evaluate_auto_scan_watchdog(auto_scan_runtime, task_running)
+
+
 def auto_scan_runtime_status() -> Dict[str, object]:
     """Return a snapshot of the continuous paper-only scanner heartbeat."""
     task = auto_entry_orchestrator_task
@@ -3391,6 +3452,11 @@ async def get_auto_paper_e2e_readiness() -> Dict[str, object]:
 @api_router.get("/paper/auto-entry/runtime-status")
 async def get_auto_scan_runtime_status() -> Dict[str, object]:
     return auto_scan_runtime_status()
+
+
+@api_router.get("/paper/auto-entry/watchdog-status")
+async def get_auto_scan_watchdog_status() -> Dict[str, object]:
+    return auto_scan_watchdog_status()
 
 
 @api_router.get("/paper/auto-entry/decision-trace")

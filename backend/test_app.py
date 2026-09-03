@@ -6845,3 +6845,72 @@ class TestAutoPaperE2EReadinessV16M5B13(unittest.TestCase):
     def test_ui_marks_e2e_readiness(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("AUTO PAPER E2E READINESS V1", html)
+
+
+class TestContinuousAutoScanV16M5B14(unittest.TestCase):
+    def setUp(self):
+        main.reset_auto_scan_runtime()
+
+    def test_runtime_contract_version(self):
+        result = main.auto_scan_runtime_status()
+        self.assertEqual(result["validation"], "SERVER_CONTINUOUS_AUTO_SCAN_V1")
+
+    def test_runtime_is_paper_only(self):
+        self.assertTrue(main.auto_scan_runtime_status()["paper_only"])
+
+    def test_runtime_disables_broker_execution(self):
+        self.assertFalse(main.auto_scan_runtime_status()["broker_execution"])
+
+    def test_runtime_disables_live_trading(self):
+        self.assertFalse(main.auto_scan_runtime_status()["live_trading_enabled"])
+
+    def test_runtime_exposes_interval(self):
+        result = main.auto_scan_runtime_status()
+        self.assertEqual(result["interval_seconds"], 5.0)
+
+    def test_reset_sets_zero_iterations(self):
+        main.auto_scan_runtime["iterations"] = 8
+        main.reset_auto_scan_runtime()
+        self.assertEqual(main.auto_scan_runtime["iterations"], 0)
+
+    def test_reset_clears_last_error(self):
+        main.auto_scan_runtime["last_error"] = "boom"
+        main.reset_auto_scan_runtime()
+        self.assertIsNone(main.auto_scan_runtime["last_error"])
+
+    def test_runtime_exposes_generation_snapshot(self):
+        self.assertIn("last_generation", main.auto_scan_runtime_status())
+
+    def test_runtime_exposes_queue_snapshot(self):
+        self.assertIn("last_queue", main.auto_scan_runtime_status())
+
+    def test_runtime_exposes_heartbeat_timestamps(self):
+        result = main.auto_scan_runtime_status()
+        self.assertIn("last_started_at", result)
+        self.assertIn("last_completed_at", result)
+
+    def test_loop_calls_server_generation(self):
+        source = inspect.getsource(main.auto_entry_orchestrator_loop)
+        self.assertIn("run_server_auto_paper_generation_once", source)
+
+    def test_loop_calls_candidate_queue(self):
+        source = inspect.getsource(main.auto_entry_orchestrator_loop)
+        self.assertIn("run_auto_entry_orchestrator_once", source)
+
+    def test_loop_records_iteration_completion(self):
+        source = inspect.getsource(main.auto_entry_orchestrator_loop)
+        self.assertIn('auto_scan_runtime["iterations"]', source)
+        self.assertIn('auto_scan_runtime["last_completed_at"]', source)
+
+    def test_loop_records_failure_without_live_fallback(self):
+        source = inspect.getsource(main.auto_entry_orchestrator_loop)
+        self.assertIn('auto_scan_runtime["last_error"]', source)
+        self.assertNotIn("live_trading_enabled = True", source)
+
+    def test_runtime_status_endpoint_exists(self):
+        source = inspect.getsource(main.get_auto_scan_runtime_status)
+        self.assertIn("auto_scan_runtime_status()", source)
+
+    def test_ui_marks_continuous_auto_scan(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("CONTINUOUS AUTO SCAN V1", html)

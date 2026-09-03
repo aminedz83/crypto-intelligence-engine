@@ -3062,6 +3062,49 @@ async def get_server_market_regime(symbol: str) -> Dict[str, object]:
 
 
 @api_router.get("/paper/auto-entry/detector/{symbol}")
+def apply_htf_context_to_ltf_setup(
+    ltf: Dict[str, object], htf: Dict[str, object]
+) -> Dict[str, object]:
+    """Gate an LTF ENTRY_NOW setup with objective 1h structure/location."""
+    result = dict(ltf)
+    result["htf_context"] = htf
+    result["htf_granularity"] = SERVER_HTF_GRANULARITY
+    result["validation"] = "SERVER_HTF_LTF_INTEGRATION_V1"
+    result["paper_only"] = True
+    if result.get("setup_state") != "ENTRY_NOW":
+        return result
+    if htf.get("status") != "READY":
+        result["setup_state"] = "WAIT"
+        result["reason"] = str(htf.get("reason") or "HTF_CONTEXT_NOT_READY")
+        return result
+    gate = result.get("entry_gate")
+    if not isinstance(gate, dict):
+        result["setup_state"] = "WAIT"
+        result["reason"] = "LTF_ENTRY_GATE_MISSING"
+        return result
+    direction = gate.get("direction")
+    structure = htf.get("structure")
+    location = htf.get("location")
+    if direction == "BULLISH":
+        if structure != "BULLISH":
+            result["setup_state"] = "WAIT"
+            result["reason"] = "HTF_STRUCTURE_NOT_BULLISH"
+        elif location == "PREMIUM":
+            result["setup_state"] = "WAIT"
+            result["reason"] = "HTF_BULLISH_ENTRY_IN_PREMIUM"
+    elif direction == "BEARISH":
+        if structure != "BEARISH":
+            result["setup_state"] = "WAIT"
+            result["reason"] = "HTF_STRUCTURE_NOT_BEARISH"
+        elif location == "DISCOUNT":
+            result["setup_state"] = "WAIT"
+            result["reason"] = "HTF_BEARISH_ENTRY_IN_DISCOUNT"
+    else:
+        result["setup_state"] = "WAIT"
+        result["reason"] = "LTF_ENTRY_DIRECTION_INVALID"
+    return result
+
+
 async def get_server_market_setup_detector(symbol: str) -> Dict[str, object]:
     canonical = symbol.upper().replace("/", "-")
     instrument = instrument_registry.get(canonical)
@@ -3118,13 +3161,44 @@ async def get_server_market_setup_detector(symbol: str) -> Dict[str, object]:
             "auto_queue": False,
         }
     result = detect_server_market_structure(candles, utcnow())
-    return {
+    ltf_result: Dict[str, object] = {
         **result,
         "symbol": canonical,
         "source": "coinbase",
         "granularity": SERVER_SETUP_GRANULARITY,
         "quality": quality.value,
     }
+    if ltf_result.get("setup_state") != "ENTRY_NOW":
+        return ltf_result
+    try:
+        htf_candles, htf_quality = await market_provider.get_candles(
+            provider_symbol, SERVER_HTF_GRANULARITY, SERVER_HTF_CANDLE_LIMIT
+        )
+    except (httpx.HTTPError, ValueError):
+        return apply_htf_context_to_ltf_setup(
+            ltf_result, {"status": "WAIT", "reason": "HTF_CANDLES_UNAVAILABLE"}
+        )
+    if htf_quality != DataQualityStatus.VALID:
+        return apply_htf_context_to_ltf_setup(
+            ltf_result,
+            {
+                "status": "WAIT",
+                "reason": "HTF_CANDLES_NOT_VALID",
+                "quality": htf_quality.value,
+            },
+        )
+    htf_latest_quality = _latest_quality(htf_candles)
+    if htf_latest_quality != DataQualityStatus.VALID.value:
+        return apply_htf_context_to_ltf_setup(
+            ltf_result,
+            {
+                "status": "WAIT",
+                "reason": "HTF_LATEST_CANDLE_NOT_FRESH",
+                "quality": htf_latest_quality,
+            },
+        )
+    htf_context = classify_server_htf_context(htf_candles, utcnow())
+    return apply_htf_context_to_ltf_setup(ltf_result, htf_context)
 
 
 AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS = 5.0

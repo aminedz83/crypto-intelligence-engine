@@ -3764,6 +3764,29 @@ class PaperPositionMark(BaseModel):
     source_timestamp: datetime
 
 
+async def paper_mark_from_coinbase_rest(
+    canonical: str, provider_symbol: str
+) -> Optional[PaperPositionMark]:
+    """Fail-safe real REST mark for crypto when the WS store has no fresh price."""
+    try:
+        datum = await market_provider.get_ticker(provider_symbol)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - monitoring fallback must fail closed
+        log.warning("Coinbase REST paper mark unavailable for %s: %s", canonical, exc)
+        return None
+    if datum.status != DataQualityStatus.VALID:
+        return None
+    if datum.value is None or datum.value <= 0 or datum.timestamp is None:
+        return None
+    return PaperPositionMark(
+        current_price=Decimal(str(datum.value)),
+        observed_at=utcnow(),
+        source="coinbase_rest_fallback",
+        source_timestamp=datum.timestamp,
+    )
+
+
 async def paper_mark_from_realtime(symbol: str) -> Optional[PaperPositionMark]:
     canonical = symbol.upper().replace("/", "-")
     instrument = instrument_registry.get(canonical)
@@ -3780,10 +3803,14 @@ async def paper_mark_from_realtime(symbol: str) -> Optional[PaperPositionMark]:
         if provider_symbol is None:
             return None
         datum = await market_store.get_ticker(provider_symbol)
-        if datum is None or datum.status != DataQualityStatus.VALID:
-            return None
-        if datum.value is None or datum.value <= 0 or datum.source_timestamp is None:
-            return None
+        if (
+            datum is None
+            or datum.status != DataQualityStatus.VALID
+            or datum.value is None
+            or datum.value <= 0
+            or datum.source_timestamp is None
+        ):
+            return await paper_mark_from_coinbase_rest(canonical, provider_symbol)
         price = Decimal(str(datum.value))
         received_at = datum.received_at
         source_timestamp = datum.source_timestamp
@@ -7273,6 +7300,33 @@ def _mount_frontend(app: FastAPI, cfg: Settings) -> None:
 
 
 # ============================ app factory ============================
+async def start_server_crypto_market_stream() -> bool:
+    """Start the Coinbase ticker stream server-side for autonomous paper monitoring."""
+    products = sorted(
+        provider_symbol
+        for instrument in instrument_registry.all()
+        if instrument.asset_class == AssetClass.CRYPTO
+        if (
+            provider_symbol := provider_symbol_map.to_provider(
+                "coinbase", instrument.canonical_symbol
+            )
+        ) is not None
+    )
+    if not products:
+        log.warning("No Coinbase products registered for server paper monitoring")
+        return False
+    try:
+        await market_ws.subscribe("ticker", products)
+        await market_ws.start()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - REST fallback keeps paper monitoring safe
+        log.warning("Server Coinbase WS auto-start failed; REST fallback remains active: %s", exc)
+        return False
+    log.info("Server Coinbase WS auto-started for paper monitoring: %s", products)
+    return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Starting %s (env=%s)", settings.app_name, settings.environment)
@@ -7286,6 +7340,7 @@ async def lifespan(app: FastAPI):
     await massive_indices_provider.connect()
     activation = await activate_massive_forex_mappings()
     log.info("Massive forex mapping activation: %s", activation)
+    await start_server_crypto_market_stream()
     try:
         await init_candle_schema()
         persistence_state.mark_ready()
@@ -7453,3 +7508,5 @@ async def market_session_context_endpoint(symbol: str) -> dict:
 
 # App must be built only after every router decorator above has executed.
 app = create_app()
+
+# V16-M5B24A — autonomous crypto WS + fail-safe REST paper-mark fallback

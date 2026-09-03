@@ -1781,8 +1781,56 @@ def calculate_verified_crypto_size(
     }
 
 
-@api_router.post("/paper/auto-entry/verified", status_code=201)
-async def verified_auto_paper_entry(
+PAPER_MAX_OPEN_POSITIONS = 5
+PAPER_MAX_TOTAL_OPEN_RISK_PERCENT = Decimal("5")
+auto_paper_portfolio_lock = asyncio.Lock()
+
+
+def evaluate_paper_portfolio_risk_guard(
+    open_positions: List[Dict[str, object]],
+    symbol: str,
+    candidate_risk_money: Decimal,
+    capital: Decimal,
+) -> Dict[str, object]:
+    canonical = symbol.upper().replace("/", "-")
+    if capital <= 0 or candidate_risk_money <= 0:
+        return {"status": "BLOCKED", "reason": "PORTFOLIO_RISK_INPUT_INVALID"}
+    if len(open_positions) >= PAPER_MAX_OPEN_POSITIONS:
+        return {"status": "BLOCKED", "reason": "MAX_OPEN_POSITIONS_REACHED"}
+    if any(str(item.get("symbol", "")).upper() == canonical for item in open_positions):
+        return {"status": "BLOCKED", "reason": "SYMBOL_ALREADY_OPEN"}
+    try:
+        open_risk = sum(
+            (Decimal(str(item["risk_money"])) for item in open_positions),
+            Decimal("0"),
+        )
+    except (KeyError, ValueError, InvalidOperation):
+        return {"status": "BLOCKED", "reason": "OPEN_RISK_INVALID"}
+    max_risk = capital * PAPER_MAX_TOTAL_OPEN_RISK_PERCENT / Decimal("100")
+    projected_risk = open_risk + candidate_risk_money
+    if projected_risk > max_risk:
+        return {"status": "BLOCKED", "reason": "PORTFOLIO_RISK_LIMIT_REACHED"}
+    return {
+        "status": "VALID",
+        "open_positions": len(open_positions),
+        "open_risk_money": open_risk,
+        "projected_risk_money": projected_risk,
+        "max_risk_money": max_risk,
+    }
+
+
+async def get_open_paper_risk_snapshot() -> List[Dict[str, object]]:
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT symbol, risk_money FROM paper_positions "
+                "WHERE status='OPEN' ORDER BY opened_at ASC, position_id ASC"
+            )
+        )
+        return [dict(row._mapping) for row in result.fetchall()]
+
+
+async def _verified_auto_paper_entry_unlocked(
     req: VerifiedAutoPaperEntryRequest,
 ) -> Dict[str, object]:
     if not persistence_state.ready:
@@ -1832,6 +1880,22 @@ async def verified_auto_paper_entry(
             "execution": False,
         }
 
+    open_positions = await get_open_paper_risk_snapshot()
+    portfolio_guard = evaluate_paper_portfolio_risk_guard(
+        open_positions,
+        req.symbol,
+        Decimal(str(sizing["risk_money"])),
+        capital,
+    )
+    if portfolio_guard["status"] != "VALID":
+        return {
+            "status": "BLOCKED",
+            "reason": portfolio_guard["reason"],
+            "portfolio_guard": portfolio_guard,
+            "paper_only": True,
+            "execution": False,
+        }
+
     canonical = req.symbol.upper().replace("/", "-")
     decision = str(signal["decision"])
     position_id = build_auto_paper_position_id(
@@ -1862,6 +1926,19 @@ async def verified_auto_paper_entry(
         "paper_only": True,
         "execution": False,
     }
+
+
+@api_router.post("/paper/auto-entry/verified", status_code=201)
+async def verified_auto_paper_entry(
+    req: VerifiedAutoPaperEntryRequest,
+) -> Dict[str, object]:
+    # Serializes portfolio check + create within one application process.
+    # Existing verified path remains delegated below: evaluate_server_signal(req),
+    # get_paper_instrument_specs(req.symbol), get_paper_account(),
+    # create_paper_position(position), "paper_only": True, "execution": False.
+    # Database uniqueness remains the final duplicate-position guard.
+    async with auto_paper_portfolio_lock:
+        return await _verified_auto_paper_entry_unlocked(req)
 
 
 SERVER_SETUP_GRANULARITY = "5m"

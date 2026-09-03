@@ -7289,11 +7289,15 @@ def market_session_context(
         state = forex_market_state(now)
         market_state = str(state["market_state"])
         reason = str(state["reason"])
-        sessions = list(state["sessions"])
+        state_sessions = state.get("sessions")
+        if isinstance(state_sessions, list):
+            sessions = [item for item in state_sessions if isinstance(item, dict)]
         value = state.get("current_session")
         current_session = str(value) if value is not None else None
-        next_open = state.get("next_open") if isinstance(state.get("next_open"), str) else None
-        next_close = state.get("next_close") if isinstance(state.get("next_close"), str) else None
+        open_value = state.get("next_open")
+        close_value = state.get("next_close")
+        next_open = open_value if isinstance(open_value, str) else None
+        next_close = close_value if isinstance(close_value, str) else None
     elif inst.market_calendar == MarketCalendarPolicy.US_EQUITY_RTH:
         market_state = open_state
         reason = "U.S. regular-hours baseline; holidays and early closes unknown"

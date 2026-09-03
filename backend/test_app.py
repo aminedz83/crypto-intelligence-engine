@@ -6709,3 +6709,79 @@ class TestAutoPaperLifecycleHardeningV16M5B11(unittest.TestCase):
     def test_ui_marks_lifecycle_hardening(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("PAPER LIFECYCLE HARDENING V1", html)
+
+
+class TestPaperPortfolioRiskGuardV16M5B12(unittest.TestCase):
+    def open_position(self, symbol="ETH-USD", risk="10"):
+        return {"symbol": symbol, "risk_money": Decimal(risk)}
+
+    def guard(self, positions=None, symbol="BTC-USD", risk="10", capital="1000"):
+        return main.evaluate_paper_portfolio_risk_guard(
+            positions or [], symbol, Decimal(risk), Decimal(capital)
+        )
+
+    def test_empty_portfolio_accepts_candidate(self):
+        self.assertEqual(self.guard()["status"], "VALID")
+
+    def test_same_symbol_open_is_blocked(self):
+        result = self.guard([self.open_position("BTC-USD")])
+        self.assertEqual(result["reason"], "SYMBOL_ALREADY_OPEN")
+
+    def test_symbol_is_canonicalized(self):
+        result = self.guard([self.open_position("BTC-USD")], symbol="btc/usd")
+        self.assertEqual(result["reason"], "SYMBOL_ALREADY_OPEN")
+
+    def test_max_open_positions_is_blocked(self):
+        positions = [self.open_position(f"COIN{i}-USD", "1") for i in range(5)]
+        result = self.guard(positions)
+        self.assertEqual(result["reason"], "MAX_OPEN_POSITIONS_REACHED")
+
+    def test_four_open_positions_remain_allowed(self):
+        positions = [self.open_position(f"COIN{i}-USD", "1") for i in range(4)]
+        self.assertEqual(self.guard(positions)["status"], "VALID")
+
+    def test_projected_risk_equal_five_percent_is_allowed(self):
+        positions = [self.open_position("ETH-USD", "40")]
+        self.assertEqual(self.guard(positions, risk="10")["status"], "VALID")
+
+    def test_projected_risk_above_five_percent_is_blocked(self):
+        positions = [self.open_position("ETH-USD", "40.01")]
+        result = self.guard(positions, risk="10")
+        self.assertEqual(result["reason"], "PORTFOLIO_RISK_LIMIT_REACHED")
+
+    def test_invalid_capital_fails_closed(self):
+        result = self.guard(capital="0")
+        self.assertEqual(result["reason"], "PORTFOLIO_RISK_INPUT_INVALID")
+
+    def test_invalid_candidate_risk_fails_closed(self):
+        result = self.guard(risk="0")
+        self.assertEqual(result["reason"], "PORTFOLIO_RISK_INPUT_INVALID")
+
+    def test_invalid_existing_risk_fails_closed(self):
+        result = self.guard([{"symbol": "ETH-USD", "risk_money": "bad"}])
+        self.assertEqual(result["reason"], "OPEN_RISK_INVALID")
+
+    def test_guard_exposes_projected_risk(self):
+        result = self.guard([self.open_position("ETH-USD", "12")], risk="8")
+        self.assertEqual(result["projected_risk_money"], Decimal("20"))
+
+    def test_verified_entry_uses_portfolio_snapshot(self):
+        source = inspect.getsource(main._verified_auto_paper_entry_unlocked)
+        self.assertIn("await get_open_paper_risk_snapshot()", source)
+        self.assertIn("evaluate_paper_portfolio_risk_guard", source)
+
+    def test_verified_entry_returns_explicit_portfolio_block(self):
+        source = inspect.getsource(main._verified_auto_paper_entry_unlocked)
+        self.assertIn('"portfolio_guard": portfolio_guard', source)
+
+    def test_public_verified_entry_is_serialized(self):
+        source = inspect.getsource(main.verified_auto_paper_entry)
+        self.assertIn("async with auto_paper_portfolio_lock", source)
+
+    def test_duplicate_database_guard_is_preserved(self):
+        source = inspect.getsource(main.create_paper_position)
+        self.assertIn("on_conflict_do_nothing", source)
+
+    def test_ui_marks_portfolio_risk_guard(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("PAPER PORTFOLIO RISK GUARD V1", html)

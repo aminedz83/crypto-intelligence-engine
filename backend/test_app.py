@@ -6468,3 +6468,162 @@ class TestServerEntryNowGateV16M5B9(unittest.TestCase):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("SERVER GATE · ENTRY NOW V1", html)
 
+
+class TestServerAutoPaperPositionV16M5B10(unittest.TestCase):
+    def detector(self, direction="BULLISH"):
+        sweep = "SSL_SWEEP" if direction == "BULLISH" else "BSL_SWEEP"
+        if direction == "BULLISH":
+            entry, stop, target = 101.0, 99.0, 107.0
+        else:
+            entry, stop, target = 101.0, 103.0, 95.0
+        return {
+            "status": "READY",
+            "setup_state": "ENTRY_NOW",
+            "latest_closed_timestamp": "2026-01-01T00:05:00+00:00",
+            "entry_gate": {"state": "ENTRY_NOW", "direction": direction},
+            "trade_plan": {
+                "state": "CANDIDATE_READY",
+                "direction": direction,
+                "entry_reference": entry,
+                "stop_loss": stop,
+                "take_profit": target,
+                "risk_reward": 3.0,
+            },
+            "structure_event": {"event": "BOS", "direction": direction},
+            "liquidity_sweep": {"event": sweep, "direction": direction},
+            "displacement": {"event": "DISPLACEMENT", "direction": direction},
+            "fvg": {"event": "FVG", "direction": direction},
+            "order_block": {
+                "event": "ORDER_BLOCK",
+                "direction": direction,
+                "state": "RETESTED",
+            },
+        }
+
+    def build(self, direction="BULLISH"):
+        return main.build_verified_auto_entry_request_from_detector(
+            "BTC-USD", self.detector(direction)
+        )
+
+    def test_wait_detector_does_not_build_request(self):
+        detector = self.detector()
+        detector["setup_state"] = "WAIT"
+        self.assertIsNone(
+            main.build_verified_auto_entry_request_from_detector("BTC-USD", detector)
+        )
+
+    def test_detector_must_be_ready(self):
+        detector = self.detector()
+        detector["status"] = "WAIT"
+        self.assertIsNone(
+            main.build_verified_auto_entry_request_from_detector("BTC-USD", detector)
+        )
+
+    def test_gate_must_be_entry_now(self):
+        detector = self.detector()
+        detector["entry_gate"]["state"] = "EXPIRED"
+        self.assertIsNone(
+            main.build_verified_auto_entry_request_from_detector("BTC-USD", detector)
+        )
+
+    def test_trade_plan_must_be_candidate_ready(self):
+        detector = self.detector()
+        detector["trade_plan"]["state"] = "WAIT"
+        self.assertIsNone(
+            main.build_verified_auto_entry_request_from_detector("BTC-USD", detector)
+        )
+
+    def test_bullish_request_maps_to_bullish_server_signal(self):
+        request = self.build()
+        self.assertIsNotNone(request)
+        self.assertEqual(request.direction, "BULLISH")
+        self.assertEqual(request.setup_state, "ENTRY_NOW")
+
+    def test_bearish_request_maps_to_bearish_server_signal(self):
+        request = self.build("BEARISH")
+        self.assertIsNotNone(request)
+        self.assertEqual(request.direction, "BEARISH")
+
+    def test_source_timestamp_comes_from_latest_closed_candle(self):
+        request = self.build()
+        self.assertIsNotNone(request)
+        self.assertEqual(request.source_timestamp.isoformat(), "2026-01-01T00:05:00+00:00")
+
+    def test_default_auto_risk_is_one_percent(self):
+        request = self.build()
+        self.assertIsNotNone(request)
+        self.assertEqual(request.risk_percent, Decimal("1"))
+
+    def test_server_confirmations_are_set(self):
+        request = self.build()
+        self.assertIsNotNone(request)
+        self.assertTrue(request.structure_confirmed)
+        self.assertTrue(request.displacement_confirmed)
+        self.assertTrue(request.order_block_confirmed)
+
+    def test_direction_mismatch_blocks_request(self):
+        detector = self.detector()
+        detector["fvg"]["direction"] = "BEARISH"
+        self.assertIsNone(
+            main.build_verified_auto_entry_request_from_detector("BTC-USD", detector)
+        )
+
+    def test_invalidated_order_block_blocks_request(self):
+        detector = self.detector()
+        detector["order_block"]["state"] = "INVALIDATED"
+        self.assertIsNone(
+            main.build_verified_auto_entry_request_from_detector("BTC-USD", detector)
+        )
+
+    def test_naive_source_timestamp_blocks_request(self):
+        detector = self.detector()
+        detector["latest_closed_timestamp"] = "2026-01-01T00:05:00"
+        self.assertIsNone(
+            main.build_verified_auto_entry_request_from_detector("BTC-USD", detector)
+        )
+
+    def test_generator_scans_registered_crypto_only(self):
+        source = inspect.getsource(main.run_server_auto_paper_generation_once)
+        self.assertIn("instrument_registry.all()", source)
+        self.assertIn("instrument.asset_class != AssetClass.CRYPTO", source)
+
+    def test_generator_uses_verified_paper_entry(self):
+        source = inspect.getsource(main.run_server_auto_paper_generation_once)
+        self.assertIn("market_provider.get_ticker", source)
+        self.assertIn("verified_auto_paper_entry(request)", source)
+        self.assertIn('stats["already_consumed"]', source)
+
+    def test_orchestrator_runs_server_auto_generation(self):
+        source = inspect.getsource(main.auto_entry_orchestrator_loop)
+        self.assertIn("run_server_auto_paper_generation_once()", source)
+        status_source = inspect.getsource(main.get_auto_entry_orchestrator_status)
+        self.assertIn("SERVER_AUTO_PAPER_POSITION_V1", status_source)
+
+    def test_ui_marks_server_auto_paper_position(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("SERVER AUTO PAPER POSITION V1", html)
+
+    def test_realtime_fill_uses_valid_ticker_price(self):
+        request = self.build()
+        self.assertIsNotNone(request)
+        ticker = main.MarketDatum(
+            "coinbase", "BTC-USD", 102.0, NOW, main.DataQualityStatus.VALID
+        )
+        filled = main.apply_realtime_market_fill_to_auto_request(
+            request, self.detector(), ticker
+        )
+        self.assertIsNotNone(filled)
+        self.assertEqual(filled.entry, Decimal("102.0"))
+        self.assertEqual(filled.source_timestamp, NOW)
+
+    def test_realtime_fill_blocks_price_outside_entry_zone(self):
+        request = self.build()
+        self.assertIsNotNone(request)
+        ticker = main.MarketDatum(
+            "coinbase", "BTC-USD", 110.0, NOW, main.DataQualityStatus.VALID
+        )
+        self.assertIsNone(
+            main.apply_realtime_market_fill_to_auto_request(
+                request, self.detector(), ticker
+            )
+        )

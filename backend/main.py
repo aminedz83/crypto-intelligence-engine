@@ -4066,14 +4066,50 @@ def calculate_paper_performance_metrics(
     }
 
 
+PAPER_PERFORMANCE_PERIODS = {"ALL", "DAY", "WEEK", "MONTH", "YEAR"}
+
+
+def paper_performance_period_start(
+    period: str, now: Optional[datetime] = None
+) -> Optional[datetime]:
+    """Return the UTC start boundary for an objective performance window."""
+    normalized = period.upper()
+    if normalized not in PAPER_PERFORMANCE_PERIODS:
+        raise ValueError("unsupported paper performance period")
+    if normalized == "ALL":
+        return None
+    current = now or utcnow()
+    if current.tzinfo is None:
+        raise ValueError("performance period now must be timezone-aware")
+    current = current.astimezone(timezone.utc)
+    if normalized == "DAY":
+        return current.replace(hour=0, minute=0, second=0, microsecond=0)
+    if normalized == "WEEK":
+        day_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        return day_start - timedelta(days=day_start.weekday())
+    if normalized == "MONTH":
+        return current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return current.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
 @api_router.get("/paper/performance")
-async def get_paper_performance(symbol: Optional[str] = None) -> Dict[str, object]:
+async def get_paper_performance(
+    symbol: Optional[str] = None, period: str = "ALL"
+) -> Dict[str, object]:
     """Return performance analytics derived only from persisted CLOSED paper trades."""
     if not persistence_state.ready:
         raise HTTPException(
             status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
         )
     canonical = symbol.upper().replace("/", "-") if symbol else None
+    normalized_period = period.upper()
+    try:
+        period_start = paper_performance_period_start(normalized_period)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "unsupported performance period"},
+        ) from exc
     try:
         async with engine.connect() as conn:
             account_result = await conn.execute(
@@ -4098,6 +4134,9 @@ async def get_paper_performance(symbol: Optional[str] = None) -> Dict[str, objec
             if canonical is not None:
                 sql += " AND symbol=:symbol"
                 params["symbol"] = canonical
+            if period_start is not None:
+                sql += " AND closed_at>=:period_start"
+                params["period_start"] = period_start
             sql += " ORDER BY closed_at ASC, position_id ASC"
             result = await conn.execute(text(sql), params)
             rows = [dict(row._mapping) for row in result.fetchall()]
@@ -4115,7 +4154,10 @@ async def get_paper_performance(symbol: Optional[str] = None) -> Dict[str, objec
     return {
         "status": "OK",
         "validation": "SERVER_PAPER_PERFORMANCE_ANALYTICS_V1",
+        "period_validation": "SERVER_PAPER_PERFORMANCE_PERIODS_V1",
         "symbol": canonical,
+        "period": normalized_period,
+        "period_start": period_start.isoformat() if period_start is not None else None,
         "metrics": metrics,
         "paper_only": True,
         "execution": False,
@@ -6967,3 +7009,5 @@ app = create_app()
 # V16-M5B4-FIX2 — fresh synchronized copy
 
 # V16-M5B17: paper performance analytics from persisted CLOSED trades
+
+# V16-M5B20: UTC DAY/WEEK/MONTH/YEAR paper performance windows

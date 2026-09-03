@@ -7199,3 +7199,96 @@ class TestTradingOperationalAuditUiV16M5B18(unittest.TestCase):
         self.assertIn('Aucune décision persistée', self.html())
 
 # V16-M5B18: 16 Trading operational audit UI regression tests
+
+
+class TestAutoScanWatchdogV16M5B19(unittest.TestCase):
+    def evaluate(self, runtime, running=True, now=None):
+        return main.evaluate_auto_scan_watchdog(runtime, running, now)
+
+    def runtime(self, completed=None, error=None, iterations=1):
+        return {
+            "last_completed_at": completed,
+            "last_error": error,
+            "iterations": iterations,
+        }
+
+    def test_contract_marker(self):
+        result = self.evaluate(self.runtime(), False)
+        self.assertEqual(result["validation"], "SERVER_AUTO_SCAN_WATCHDOG_V1")
+
+    def test_stopped_when_task_not_running(self):
+        result = self.evaluate(self.runtime(), False)
+        self.assertEqual(result["status"], "STOPPED")
+
+    def test_stopped_reason(self):
+        result = self.evaluate(self.runtime(), False)
+        self.assertEqual(result["reason"], "ORCHESTRATOR_TASK_NOT_RUNNING")
+
+    def test_starting_before_first_completed_scan(self):
+        result = self.evaluate(self.runtime(), True)
+        self.assertEqual(result["status"], "STARTING")
+
+    def test_starting_reason(self):
+        result = self.evaluate(self.runtime(), True)
+        self.assertEqual(result["reason"], "WAITING_FOR_FIRST_COMPLETED_SCAN")
+
+    def test_healthy_fresh_heartbeat(self):
+        now = datetime(2026, 9, 3, 3, 0, tzinfo=timezone.utc)
+        completed = datetime(2026, 9, 3, 2, 59, 55, tzinfo=timezone.utc).isoformat()
+        result = self.evaluate(self.runtime(completed), True, now)
+        self.assertEqual(result["status"], "HEALTHY")
+
+    def test_fresh_heartbeat_age(self):
+        now = datetime(2026, 9, 3, 3, 0, tzinfo=timezone.utc)
+        completed = datetime(2026, 9, 3, 2, 59, 55, tzinfo=timezone.utc).isoformat()
+        result = self.evaluate(self.runtime(completed), True, now)
+        self.assertEqual(result["heartbeat_age_seconds"], 5.0)
+
+    def test_stale_heartbeat(self):
+        now = datetime(2026, 9, 3, 3, 0, tzinfo=timezone.utc)
+        completed = datetime(2026, 9, 3, 2, 59, 30, tzinfo=timezone.utc).isoformat()
+        result = self.evaluate(self.runtime(completed), True, now)
+        self.assertEqual(result["status"], "STALE")
+
+    def test_stale_reason(self):
+        now = datetime(2026, 9, 3, 3, 0, tzinfo=timezone.utc)
+        completed = datetime(2026, 9, 3, 2, 59, 30, tzinfo=timezone.utc).isoformat()
+        result = self.evaluate(self.runtime(completed), True, now)
+        self.assertEqual(result["reason"], "SCAN_HEARTBEAT_STALE")
+
+    def test_error_wins_over_fresh_heartbeat(self):
+        now = datetime(2026, 9, 3, 3, 0, tzinfo=timezone.utc)
+        completed = datetime(2026, 9, 3, 2, 59, 59, tzinfo=timezone.utc).isoformat()
+        result = self.evaluate(self.runtime(completed, "RuntimeError"), True, now)
+        self.assertEqual(result["status"], "ERROR")
+
+    def test_error_reason_exposes_class_only(self):
+        result = self.evaluate(self.runtime(error="RuntimeError"), True)
+        self.assertEqual(result["reason"], "LAST_SCAN_ERROR:RuntimeError")
+
+    def test_invalid_heartbeat_is_starting(self):
+        result = self.evaluate(self.runtime("not-a-timestamp"), True)
+        self.assertEqual(result["status"], "STARTING")
+
+    def test_naive_now_rejected(self):
+        with self.assertRaises(ValueError):
+            self.evaluate(self.runtime(), True, datetime(2026, 9, 3, 3, 0))
+
+    def test_paper_only_contract(self):
+        result = self.evaluate(self.runtime(), False)
+        self.assertTrue(result["paper_only"])
+        self.assertFalse(result["broker_execution"])
+        self.assertFalse(result["live_trading_enabled"])
+
+    def test_endpoint_calls_watchdog_status(self):
+        source = inspect.getsource(main.get_auto_scan_watchdog_status)
+        self.assertIn("auto_scan_watchdog_status()", source)
+
+    def test_watchdog_threshold_is_three_scan_intervals_or_more(self):
+        self.assertGreaterEqual(
+            main.AUTO_SCAN_WATCHDOG_STALE_AFTER_SECONDS,
+            main.AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS * 3,
+        )
+
+
+# V16-M5B19: 16 continuous scanner watchdog regression tests

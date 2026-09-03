@@ -5299,7 +5299,7 @@ class TestServerMarketSetupDetectorV16M5B1(unittest.TestCase):
     def test_full_smc_is_explicitly_not_implemented(self):
         source = inspect.getsource(main.detect_server_market_structure)
         self.assertIn(
-            '"smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_V1"',
+            '"smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_RETEST_V1"',
             source,
         )
         self.assertIn('"liquidity_sweep": liquidity_sweep', source)

@@ -5298,16 +5298,13 @@ class TestServerMarketSetupDetectorV16M5B1(unittest.TestCase):
 
     def test_full_smc_is_explicitly_not_implemented(self):
         source = inspect.getsource(main.detect_server_market_structure)
-        self.assertIn(
-            '"smc_confirmation": '
-            '"STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_RETEST_PLAN_V1"',
-            source,
-        )
+        self.assertIn('"smc_confirmation": (', source)
+        self.assertIn("FVG_OB_RETEST_PLAN_GATE_V1", source)
         self.assertIn('"liquidity_sweep": liquidity_sweep', source)
         self.assertIn('"displacement": displacement', source)
         self.assertNotIn('"liquidity_sweep": "NOT_IMPLEMENTED"', source)
         self.assertNotIn('"displacement": "NOT_IMPLEMENTED"', source)
-        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"setup_state": entry_gate["state"]', source)
         self.assertIn('"auto_queue": False', source)
 
     def test_non_crypto_is_not_supported(self):
@@ -5554,12 +5551,12 @@ class TestServerStructureNoLookAheadV16M5B2Fix(unittest.TestCase):
 
     def test_detector_remains_setup_state_wait(self):
         source = inspect.getsource(main.detect_server_market_structure)
-        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"setup_state": entry_gate["state"]', source)
 
     def test_liquidity_sweep_preserves_wait_and_no_auto_queue(self):
         source = inspect.getsource(main.detect_server_market_structure)
         self.assertIn('"liquidity_sweep": liquidity_sweep', source)
-        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"setup_state": entry_gate["state"]', source)
         self.assertIn('"auto_queue": False', source)
 
 
@@ -5658,7 +5655,7 @@ class TestServerLiquiditySweepV16M5B3(unittest.TestCase):
 
     def test_sweep_does_not_enable_auto_entry(self):
         source = inspect.getsource(main.detect_server_market_structure)
-        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"setup_state": entry_gate["state"]', source)
         self.assertIn('"auto_queue": False', source)
 
     def test_ui_marks_server_liquidity_sweep_detector(self):
@@ -5746,7 +5743,7 @@ class TestServerDisplacementV16M5B4(unittest.TestCase):
 
     def test_displacement_does_not_enable_auto_entry(self):
         source = inspect.getsource(main.detect_server_market_structure)
-        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"setup_state": entry_gate["state"]', source)
         self.assertIn('"auto_queue": False', source)
 
     def test_ui_marks_server_displacement_detector(self):
@@ -5884,7 +5881,7 @@ class TestServerFvgV16M5B5(unittest.TestCase):
 
     def test_fvg_does_not_enable_auto_entry(self):
         source = inspect.getsource(main.detect_server_market_structure)
-        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"setup_state": entry_gate["state"]', source)
         self.assertIn('"auto_queue": False', source)
 
     def test_ui_marks_server_fvg_detector(self):
@@ -6057,7 +6054,7 @@ class TestServerOrderBlockV16M5B6(unittest.TestCase):
 
     def test_order_block_does_not_enable_auto_entry(self):
         source = inspect.getsource(main.detect_server_market_structure)
-        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"setup_state": entry_gate["state"]', source)
         self.assertIn('"auto_queue": False', source)
 
     def test_ui_marks_server_order_block_detector(self):
@@ -6180,14 +6177,11 @@ class TestServerRetestRevalidationV16M5B7(unittest.TestCase):
 
     def test_detector_contract_names_retest(self):
         source = inspect.getsource(main.detect_server_market_structure)
-        self.assertIn(
-            "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_RETEST_PLAN_V1",
-            source,
-        )
+        self.assertIn("FVG_OB_RETEST_PLAN_GATE_V1", source)
 
     def test_revalidation_does_not_enable_auto_entry(self):
         source = inspect.getsource(main.detect_server_market_structure)
-        self.assertIn('"setup_state": "WAIT"', source)
+        self.assertIn('"setup_state": entry_gate["state"]', source)
         self.assertIn('"auto_queue": False', source)
 
     def test_orchestrator_and_ui_mark_revalidation(self):
@@ -6311,7 +6305,7 @@ class TestServerTradePlanV16M5B8(unittest.TestCase):
 
     def test_detector_contract_names_plan(self):
         source = inspect.getsource(main.detect_server_market_structure)
-        self.assertIn("FVG_OB_RETEST_PLAN_V1", source)
+        self.assertIn("FVG_OB_RETEST_PLAN_GATE_V1", source)
 
     def test_orchestrator_names_server_trade_plan(self):
         source = inspect.getsource(main.get_auto_entry_orchestrator_status)
@@ -6320,3 +6314,157 @@ class TestServerTradePlanV16M5B8(unittest.TestCase):
     def test_ui_marks_server_trade_plan(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("SERVER BUILDER · TRADE PLAN V1", html)
+
+class TestServerEntryNowGateV16M5B9(unittest.TestCase):
+    def candle(self, index):
+        return main.Candle(
+            start=NOW + timedelta(minutes=index * 5),
+            low=99.0,
+            high=103.0,
+            open=100.0,
+            close=102.0,
+            volume=1.0,
+            status=main.DataQualityStatus.VALID,
+        )
+
+    def plan(self, direction="BULLISH"):
+        if direction == "BULLISH":
+            stop, target = 99.0, 108.0
+        else:
+            stop, target = 103.0, 95.0
+        return {
+            "event": "TRADE_PLAN",
+            "state": "CANDIDATE_READY",
+            "direction": direction,
+            "entry_zone_low": 99.0,
+            "entry_zone_high": 103.0,
+            "entry_reference": 101.0,
+            "stop_loss": stop,
+            "take_profit": target,
+            "risk_reward": 3.5,
+            "auto_queue": False,
+        }
+
+    def revalidation(self, direction="BULLISH", index=0):
+        return {
+            "event": "REVALIDATION",
+            "state": "REVALIDATED",
+            "direction": direction,
+            "revalidation_index": index,
+        }
+
+    def order_block(self, direction="BULLISH"):
+        return {
+            "event": "ORDER_BLOCK",
+            "direction": direction,
+            "state": "RETESTED",
+        }
+
+    def test_bullish_current_revalidation_is_entry_now(self):
+        gate = main.evaluate_server_entry_now_gate(
+            [self.candle(0)], self.plan(), self.revalidation(), self.order_block()
+        )
+        self.assertEqual(gate["state"], "ENTRY_NOW")
+        self.assertEqual(gate["direction"], "BULLISH")
+
+    def test_bearish_current_revalidation_is_entry_now(self):
+        gate = main.evaluate_server_entry_now_gate(
+            [self.candle(0)], self.plan("BEARISH"),
+            self.revalidation("BEARISH"), self.order_block("BEARISH"),
+        )
+        self.assertEqual(gate["state"], "ENTRY_NOW")
+
+    def test_gate_never_auto_queues(self):
+        gate = main.evaluate_server_entry_now_gate(
+            [self.candle(0)], self.plan(), self.revalidation(), self.order_block()
+        )
+        self.assertFalse(gate["auto_queue"])
+
+    def test_invalidated_order_block_wins(self):
+        ob = self.order_block()
+        ob["state"] = "INVALIDATED"
+        gate = main.evaluate_server_entry_now_gate(
+            [self.candle(0)], self.plan(), self.revalidation(), ob
+        )
+        self.assertEqual(gate["state"], "INVALIDATED")
+
+    def test_invalidated_revalidation_wins(self):
+        revalidation = self.revalidation()
+        revalidation["state"] = "INVALIDATED"
+        gate = main.evaluate_server_entry_now_gate(
+            [self.candle(0)], self.plan(), revalidation, self.order_block()
+        )
+        self.assertEqual(gate["state"], "INVALIDATED")
+
+    def test_incomplete_trade_plan_waits(self):
+        plan = self.plan()
+        plan["state"] = "WAIT"
+        gate = main.evaluate_server_entry_now_gate(
+            [self.candle(0)], plan, self.revalidation(), self.order_block()
+        )
+        self.assertEqual(gate["state"], "WAIT")
+
+    def test_direction_mismatch_waits(self):
+        gate = main.evaluate_server_entry_now_gate(
+            [self.candle(0)], self.plan(),
+            self.revalidation("BEARISH"), self.order_block(),
+        )
+        self.assertEqual(gate["state"], "WAIT")
+
+    def test_missing_revalidation_index_waits(self):
+        revalidation = self.revalidation()
+        revalidation["revalidation_index"] = None
+        gate = main.evaluate_server_entry_now_gate(
+            [self.candle(0)], self.plan(), revalidation, self.order_block()
+        )
+        self.assertEqual(gate["state"], "WAIT")
+
+    def test_future_revalidation_index_waits(self):
+        gate = main.evaluate_server_entry_now_gate(
+            [self.candle(0)], self.plan(), self.revalidation(index=2),
+            self.order_block(),
+        )
+        self.assertEqual(gate["state"], "WAIT")
+
+    def test_stale_revalidation_expires(self):
+        gate = main.evaluate_server_entry_now_gate(
+            [self.candle(0), self.candle(1)], self.plan(),
+            self.revalidation(index=0), self.order_block(),
+        )
+        self.assertEqual(gate["state"], "EXPIRED")
+
+    def test_bullish_invalid_trade_geometry_waits(self):
+        plan = self.plan()
+        plan["stop_loss"] = 102.0
+        gate = main.evaluate_server_entry_now_gate(
+            [self.candle(0)], plan, self.revalidation(), self.order_block()
+        )
+        self.assertEqual(gate["state"], "WAIT")
+
+    def test_bearish_invalid_trade_geometry_waits(self):
+        plan = self.plan("BEARISH")
+        plan["take_profit"] = 102.0
+        gate = main.evaluate_server_entry_now_gate(
+            [self.candle(0)], plan, self.revalidation("BEARISH"),
+            self.order_block("BEARISH"),
+        )
+        self.assertEqual(gate["state"], "WAIT")
+
+    def test_detector_exposes_entry_gate(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn("evaluate_server_entry_now_gate", source)
+        self.assertIn('"entry_gate": entry_gate', source)
+
+    def test_detector_setup_state_comes_from_gate(self):
+        source = inspect.getsource(main.detect_server_market_structure)
+        self.assertIn('"setup_state": entry_gate["state"]', source)
+        self.assertIn("RETEST_PLAN_GATE_V1", source)
+
+    def test_orchestrator_names_server_entry_gate(self):
+        source = inspect.getsource(main.get_auto_entry_orchestrator_status)
+        self.assertIn('"entry_now_gate": "SERVER_ENTRY_NOW_GATE_V1"', source)
+
+    def test_ui_marks_server_entry_now_gate(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("SERVER GATE · ENTRY NOW V1", html)
+

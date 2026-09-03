@@ -7820,3 +7820,71 @@ class TestFrontendRuntimeSynchronizationV16M5B23Fix5(unittest.TestCase):
             'modCard("Signal Engine","NOT IMPLEMENTED"',
             html,
         )
+
+# V16-M5B24A: autonomous crypto market stream + REST monitoring fallback
+class TestAutonomousPaperMonitoringV16M5B24A(unittest.TestCase):
+    def test_server_stream_helper_exists(self):
+        self.assertTrue(callable(main.start_server_crypto_market_stream))
+
+    def test_server_stream_uses_registered_crypto_instruments(self):
+        source = inspect.getsource(main.start_server_crypto_market_stream)
+        self.assertIn("instrument_registry.all()", source)
+        self.assertIn("AssetClass.CRYPTO", source)
+
+    def test_server_stream_uses_coinbase_mapping(self):
+        source = inspect.getsource(main.start_server_crypto_market_stream)
+        self.assertIn('to_provider(', source)
+        self.assertIn('"coinbase"', source)
+
+    def test_server_stream_subscribes_ticker(self):
+        source = inspect.getsource(main.start_server_crypto_market_stream)
+        self.assertIn('market_ws.subscribe("ticker", products)', source)
+
+    def test_server_stream_starts_ws(self):
+        source = inspect.getsource(main.start_server_crypto_market_stream)
+        self.assertIn("await market_ws.start()", source)
+
+    def test_server_stream_failure_is_fail_safe(self):
+        source = inspect.getsource(main.start_server_crypto_market_stream)
+        self.assertIn("return False", source)
+        self.assertIn("REST fallback remains active", source)
+
+    def test_lifespan_autostarts_crypto_stream(self):
+        source = inspect.getsource(main.lifespan)
+        self.assertIn("await start_server_crypto_market_stream()", source)
+
+    def test_lifespan_still_stops_crypto_stream(self):
+        source = inspect.getsource(main.lifespan)
+        self.assertIn("await market_ws.stop()", source)
+
+    def test_rest_fallback_helper_exists(self):
+        self.assertTrue(callable(main.paper_mark_from_coinbase_rest))
+
+    def test_rest_fallback_uses_real_coinbase_ticker(self):
+        source = inspect.getsource(main.paper_mark_from_coinbase_rest)
+        self.assertIn("await market_provider.get_ticker(provider_symbol)", source)
+
+    def test_rest_fallback_requires_valid_quality(self):
+        source = inspect.getsource(main.paper_mark_from_coinbase_rest)
+        self.assertIn("datum.status != DataQualityStatus.VALID", source)
+
+    def test_rest_fallback_rejects_missing_timestamp(self):
+        source = inspect.getsource(main.paper_mark_from_coinbase_rest)
+        self.assertIn("datum.timestamp is None", source)
+
+    def test_rest_fallback_rejects_nonpositive_price(self):
+        source = inspect.getsource(main.paper_mark_from_coinbase_rest)
+        self.assertIn("datum.value <= 0", source)
+
+    def test_rest_fallback_is_identified_in_mark_source(self):
+        source = inspect.getsource(main.paper_mark_from_coinbase_rest)
+        self.assertIn('source="coinbase_rest_fallback"', source)
+
+    def test_crypto_monitor_falls_back_when_ws_mark_is_unusable(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        self.assertIn("await paper_mark_from_coinbase_rest(canonical, provider_symbol)", source)
+
+    def test_noncrypto_monitor_paths_are_not_replaced_by_rest_fallback(self):
+        source = inspect.getsource(main.paper_mark_from_realtime)
+        fallback = source.count("paper_mark_from_coinbase_rest")
+        self.assertEqual(fallback, 1)

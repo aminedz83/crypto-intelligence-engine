@@ -6997,3 +6997,65 @@ class TestDecisionTraceV16M5B15(unittest.TestCase):
     def test_ui_marks_decision_trace(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("DECISION TRACE V1", html)
+
+
+class TestSignalDecisionHistoryV16M5B16(unittest.TestCase):
+    def test_history_table_exists(self):
+        self.assertEqual(main.signal_decision_history_table.name, "signal_decision_history")
+
+    def test_history_has_decision_id_primary_key(self):
+        column = main.signal_decision_history_table.c.decision_id
+        self.assertTrue(column.primary_key)
+
+    def test_history_persists_state(self):
+        self.assertIn("state", main.signal_decision_history_table.c)
+
+    def test_history_persists_reason(self):
+        self.assertIn("reason", main.signal_decision_history_table.c)
+
+    def test_history_persists_detector_context(self):
+        self.assertIn("detector_context", main.signal_decision_history_table.c)
+
+    def test_history_is_paper_only(self):
+        source = inspect.getsource(main.persist_auto_decision_trace)
+        self.assertIn('"paper_only": True', source)
+
+    def test_history_disables_execution(self):
+        source = inspect.getsource(main.persist_auto_decision_trace)
+        self.assertIn('"execution": False', source)
+
+    def test_history_uses_postgres_insert(self):
+        source = inspect.getsource(main.persist_auto_decision_trace)
+        self.assertIn("pg_insert(signal_decision_history_table)", source)
+
+    def test_history_insert_is_idempotent(self):
+        source = inspect.getsource(main.persist_auto_decision_trace)
+        self.assertIn("on_conflict_do_nothing", source)
+
+    def test_scanner_records_and_persists(self):
+        source = inspect.getsource(main.run_server_auto_paper_generation_once)
+        self.assertIn("record_and_persist_auto_decision_trace", source)
+
+    def test_history_endpoint_exists(self):
+        source = inspect.getsource(main.get_signal_decision_history)
+        self.assertIn("signal_decision_history", source)
+
+    def test_history_contract_version(self):
+        source = inspect.getsource(main.signal_decision_history)
+        self.assertIn("SERVER_SIGNAL_DECISION_HISTORY_V1", source)
+
+    def test_history_limit_is_bounded(self):
+        source = inspect.getsource(main.signal_decision_history)
+        self.assertIn("min(limit, 500)", source)
+
+    def test_history_supports_symbol_filter(self):
+        source = inspect.getsource(main.signal_decision_history)
+        self.assertIn("symbol = :symbol", source)
+
+    def test_history_supports_state_filter(self):
+        source = inspect.getsource(main.signal_decision_history)
+        self.assertIn("state = :state", source)
+
+    def test_ui_marks_signal_decision_history(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("SIGNAL DECISION HISTORY V1", html)

@@ -4164,6 +4164,115 @@ async def get_paper_performance(
     }
 
 
+PAPER_PERFORMANCE_BREAKDOWN_GROUPS = {"SYMBOL", "SIDE"}
+
+
+def build_paper_performance_breakdown(
+    closed_positions: List[Dict[str, object]],
+    initial_capital: Decimal,
+    group_by: str,
+) -> List[Dict[str, object]]:
+    """Group persisted closed paper trades by an actually stored dimension."""
+    normalized = group_by.upper()
+    if normalized not in PAPER_PERFORMANCE_BREAKDOWN_GROUPS:
+        raise ValueError("unsupported paper performance breakdown")
+    grouped: Dict[str, List[Dict[str, object]]] = {}
+    field = "symbol" if normalized == "SYMBOL" else "side"
+    for position in closed_positions:
+        raw_value = position.get(field)
+        if raw_value is None or not str(raw_value).strip():
+            raise ValueError(f"closed paper trade missing {field}")
+        key = str(raw_value).upper()
+        grouped.setdefault(key, []).append(position)
+    return [
+        {
+            "group": key,
+            "metrics": calculate_paper_performance_metrics(grouped[key], initial_capital),
+        }
+        for key in sorted(grouped)
+    ]
+
+
+@api_router.get("/paper/performance/breakdown")
+async def get_paper_performance_breakdown(
+    group_by: str = "SYMBOL",
+    period: str = "ALL",
+) -> Dict[str, object]:
+    """Break down persisted CLOSED paper performance by stored symbol or side."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+    normalized_group = group_by.upper()
+    if normalized_group not in PAPER_PERFORMANCE_BREAKDOWN_GROUPS:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "unsupported performance breakdown"},
+        )
+    normalized_period = period.upper()
+    try:
+        period_start = paper_performance_period_start(normalized_period)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "unsupported performance period"},
+        ) from exc
+    try:
+        async with engine.connect() as conn:
+            account_result = await conn.execute(
+                text(
+                    "SELECT initial_capital FROM paper_account "
+                    "WHERE account_id=:account_id"
+                ),
+                {"account_id": PAPER_ACCOUNT_ID},
+            )
+            account = account_result.fetchone()
+            if account is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "status": "UNAVAILABLE",
+                        "reason": "paper account not initialized",
+                    },
+                )
+            sql = (
+                "SELECT position_id, symbol, side, entry, close_price, size, risk_money, "
+                "closed_at FROM paper_positions WHERE status='CLOSED' "
+                "AND close_price IS NOT NULL"
+            )
+            params: Dict[str, object] = {}
+            if period_start is not None:
+                sql += " AND closed_at>=:period_start"
+                params["period_start"] = period_start
+            sql += " ORDER BY closed_at ASC, position_id ASC"
+            result = await conn.execute(text(sql), params)
+            rows = [dict(row._mapping) for row in result.fetchall()]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"},
+        ) from exc
+
+    initial_capital = Decimal(str(account._mapping["initial_capital"]))
+    groups = build_paper_performance_breakdown(rows, initial_capital, normalized_group)
+    return {
+        "status": "OK",
+        "validation": "SERVER_PAPER_PERFORMANCE_BREAKDOWN_V1",
+        "group_by": normalized_group,
+        "period": normalized_period,
+        "period_start": period_start.isoformat() if period_start is not None else None,
+        "groups": groups,
+        "dimensions_available": ["SYMBOL", "SIDE"],
+        "dimensions_deferred": ["TIMEFRAME", "STRATEGY", "SESSION", "REGIME"],
+        "paper_only": True,
+        "execution": False,
+    }
+
+
 @api_router.get("/paper/positions")
 async def list_paper_positions(status_filter: Optional[str] = None) -> Dict[str, object]:
     if not persistence_state.ready:

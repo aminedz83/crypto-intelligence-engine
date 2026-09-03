@@ -6785,3 +6785,63 @@ class TestPaperPortfolioRiskGuardV16M5B12(unittest.TestCase):
     def test_ui_marks_portfolio_risk_guard(self):
         html = INDEX.read_text(encoding="utf-8")
         self.assertIn("PAPER PORTFOLIO RISK GUARD V1", html)
+
+
+class TestAutoPaperE2EReadinessV16M5B13(unittest.TestCase):
+    def test_readiness_contract_has_version(self):
+        result = main.auto_paper_e2e_readiness()
+        self.assertEqual(result["validation"], "SERVER_AUTO_PAPER_E2E_READINESS_V1")
+
+    def test_readiness_is_paper_only(self):
+        self.assertTrue(main.auto_paper_e2e_readiness()["paper_only"])
+
+    def test_readiness_disables_broker_execution(self):
+        self.assertFalse(main.auto_paper_e2e_readiness()["broker_execution"])
+
+    def test_readiness_disables_live_trading(self):
+        self.assertFalse(main.auto_paper_e2e_readiness()["live_trading_enabled"])
+
+    def test_pipeline_starts_with_real_market_data(self):
+        pipeline = main.auto_paper_e2e_readiness()["pipeline"]
+        self.assertEqual(pipeline[0], "REAL_MARKET_DATA")
+
+    def test_pipeline_contains_server_smc(self):
+        self.assertIn("SERVER_SMC_SETUP", main.auto_paper_e2e_readiness()["pipeline"])
+
+    def test_pipeline_contains_entry_gate(self):
+        self.assertIn("ENTRY_NOW_GATE", main.auto_paper_e2e_readiness()["pipeline"])
+
+    def test_pipeline_contains_portfolio_guard(self):
+        pipeline = main.auto_paper_e2e_readiness()["pipeline"]
+        self.assertIn("PORTFOLIO_RISK_GUARD", pipeline)
+
+    def test_pipeline_contains_position_create(self):
+        pipeline = main.auto_paper_e2e_readiness()["pipeline"]
+        self.assertIn("PAPER_POSITION_CREATE", pipeline)
+
+    def test_pipeline_contains_realtime_mark(self):
+        self.assertIn("REALTIME_MARK", main.auto_paper_e2e_readiness()["pipeline"])
+
+    def test_pipeline_contains_sl_tp_close(self):
+        self.assertIn("SL_TP_CLOSE", main.auto_paper_e2e_readiness()["pipeline"])
+
+    def test_pipeline_ends_with_history(self):
+        pipeline = main.auto_paper_e2e_readiness()["pipeline"]
+        self.assertEqual(pipeline[-1], "PAPER_HISTORY")
+
+    def test_readiness_requires_persistence_and_orchestrator(self):
+        source = inspect.getsource(main.auto_paper_e2e_readiness)
+        self.assertIn("persistence_state.ready and orchestrator_running", source)
+
+    def test_generation_calls_verified_entry(self):
+        source = inspect.getsource(main.run_server_auto_paper_generation_once)
+        self.assertIn("await verified_auto_paper_entry(request)", source)
+
+    def test_monitor_calls_realtime_mark_and_position_mark(self):
+        source = inspect.getsource(main.monitor_open_paper_positions_once)
+        self.assertIn("await paper_mark_from_realtime", source)
+        self.assertIn("await mark_paper_position", source)
+
+    def test_ui_marks_e2e_readiness(self):
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn("AUTO PAPER E2E READINESS V1", html)

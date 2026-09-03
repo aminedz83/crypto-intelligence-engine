@@ -3199,7 +3199,7 @@ async def paper_mark_from_realtime(symbol: str) -> Optional[PaperPositionMark]:
 
 async def monitor_open_paper_positions_once() -> Dict[str, int]:
     if not persistence_state.ready:
-        return {"checked": 0, "marked": 0, "unavailable": 0}
+        return {"checked": 0, "marked": 0, "unavailable": 0, "errors": 0}
     async with engine.connect() as conn:
         result = await conn.execute(
             text("SELECT position_id, symbol FROM paper_positions WHERE status='OPEN'")
@@ -3207,14 +3207,30 @@ async def monitor_open_paper_positions_once() -> Dict[str, int]:
         rows = result.fetchall()
     marked = 0
     unavailable = 0
+    errors = 0
     for row in rows:
-        mark = await paper_mark_from_realtime(row._mapping["symbol"])
-        if mark is None:
-            unavailable += 1
-            continue
-        await mark_paper_position(row._mapping["position_id"], mark)
-        marked += 1
-    return {"checked": len(rows), "marked": marked, "unavailable": unavailable}
+        try:
+            mark = await paper_mark_from_realtime(row._mapping["symbol"])
+            if mark is None:
+                unavailable += 1
+                continue
+            await mark_paper_position(row._mapping["position_id"], mark)
+            marked += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - isolate one position from the batch
+            errors += 1
+            log.error(
+                "Paper position monitor failed for %s: %s",
+                row._mapping["position_id"],
+                exc,
+            )
+    return {
+        "checked": len(rows),
+        "marked": marked,
+        "unavailable": unavailable,
+        "errors": errors,
+    }
 
 
 async def paper_monitor_loop(stop_event: asyncio.Event) -> None:
@@ -3230,6 +3246,19 @@ async def paper_monitor_loop(stop_event: asyncio.Event) -> None:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except asyncio.TimeoutError:
             pass
+
+
+def paper_mark_temporally_valid(
+    mark: PaperPositionMark, opened_at: datetime
+) -> bool:
+    timestamps = (mark.observed_at, mark.source_timestamp, opened_at)
+    if any(value.tzinfo is None or value.utcoffset() is None for value in timestamps):
+        return False
+    if mark.source_timestamp > mark.observed_at:
+        return False
+    if mark.source_timestamp < opened_at:
+        return False
+    return True
 
 
 def evaluate_paper_close(side: str, price: Decimal, stop_loss: Decimal,
@@ -3277,6 +3306,11 @@ async def mark_paper_position(position_id: str, req: PaperPositionMark) -> Dict[
             data = dict(row._mapping)
             if data["status"] != "OPEN":
                 return paper_position_to_dict(row)
+            if not paper_mark_temporally_valid(req, data["opened_at"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"status": "CONFLICT", "reason": "STALE_OR_INVALID_MARK"},
+                )
             outcome = evaluate_paper_close(
                 data["side"], req.current_price, data["stop_loss"], data["take_profit"]
             )

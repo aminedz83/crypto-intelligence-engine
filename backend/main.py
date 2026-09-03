@@ -2831,6 +2831,9 @@ async def get_server_market_setup_detector(symbol: str) -> Dict[str, object]:
 AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS = 5.0
 auto_entry_candidates: Dict[str, AutoEntryCandidateState] = {}
 auto_entry_orchestrator_task: Optional[asyncio.Task] = None
+AUTO_DECISION_TRACE_MAX = 200
+auto_decision_trace: List[Dict[str, object]] = []
+
 auto_scan_runtime: Dict[str, object] = {
     "iterations": 0,
     "last_started_at": None,
@@ -2853,6 +2856,76 @@ def reset_auto_scan_runtime() -> None:
             "last_error": None,
         }
     )
+    auto_decision_trace.clear()
+
+
+def _decision_reason_from_detector(detector: Dict[str, object]) -> str:
+    """Return the first objective server blocker for the current SMC setup."""
+    if detector.get("status") != "READY":
+        raw_reason = detector.get("reason")
+        return str(raw_reason) if raw_reason else "DETECTOR_NOT_READY"
+    setup_state = str(detector.get("setup_state", "WAIT"))
+    if setup_state == "ENTRY_NOW":
+        return "ALL_CONFIRMATIONS_VALID"
+    if setup_state == "INVALIDATED":
+        return "ENTRY_GATE_INVALIDATED"
+    if setup_state == "EXPIRED":
+        return "ENTRY_WINDOW_EXPIRED"
+    checks = (
+        ("structure_event", "STRUCTURE_NOT_CONFIRMED"),
+        ("liquidity_sweep", "LIQUIDITY_SWEEP_NOT_CONFIRMED"),
+        ("displacement", "DISPLACEMENT_NOT_CONFIRMED"),
+        ("fvg", "FVG_NOT_CONFIRMED"),
+        ("order_block", "ORDER_BLOCK_NOT_CONFIRMED"),
+    )
+    for key, reason in checks:
+        if not isinstance(detector.get(key), dict):
+            return reason
+    revalidation = detector.get("revalidation")
+    if not isinstance(revalidation, dict):
+        return "RETEST_REVALIDATION_NOT_CONFIRMED"
+    if revalidation.get("state") != "REVALIDATED":
+        return str(revalidation.get("state") or "RETEST_REVALIDATION_NOT_CONFIRMED")
+    trade_plan = detector.get("trade_plan")
+    if not isinstance(trade_plan, dict) or trade_plan.get("state") != "CANDIDATE_READY":
+        return "TRADE_PLAN_NOT_READY"
+    gate = detector.get("entry_gate")
+    if isinstance(gate, dict) and gate.get("state"):
+        return f'ENTRY_GATE_{gate["state"]}'
+    return "WAITING_FOR_VALID_ENTRY"
+
+
+def record_auto_decision_trace(
+    symbol: str, state: str, reason: str, detector: Optional[Dict[str, object]] = None
+) -> None:
+    """Store a bounded, paper-only runtime explanation for one scan decision."""
+    entry: Dict[str, object] = {
+        "timestamp": utcnow().isoformat(),
+        "symbol": symbol.upper().replace("/", "-"),
+        "state": state,
+        "reason": reason,
+        "paper_only": True,
+        "execution": False,
+    }
+    if detector is not None:
+        entry["setup_state"] = detector.get("setup_state", "WAIT")
+        entry["latest_closed_timestamp"] = detector.get("latest_closed_timestamp")
+    auto_decision_trace.append(entry)
+    if len(auto_decision_trace) > AUTO_DECISION_TRACE_MAX:
+        del auto_decision_trace[:-AUTO_DECISION_TRACE_MAX]
+
+
+def auto_decision_trace_status(limit: int = 50) -> Dict[str, object]:
+    safe_limit = max(1, min(limit, AUTO_DECISION_TRACE_MAX))
+    return {
+        "validation": "SERVER_DECISION_TRACE_V1",
+        "count": len(auto_decision_trace),
+        "limit": safe_limit,
+        "items": list(reversed(auto_decision_trace[-safe_limit:])),
+        "paper_only": True,
+        "broker_execution": False,
+        "live_trading_enabled": False,
+    }
 
 
 def auto_scan_runtime_status() -> Dict[str, object]:
@@ -2863,6 +2936,8 @@ def auto_scan_runtime_status() -> Dict[str, object]:
         "validation": "SERVER_CONTINUOUS_AUTO_SCAN_V1",
         "interval_seconds": AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS,
         **auto_scan_runtime,
+        "decision_trace_count": len(auto_decision_trace),
+        "latest_decision": auto_decision_trace[-1] if auto_decision_trace else None,
         "paper_only": True,
         "broker_execution": False,
         "live_trading_enabled": False,
@@ -3015,54 +3090,74 @@ def apply_realtime_market_fill_to_auto_request(
 
 
 async def run_server_auto_paper_generation_once() -> Dict[str, int]:
-    """Scan registered crypto instruments and consume server ENTRY_NOW once.
-
-    Duplicate deterministic position IDs are treated as already consumed. No
-    broker/MT5 path exists: verified_auto_paper_entry persists paper positions.
-    """
-    stats = {"checked": 0, "entry_now": 0, "opened": 0, "already_consumed": 0, "blocked": 0}
+    """Scan crypto instruments and record every server decision observably."""
+    stats = {
+        "checked": 0,
+        "entry_now": 0,
+        "opened": 0,
+        "already_consumed": 0,
+        "blocked": 0,
+    }
     if not persistence_state.ready:
         return stats
     for instrument in instrument_registry.all():
         if instrument.asset_class != AssetClass.CRYPTO:
             continue
+        symbol = instrument.canonical_symbol
         stats["checked"] += 1
+        detector: Optional[Dict[str, object]] = None
         try:
-            detector = await get_server_market_setup_detector(instrument.canonical_symbol)
-            request = build_verified_auto_entry_request_from_detector(
-                instrument.canonical_symbol, detector
-            )
+            detector = await get_server_market_setup_detector(symbol)
+            request = build_verified_auto_entry_request_from_detector(symbol, detector)
             if request is None:
+                setup_state = str(detector.get("setup_state", "WAIT"))
+                record_auto_decision_trace(
+                    symbol, setup_state, _decision_reason_from_detector(detector), detector
+                )
                 continue
-            provider_symbol = provider_symbol_map.to_provider(
-                "coinbase", instrument.canonical_symbol
-            )
+            provider_symbol = provider_symbol_map.to_provider("coinbase", symbol)
             if provider_symbol is None:
                 stats["blocked"] += 1
+                record_auto_decision_trace(
+                    symbol, "BLOCKED", "PROVIDER_SYMBOL_UNAVAILABLE", detector
+                )
                 continue
             ticker = await market_provider.get_ticker(provider_symbol)
-            request = apply_realtime_market_fill_to_auto_request(
-                request, detector, ticker
-            )
+            request = apply_realtime_market_fill_to_auto_request(request, detector, ticker)
             if request is None:
                 stats["blocked"] += 1
+                record_auto_decision_trace(
+                    symbol, "BLOCKED", "REALTIME_FILL_NOT_ELIGIBLE", detector
+                )
                 continue
             stats["entry_now"] += 1
             result = await verified_auto_paper_entry(request)
         except HTTPException as exc:
             if exc.status_code == 409:
                 stats["already_consumed"] += 1
+                reason = "DUPLICATE_OR_PORTFOLIO_CONFLICT"
             else:
                 stats["blocked"] += 1
+                reason = f"HTTP_{exc.status_code}"
+            record_auto_decision_trace(symbol, "BLOCKED", reason, detector)
             continue
         except Exception as exc:  # noqa: BLE001
             log.error("Server auto-paper generation failed: %s", exc)
             stats["blocked"] += 1
+            record_auto_decision_trace(
+                symbol, "BLOCKED", f"RUNTIME_{type(exc).__name__}", detector
+            )
             continue
         if result.get("status") == "OPENED":
             stats["opened"] += 1
+            record_auto_decision_trace(
+                symbol, "ENTRY_NOW", "PAPER_POSITION_OPENED", detector
+            )
         else:
             stats["blocked"] += 1
+            raw_reason = result.get("reason")
+            reason = str(raw_reason) if raw_reason else "VERIFIED_ENTRY_BLOCKED"
+            record_auto_decision_trace(symbol, "BLOCKED", reason, detector)
     return stats
 
 
@@ -3169,6 +3264,11 @@ async def get_auto_scan_runtime_status() -> Dict[str, object]:
     return auto_scan_runtime_status()
 
 
+@api_router.get("/paper/auto-entry/decision-trace")
+async def get_auto_decision_trace(limit: int = 50) -> Dict[str, object]:
+    return auto_decision_trace_status(limit)
+
+
 @api_router.post("/paper/auto-entry/candidates")
 async def queue_auto_entry_candidate(
     req: AutoEntryCandidateRequest,
@@ -3193,6 +3293,7 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "entry_now_gate": "SERVER_ENTRY_NOW_GATE_V1",
         "smc_auto_candidate_generation": "SERVER_AUTO_PAPER_POSITION_V1",
         "auto_position_creation": "SERVER_AUTO_PAPER_POSITION_V1",
+        "decision_trace": "SERVER_DECISION_TRACE_V1",
         "paper_only": True,
         "execution": False,
     }

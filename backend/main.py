@@ -5229,6 +5229,10 @@ def _register_coinbase_instruments() -> None:
     for canon, base, quote, name in (
         ("BTC-USD", "BTC", "USD", "Bitcoin / US Dollar"),
         ("ETH-USD", "ETH", "USD", "Ethereum / US Dollar"),
+        ("SOL-USD", "SOL", "USD", "Solana / US Dollar"),
+        ("XRP-USD", "XRP", "USD", "XRP / US Dollar"),
+        ("LTC-USD", "LTC", "USD", "Litecoin / US Dollar"),
+        ("ADA-USD", "ADA", "USD", "Cardano / US Dollar"),
     ):
         instrument_registry.register(
             Instrument(
@@ -7510,3 +7514,5 @@ async def market_session_context_endpoint(symbol: str) -> dict:
 app = create_app()
 
 # V16-M5B24A — autonomous crypto WS + fail-safe REST paper-mark fallback
+
+# V16-M5B24B — crypto registry alignment: BTC/ETH/SOL/XRP/LTC/ADA

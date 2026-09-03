@@ -2360,6 +2360,103 @@ def latest_confirmed_revalidation(
     return base
 
 
+
+def build_server_trade_plan(
+    candles: List[Candle],
+    swing_highs: List[int],
+    swing_lows: List[int],
+    structure_event: Dict[str, object],
+    liquidity_sweep: Optional[Dict[str, object]],
+    displacement: Optional[Dict[str, object]],
+    fvg: Optional[Dict[str, object]],
+    order_block: Optional[Dict[str, object]],
+    revalidation: Dict[str, object],
+) -> Dict[str, object]:
+    """Build a paper-only trade-plan candidate from the complete SMC chain.
+
+    Every confirmation must agree on direction. Entry is the confirmed Order
+    Block zone, the reference entry is its midpoint, the structural stop is the
+    far OB boundary, and the target is the nearest confirmed opposite-liquidity
+    swing beyond entry. The result never queues or executes an order.
+    """
+    waiting: Dict[str, object] = {
+        "event": "TRADE_PLAN",
+        "state": "WAIT",
+        "direction": None,
+        "entry_zone_low": None,
+        "entry_zone_high": None,
+        "entry_reference": None,
+        "stop_loss": None,
+        "take_profit": None,
+        "risk_reward": None,
+        "auto_queue": False,
+    }
+    if revalidation.get("state") != "REVALIDATED":
+        return waiting
+    direction = revalidation.get("direction")
+    if direction not in {"BULLISH", "BEARISH"}:
+        return waiting
+
+    confirmations = (
+        structure_event,
+        liquidity_sweep,
+        displacement,
+        fvg,
+        order_block,
+    )
+    if any(not item for item in confirmations):
+        return waiting
+    if any(item.get("direction") != direction for item in confirmations if item):
+        return waiting
+    if order_block is None or order_block.get("state") == "INVALIDATED":
+        return waiting
+
+    zone_low = order_block.get("zone_low")
+    zone_high = order_block.get("zone_high")
+    if (
+        not isinstance(zone_low, (int, float))
+        or not isinstance(zone_high, (int, float))
+        or zone_low >= zone_high
+    ):
+        return waiting
+    entry = (float(zone_low) + float(zone_high)) / 2.0
+
+    target_candidates: List[float] = []
+    indexes = swing_highs if direction == "BULLISH" else swing_lows
+    for index in indexes:
+        if index < 0 or index >= len(candles):
+            continue
+        value = candles[index].high if direction == "BULLISH" else candles[index].low
+        if value is None:
+            continue
+        numeric = float(value)
+        if direction == "BULLISH" and numeric > entry:
+            target_candidates.append(numeric)
+        elif direction == "BEARISH" and numeric < entry:
+            target_candidates.append(numeric)
+    if not target_candidates:
+        return waiting
+
+    stop = float(zone_low) if direction == "BULLISH" else float(zone_high)
+    target = min(target_candidates) if direction == "BULLISH" else max(target_candidates)
+    risk = abs(entry - stop)
+    reward = abs(target - entry)
+    if risk <= 0.0 or reward <= 0.0:
+        return waiting
+
+    return {
+        "event": "TRADE_PLAN",
+        "state": "CANDIDATE_READY",
+        "direction": direction,
+        "entry_zone_low": float(zone_low),
+        "entry_zone_high": float(zone_high),
+        "entry_reference": entry,
+        "stop_loss": stop,
+        "take_profit": target,
+        "risk_reward": reward / risk,
+        "auto_queue": False,
+    }
+
 def structure_from_confirmed_swings(
     candles: List[Candle],
     swing_highs: List[int],
@@ -2463,6 +2560,17 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
     fvg = latest_confirmed_fvg(closed)
     order_block = latest_confirmed_order_block(closed, displacement)
     revalidation = latest_confirmed_revalidation(closed, order_block, fvg)
+    trade_plan = build_server_trade_plan(
+        closed,
+        highs,
+        lows,
+        structure_event,
+        liquidity_sweep,
+        displacement,
+        fvg,
+        order_block,
+        revalidation,
+    )
     latest = closed[-1]
     return {
         "status": "READY",
@@ -2474,12 +2582,13 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
         "setup_state": "WAIT",
         "auto_queue": False,
-        "smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_RETEST_V1",
+        "smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_FVG_OB_RETEST_PLAN_V1",
         "liquidity_sweep": liquidity_sweep or {"event": "NONE", "direction": None},
         "displacement": displacement or {"event": "NONE", "direction": None},
         "fvg": fvg or {"event": "NONE", "direction": None},
         "order_block": order_block or {"event": "NONE", "direction": None},
         "revalidation": revalidation,
+        "trade_plan": trade_plan,
     }
 
 
@@ -2639,6 +2748,7 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "fvg_detection": "SERVER_FVG_V1",
         "order_block_detection": "SERVER_ORDER_BLOCK_V1",
         "retest_revalidation": "SERVER_RETEST_REVALIDATION_V1",
+        "trade_plan_builder": "SERVER_TRADE_PLAN_V1",
         "smc_auto_candidate_generation": "NOT_IMPLEMENTED",
         "paper_only": True,
         "execution": False,

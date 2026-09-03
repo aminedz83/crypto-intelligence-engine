@@ -2831,6 +2831,42 @@ async def get_server_market_setup_detector(symbol: str) -> Dict[str, object]:
 AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS = 5.0
 auto_entry_candidates: Dict[str, AutoEntryCandidateState] = {}
 auto_entry_orchestrator_task: Optional[asyncio.Task] = None
+auto_scan_runtime: Dict[str, object] = {
+    "iterations": 0,
+    "last_started_at": None,
+    "last_completed_at": None,
+    "last_generation": None,
+    "last_queue": None,
+    "last_error": None,
+}
+
+
+def reset_auto_scan_runtime() -> None:
+    """Reset observable runtime counters without changing trading state."""
+    auto_scan_runtime.update(
+        {
+            "iterations": 0,
+            "last_started_at": None,
+            "last_completed_at": None,
+            "last_generation": None,
+            "last_queue": None,
+            "last_error": None,
+        }
+    )
+
+
+def auto_scan_runtime_status() -> Dict[str, object]:
+    """Return a snapshot of the continuous paper-only scanner heartbeat."""
+    task = auto_entry_orchestrator_task
+    return {
+        "status": "RUNNING" if task is not None and not task.done() else "STOPPED",
+        "validation": "SERVER_CONTINUOUS_AUTO_SCAN_V1",
+        "interval_seconds": AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS,
+        **auto_scan_runtime,
+        "paper_only": True,
+        "broker_execution": False,
+        "live_trading_enabled": False,
+    }
 
 
 def register_auto_entry_candidate(
@@ -3069,13 +3105,21 @@ async def run_auto_entry_orchestrator_once() -> Dict[str, int]:
 
 async def auto_entry_orchestrator_loop() -> None:
     while True:
+        auto_scan_runtime["last_started_at"] = utcnow().isoformat()
+        auto_scan_runtime["last_error"] = None
         try:
-            await run_server_auto_paper_generation_once()
-            await run_auto_entry_orchestrator_once()
+            generation = await run_server_auto_paper_generation_once()
+            queue = await run_auto_entry_orchestrator_once()
+            auto_scan_runtime["last_generation"] = generation
+            auto_scan_runtime["last_queue"] = queue
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
+            auto_scan_runtime["last_error"] = type(exc).__name__
             log.error("Auto-entry orchestrator iteration failed: %s", exc)
+        finally:
+            auto_scan_runtime["iterations"] = int(auto_scan_runtime["iterations"]) + 1
+            auto_scan_runtime["last_completed_at"] = utcnow().isoformat()
         await asyncio.sleep(AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS)
 
 
@@ -3115,6 +3159,11 @@ def auto_paper_e2e_readiness() -> Dict[str, object]:
 @api_router.get("/paper/auto-entry/e2e-readiness")
 async def get_auto_paper_e2e_readiness() -> Dict[str, object]:
     return auto_paper_e2e_readiness()
+
+
+@api_router.get("/paper/auto-entry/runtime-status")
+async def get_auto_scan_runtime_status() -> Dict[str, object]:
+    return auto_scan_runtime_status()
 
 
 @api_router.post("/paper/auto-entry/candidates")

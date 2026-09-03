@@ -7061,3 +7061,81 @@ class TestSignalDecisionHistoryV16M5B16(unittest.TestCase):
         self.assertIn("SIGNAL DECISION HISTORY V1", html)
 
 # V16-M5B16-FIX2: M5B15 regression contract follows persisted decision wrapper
+
+
+class TestPaperPerformanceAnalyticsV16M5B17(unittest.TestCase):
+    def setUp(self):
+        self.calc = main.calculate_paper_performance_metrics
+        self.capital = Decimal("1000")
+
+    def trade(self, side="LONG", entry="100", close="110", size="1", risk="10"):
+        return {
+            "side": side, "entry": entry, "close_price": close,
+            "size": size, "risk_money": risk,
+        }
+
+    def test_empty_history_has_zero_closed_trades(self):
+        self.assertEqual(self.calc([], self.capital)["closed_trades"], 0)
+
+    def test_empty_history_does_not_invent_win_rate(self):
+        self.assertIsNone(self.calc([], self.capital)["win_rate_percent"])
+
+    def test_long_win_pnl(self):
+        result = self.calc([self.trade()], self.capital)
+        self.assertEqual(result["net_pnl"], "10")
+
+    def test_short_win_pnl(self):
+        result = self.calc([self.trade(side="SHORT", close="90")], self.capital)
+        self.assertEqual(result["net_pnl"], "10")
+
+    def test_counts_wins_losses_and_breakeven(self):
+        trades = [self.trade(), self.trade(close="90"), self.trade(close="100")]
+        result = self.calc(trades, self.capital)
+        self.assertEqual((result["wins"], result["losses"], result["breakeven"]), (1, 1, 1))
+
+    def test_win_rate_uses_all_closed_trades(self):
+        result = self.calc([self.trade(), self.trade(close="90")], self.capital)
+        self.assertEqual(result["win_rate_percent"], "50.0")
+
+    def test_profit_factor(self):
+        result = self.calc([self.trade(close="120"), self.trade(close="90")], self.capital)
+        self.assertEqual(result["profit_factor"], "2")
+
+    def test_profit_factor_none_without_losses(self):
+        self.assertIsNone(self.calc([self.trade()], self.capital)["profit_factor"])
+
+    def test_expectancy_is_net_pnl_per_trade(self):
+        result = self.calc([self.trade(close="120"), self.trade(close="90")], self.capital)
+        self.assertEqual(result["expectancy"], "5")
+
+    def test_average_realized_rr_uses_persisted_risk_money(self):
+        result = self.calc([self.trade(close="120", risk="10")], self.capital)
+        self.assertEqual(result["average_realized_rr"], "2")
+
+    def test_zero_risk_is_excluded_from_rr_average(self):
+        result = self.calc([self.trade(risk="0")], self.capital)
+        self.assertIsNone(result["average_realized_rr"])
+
+    def test_drawdown_uses_closed_trade_equity_curve(self):
+        trades = [self.trade(close="120"), self.trade(close="80")]
+        result = self.calc(trades, self.capital)
+        self.assertEqual(result["max_drawdown"], "20")
+
+    def test_non_positive_initial_capital_rejected(self):
+        with self.assertRaises(ValueError):
+            self.calc([], Decimal("0"))
+
+    def test_endpoint_contract_version(self):
+        source = inspect.getsource(main.get_paper_performance)
+        self.assertIn("SERVER_PAPER_PERFORMANCE_ANALYTICS_V1", source)
+
+    def test_endpoint_filters_closed_positions_only(self):
+        source = inspect.getsource(main.get_paper_performance)
+        self.assertIn("WHERE status='CLOSED'", source)
+
+    def test_endpoint_is_paper_only_and_no_execution(self):
+        source = inspect.getsource(main.get_paper_performance)
+        self.assertIn('"paper_only": True', source)
+        self.assertIn('"execution": False', source)
+
+# V16-M5B17: 16 performance analytics regression tests

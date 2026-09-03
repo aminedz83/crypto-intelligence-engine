@@ -2953,7 +2953,9 @@ def classify_server_htf_context(candles: List[Candle], now: datetime) -> Dict[st
         "closed_candles": len(closed),
         "confirmed_swing_highs": len(highs),
         "confirmed_swing_lows": len(lows),
-        "latest_closed_timestamp": closed[-1].start.isoformat(),
+        "latest_closed_timestamp": (
+            closed[-1].start.isoformat() if closed[-1].start else None
+        ),
         "validation": "SERVER_HTF_CONTEXT_V1",
         "no_lookahead": True,
         "execution": False,

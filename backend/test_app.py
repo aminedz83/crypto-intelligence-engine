@@ -7139,3 +7139,60 @@ class TestPaperPerformanceAnalyticsV16M5B17(unittest.TestCase):
         self.assertIn('"execution": False', source)
 
 # V16-M5B17: 16 performance analytics regression tests
+
+
+class TestTradingOperationalAuditUiV16M5B18(unittest.TestCase):
+    def html(self):
+        return INDEX.read_text(encoding="utf-8")
+
+    def test_ui_m5b18_contract_marker(self):
+        self.assertIn("TRADING OPERATIONAL AUDIT UI V1", self.html())
+
+    def test_ui_fetches_performance_endpoint(self):
+        self.assertIn('/api/v1/paper/performance', self.html())
+
+    def test_ui_fetches_durable_decision_history(self):
+        self.assertIn('/api/v1/paper/auto-entry/decision-history?limit=50', self.html())
+
+    def test_ui_stores_performance(self):
+        self.assertIn('paperUiState.performance=performance.data||null', self.html())
+
+    def test_ui_stores_decisions(self):
+        self.assertIn('paperUiState.decisions=(decisions.data&&decisions.data.items)||[]', self.html())
+
+    def test_ui_exposes_closed_trade_count(self):
+        self.assertIn('Trades clôturés', self.html())
+
+    def test_ui_exposes_win_rate(self):
+        self.assertIn('Win Rate', self.html())
+
+    def test_ui_exposes_profit_factor(self):
+        self.assertIn('Profit Factor', self.html())
+
+    def test_ui_exposes_expectancy(self):
+        self.assertIn('Expectancy', self.html())
+
+    def test_ui_exposes_net_pnl(self):
+        self.assertIn('P&L net', self.html())
+
+    def test_ui_exposes_realized_rr(self):
+        self.assertIn('RR réalisé moyen', self.html())
+
+    def test_ui_exposes_max_drawdown(self):
+        self.assertIn('Max Drawdown', self.html())
+
+    def test_ui_has_symbol_filter(self):
+        self.assertIn('Filtre symbole', self.html())
+
+    def test_ui_has_state_filter(self):
+        self.assertIn('Filtre état', self.html())
+
+    def test_ui_filters_are_sent_to_server(self):
+        html = self.html()
+        self.assertIn('&symbol=', html)
+        self.assertIn('&state=', html)
+
+    def test_ui_keeps_no_fabricated_decision_contract(self):
+        self.assertIn('Aucune décision persistée', self.html())
+
+# V16-M5B18: 16 Trading operational audit UI regression tests

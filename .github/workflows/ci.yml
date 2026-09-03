@@ -38,7 +38,7 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "1205"
+      EXPECTED_TESTS: "1221"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -194,3 +194,5 @@ jobs:
 # V16-M5B19: EXPECTED_TESTS=1189 (16 continuous scanner watchdog tests)
 
 # V16-M5B20: EXPECTED_TESTS=1205 (16 UTC performance-period tests)
+
+# V16-M5B21: EXPECTED_TESTS=1221 (16 persisted-dimension breakdown tests)

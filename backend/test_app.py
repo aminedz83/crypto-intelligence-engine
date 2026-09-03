@@ -8052,7 +8052,7 @@ class ServerHtfContextFoundationTests(unittest.TestCase):
         source = inspect.getsource(main.get_server_market_setup_detector)
         self.assertIn("classify_server_htf_context", source)
         self.assertIn("apply_htf_context_to_ltf_setup", source)
-        self.assertNotIn("SERVER_HTF_GRANULARITY", source)
+        self.assertIn("SERVER_HTF_GRANULARITY", source)
 
 
 # ---------------- V16-M5B25A-FIX2: ENTRY_NOW execution diagnostics ----------------

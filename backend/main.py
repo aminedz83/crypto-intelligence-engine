@@ -4057,10 +4057,12 @@ async def auto_entry_orchestrator_loop() -> None:
             generation = await run_server_auto_paper_generation_once()
             trend_generation = await run_trend_pullback_paper_generation_once()
             breakout_generation = await run_breakout_expansion_paper_generation_once()
+            multi_asset_analysis = await run_multi_asset_strategy_analysis_once()
             queue = await run_auto_entry_orchestrator_once()
             auto_scan_runtime["last_generation"] = generation
             auto_scan_runtime["last_trend_pullback_generation"] = trend_generation
             auto_scan_runtime["last_breakout_expansion_generation"] = breakout_generation
+            auto_scan_runtime["last_multi_asset_analysis"] = multi_asset_analysis
             auto_scan_runtime["last_queue"] = queue
         except asyncio.CancelledError:
             raise
@@ -8523,6 +8525,531 @@ async def get_candidate_strategy_detections(symbol: str) -> Dict[str, object]:
         "marker": CANDIDATE_DETECTOR_VERSION,
     }
 
+
+
+# V16-M5B29B — Multi-Asset Strategy Analysis (observational, non-executing)
+# ---------------------------------------------------------------------------
+# Purpose: run the existing objective SMC / Trend Pullback / Breakout Expansion
+# detectors against REAL provider candles for FOREX, METAL and INDEX instruments.
+# This layer deliberately does NOT create, queue or size a multi-asset paper trade.
+# M5B29A fail-closed sizing rules remain authoritative until a later execution
+# milestone independently validates conversions, contract values and SL/TP P&L.
+MULTI_ASSET_ANALYSIS_VERSION = "SERVER_MULTI_ASSET_STRATEGY_ANALYSIS_V1"
+MULTI_ASSET_ANALYSIS_INTERVAL_SECONDS = 300.0
+_multi_asset_analysis_last_run_monotonic = 0.0
+_multi_asset_decision_fingerprints: Dict[str, str] = {}
+multi_asset_analysis_runtime: Dict[str, object] = {
+    "runs": 0,
+    "last_started_at": None,
+    "last_completed_at": None,
+    "last_error": None,
+    "last_summary": None,
+}
+
+
+def _analysis_candle_from_dict(item: Any) -> Optional[Candle]:
+    """Convert a provider-neutral history row to the established Candle model.
+
+    No OHLC value, timestamp or quality is invented. Volume is optional because
+    Gold/index feeds legitimately do not always expose it and the three detectors
+    used here do not depend on volume.
+    """
+    if not isinstance(item, dict):
+        return None
+    start = parse_iso8601(item.get("start"))
+    open_ = _to_float(item.get("open"))
+    high = _to_float(item.get("high"))
+    low = _to_float(item.get("low"))
+    close = _to_float(item.get("close"))
+    volume = _to_float(item.get("volume")) if item.get("volume") is not None else None
+    if start is None or open_ is None or high is None or low is None or close is None:
+        return None
+    if min(open_, high, low, close) < 0 or high < low:
+        return None
+    if not (low <= open_ <= high and low <= close <= high):
+        return None
+    raw_quality = str(item.get("quality") or DataQualityStatus.VALID.value)
+    try:
+        status_value = DataQualityStatus(raw_quality)
+    except ValueError:
+        status_value = DataQualityStatus.UNKNOWN
+    if status_value in {
+        DataQualityStatus.INVALID,
+        DataQualityStatus.MISSING,
+        DataQualityStatus.CONFLICTED,
+        DataQualityStatus.UNKNOWN,
+    }:
+        return None
+    return Candle(start, low, high, open_, close, volume, status_value)
+
+
+def _analysis_closed_candles(
+    candles: List[Candle], granularity: str, now: datetime, limit: int
+) -> List[Candle]:
+    """Keep only genuinely closed, structurally valid bars for one timeframe."""
+    bucket = GRANULARITIES[granularity][1]
+    usable = {DataQualityStatus.VALID, DataQualityStatus.STALE}
+    kept = [
+        candle
+        for candle in candles
+        if candle.start is not None
+        and candle.status in usable
+        and candle.open is not None
+        and candle.high is not None
+        and candle.low is not None
+        and candle.close is not None
+        and candle.start + timedelta(seconds=bucket) <= now
+    ]
+    kept.sort(key=lambda item: item.start or datetime.min.replace(tzinfo=timezone.utc))
+    return kept[-limit:]
+
+
+def _analysis_history_span_seconds(
+    asset_class: AssetClass, granularity: str, limit: int
+) -> int:
+    bucket = GRANULARITIES[granularity][1]
+    bare = bucket * max(limit + 10, 1)
+    # Session-aware markets need a wider wall-clock range than their bar count.
+    # These are retrieval windows only, never fabricated candles.
+    if asset_class == AssetClass.INDEX:
+        return max(bare * 6, 21 * 86400)
+    if asset_class in {AssetClass.FOREX, AssetClass.METAL}:
+        return max(bare * 3, 10 * 86400)
+    return bare * 2
+
+
+def _analysis_latest_quality(
+    candles: List[Candle], granularity: str, asset_class: AssetClass, now: datetime
+) -> str:
+    if not candles or candles[-1].start is None:
+        return DataQualityStatus.MISSING.value
+    bucket = GRANULARITIES[granularity][1]
+    # Massive index values may be 15-minute delayed. This budget only controls
+    # observational analysis and never authorizes an entry.
+    budget = bucket * 4
+    if asset_class == AssetClass.INDEX:
+        budget = max(budget, 25 * 60)
+    closed_at = candles[-1].start + timedelta(seconds=bucket)
+    age = max(0.0, (now - closed_at).total_seconds())
+    return DataQualityStatus.VALID.value if age <= budget else DataQualityStatus.STALE.value
+
+
+async def _fetch_multi_asset_analysis_candles(
+    canonical: str, granularity: str, limit: int, now: datetime
+) -> Dict[str, object]:
+    """Fetch REAL candles from the provider mapped to the instrument class."""
+    instrument = instrument_registry.get(canonical)
+    if instrument is None:
+        return {"status": "UNAVAILABLE", "reason": "INSTRUMENT_NOT_REGISTERED"}
+    if granularity not in GRANULARITIES:
+        return {"status": "UNAVAILABLE", "reason": "GRANULARITY_NOT_SUPPORTED"}
+
+    source: Optional[str] = None
+    raw_rows: List[Dict[str, object]] = []
+    provider_status = "OK"
+    provider_reason: Optional[str] = None
+
+    try:
+        if instrument.asset_class == AssetClass.CRYPTO:
+            source = "coinbase"
+            provider_symbol = provider_symbol_map.to_provider(source, canonical)
+            if provider_symbol is None:
+                return {"status": "UNAVAILABLE", "reason": "PROVIDER_SYMBOL_NOT_MAPPED"}
+            candles, quality = await market_provider.get_candles(provider_symbol, granularity, limit)
+            closed = _analysis_closed_candles(candles, granularity, now, limit)
+            return {
+                "status": "OK" if closed else "EMPTY",
+                "source": source,
+                "quality": quality.value,
+                "latest_quality": _analysis_latest_quality(
+                    closed, granularity, instrument.asset_class, now
+                ),
+                "candles": closed,
+            }
+
+        span = _analysis_history_span_seconds(instrument.asset_class, granularity, limit)
+        end = int(now.timestamp())
+        start = end - span
+
+        if instrument.asset_class == AssetClass.FOREX:
+            source = "massive"
+            history = await fetch_forex_history(canonical, granularity, start, end)
+            provider_status = str(history.get("status") or "UNAVAILABLE")
+            provider_reason = (
+                str(history.get("reason")) if history.get("reason") is not None else None
+            )
+            rows = history.get("candles")
+            raw_rows = rows if isinstance(rows, list) else []
+        elif instrument.asset_class == AssetClass.METAL:
+            source = "twelvedata"
+            history = await fetch_metal_history(canonical, granularity, start, end)
+            provider_status = str(history.result.get("status") or "UNAVAILABLE")
+            provider_reason = (
+                str(history.result.get("reason"))
+                if history.result.get("reason") is not None
+                else None
+            )
+            rows = history.result.get("candles")
+            raw_rows = rows if isinstance(rows, list) else []
+        elif instrument.asset_class == AssetClass.INDEX:
+            source = "massive"
+            history = await fetch_index_history(canonical, granularity, start, end)
+            provider_status = str(history.get("status") or "UNAVAILABLE")
+            provider_reason = (
+                str(history.get("reason")) if history.get("reason") is not None else None
+            )
+            rows = history.get("candles")
+            raw_rows = rows if isinstance(rows, list) else []
+        else:
+            return {"status": "UNAVAILABLE", "reason": "ASSET_CLASS_NOT_SUPPORTED"}
+    except (httpx.HTTPError, ValueError) as exc:
+        log.warning(
+            "Multi-asset analysis candle fetch failed for %s/%s: %s",
+            canonical,
+            granularity,
+            type(exc).__name__,
+        )
+        return {
+            "status": "UNAVAILABLE",
+            "source": source,
+            "reason": "PROVIDER_CANDLES_UNAVAILABLE",
+        }
+
+    if provider_status != "OK":
+        return {
+            "status": "UNAVAILABLE" if provider_status not in {"EMPTY"} else "EMPTY",
+            "source": source,
+            "provider_status": provider_status,
+            "reason": provider_reason or f"PROVIDER_{provider_status}",
+            "candles": [],
+        }
+
+    parsed = [c for item in raw_rows if (c := _analysis_candle_from_dict(item)) is not None]
+    closed = _analysis_closed_candles(parsed, granularity, now, limit)
+    return {
+        "status": "OK" if closed else "EMPTY",
+        "source": source,
+        "provider_status": provider_status,
+        "latest_quality": _analysis_latest_quality(
+            closed, granularity, instrument.asset_class, now
+        ),
+        "candles": closed,
+    }
+
+
+def _multi_asset_detection_state(detector: Dict[str, object]) -> Tuple[str, str]:
+    strategy_id = str(detector.get("strategy_id") or "")
+    if strategy_id == "SMC_LIQUIDITY_REVERSAL":
+        state = str(detector.get("setup_state") or detector.get("status") or "WAIT")
+        return state, _decision_reason_from_detector(detector)
+    status_value = str(detector.get("status") or "WAIT")
+    state = "SETUP" if status_value == "SETUP" else "WAIT"
+    return state, str(detector.get("reason") or "WAITING_FOR_VALID_SETUP")
+
+
+async def analyze_multi_asset_strategy_symbol(symbol: str) -> Dict[str, object]:
+    """Analyze one registered instrument with all three strategy families.
+
+    The result is observational. Even an SMC ENTRY_NOW or candidate SETUP has
+    auto_queue=False and execution=False in this milestone.
+    """
+    canonical = symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    now = utcnow()
+    if instrument is None:
+        return {
+            "status": "UNAVAILABLE",
+            "symbol": canonical,
+            "reason": "INSTRUMENT_NOT_REGISTERED",
+            "execution": False,
+        }
+
+    session = market_session_context(canonical, now)
+    market_state = str(session.get("market_state") or "UNKNOWN")
+    if market_state == "CLOSED":
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "asset_class": instrument.asset_class.value,
+            "reason": "MARKET_CLOSED",
+            "session": session,
+            "detections": [],
+            "analysis_only": True,
+            "auto_queue": False,
+            "execution": False,
+            "marker": MULTI_ASSET_ANALYSIS_VERSION,
+        }
+
+    ltf_fetch = await _fetch_multi_asset_analysis_candles(
+        canonical, SERVER_SETUP_GRANULARITY, SERVER_SETUP_CANDLE_LIMIT, now
+    )
+    if ltf_fetch.get("status") != "OK":
+        return {
+            "status": "WAIT" if ltf_fetch.get("status") == "EMPTY" else "UNAVAILABLE",
+            "symbol": canonical,
+            "asset_class": instrument.asset_class.value,
+            "source": ltf_fetch.get("source"),
+            "reason": str(ltf_fetch.get("reason") or "CANDLES_UNAVAILABLE"),
+            "provider_status": ltf_fetch.get("provider_status"),
+            "session": session,
+            "detections": [],
+            "analysis_only": True,
+            "auto_queue": False,
+            "execution": False,
+            "marker": MULTI_ASSET_ANALYSIS_VERSION,
+        }
+
+    ltf_candles = ltf_fetch.get("candles")
+    if not isinstance(ltf_candles, list) or not ltf_candles:
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "asset_class": instrument.asset_class.value,
+            "source": ltf_fetch.get("source"),
+            "reason": "NO_CLOSED_CANDLES",
+            "session": session,
+            "detections": [],
+            "analysis_only": True,
+            "auto_queue": False,
+            "execution": False,
+            "marker": MULTI_ASSET_ANALYSIS_VERSION,
+        }
+
+    latest_quality = str(ltf_fetch.get("latest_quality") or DataQualityStatus.UNKNOWN.value)
+    if latest_quality != DataQualityStatus.VALID.value:
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "asset_class": instrument.asset_class.value,
+            "source": ltf_fetch.get("source"),
+            "reason": "LATEST_CANDLE_NOT_FRESH",
+            "quality": latest_quality,
+            "session": session,
+            "detections": [],
+            "analysis_only": True,
+            "auto_queue": False,
+            "execution": False,
+            "marker": MULTI_ASSET_ANALYSIS_VERSION,
+        }
+
+    regime = classify_server_market_regime(ltf_candles, now)
+    smc_raw = detect_server_market_structure(ltf_candles, now)
+    smc: Dict[str, object] = {
+        **smc_raw,
+        "strategy_id": "SMC_LIQUIDITY_REVERSAL",
+        "strategy_version": "1.0",
+        "analysis_only": True,
+        "auto_queue": False,
+        "execution": False,
+    }
+
+    # Preserve the existing HTF gate for an SMC ENTRY_NOW. We fetch 1h only when
+    # the LTF chain has already reached ENTRY_NOW, reducing provider load.
+    if smc.get("setup_state") == "ENTRY_NOW":
+        htf_fetch = await _fetch_multi_asset_analysis_candles(
+            canonical, SERVER_HTF_GRANULARITY, SERVER_HTF_CANDLE_LIMIT, now
+        )
+        if htf_fetch.get("status") != "OK":
+            smc = apply_htf_context_to_ltf_setup(
+                smc,
+                {
+                    "status": "WAIT",
+                    "reason": str(htf_fetch.get("reason") or "HTF_CANDLES_UNAVAILABLE"),
+                },
+            )
+        else:
+            htf_candles = htf_fetch.get("candles")
+            if isinstance(htf_candles, list) and htf_candles:
+                htf_context = classify_server_htf_context(htf_candles, now)
+                smc = apply_htf_context_to_ltf_setup(smc, htf_context)
+            else:
+                smc = apply_htf_context_to_ltf_setup(
+                    smc, {"status": "WAIT", "reason": "HTF_CANDLES_UNAVAILABLE"}
+                )
+        smc.update(
+            {
+                "strategy_id": "SMC_LIQUIDITY_REVERSAL",
+                "strategy_version": "1.0",
+                "analysis_only": True,
+                "auto_queue": False,
+                "execution": False,
+            }
+        )
+
+    trend = detect_trend_pullback_candidate(ltf_candles, now, regime)
+    trend.update({"analysis_only": True, "auto_queue": False, "execution": False})
+    breakout = detect_breakout_expansion_candidate(ltf_candles, now, regime)
+    breakout.update({"analysis_only": True, "auto_queue": False, "execution": False})
+    detections = [smc, trend, breakout]
+
+    return {
+        "status": "READY" if regime.get("status") == "READY" else "WAIT",
+        "symbol": canonical,
+        "asset_class": instrument.asset_class.value,
+        "source": ltf_fetch.get("source"),
+        "granularity": SERVER_SETUP_GRANULARITY,
+        "quality": latest_quality,
+        "session": session,
+        "regime": regime,
+        "detections": detections,
+        "analysis_only": True,
+        "paper_only": True,
+        "auto_queue": False,
+        "execution": False,
+        "marker": MULTI_ASSET_ANALYSIS_VERSION,
+    }
+
+
+async def _persist_multi_asset_analysis_decisions(result: Dict[str, object]) -> int:
+    """Persist only a strategy state change/new candle, avoiding 5-minute spam."""
+    symbol = str(result.get("symbol") or "")
+    detections = result.get("detections")
+    if not symbol or not isinstance(detections, list):
+        return 0
+    written = 0
+    for detector in detections:
+        if not isinstance(detector, dict):
+            continue
+        strategy_id = str(detector.get("strategy_id") or "UNKNOWN_STRATEGY")
+        state, reason = _multi_asset_detection_state(detector)
+        latest = detector.get("latest_closed_timestamp")
+        fingerprint_raw = f"{symbol}|{strategy_id}|{state}|{reason}|{latest}"
+        fingerprint = hashlib.sha256(fingerprint_raw.encode("utf-8")).hexdigest()
+        key = f"{symbol}|{strategy_id}"
+        if _multi_asset_decision_fingerprints.get(key) == fingerprint:
+            continue
+        _multi_asset_decision_fingerprints[key] = fingerprint
+        context = dict(detector)
+        context.update(
+            {
+                "setup_state": state,
+                "strategy_id": strategy_id,
+                "asset_class": result.get("asset_class"),
+                "source": result.get("source"),
+                "granularity": result.get("granularity"),
+                "regime": result.get("regime"),
+                "session": result.get("session"),
+                "analysis_only": True,
+                "execution": False,
+                "marker": MULTI_ASSET_ANALYSIS_VERSION,
+            }
+        )
+        await record_and_persist_auto_decision_trace(symbol, state, reason, context)
+        written += 1
+    return written
+
+
+async def run_multi_asset_strategy_analysis_once(force: bool = False) -> Dict[str, object]:
+    """Scan registered non-crypto instruments at a safe 5-minute cadence."""
+    global _multi_asset_analysis_last_run_monotonic
+    now_mono = time.monotonic()
+    elapsed = now_mono - _multi_asset_analysis_last_run_monotonic
+    if not force and _multi_asset_analysis_last_run_monotonic and elapsed < MULTI_ASSET_ANALYSIS_INTERVAL_SECONDS:
+        return {
+            "status": "SKIPPED",
+            "reason": "ANALYSIS_INTERVAL_NOT_ELAPSED",
+            "next_in_seconds": round(MULTI_ASSET_ANALYSIS_INTERVAL_SECONDS - elapsed, 3),
+            "execution": False,
+        }
+
+    _multi_asset_analysis_last_run_monotonic = now_mono
+    multi_asset_analysis_runtime["last_started_at"] = utcnow().isoformat()
+    multi_asset_analysis_runtime["last_error"] = None
+    checked = ready = waiting = unavailable = persisted = 0
+    by_class: Dict[str, int] = {}
+    results: List[Dict[str, object]] = []
+    try:
+        instruments = sorted(
+            (
+                instrument
+                for instrument in instrument_registry.all()
+                if instrument.asset_class in {AssetClass.FOREX, AssetClass.METAL, AssetClass.INDEX}
+            ),
+            key=lambda item: item.canonical_symbol,
+        )
+        for instrument in instruments:
+            checked += 1
+            by_class[instrument.asset_class.value] = by_class.get(instrument.asset_class.value, 0) + 1
+            result = await analyze_multi_asset_strategy_symbol(instrument.canonical_symbol)
+            results.append(result)
+            status_value = str(result.get("status") or "UNAVAILABLE")
+            if status_value == "READY":
+                ready += 1
+                persisted += await _persist_multi_asset_analysis_decisions(result)
+            elif status_value == "WAIT":
+                waiting += 1
+            else:
+                unavailable += 1
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - fail-safe observational scanner boundary
+        multi_asset_analysis_runtime["last_error"] = type(exc).__name__
+        log.error("Multi-asset strategy analysis iteration failed: %s", exc)
+
+    summary: Dict[str, object] = {
+        "status": "READY" if ready else ("WAIT" if waiting else "UNAVAILABLE"),
+        "checked": checked,
+        "ready": ready,
+        "waiting": waiting,
+        "unavailable": unavailable,
+        "decisions_persisted": persisted,
+        "by_asset_class": by_class,
+        "results": results,
+        "analysis_only": True,
+        "paper_only": True,
+        "auto_queue": False,
+        "execution": False,
+        "marker": MULTI_ASSET_ANALYSIS_VERSION,
+    }
+    runs = multi_asset_analysis_runtime.get("runs", 0)
+    multi_asset_analysis_runtime["runs"] = int(runs) + 1 if isinstance(runs, int) else 1
+    multi_asset_analysis_runtime["last_summary"] = summary
+    multi_asset_analysis_runtime["last_completed_at"] = utcnow().isoformat()
+    return summary
+
+
+@api_router.get("/strategies/multi-asset/detect/{symbol}")
+async def get_multi_asset_strategy_analysis(symbol: str) -> Dict[str, object]:
+    return await analyze_multi_asset_strategy_symbol(symbol)
+
+
+@api_router.get("/strategies/multi-asset/runtime")
+async def get_multi_asset_strategy_analysis_runtime() -> Dict[str, object]:
+    return {
+        "status": "READY",
+        "interval_seconds": MULTI_ASSET_ANALYSIS_INTERVAL_SECONDS,
+        "runtime": dict(multi_asset_analysis_runtime),
+        "analysis_only": True,
+        "auto_queue": False,
+        "execution": False,
+        "marker": MULTI_ASSET_ANALYSIS_VERSION,
+    }
+
+
+@api_router.get("/strategies/multi-asset/universe")
+async def get_multi_asset_strategy_analysis_universe() -> Dict[str, object]:
+    instruments = [
+        {
+            "symbol": instrument.canonical_symbol,
+            "asset_class": instrument.asset_class.value,
+            "display_name": instrument.display_name,
+            "market_calendar": instrument.market_calendar.value,
+        }
+        for instrument in sorted(
+            instrument_registry.all(), key=lambda item: item.canonical_symbol
+        )
+        if instrument.asset_class in {AssetClass.FOREX, AssetClass.METAL, AssetClass.INDEX}
+    ]
+    return {
+        "status": "READY",
+        "instruments": instruments,
+        "count": len(instruments),
+        "strategies": ["SMC_LIQUIDITY_REVERSAL", "TREND_PULLBACK", "BREAKOUT_EXPANSION"],
+        "analysis_only": True,
+        "auto_queue": False,
+        "execution": False,
+        "marker": MULTI_ASSET_ANALYSIS_VERSION,
+    }
 
 
 # V16-M5B28B1 — Trend Pullback paper execution (paper-only)

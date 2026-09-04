@@ -4058,11 +4058,13 @@ async def auto_entry_orchestrator_loop() -> None:
             trend_generation = await run_trend_pullback_paper_generation_once()
             breakout_generation = await run_breakout_expansion_paper_generation_once()
             multi_asset_analysis = await run_multi_asset_strategy_analysis_once()
+            multi_asset_generation = await run_multi_asset_paper_generation_once()
             queue = await run_auto_entry_orchestrator_once()
             auto_scan_runtime["last_generation"] = generation
             auto_scan_runtime["last_trend_pullback_generation"] = trend_generation
             auto_scan_runtime["last_breakout_expansion_generation"] = breakout_generation
             auto_scan_runtime["last_multi_asset_analysis"] = multi_asset_analysis
+            auto_scan_runtime["last_multi_asset_generation"] = multi_asset_generation
             auto_scan_runtime["last_queue"] = queue
         except asyncio.CancelledError:
             raise
@@ -9060,6 +9062,384 @@ async def get_multi_asset_strategy_analysis_universe() -> Dict[str, object]:
         "auto_queue": False,
         "execution": False,
         "marker": MULTI_ASSET_ANALYSIS_VERSION,
+    }
+
+
+# V16-M5B29C — Multi-Asset Paper Execution Foundation
+# First executable multi-asset slice: USD-quoted spot Forex in native base units.
+# This is PAPER ONLY. Gold, cash indices, and non-USD-quoted FX remain fail-closed
+# until their missing calendar / contract-value / account-currency rules are verified.
+MULTI_ASSET_PAPER_EXECUTION_VERSION = "SERVER_MULTI_ASSET_PAPER_EXECUTION_V1"
+MULTI_ASSET_PAPER_RISK_PERCENT = Decimal("1")
+
+
+def multi_asset_paper_execution_readiness(symbol: str) -> Dict[str, object]:
+    """Return explicit authorization state for multi-asset PAPER execution.
+
+    M5B29C authorizes only mathematically well-defined USD-quoted spot Forex
+    positions in native base units. It does not model broker lots/contracts and
+    never authorizes live trading.
+    """
+    canonical = symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    observed_at = utcnow()
+    base: Dict[str, object] = {
+        "validation": MULTI_ASSET_PAPER_EXECUTION_VERSION,
+        "symbol": canonical,
+        "observed_at": observed_at.isoformat(),
+        "paper_only": True,
+        "live_trading": False,
+        "execution": False,
+        "auto_entry_authorized": False,
+    }
+    if instrument is None:
+        return {**base, "status": "BLOCKED", "reason": "INSTRUMENT_NOT_REGISTERED"}
+
+    base.update(
+        {
+            "asset_class": instrument.asset_class.value,
+            "base_asset": instrument.base_asset,
+            "quote_asset": instrument.quote_asset,
+            "market_calendar": instrument.market_calendar.value,
+        }
+    )
+    if instrument.asset_class == AssetClass.CRYPTO:
+        return {
+            **base,
+            "status": "DELEGATED",
+            "reason": "USE_EXISTING_CRYPTO_PAPER_PIPELINE",
+        }
+    if instrument.asset_class == AssetClass.METAL:
+        return {
+            **base,
+            "status": "BLOCKED",
+            "reason": "MARKET_CALENDAR_NOT_CONFIGURED",
+        }
+    if instrument.asset_class == AssetClass.INDEX:
+        return {
+            **base,
+            "status": "BLOCKED",
+            "reason": "VERIFIED_INDEX_CONTRACT_VALUE_NOT_IMPLEMENTED",
+        }
+    if instrument.asset_class != AssetClass.FOREX:
+        return {**base, "status": "BLOCKED", "reason": "ASSET_CLASS_NOT_SUPPORTED"}
+    if instrument.market_calendar != MarketCalendarPolicy.FOREX_WEEK:
+        return {**base, "status": "BLOCKED", "reason": "MARKET_CALENDAR_NOT_VERIFIED"}
+    if instrument.quote_asset != "USD":
+        return {
+            **base,
+            "status": "BLOCKED",
+            "reason": "ACCOUNT_CURRENCY_CONVERSION_NOT_IMPLEMENTED",
+        }
+    if provider_symbol_map.to_provider("massive", canonical) is None:
+        return {**base, "status": "BLOCKED", "reason": "PROVIDER_SYMBOL_NOT_MAPPED"}
+
+    session = market_session_context(canonical, observed_at)
+    market_state = str(session.get("market_state") or "UNKNOWN")
+    if market_state != "OPEN":
+        return {
+            **base,
+            "status": "BLOCKED",
+            "reason": "MARKET_CLOSED" if market_state == "CLOSED" else "MARKET_STATE_UNKNOWN",
+            "session": session,
+        }
+
+    sizing = multi_asset_sizing_readiness(canonical)
+    if sizing.get("status") != "PREVIEW_READY":
+        return {
+            **base,
+            "status": "BLOCKED",
+            "reason": str(sizing.get("reason") or "SIZING_NOT_READY"),
+            "sizing": sizing,
+            "session": session,
+        }
+    return {
+        **base,
+        "status": "READY",
+        "reason": "USD_QUOTED_SPOT_FOREX_PAPER_READY",
+        "sizing_mode": "BASE_UNITS",
+        "pnl_currency": "USD",
+        "risk_percent": str(MULTI_ASSET_PAPER_RISK_PERCENT),
+        "broker_contract_size_applied": False,
+        "session": session,
+        "auto_entry_authorized": True,
+    }
+
+
+@api_router.get("/paper/multi-asset-execution/readiness/{symbol}")
+async def get_multi_asset_paper_execution_readiness(symbol: str) -> Dict[str, object]:
+    return multi_asset_paper_execution_readiness(symbol)
+
+
+def _paper_mark_to_market_datum(symbol: str, mark: PaperPositionMark) -> MarketDatum:
+    return MarketDatum(
+        source=mark.source,
+        symbol=symbol,
+        value=float(mark.current_price),
+        timestamp=mark.source_timestamp,
+        status=DataQualityStatus.VALID,
+    )
+
+
+def build_smc_multi_asset_paper_plan(
+    detector: Dict[str, object], mark: PaperPositionMark
+) -> Dict[str, object]:
+    base: Dict[str, object] = {
+        "strategy_id": "SMC_LIQUIDITY_REVERSAL",
+        "strategy_version": "1.0-paper",
+        "paper_only": True,
+        "execution": False,
+    }
+    if detector.get("setup_state") != "ENTRY_NOW":
+        return {**base, "status": "WAIT", "reason": "SMC_SETUP_NOT_ENTRY_NOW"}
+    trade_plan = detector.get("trade_plan")
+    if not isinstance(trade_plan, dict):
+        return {**base, "status": "WAIT", "reason": "SMC_TRADE_PLAN_MISSING"}
+    try:
+        stop = Decimal(str(trade_plan["stop_loss"]))
+        target = Decimal(str(trade_plan["take_profit"]))
+        zone_low = Decimal(str(trade_plan["entry_zone_low"]))
+        zone_high = Decimal(str(trade_plan["entry_zone_high"]))
+    except (KeyError, ValueError, InvalidOperation):
+        return {**base, "status": "WAIT", "reason": "SMC_TRADE_PLAN_INVALID"}
+    entry = mark.current_price
+    if not zone_low <= entry <= zone_high:
+        return {**base, "status": "WAIT", "reason": "REALTIME_PRICE_OUTSIDE_ENTRY_ZONE"}
+    direction = str(detector.get("direction") or "")
+    if direction == "BULLISH":
+        if not stop < entry < target:
+            return {**base, "status": "WAIT", "reason": "SMC_LONG_LEVELS_INVALID"}
+        side = "LONG"
+    elif direction == "BEARISH":
+        if not target < entry < stop:
+            return {**base, "status": "WAIT", "reason": "SMC_SHORT_LEVELS_INVALID"}
+        side = "SHORT"
+    else:
+        return {**base, "status": "WAIT", "reason": "SMC_DIRECTION_INVALID"}
+    return {
+        **base,
+        "status": "ENTRY_NOW",
+        "side": side,
+        "direction": direction,
+        "entry": entry,
+        "stop_loss": stop,
+        "take_profit": target,
+        "source_timestamp": mark.source_timestamp,
+        "setup_timestamp": detector.get("latest_closed_timestamp"),
+        "plan_source": f"SMC_CLOSED_STRUCTURE+REAL_{mark.source.upper()}_MARK",
+    }
+
+
+async def execute_multi_asset_paper_plan(
+    symbol: str, plan: Dict[str, object]
+) -> Dict[str, object]:
+    """Persist one authorized non-crypto PAPER position, fail-closed by class."""
+    if not persistence_state.ready:
+        return {"status": "BLOCKED", "reason": "PERSISTENCE_NOT_READY"}
+    if plan.get("status") != "ENTRY_NOW":
+        return {"status": "BLOCKED", "reason": "PLAN_NOT_ENTRY_NOW"}
+    canonical = symbol.upper().replace("/", "-")
+    readiness = multi_asset_paper_execution_readiness(canonical)
+    if readiness.get("status") != "READY" or not readiness.get("auto_entry_authorized"):
+        return {
+            "status": "BLOCKED",
+            "reason": str(readiness.get("reason") or "MULTI_ASSET_EXECUTION_NOT_READY"),
+            "readiness": readiness,
+        }
+    try:
+        entry = Decimal(str(plan["entry"]))
+        stop = Decimal(str(plan["stop_loss"]))
+        target = Decimal(str(plan["take_profit"]))
+        source_timestamp = plan["source_timestamp"]
+    except (KeyError, ValueError, InvalidOperation):
+        return {"status": "BLOCKED", "reason": "PLAN_INVALID"}
+    if not isinstance(source_timestamp, datetime) or source_timestamp.tzinfo is None:
+        return {"status": "BLOCKED", "reason": "SOURCE_TIMESTAMP_INVALID"}
+    side = str(plan.get("side") or "")
+    if side == "LONG" and not stop < entry < target:
+        return {"status": "BLOCKED", "reason": "LONG_LEVELS_INVALID"}
+    if side == "SHORT" and not target < entry < stop:
+        return {"status": "BLOCKED", "reason": "SHORT_LEVELS_INVALID"}
+    if side not in {"LONG", "SHORT"}:
+        return {"status": "BLOCKED", "reason": "SIDE_INVALID"}
+
+    if classify_freshness(
+        source_timestamp, settings.ticker_max_age_seconds, now=utcnow()
+    ) != DataQualityStatus.VALID:
+        return {"status": "BLOCKED", "reason": "REALTIME_MARK_NOT_FRESH"}
+
+    account = await get_paper_account()
+    capital = Decimal(str(account["current_capital"]))
+    sizing_readiness = multi_asset_sizing_readiness(canonical)
+    sizing = calculate_multi_asset_unit_size(
+        capital,
+        MULTI_ASSET_PAPER_RISK_PERCENT,
+        entry,
+        stop,
+        sizing_readiness,
+    )
+    if sizing.get("status") != "VALID":
+        return {"status": "BLOCKED", "reason": str(sizing.get("reason") or "SIZING_INVALID")}
+
+    strategy_id = str(plan.get("strategy_id") or "MULTI_ASSET")
+    strategy_version = str(plan.get("strategy_version") or "unknown")
+    async with auto_paper_portfolio_lock:
+        open_positions = await get_open_paper_risk_snapshot()
+        guard = evaluate_paper_portfolio_risk_guard(
+            open_positions,
+            canonical,
+            Decimal(str(sizing["risk_money"])),
+            capital,
+        )
+        if guard.get("status") != "VALID":
+            return {"status": "BLOCKED", "reason": str(guard.get("reason"))}
+        position = PaperPositionCreate(
+            position_id=build_strategy_paper_position_id(
+                strategy_id,
+                canonical,
+                side,
+                plan.get("setup_timestamp"),
+            ),
+            symbol=canonical,
+            side=side,
+            entry=entry,
+            stop_loss=stop,
+            take_profit=target,
+            size=Decimal(str(sizing["size"])),
+            size_unit=str(sizing.get("size_unit") or "BASE_UNITS"),
+            risk_money=Decimal(str(sizing["risk_money"])),
+            risk_percent=Decimal(str(sizing["risk_percent"])),
+            capital_before=capital,
+            source=f"strategy:{strategy_id}@{strategy_version}",
+            source_timestamp=source_timestamp,
+            opened_at=utcnow(),
+        )
+        created = await create_paper_position(position)
+    return {
+        "status": "OPENED",
+        "strategy_id": strategy_id,
+        "strategy_version": strategy_version,
+        "position": created,
+        "sizing_model": sizing_readiness,
+        "paper_only": True,
+        "live_trading": False,
+        "execution": False,
+        "marker": MULTI_ASSET_PAPER_EXECUTION_VERSION,
+    }
+
+
+async def run_multi_asset_paper_generation_once() -> Dict[str, int]:
+    """Auto-open only verified USD-quoted Forex paper setups from real data."""
+    stats = {
+        "checked": 0,
+        "ready": 0,
+        "setups": 0,
+        "opened": 0,
+        "blocked": 0,
+        "conflicts": 0,
+    }
+    if not persistence_state.ready:
+        return stats
+    for instrument in instrument_registry.all():
+        if instrument.asset_class == AssetClass.CRYPTO:
+            continue
+        canonical = instrument.canonical_symbol
+        stats["checked"] += 1
+        readiness = multi_asset_paper_execution_readiness(canonical)
+        if readiness.get("status") != "READY":
+            continue
+        stats["ready"] += 1
+        try:
+            analysis = await analyze_multi_asset_strategy_symbol(canonical)
+            detections = analysis.get("detections")
+            if not isinstance(detections, list):
+                stats["blocked"] += 1
+                continue
+            candles_fetch = await _fetch_multi_asset_analysis_candles(
+                canonical,
+                SERVER_SETUP_GRANULARITY,
+                SERVER_SETUP_CANDLE_LIMIT,
+                utcnow(),
+            )
+            candles_obj = candles_fetch.get("candles")
+            if not isinstance(candles_obj, list) or not candles_obj:
+                stats["blocked"] += 1
+                continue
+            mark = await paper_mark_from_realtime(canonical)
+            if mark is None:
+                stats["blocked"] += 1
+                continue
+            market_datum = _paper_mark_to_market_datum(canonical, mark)
+            for detector_obj in detections:
+                if not isinstance(detector_obj, dict):
+                    continue
+                strategy_id = str(detector_obj.get("strategy_id") or "")
+                plan: Optional[Dict[str, object]] = None
+                if strategy_id == "SMC_LIQUIDITY_REVERSAL":
+                    if detector_obj.get("setup_state") != "ENTRY_NOW":
+                        continue
+                    plan = build_smc_multi_asset_paper_plan(detector_obj, mark)
+                elif strategy_id == "TREND_PULLBACK":
+                    if detector_obj.get("status") != "SETUP":
+                        continue
+                    plan = build_trend_pullback_paper_plan(
+                        candles_obj,
+                        utcnow(),
+                        detector_obj,
+                        market_datum,
+                    )
+                    plan["plan_source"] = (
+                        f"CLOSED_PULLBACK_STRUCTURE+REAL_{mark.source.upper()}_MARK"
+                    )
+                elif strategy_id == "BREAKOUT_EXPANSION":
+                    if detector_obj.get("status") != "SETUP":
+                        continue
+                    plan = build_breakout_expansion_paper_plan(
+                        detector_obj,
+                        market_datum,
+                        utcnow(),
+                    )
+                    plan["plan_source"] = f"CLOSED_BREAKOUT_RANGE+REAL_{mark.source.upper()}_MARK"
+                if plan is None or plan.get("status") != "ENTRY_NOW":
+                    continue
+                stats["setups"] += 1
+                try:
+                    result = await execute_multi_asset_paper_plan(canonical, plan)
+                except HTTPException as exc:
+                    if exc.status_code == 409:
+                        stats["conflicts"] += 1
+                    else:
+                        stats["blocked"] += 1
+                    continue
+                if result.get("status") == "OPENED":
+                    stats["opened"] += 1
+                else:
+                    stats["blocked"] += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.error("Multi-asset paper generation failed for %s: %s", canonical, exc)
+            stats["blocked"] += 1
+    return stats
+
+
+@api_router.get("/paper/multi-asset-execution/status")
+async def get_multi_asset_paper_execution_status() -> Dict[str, object]:
+    instruments: List[Dict[str, object]] = []
+    for instrument in instrument_registry.all():
+        if instrument.asset_class == AssetClass.CRYPTO:
+            continue
+        instruments.append(multi_asset_paper_execution_readiness(instrument.canonical_symbol))
+    return {
+        "status": "ACTIVE_PAPER_FOUNDATION",
+        "marker": MULTI_ASSET_PAPER_EXECUTION_VERSION,
+        "risk_percent": str(MULTI_ASSET_PAPER_RISK_PERCENT),
+        "authorized_scope": "USD_QUOTED_SPOT_FOREX_BASE_UNITS_ONLY",
+        "strategies": ["SMC_LIQUIDITY_REVERSAL", "TREND_PULLBACK", "BREAKOUT_EXPANSION"],
+        "instruments": instruments,
+        "paper_only": True,
+        "live_trading": False,
+        "execution": False,
     }
 
 

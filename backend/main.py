@@ -1530,6 +1530,32 @@ paper_adaptive_edge_trade_link_table = Table(
 )
 
 
+# V16-M5B30I — isolated counterfactuals for technically valid setups blocked by edge.
+paper_adaptive_edge_counterfactual_table = Table(
+    "paper_adaptive_edge_counterfactual",
+    metadata,
+    Column("counterfactual_id", String, primary_key=True),
+    Column("decision_id", String, nullable=False),
+    Column("symbol", String, nullable=False),
+    Column("strategy_id", String, nullable=False),
+    Column("side", String, nullable=False),
+    Column("entry", Numeric(38, 18), nullable=False),
+    Column("stop_loss", Numeric(38, 18), nullable=False),
+    Column("take_profit", Numeric(38, 18), nullable=False),
+    Column("status", String, nullable=False),
+    Column("opened_at", DateTime(timezone=True), nullable=False),
+    Column("source_timestamp", DateTime(timezone=True), nullable=False),
+    Column("close_reason", String, nullable=True),
+    Column("close_price", Numeric(38, 18), nullable=True),
+    Column("closed_at", DateTime(timezone=True), nullable=True),
+    Column("realized_rr", Numeric(20, 8), nullable=True),
+    Column("mark_source", String, nullable=True),
+    Column("mark_source_timestamp", DateTime(timezone=True), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+
 candles_table = Table(
     "candles",
     metadata,
@@ -2218,6 +2244,21 @@ async def _verified_auto_paper_entry_unlocked(
         req.performance_session, req.performance_market_regime,
     )
     if edge_gate.get("action") == "BLOCKED":
+        if (
+            req.entry is not None
+            and req.stop_loss is not None
+            and req.take_profit is not None
+        ):
+            await persist_adaptive_edge_blocked_counterfactual(
+                edge_gate,
+                req.symbol,
+                "SMC_LIQUIDITY_REVERSAL",
+                str(signal["decision"]),
+                req.entry,
+                req.stop_loss,
+                req.take_profit,
+                req.source_timestamp,
+            )
         return {
             "status": "BLOCKED", "reason": "ADAPTIVE_EDGE_WEAK",
             "adaptive_edge_gate": edge_gate, "paper_only": True, "execution": False,
@@ -4614,6 +4655,12 @@ async def paper_monitor_loop(stop_event: asyncio.Event) -> None:
         except Exception as exc:  # noqa: BLE001 - loop must fail safe and keep serving
             log.error("Paper monitor iteration failed: %s", exc)
         try:
+            await monitor_adaptive_edge_counterfactuals_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.error("Counterfactual monitor iteration failed: %s", exc)
+        try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except asyncio.TimeoutError:
             pass
@@ -5850,6 +5897,144 @@ ADAPTIVE_EDGE_REPLAY_VERSION = "SERVER_ADAPTIVE_EDGE_DECISION_REPLAY_V1"
 
 ADAPTIVE_EDGE_IMPACT_VERSION = "SERVER_ADAPTIVE_EDGE_IMPACT_VALIDATION_V1"
 
+ADAPTIVE_EDGE_COUNTERFACTUAL_VERSION = "SERVER_ADAPTIVE_EDGE_BLOCKED_REPLAY_V1"
+
+
+async def persist_adaptive_edge_blocked_counterfactual(
+    gate: Dict[str, object],
+    symbol: str,
+    strategy_id: str,
+    side: str,
+    entry: Decimal,
+    stop_loss: Decimal,
+    take_profit: Decimal,
+    source_timestamp: datetime,
+) -> None:
+    """Persist a zero-capital shadow setup; it never enters paper_positions."""
+    decision_id = gate.get("decision_id")
+    if gate.get("action") != "BLOCKED":
+        return
+    if not isinstance(decision_id, str) or not decision_id:
+        return
+    if side not in {"LONG", "SHORT"}:
+        return
+    if source_timestamp.tzinfo is None:
+        return
+    if side == "LONG" and not stop_loss < entry < take_profit:
+        return
+    if side == "SHORT" and not take_profit < entry < stop_loss:
+        return
+    seed = f"{decision_id}|{symbol}|{strategy_id}|{source_timestamp.isoformat()}"
+    counterfactual_id = "edge-cf-" + hashlib.sha256(seed.encode()).hexdigest()[:24]
+    now = utcnow()
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                pg_insert(paper_adaptive_edge_counterfactual_table).values(
+                    counterfactual_id=counterfactual_id,
+                    decision_id=decision_id,
+                    symbol=symbol.upper().replace("/", "-"),
+                    strategy_id=strategy_id,
+                    side=side,
+                    entry=entry,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    status="OPEN",
+                    opened_at=now,
+                    source_timestamp=source_timestamp,
+                    created_at=now,
+                    updated_at=now,
+                ).on_conflict_do_nothing(index_elements=["counterfactual_id"])
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Adaptive edge counterfactual unavailable: %s", type(exc).__name__)
+
+
+def adaptive_edge_counterfactual_rr(
+    side: str, entry: Decimal, stop_loss: Decimal, close_price: Decimal
+) -> Decimal:
+    risk = abs(entry - stop_loss)
+    if risk <= 0:
+        return Decimal("0")
+    if side == "LONG":
+        return (close_price - entry) / risk
+    return (entry - close_price) / risk
+
+
+async def monitor_adaptive_edge_counterfactuals_once() -> Dict[str, int]:
+    """Resolve open shadow setups from the same fresh realtime marks as paper positions."""
+    if not persistence_state.ready:
+        return {"checked": 0, "resolved": 0, "unavailable": 0, "errors": 0}
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT * FROM paper_adaptive_edge_counterfactual "
+                "WHERE status='OPEN' ORDER BY opened_at ASC, counterfactual_id ASC"
+            )
+        )
+        rows = result.fetchall()
+    resolved = 0
+    unavailable = 0
+    errors = 0
+    for row in rows:
+        data = row._mapping
+        try:
+            mark = await paper_mark_from_realtime(str(data["symbol"]))
+            if mark is None or not paper_mark_temporally_valid(mark, data["opened_at"]):
+                unavailable += 1
+                continue
+            outcome = evaluate_paper_close(
+                str(data["side"]),
+                mark.current_price,
+                Decimal(str(data["stop_loss"])),
+                Decimal(str(data["take_profit"])),
+            )
+            if outcome is None:
+                continue
+            reason, close_price = outcome
+            realized_rr = adaptive_edge_counterfactual_rr(
+                str(data["side"]),
+                Decimal(str(data["entry"])),
+                Decimal(str(data["stop_loss"])),
+                close_price,
+            )
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE paper_adaptive_edge_counterfactual "
+                        "SET status='RESOLVED', close_reason=:reason, "
+                        "close_price=:close_price, closed_at=:closed_at, "
+                        "realized_rr=:realized_rr, mark_source=:mark_source, "
+                        "mark_source_timestamp=:mark_source_timestamp, "
+                        "updated_at=:updated_at "
+                        "WHERE counterfactual_id=:counterfactual_id AND status='OPEN'"
+                    ),
+                    {
+                        "reason": reason,
+                        "close_price": close_price,
+                        "closed_at": mark.observed_at,
+                        "realized_rr": realized_rr,
+                        "mark_source": mark.source,
+                        "mark_source_timestamp": mark.source_timestamp,
+                        "updated_at": utcnow(),
+                        "counterfactual_id": data["counterfactual_id"],
+                    },
+                )
+            resolved += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            log.warning("Counterfactual monitor failed: %s", type(exc).__name__)
+    return {
+        "checked": len(rows),
+        "resolved": resolved,
+        "unavailable": unavailable,
+        "errors": errors,
+    }
+
+
+
 
 async def persist_adaptive_edge_trade_link(
     position_id: str, gate: Dict[str, object]
@@ -5893,6 +6078,79 @@ def _impact_metrics_or_empty(
             "max_drawdown_percent": "0",
         }
     return calculate_paper_performance_metrics(positions, initial_capital)
+
+
+@api_router.get("/paper/adaptive-edge/counterfactual-replay")
+async def get_adaptive_edge_counterfactual_replay(limit: int = 100) -> Dict[str, object]:
+    """Read zero-capital BLOCKED setup outcomes; never modifies the paper account."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+    safe_limit = max(1, min(limit, 500))
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT * FROM paper_adaptive_edge_counterfactual "
+                    "ORDER BY created_at DESC, counterfactual_id DESC LIMIT :limit"
+                ),
+                {"limit": safe_limit},
+            )
+            rows = [dict(row._mapping) for row in result.fetchall()]
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "counterfactual replay failed"},
+        ) from exc
+    for row in rows:
+        for key in ("entry", "stop_loss", "take_profit", "close_price", "realized_rr"):
+            if row.get(key) is not None:
+                row[key] = str(row[key])
+        for key in (
+            "opened_at",
+            "source_timestamp",
+            "closed_at",
+            "mark_source_timestamp",
+            "created_at",
+            "updated_at",
+        ):
+            value = row.get(key)
+            if isinstance(value, datetime):
+                row[key] = value.isoformat()
+    resolved = [row for row in rows if row.get("status") == "RESOLVED"]
+    wins = sum(1 for row in resolved if Decimal(str(row.get("realized_rr") or "0")) > 0)
+    losses = sum(1 for row in resolved if Decimal(str(row.get("realized_rr") or "0")) < 0)
+    rr_values = [Decimal(str(row.get("realized_rr") or "0")) for row in resolved]
+    avg_rr = (
+        sum(rr_values, Decimal("0")) / Decimal(len(rr_values))
+        if rr_values
+        else Decimal("0")
+    )
+    return {
+        "status": "OK",
+        "validation": ADAPTIVE_EDGE_COUNTERFACTUAL_VERSION,
+        "count": len(rows),
+        "summary": {
+            "resolved": len(resolved),
+            "open": sum(1 for row in rows if row.get("status") == "OPEN"),
+            "wins": wins,
+            "losses": losses,
+            "win_rate_percent": (
+                str(Decimal(wins) * Decimal("100") / Decimal(len(resolved)))
+                if resolved
+                else "0"
+            ),
+            "average_realized_rr": str(avg_rr),
+        },
+        "items": rows,
+        "zero_capital": True,
+        "affects_paper_account": False,
+        "live_trading": False,
+        "method": "REALTIME_MARK_FIRST_TOUCH_MONITOR",
+    }
 
 
 @api_router.get("/paper/adaptive-edge/impact-validation")
@@ -5956,6 +6214,19 @@ async def get_adaptive_edge_impact_validation(period: str = "ALL") -> Dict[str, 
                 blocked_params["period_start"] = period_start
             blocked_result = await conn.execute(text(blocked_sql), blocked_params)
             blocked_row = blocked_result.fetchone()
+            counterfactual_sql = (
+                "SELECT status, realized_rr FROM paper_adaptive_edge_counterfactual"
+            )
+            counterfactual_params: Dict[str, object] = {}
+            if period_start is not None:
+                counterfactual_sql += " WHERE created_at>=:period_start"
+                counterfactual_params["period_start"] = period_start
+            counterfactual_result = await conn.execute(
+                text(counterfactual_sql), counterfactual_params
+            )
+            counterfactual_rows = [
+                dict(row._mapping) for row in counterfactual_result.fetchall()
+            ]
     except HTTPException:
         raise
     except Exception as exc:
@@ -5971,6 +6242,19 @@ async def get_adaptive_edge_impact_validation(period: str = "ALL") -> Dict[str, 
     linked = allowed + favored
     historical = [row for row in rows if row.get("decision_id") is None]
     blocked_count = int(blocked_row._mapping["count"]) if blocked_row is not None else 0
+    blocked_resolved = [
+        row for row in counterfactual_rows if row.get("status") == "RESOLVED"
+    ]
+    blocked_rr = [
+        Decimal(str(row.get("realized_rr") or "0")) for row in blocked_resolved
+    ]
+    blocked_wins = sum(1 for value in blocked_rr if value > 0)
+    blocked_losses = sum(1 for value in blocked_rr if value < 0)
+    blocked_avg_rr = (
+        sum(blocked_rr, Decimal("0")) / Decimal(len(blocked_rr))
+        if blocked_rr
+        else Decimal("0")
+    )
 
     return {
         "status": "OK",
@@ -5988,14 +6272,31 @@ async def get_adaptive_edge_impact_validation(period: str = "ALL") -> Dict[str, 
             "linked_closed_positions": len(linked),
             "historical_unlinked_closed_positions": len(historical),
             "blocked_gate_decisions": blocked_count,
+            "blocked_counterfactual_open": sum(
+                1 for row in counterfactual_rows if row.get("status") == "OPEN"
+            ),
+            "blocked_counterfactual_resolved": len(blocked_resolved),
+        },
+        "blocked_counterfactual": {
+            "resolved": len(blocked_resolved),
+            "wins": blocked_wins,
+            "losses": blocked_losses,
+            "win_rate_percent": (
+                str(Decimal(blocked_wins) * Decimal("100") / Decimal(len(blocked_resolved)))
+                if blocked_resolved
+                else "0"
+            ),
+            "average_realized_rr": str(blocked_avg_rr),
         },
         "interpretation": {
             "historical_baseline_is_causal_control": False,
-            "blocked_trade_outcomes_measured": False,
-            "blocked_counterfactual_status": "NOT_MEASURED",
+            "blocked_trade_outcomes_measured": bool(blocked_resolved),
+            "blocked_counterfactual_status": (
+                "MEASURED" if blocked_resolved else "PENDING"
+            ),
             "reason": (
-                "Blocked entries create no paper position, so hypothetical P&L is not "
-                "fabricated. This endpoint validates observed executed cohorts only."
+                "BLOCKED setups are isolated zero-capital shadow records and are "
+                "resolved only from subsequent fresh realtime marks."
             ),
         },
         "paper_only": True,
@@ -10687,6 +10988,16 @@ async def execute_multi_asset_paper_plan(
         plan.get("performance_session"), plan.get("performance_market_regime"),
     )
     if edge_gate.get("action") == "BLOCKED":
+        await persist_adaptive_edge_blocked_counterfactual(
+            edge_gate,
+            canonical,
+            str(plan.get("strategy_id") or "MULTI_ASSET"),
+            side,
+            entry,
+            stop,
+            target,
+            source_timestamp,
+        )
         return {
             "status": "BLOCKED", "reason": "ADAPTIVE_EDGE_WEAK",
             "adaptive_edge_gate": edge_gate,
@@ -11184,6 +11495,16 @@ async def execute_trend_pullback_paper_plan(
         plan.get("performance_session"), plan.get("performance_market_regime"),
     )
     if edge_gate.get("action") == "BLOCKED":
+        await persist_adaptive_edge_blocked_counterfactual(
+            edge_gate,
+            canonical,
+            "TREND_PULLBACK",
+            side,
+            entry,
+            stop,
+            target,
+            source_timestamp,
+        )
         return {
             "status": "BLOCKED", "reason": "ADAPTIVE_EDGE_WEAK",
             "adaptive_edge_gate": edge_gate,
@@ -11420,6 +11741,16 @@ async def execute_breakout_expansion_paper_plan(
         plan.get("performance_session"), plan.get("performance_market_regime"),
     )
     if edge_gate.get("action") == "BLOCKED":
+        await persist_adaptive_edge_blocked_counterfactual(
+            edge_gate,
+            canonical,
+            "BREAKOUT_EXPANSION",
+            side,
+            entry,
+            stop,
+            target,
+            source_timestamp,
+        )
         return {
             "status": "BLOCKED", "reason": "ADAPTIVE_EDGE_WEAK",
             "adaptive_edge_gate": edge_gate,

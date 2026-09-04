@@ -669,7 +669,7 @@ function clear(n){while(n&&n.firstChild)n.removeChild(n.firstChild)}function byI
 function apiRequest(path,options){var ctrl=new AbortController(),to=setTimeout(function(){ctrl.abort()},8000),opts=options||{};opts.headers=Object.assign({"Accept":"application/json"},opts.headers||{});opts.signal=ctrl.signal;return fetch(path,opts).then(function(res){clearTimeout(to);return res.text().then(function(txt){var data=null;try{data=txt?JSON.parse(txt):null}catch(e){}return{ok:res.ok,status:res.status,data:data}})}).catch(function(err){clearTimeout(to);return{ok:false,status:0,data:null,netError:err&&err.name==="AbortError"?"timeout":"network"}})}
 function api(path){return apiRequest(path,{method:"GET"})}
 function apiPost(path,body){return apiRequest(path,{method:"POST",headers:{"Content-Type":"application/json"},body:body===undefined?undefined:JSON.stringify(body)})}
-var paperUiState={account:null,positions:[],performance:null,decisions:[],edgeReplay:[],watchdog:null,runtime:null,multiAsset:null,error:null,sectionErrors:{},loading:false,updatedAt:null,serverSnapshotAt:null,decisionSymbol:"",decisionState:""};
+var paperUiState={account:null,positions:[],performance:null,decisions:[],edgeReplay:[],edgeImpact:null,watchdog:null,runtime:null,multiAsset:null,error:null,sectionErrors:{},loading:false,updatedAt:null,serverSnapshotAt:null,decisionSymbol:"",decisionState:""};
 function paperMetric(v,suffix){
   if(v===null||v===undefined||v===""||!Number.isFinite(Number(v)))return "—";
   return Number(v).toLocaleString("en-US",{maximumFractionDigits:2})+(suffix||"");
@@ -690,11 +690,14 @@ function refreshPaperTrading(){
   if(paperUiState.decisionSymbol)snapshotParams.push("symbol="+encodeURIComponent(paperUiState.decisionSymbol));
   if(paperUiState.decisionState)snapshotParams.push("state="+encodeURIComponent(paperUiState.decisionState));
   if(snapshotParams.length)snapshotPath+="?"+snapshotParams.join("&");
-  return Promise.all([api(snapshotPath),api("/api/v1/paper/multi-asset-monitoring"),api("/api/v1/paper/adaptive-edge/decision-replay?limit=50")]).then(function(results){
+  return Promise.all([api(snapshotPath),api("/api/v1/paper/multi-asset-monitoring"),api("/api/v1/paper/adaptive-edge/decision-replay?limit=50"),api("/api/v1/paper/adaptive-edge/impact-validation?period=ALL")]).then(function(results){
     var result=results[0],multi=result&&results[1];
     if(results[1]&&results[1].ok&&results[1].data)paperUiState.multiAsset=results[1].data;
     if(results[2]&&results[2].ok&&results[2].data){
       paperUiState.edgeReplay=Array.isArray(results[2].data.items)?results[2].data.items:[];
+    }
+    if(results[3]&&results[3].ok&&results[3].data){
+      paperUiState.edgeImpact=results[3].data;
     }
     if(!result.ok||!result.data){paperUiState.error=errorMessage(result);return;}
     var snap=result.data,sections=snap.sections||{};
@@ -1489,6 +1492,51 @@ function strategyPerformanceMatrix(){
   return host;
 }
 
+function impactMetricBlock(label,m){
+  m=m||{};
+  return h("div",{class:"card"},[
+    h("div",{class:"module-title"},[
+      h("div",{},[h("h3",{},[label]),h("p",{},[String(m.closed_trades||0)+" trades CLOSED"])])
+    ]),
+    h("div",{class:"metric-strip"},[
+      h("div",{class:"metric-mini"},[h("span",{},["Win Rate"]),h("b",{},[paperMetric(m.win_rate_percent," %")])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Profit Factor"]),h("b",{},[paperMetric(m.profit_factor,"")])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Expectancy"]),h("b",{},[paperMetric(m.expectancy,"")])]),
+      h("div",{class:"metric-mini"},[h("span",{},["RR moyen"]),h("b",{},[paperMetric(m.average_realized_rr," R")])])
+    ]),
+    h("div",{class:"metric-strip"},[
+      h("div",{class:"metric-mini"},[h("span",{},["P&L net"]),h("b",{},[paperMoney(m.net_pnl)])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Drawdown"]),h("b",{},[paperMetric(m.max_drawdown_percent," %")])])
+    ])
+  ]);
+}
+function adaptiveEdgeImpactValidation(){
+  var d=paperUiState.edgeImpact;
+  if(!d)return modCard("Adaptive Edge Impact","OBSERVATION",placeholder(
+    "Impact en attente","Les métriques apparaîtront après des trades paper clôturés liés au gate actif."
+  ));
+  var o=d.observed||{},c=d.coverage||{},i=d.interpretation||{};
+  return modCard("Adaptive Edge Impact","OBSERVED · PAPER ONLY",h("div",{class:"section-stack"},[
+    h("div",{class:"metric-strip"},[
+      h("div",{class:"metric-mini"},[h("span",{},["Linked CLOSED"]),h("b",{},[String(c.linked_closed_positions||0)])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Gate BLOCKED"]),h("b",{},[String(c.blocked_gate_decisions||0)])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Historique"]),h("b",{},[String(c.historical_unlinked_closed_positions||0)])])
+    ]),
+    h("div",{class:"grid-2"},[
+      impactMetricBlock("Gate exécuté",o.linked_executed),
+      impactMetricBlock("FAVORED",o.favored),
+      impactMetricBlock("ALLOWED",o.allowed),
+      impactMetricBlock("Historique non lié",o.historical_unlinked)
+    ]),
+    h("div",{class:"notice"},[
+      h("b",{},["Contre-factuel BLOCKED : "]),
+      h("span",{},[i.blocked_counterfactual_status||"NOT_MEASURED"]),
+      h("div",{class:"muted"},[
+        "Un trade bloqué n’a pas de résultat réel. L’application n’invente donc aucun P&L hypothétique."
+      ])
+    ])
+  ]));
+}
 function renderStrategies(){
   var v=byId("view-strategies");clear(v);
   v.appendChild(pageHead("Stratégies","3 familles objectives · validation et replay sur données réelles.","PAPER ONLY"));
@@ -1515,6 +1563,7 @@ function renderStrategies(){
     });
     host.appendChild(g);
     host.appendChild(strategyPerformanceMatrix());
+    host.appendChild(adaptiveEdgeImpactValidation());
     host.appendChild(modCard("Validation statistique","SERVER-AUTHORITATIVE",h("div",{class:"section-stack"},[
       h("div",{class:"journal-card"},[h("h4",{},["Règle"]),h("p",{},["Aucune stratégie n’est déclarée rentable sans échantillon OOS suffisant. INS UFFICIENT_SAMPLE bloque le ranking plutôt que d’inventer une performance."])]),
       h("div",{class:"journal-card"},[h("h4",{},["Replay"]),h("p",{},["Le backend expose un replay déterministe sur bougies Coinbase fermées avec coûts exprimés en R."])])
@@ -2428,6 +2477,7 @@ function renderHelpGlossary(){
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->
 <!-- V16-M5B30G · ADAPTIVE EDGE DECISION REPLAY + EXPLAINABILITY UI -->
+<!-- V16-M5B30H · ADAPTIVE EDGE IMPACT VALIDATION · OBSERVED PAPER OUTCOMES ONLY -->
 <!-- V16-M5B5 — server FVG detector -->
 
 <!-- SERVER DETECTOR · ORDER BLOCK V1 -->

@@ -8363,21 +8363,37 @@ class CandidateStrategyDetectorsV16M5B27Tests(unittest.TestCase):
 
     def test_trend_pullback_waits_on_small_sample(self):
         candles, now = self._candles(count=10)
-        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "NORMAL"}
-        self.assertEqual(main.detect_trend_pullback_candidate(candles, now, regime)["reason"], "INSUFFICIENT_CLOSED_CANDLES")
+        regime = {
+            "status": "READY",
+            "regime": "TREND",
+            "direction": "BULLISH",
+            "volatility": "NORMAL",
+        }
+        result = main.detect_trend_pullback_candidate(candles, now, regime)
+        self.assertEqual(result["reason"], "INSUFFICIENT_CLOSED_CANDLES")
 
     def test_trend_pullback_bullish_setup(self):
         candles, now = self._candles()
         candles[-2].low = 100.0
         candles[-1].close = candles[-2].high + 2.0
         candles[-1].high = candles[-1].close + 0.5
-        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "NORMAL"}
+        regime = {
+            "status": "READY",
+            "regime": "TREND",
+            "direction": "BULLISH",
+            "volatility": "NORMAL",
+        }
         result = main.detect_trend_pullback_candidate(candles, now, regime)
         self.assertEqual((result["status"], result["direction"]), ("SETUP", "BULLISH"))
 
     def test_trend_pullback_is_candidate_only(self):
         candles, now = self._candles()
-        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "NORMAL"}
+        regime = {
+            "status": "READY",
+            "regime": "TREND",
+            "direction": "BULLISH",
+            "volatility": "NORMAL",
+        }
         result = main.detect_trend_pullback_candidate(candles, now, regime)
         self.assertTrue(result["candidate_only"])
         self.assertFalse(result["auto_queue"])
@@ -8385,19 +8401,36 @@ class CandidateStrategyDetectorsV16M5B27Tests(unittest.TestCase):
 
     def test_trend_pullback_declares_no_lookahead(self):
         candles, now = self._candles()
-        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "NORMAL"}
-        self.assertTrue(main.detect_trend_pullback_candidate(candles, now, regime)["no_lookahead"])
+        regime = {
+            "status": "READY",
+            "regime": "TREND",
+            "direction": "BULLISH",
+            "volatility": "NORMAL",
+        }
+        result = main.detect_trend_pullback_candidate(candles, now, regime)
+        self.assertTrue(result["no_lookahead"])
 
     def test_breakout_requires_expansion_context(self):
         candles, now = self._candles(count=21)
-        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "NORMAL"}
+        regime = {
+            "status": "READY",
+            "regime": "TREND",
+            "direction": "BULLISH",
+            "volatility": "NORMAL",
+        }
         result = main.detect_breakout_expansion_candidate(candles, now, regime)
         self.assertEqual((result["status"], result["reason"]), ("WAIT", "VOLATILITY_NOT_ELIGIBLE"))
 
     def test_breakout_waits_on_small_sample(self):
         candles, now = self._candles(count=10)
-        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "EXPANSION"}
-        self.assertEqual(main.detect_breakout_expansion_candidate(candles, now, regime)["reason"], "INSUFFICIENT_CLOSED_CANDLES")
+        regime = {
+            "status": "READY",
+            "regime": "TREND",
+            "direction": "BULLISH",
+            "volatility": "EXPANSION",
+        }
+        result = main.detect_breakout_expansion_candidate(candles, now, regime)
+        self.assertEqual(result["reason"], "INSUFFICIENT_CLOSED_CANDLES")
 
     def test_breakout_bullish_setup(self):
         candles, now = self._candles(count=21, step=0.1)
@@ -8406,7 +8439,12 @@ class CandidateStrategyDetectorsV16M5B27Tests(unittest.TestCase):
         candles[-1].close = prior_high + 2.0
         candles[-1].low = candles[-1].open - 0.1
         candles[-1].high = candles[-1].close + 0.1
-        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "EXPANSION"}
+        regime = {
+            "status": "READY",
+            "regime": "TREND",
+            "direction": "BULLISH",
+            "volatility": "EXPANSION",
+        }
         result = main.detect_breakout_expansion_candidate(candles, now, regime)
         self.assertEqual((result["status"], result["direction"]), ("SETUP", "BULLISH"))
 
@@ -8417,13 +8455,23 @@ class CandidateStrategyDetectorsV16M5B27Tests(unittest.TestCase):
         candles[-1].close = prior_low - 2.0
         candles[-1].high = candles[-1].open + 0.1
         candles[-1].low = candles[-1].close - 0.1
-        regime = {"status": "READY", "regime": "TREND", "direction": "BEARISH", "volatility": "EXPANSION"}
+        regime = {
+            "status": "READY",
+            "regime": "TREND",
+            "direction": "BEARISH",
+            "volatility": "EXPANSION",
+        }
         result = main.detect_breakout_expansion_candidate(candles, now, regime)
         self.assertEqual((result["status"], result["direction"]), ("SETUP", "BEARISH"))
 
     def test_breakout_is_candidate_only(self):
         candles, now = self._candles(count=21)
-        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "EXPANSION"}
+        regime = {
+            "status": "READY",
+            "regime": "TREND",
+            "direction": "BULLISH",
+            "volatility": "EXPANSION",
+        }
         result = main.detect_breakout_expansion_candidate(candles, now, regime)
         self.assertTrue(result["candidate_only"])
         self.assertFalse(result["auto_queue"])
@@ -8431,8 +8479,14 @@ class CandidateStrategyDetectorsV16M5B27Tests(unittest.TestCase):
 
     def test_breakout_declares_no_lookahead(self):
         candles, now = self._candles(count=21)
-        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "EXPANSION"}
-        self.assertTrue(main.detect_breakout_expansion_candidate(candles, now, regime)["no_lookahead"])
+        regime = {
+            "status": "READY",
+            "regime": "TREND",
+            "direction": "BULLISH",
+            "volatility": "EXPANSION",
+        }
+        result = main.detect_breakout_expansion_candidate(candles, now, regime)
+        self.assertTrue(result["no_lookahead"])
 
     def test_endpoint_is_registered(self):
         paths = {route.path for route in main.api_router.routes}

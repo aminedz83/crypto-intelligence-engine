@@ -5112,7 +5112,7 @@ def paper_strategy_from_source(source: object) -> Dict[str, Optional[str]]:
 
 def paper_performance_matrix_label(metrics: Dict[str, object]) -> str:
     """Conservative evidence label; small samples never receive an edge claim."""
-    trades = int(metrics.get("closed_trades") or 0)
+    trades = int(str(metrics.get("closed_trades") or 0))
     if trades < PAPER_PERFORMANCE_MATRIX_MIN_SAMPLE:
         return "INSUFFICIENT_SAMPLE"
     expectancy_raw = metrics.get("expectancy")

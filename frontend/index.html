@@ -597,6 +597,10 @@ body.market-menu-open .market-tabs-wrap{display:block!important}
 }
 </style>
 
+
+<style id="v16-m5b29f-multi-asset-monitoring">
+.multi-monitor-grid{display:grid;gap:9px}.multi-monitor-card{padding:12px;border:1px solid #203149;border-radius:13px;background:#06101b}.multi-monitor-head{display:flex;align-items:center;gap:8px}.multi-monitor-icon{width:34px;height:34px;border:1px solid #2d4160;border-radius:10px;display:grid;place-items:center;color:#9bc5ff;background:#0b1727}.multi-monitor-icon svg{width:22px;height:22px}.multi-monitor-main{min-width:0;flex:1}.multi-monitor-symbol{font-weight:900;font-size:12px}.multi-monitor-sub{font-size:7.5px;color:#7f91a8;margin-top:3px}.multi-monitor-pills{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px}.multi-monitor-pill{font-size:7px;font-weight:850;padding:4px 6px;border:1px solid #334963;border-radius:999px;color:#aebcd0}.multi-monitor-pill.good{color:#57ef8c;border-color:#257b46;background:#0a2817}.multi-monitor-pill.bad{color:#ff7c89;border-color:#743942;background:#281217}.multi-monitor-pill.wait{color:#e4c875;border-color:#6a5b2d;background:#28230f}.multi-monitor-strategies{display:grid;gap:6px;margin-top:10px}.multi-monitor-strategy{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:8px;border:1px solid #192a40;border-radius:9px;background:#08131f}.multi-monitor-strategy b{font-size:8px}.multi-monitor-strategy span{font-size:7px;color:#8494a9;overflow-wrap:anywhere}.multi-monitor-foot{display:flex;gap:10px;flex-wrap:wrap;margin-top:9px;color:#6f8199;font-size:7px}.multi-monitor-empty{font-size:8px;color:#7f91a8;padding:9px 0}
+</style>
 </head>
 <body>
 <header class="header">
@@ -649,7 +653,7 @@ function clear(n){while(n&&n.firstChild)n.removeChild(n.firstChild)}function byI
 function apiRequest(path,options){var ctrl=new AbortController(),to=setTimeout(function(){ctrl.abort()},8000),opts=options||{};opts.headers=Object.assign({"Accept":"application/json"},opts.headers||{});opts.signal=ctrl.signal;return fetch(path,opts).then(function(res){clearTimeout(to);return res.text().then(function(txt){var data=null;try{data=txt?JSON.parse(txt):null}catch(e){}return{ok:res.ok,status:res.status,data:data}})}).catch(function(err){clearTimeout(to);return{ok:false,status:0,data:null,netError:err&&err.name==="AbortError"?"timeout":"network"}})}
 function api(path){return apiRequest(path,{method:"GET"})}
 function apiPost(path,body){return apiRequest(path,{method:"POST",headers:{"Content-Type":"application/json"},body:body===undefined?undefined:JSON.stringify(body)})}
-var paperUiState={account:null,positions:[],performance:null,decisions:[],watchdog:null,runtime:null,error:null,sectionErrors:{},loading:false,updatedAt:null,serverSnapshotAt:null,decisionSymbol:"",decisionState:""};
+var paperUiState={account:null,positions:[],performance:null,decisions:[],watchdog:null,runtime:null,multiAsset:null,error:null,sectionErrors:{},loading:false,updatedAt:null,serverSnapshotAt:null,decisionSymbol:"",decisionState:""};
 function paperMetric(v,suffix){
   if(v===null||v===undefined||v===""||!Number.isFinite(Number(v)))return "—";
   return Number(v).toLocaleString("en-US",{maximumFractionDigits:2})+(suffix||"");
@@ -670,7 +674,9 @@ function refreshPaperTrading(){
   if(paperUiState.decisionSymbol)snapshotParams.push("symbol="+encodeURIComponent(paperUiState.decisionSymbol));
   if(paperUiState.decisionState)snapshotParams.push("state="+encodeURIComponent(paperUiState.decisionState));
   if(snapshotParams.length)snapshotPath+="?"+snapshotParams.join("&");
-  return api(snapshotPath).then(function(result){
+  return Promise.all([api(snapshotPath),api("/api/v1/paper/multi-asset-monitoring")]).then(function(results){
+    var result=results[0],multi=result&&results[1];
+    if(results[1]&&results[1].ok&&results[1].data)paperUiState.multiAsset=results[1].data;
     if(!result.ok||!result.data){paperUiState.error=errorMessage(result);return;}
     var snap=result.data,sections=snap.sections||{};
     paperUiState.serverSnapshotAt=snap.snapshot_at||null;
@@ -1082,6 +1088,50 @@ function placeholder(title,sub){
   return h("div",{class:"placeholder"},[h("strong",{},[title]),sub||""])
 }
 
+function multiAssetIcon(assetClass){
+  var key=assetClass==="FOREX"?"forex":assetClass==="METAL"?"metal":"indices";
+  return h("div",{class:"multi-monitor-icon",html:iconSvg(key)},[]);
+}
+function monitorStatusClass(v){v=String(v||"").toUpperCase();return v==="READY"||v==="VALID"||v==="ENTRY_NOW"||v==="SETUP"?"good":v==="WAIT"||v==="NOT_SCANNED"||v==="UNKNOWN"?"wait":"bad";}
+function multiAssetMonitorCard(item){
+  var ready=item.execution_readiness||{},quality=item.quality||{},session=item.session||{};
+  var q=typeof quality==="string"?quality:(quality.status||quality.quality||"UNKNOWN");
+  var market=session.market_state||session.status||ready.session&&ready.session.market_state||"UNKNOWN";
+  var strategies=(item.detections||[]).map(function(d){
+    var label=String(d.strategy_id||"STRATEGY").replaceAll("_"," ");
+    return h("div",{class:"multi-monitor-strategy"},[
+      h("div",{},[h("b",{},[label]),h("span",{},[" · "+humanDecisionReason(d.reason)])]),
+      h("span",{class:"multi-monitor-pill "+monitorStatusClass(d.state)},[String(d.state||"UNKNOWN").replaceAll("_"," ")])
+    ]);
+  });
+  return h("div",{class:"multi-monitor-card","data-multi-asset-symbol":item.symbol||""},[
+    h("div",{class:"multi-monitor-head"},[
+      multiAssetIcon(item.asset_class),
+      h("div",{class:"multi-monitor-main"},[h("div",{class:"multi-monitor-symbol"},[item.symbol||"—"]),h("div",{class:"multi-monitor-sub"},[(item.asset_class||"—")+" · "+(item.provider||"provider en attente")+(item.granularity?" · "+item.granularity:"")])]),
+      h("span",{class:"multi-monitor-pill "+monitorStatusClass(item.analysis_status)},[item.analysis_status||"UNKNOWN"])
+    ]),
+    h("div",{class:"multi-monitor-pills"},[
+      h("span",{class:"multi-monitor-pill "+monitorStatusClass(q)},["DATA "+q]),
+      h("span",{class:"multi-monitor-pill "+monitorStatusClass(market)},["MARCHÉ "+market]),
+      h("span",{class:"multi-monitor-pill "+monitorStatusClass(ready.status)},["PAPER "+(ready.status||"UNKNOWN")]),
+      h("span",{class:"multi-monitor-pill "+(item.open_position_count?"good":"wait")},["OPEN "+String(item.open_position_count||0)])
+    ]),
+    strategies.length?h("div",{class:"multi-monitor-strategies"},strategies):h("div",{class:"multi-monitor-empty"},["Aucune analyse runtime persistée pour cet actif."]),
+    h("div",{class:"multi-monitor-foot"},[
+      h("span",{},["Blocage/autorisation · "+humanDecisionReason(ready.reason||"UNKNOWN")]),
+      ready.conversion_symbol?h("span",{},["FX conversion · "+ready.conversion_symbol+(ready.conversion_inverse?" inverse":" direct")]):null
+    ])
+  ]);
+}
+function multiAssetMonitoringBlock(){
+  var m=paperUiState.multiAsset,items=m&&m.instruments||[];
+  return modCard("Multi-Asset Runtime",m&&m.status||"UNKNOWN",h("div",{class:"section-stack"},[
+    h("div",{class:"kv"},[h("span",{},["Dernière analyse"]),h("b",{},[m&&m.analysis_last_completed_at?formatMontrealTime(m.analysis_last_completed_at):"—"])]),
+    h("div",{class:"kv"},[h("span",{},["Cycles multi-actifs"]),h("b",{},[m?String(m.analysis_runs||0):"—"])]),
+    items.length?h("div",{class:"multi-monitor-grid"},items.map(multiAssetMonitorCard)):placeholder("Monitoring en attente","Le backend n'a pas encore produit de snapshot multi-actifs.")
+  ]));
+}
+
 function renderSignals(){
   var v=byId("view-signals");clear(v);
   var watchdog=paperUiState.watchdog||{},runtime=paperUiState.runtime||{};
@@ -1089,9 +1139,10 @@ function renderSignals(){
     return (!paperUiState.decisionSymbol||d.symbol===paperUiState.decisionSymbol)&&
       (!paperUiState.decisionState||d.state===paperUiState.decisionState);
   });
-  v.appendChild(pageHead("Signaux","Décisions SMC serveur persistées et état du scanner.","SERVER AUTHORITATIVE"));
+  v.appendChild(pageHead("Signaux","Décisions serveur + monitoring Crypto, Forex, Gold et Indices.","SERVER AUTHORITATIVE"));
   v.appendChild(signalSummary(rows));
   v.appendChild(paperSyncRow());
+  v.appendChild(multiAssetMonitoringBlock());
   v.appendChild(modCard("Signal Engine",watchdog.status||"UNKNOWN",h("div",{class:"section-stack"},[
     h("div",{class:"kv"},[h("span",{},["Watchdog scanner"]),h("b",{},[watchdog.status||"—"])]),
     h("div",{class:"kv"},[h("span",{},["Dernier cycle"]),h("b",{},[runtime.last_completed_at||"—"])]),

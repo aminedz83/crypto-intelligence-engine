@@ -1450,6 +1450,22 @@ paper_fx_conversion_snapshots_table = Table(
     Column("created_at", DateTime(timezone=True), nullable=False),
 )
 
+
+# V16-M5B30B — immutable strategy context captured at paper entry time.
+# Kept in a dedicated table so existing paper_positions schema remains backward compatible.
+paper_position_context_table = Table(
+    "paper_position_context",
+    metadata,
+    Column("position_id", String, primary_key=True),
+    Column("strategy_id", String, nullable=True),
+    Column("strategy_version", String, nullable=True),
+    Column("timeframe", String, nullable=True),
+    Column("session", String, nullable=True),
+    Column("market_regime", String, nullable=True),
+    Column("setup_context", Text, nullable=True),
+    Column("captured_at", DateTime(timezone=True), nullable=False),
+)
+
 candles_table = Table(
     "candles",
     metadata,
@@ -1549,6 +1565,10 @@ class ServerSignalRequest(BaseModel):
 
 class VerifiedAutoPaperEntryRequest(ServerSignalRequest):
     risk_percent: Decimal = Decimal("1")
+    performance_timeframe: Optional[str] = None
+    performance_session: Optional[str] = None
+    performance_market_regime: Optional[str] = None
+    performance_setup_context: Optional[str] = None
 
 
 class AutoEntryCandidateRequest(VerifiedAutoPaperEntryRequest):
@@ -1596,6 +1616,12 @@ class PaperPositionCreate(BaseModel):
     fx_conversion_inverse: Optional[bool] = None
     fx_conversion_source: Optional[str] = None
     fx_conversion_source_timestamp: Optional[datetime] = None
+    performance_strategy_id: Optional[str] = None
+    performance_strategy_version: Optional[str] = None
+    performance_timeframe: Optional[str] = None
+    performance_session: Optional[str] = None
+    performance_market_regime: Optional[str] = None
+    performance_setup_context: Optional[str] = None
 
 
 def validate_paper_position_create(req: PaperPositionCreate) -> None:
@@ -2190,6 +2216,12 @@ async def _verified_auto_paper_entry_unlocked(
         source="server_signal+coinbase_public_product",
         source_timestamp=req.source_timestamp,
         opened_at=utcnow(),
+        performance_strategy_id="SMC_LIQUIDITY_REVERSAL",
+        performance_strategy_version="1.0",
+        performance_timeframe=req.performance_timeframe,
+        performance_session=req.performance_session,
+        performance_market_regime=req.performance_market_regime,
+        performance_setup_context=req.performance_setup_context,
     )
     created = await create_paper_position(position)
     return {
@@ -4022,6 +4054,26 @@ async def run_server_auto_paper_generation_once() -> Dict[str, int]:
                 )
                 continue
             request = fill_request
+            request.performance_timeframe = SERVER_SETUP_GRANULARITY
+            session_snapshot = market_session_context(symbol, utcnow())
+            session_value = session_snapshot.get("current_session")
+            request.performance_session = (
+                str(session_value) if session_value is not None else None
+            )
+            regime_snapshot = await get_server_market_regime(symbol)
+            regime_value = regime_snapshot.get("regime")
+            request.performance_market_regime = (
+                str(regime_value) if regime_value is not None else None
+            )
+            request.performance_setup_context = json.dumps(
+                {
+                    "setup_state": detector.get("setup_state"),
+                    "direction": detector.get("direction"),
+                    "latest_closed_timestamp": detector.get("latest_closed_timestamp"),
+                },
+                default=str,
+                sort_keys=True,
+            )
             stats["entry_now"] += 1
             result = await verified_auto_paper_entry(request)
         except HTTPException as exc:
@@ -4305,6 +4357,27 @@ async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
                 }
                 await conn.execute(
                     pg_insert(paper_fx_conversion_snapshots_table).values(fx_values)
+                )
+            context_values = (
+                req.performance_strategy_id,
+                req.performance_strategy_version,
+                req.performance_timeframe,
+                req.performance_session,
+                req.performance_market_regime,
+                req.performance_setup_context,
+            )
+            if any(value is not None for value in context_values):
+                await conn.execute(
+                    pg_insert(paper_position_context_table).values(
+                        position_id=req.position_id,
+                        strategy_id=req.performance_strategy_id,
+                        strategy_version=req.performance_strategy_version,
+                        timeframe=req.performance_timeframe,
+                        session=req.performance_session,
+                        market_regime=req.performance_market_regime,
+                        setup_context=req.performance_setup_context,
+                        captured_at=now,
+                    ).on_conflict_do_nothing(index_elements=["position_id"])
                 )
     except HTTPException:
         raise
@@ -5088,15 +5161,16 @@ def build_paper_performance_breakdown(
     ]
 
 
-# V16-M5B30A — persisted paper performance matrix foundation.
-# Only dimensions that are actually persisted are scored. TIMEFRAME / SESSION /
-# REGIME remain explicitly deferred rather than inferred from current market state.
-PAPER_PERFORMANCE_MATRIX_VERSION = "SERVER_PAPER_PERFORMANCE_MATRIX_V1"
+# V16-M5B30B — full persisted paper performance dimensions.
+# New positions persist entry-time TIMEFRAME / SESSION / REGIME in a dedicated
+# immutable context row. Historical positions remain explicit UNKNOWN rather than
+# being reconstructed from current market conditions.
+PAPER_PERFORMANCE_MATRIX_VERSION = "SERVER_PAPER_PERFORMANCE_MATRIX_V2"
 PAPER_PERFORMANCE_MATRIX_MIN_SAMPLE = 20
 
 
 def paper_strategy_from_source(source: object) -> Dict[str, Optional[str]]:
-    """Parse persisted strategy attribution without inventing missing metadata."""
+    """Parse legacy strategy attribution without inventing missing metadata."""
     raw = str(source or "").strip()
     if not raw.startswith("strategy:"):
         return {"strategy_id": None, "strategy_version": None}
@@ -5129,36 +5203,64 @@ def paper_performance_matrix_label(metrics: Dict[str, object]) -> str:
 def build_paper_performance_matrix(
     closed_positions: List[Dict[str, object]], initial_capital: Decimal
 ) -> List[Dict[str, object]]:
-    """Build SYMBOL x persisted STRATEGY cells from closed paper positions."""
-    grouped: Dict[tuple[str, str, str], List[Dict[str, object]]] = {}
+    """Build SYMBOL x STRATEGY x TF x SESSION x REGIME from persisted context."""
+    grouped: Dict[
+        tuple[str, str, str, str, str, str], List[Dict[str, object]]
+    ] = {}
     for position in closed_positions:
         symbol = str(position.get("symbol") or "").upper()
-        attribution = paper_strategy_from_source(position.get("source"))
-        strategy_id = attribution["strategy_id"]
-        strategy_version = attribution["strategy_version"]
-        if not symbol or strategy_id is None:
+        legacy = paper_strategy_from_source(position.get("source"))
+        strategy_id = str(position.get("strategy_id") or legacy["strategy_id"] or "")
+        strategy_version = str(
+            position.get("strategy_version") or legacy["strategy_version"] or "UNKNOWN"
+        )
+        if not symbol or not strategy_id:
             continue
-        key = (symbol, strategy_id, strategy_version or "UNKNOWN")
+        timeframe = str(position.get("timeframe") or "UNKNOWN")
+        session = str(position.get("session") or "UNKNOWN")
+        regime = str(position.get("market_regime") or "UNKNOWN")
+        key: tuple[str, str, str, str, str, str] = (
+            symbol, strategy_id, strategy_version, timeframe, session, regime
+        )
         grouped.setdefault(key, []).append(position)
 
     cells: List[Dict[str, object]] = []
-    for symbol, strategy_id, strategy_version in sorted(grouped):
-        metrics = calculate_paper_performance_metrics(
-            grouped[(symbol, strategy_id, strategy_version)], initial_capital
-        )
+    for key in sorted(grouped):
+        symbol, strategy_id, strategy_version, timeframe, session, regime = key
+        metrics = calculate_paper_performance_metrics(grouped[key], initial_capital)
         cells.append(
             {
                 "symbol": symbol,
                 "strategy_id": strategy_id,
                 "strategy_version": strategy_version,
-                "timeframe": None,
-                "session": None,
-                "regime": None,
+                "timeframe": None if timeframe == "UNKNOWN" else timeframe,
+                "session": None if session == "UNKNOWN" else session,
+                "regime": None if regime == "UNKNOWN" else regime,
+                "context_complete": all(
+                    value != "UNKNOWN" for value in (timeframe, session, regime)
+                ),
                 "metrics": metrics,
                 "evidence": paper_performance_matrix_label(metrics),
             }
         )
     return cells
+
+
+def paper_performance_context_coverage(rows: List[Dict[str, object]]) -> Dict[str, int]:
+    """Expose historical coverage without pretending old rows have entry context."""
+    total = len(rows)
+    complete = sum(
+        1
+        for row in rows
+        if row.get("timeframe") is not None
+        and row.get("session") is not None
+        and row.get("market_regime") is not None
+    )
+    return {
+        "closed_positions": total,
+        "context_complete": complete,
+        "legacy_missing": total - complete,
+    }
 
 
 @api_router.get("/paper/performance/matrix")
@@ -5194,9 +5296,12 @@ async def get_paper_performance_matrix(period: str = "ALL") -> Dict[str, object]
                 )
             sql = (
                 "SELECT p.position_id, p.symbol, p.side, p.entry, p.close_price, p.size, "
-                "p.risk_money, p.closed_at, p.source, fx.quote_to_usd "
+                "p.risk_money, p.closed_at, p.source, fx.quote_to_usd, "
+                "ctx.strategy_id, ctx.strategy_version, ctx.timeframe, ctx.session, "
+                "ctx.market_regime "
                 "FROM paper_positions p LEFT JOIN paper_fx_conversion_snapshots fx "
                 "ON fx.position_id=p.position_id AND fx.phase='CLOSE' "
+                "LEFT JOIN paper_position_context ctx ON ctx.position_id=p.position_id "
                 "WHERE status='CLOSED' AND p.close_price IS NOT NULL"
             )
             params: Dict[str, object] = {}
@@ -5217,14 +5322,18 @@ async def get_paper_performance_matrix(period: str = "ALL") -> Dict[str, object]
 
     initial_capital = Decimal(str(account._mapping["initial_capital"]))
     cells = build_paper_performance_matrix(rows, initial_capital)
+    coverage = paper_performance_context_coverage(rows)
     return {
         "status": "OK",
         "validation": PAPER_PERFORMANCE_MATRIX_VERSION,
         "period": normalized_period,
         "period_start": period_start.isoformat() if period_start is not None else None,
         "minimum_sample": PAPER_PERFORMANCE_MATRIX_MIN_SAMPLE,
-        "dimensions_available": ["SYMBOL", "STRATEGY"],
-        "dimensions_deferred": ["TIMEFRAME", "SESSION", "REGIME"],
+        "dimensions_available": [
+            "SYMBOL", "STRATEGY", "TIMEFRAME", "SESSION", "REGIME"
+        ],
+        "dimensions_deferred": [],
+        "context_coverage": coverage,
         "cells": cells,
         "paper_only": True,
         "execution": False,
@@ -9904,6 +10013,28 @@ async def execute_multi_asset_paper_plan(
             source=f"strategy:{strategy_id}@{strategy_version}",
             source_timestamp=source_timestamp,
             opened_at=utcnow(),
+            performance_strategy_id=strategy_id,
+            performance_strategy_version=strategy_version,
+            performance_timeframe=(
+                str(plan.get("performance_timeframe"))
+                if plan.get("performance_timeframe") is not None
+                else None
+            ),
+            performance_session=(
+                str(plan.get("performance_session"))
+                if plan.get("performance_session") is not None
+                else None
+            ),
+            performance_market_regime=(
+                str(plan.get("performance_market_regime"))
+                if plan.get("performance_market_regime") is not None
+                else None
+            ),
+            performance_setup_context=(
+                str(plan.get("performance_setup_context"))
+                if plan.get("performance_setup_context") is not None
+                else None
+            ),
             fx_quote_currency=(
                 str(fx_conversion.get("quote_currency")) if fx_conversion else None
             ),
@@ -10010,6 +10141,34 @@ async def run_multi_asset_paper_generation_once() -> Dict[str, int]:
                     plan["plan_source"] = f"CLOSED_BREAKOUT_RANGE+REAL_{mark.source.upper()}_MARK"
                 if plan is None or plan.get("status") != "ENTRY_NOW":
                     continue
+                session_obj = analysis.get("session")
+                session_value = (
+                    session_obj.get("current_session")
+                    if isinstance(session_obj, dict)
+                    else None
+                )
+                regime_obj = analysis.get("regime")
+                regime_value = (
+                    regime_obj.get("regime") if isinstance(regime_obj, dict) else None
+                )
+                plan["performance_timeframe"] = str(
+                    analysis.get("granularity") or SERVER_SETUP_GRANULARITY
+                )
+                plan["performance_session"] = (
+                    str(session_value) if session_value is not None else None
+                )
+                plan["performance_market_regime"] = (
+                    str(regime_value) if regime_value is not None else None
+                )
+                plan["performance_setup_context"] = json.dumps(
+                    {
+                        "asset_class": analysis.get("asset_class"),
+                        "strategy_id": strategy_id,
+                        "detector": detector_obj,
+                    },
+                    default=str,
+                    sort_keys=True,
+                )
                 stats["setups"] += 1
                 try:
                     result = await execute_multi_asset_paper_plan(canonical, plan)
@@ -10296,6 +10455,28 @@ async def execute_trend_pullback_paper_plan(
             source=f"strategy:TREND_PULLBACK@{TREND_PULLBACK_PAPER_VERSION}",
             source_timestamp=source_timestamp,
             opened_at=utcnow(),
+            performance_strategy_id="TREND_PULLBACK",
+            performance_strategy_version=TREND_PULLBACK_PAPER_VERSION,
+            performance_timeframe=(
+                str(plan.get("performance_timeframe"))
+                if plan.get("performance_timeframe") is not None
+                else None
+            ),
+            performance_session=(
+                str(plan.get("performance_session"))
+                if plan.get("performance_session") is not None
+                else None
+            ),
+            performance_market_regime=(
+                str(plan.get("performance_market_regime"))
+                if plan.get("performance_market_regime") is not None
+                else None
+            ),
+            performance_setup_context=(
+                str(plan.get("performance_setup_context"))
+                if plan.get("performance_setup_context") is not None
+                else None
+            ),
         )
         created = await create_paper_position(position)
     return {
@@ -10336,6 +10517,13 @@ async def run_trend_pullback_paper_generation_once() -> Dict[str, int]:
             stats["setups"] += 1
             ticker = await market_provider.get_ticker(provider_symbol)
             plan = build_trend_pullback_paper_plan(candles, now, detection, ticker)
+            session_snapshot = market_session_context(symbol, now)
+            plan["performance_timeframe"] = SERVER_SETUP_GRANULARITY
+            plan["performance_session"] = session_snapshot.get("current_session")
+            plan["performance_market_regime"] = regime.get("regime")
+            plan["performance_setup_context"] = json.dumps(
+                {"detector": detection}, default=str, sort_keys=True
+            )
             if plan.get("status") != "ENTRY_NOW":
                 stats["blocked"] += 1
                 continue
@@ -10493,6 +10681,28 @@ async def execute_breakout_expansion_paper_plan(
             source=f"strategy:BREAKOUT_EXPANSION@{BREAKOUT_EXPANSION_PAPER_VERSION}",
             source_timestamp=source_timestamp,
             opened_at=utcnow(),
+            performance_strategy_id="BREAKOUT_EXPANSION",
+            performance_strategy_version=BREAKOUT_EXPANSION_PAPER_VERSION,
+            performance_timeframe=(
+                str(plan.get("performance_timeframe"))
+                if plan.get("performance_timeframe") is not None
+                else None
+            ),
+            performance_session=(
+                str(plan.get("performance_session"))
+                if plan.get("performance_session") is not None
+                else None
+            ),
+            performance_market_regime=(
+                str(plan.get("performance_market_regime"))
+                if plan.get("performance_market_regime") is not None
+                else None
+            ),
+            performance_setup_context=(
+                str(plan.get("performance_setup_context"))
+                if plan.get("performance_setup_context") is not None
+                else None
+            ),
         )
         created = await create_paper_position(position)
     return {
@@ -10533,6 +10743,13 @@ async def run_breakout_expansion_paper_generation_once() -> Dict[str, int]:
             stats["setups"] += 1
             ticker = await market_provider.get_ticker(provider_symbol)
             plan = build_breakout_expansion_paper_plan(detection, ticker, now)
+            session_snapshot = market_session_context(symbol, now)
+            plan["performance_timeframe"] = SERVER_SETUP_GRANULARITY
+            plan["performance_session"] = session_snapshot.get("current_session")
+            plan["performance_market_regime"] = regime.get("regime")
+            plan["performance_setup_context"] = json.dumps(
+                {"detector": detection}, default=str, sort_keys=True
+            )
             if plan.get("status") != "ENTRY_NOW":
                 stats["blocked"] += 1
                 continue

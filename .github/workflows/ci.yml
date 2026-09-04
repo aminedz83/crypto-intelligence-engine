@@ -38,7 +38,7 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "1365"
+      EXPECTED_TESTS: "1381"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -211,3 +211,5 @@ jobs:
 # V16-M5B25A-FIX2: EXPECTED_TESTS=1349 (16 ENTRY_NOW execution diagnostics tests)
 
 # V16-M5B25B: EXPECTED_TESTS=1365 (16 HTF->LTF integration tests)
+
+# V16-M5B27: EXPECTED_TESTS=1381 (16 candidate strategy detector tests)

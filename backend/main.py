@@ -9257,7 +9257,10 @@ def multi_asset_paper_execution_readiness(symbol: str) -> Dict[str, object]:
             "auto_entry_authorized": True,
         }
     if instrument.asset_class == AssetClass.METAL:
-        if canonical != "XAU-USD" or provider_symbol_map.to_provider("twelvedata", canonical) is None:
+        if (
+            canonical != "XAU-USD"
+            or provider_symbol_map.to_provider("twelvedata", canonical) is None
+        ):
             return {**base, "status": "BLOCKED", "reason": "METAL_PROVIDER_NOT_MAPPED"}
         spot_session = forex_market_state(observed_at)
         if str(spot_session.get("market_state") or "UNKNOWN") != "OPEN":

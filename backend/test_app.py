@@ -11,6 +11,7 @@ import asyncio
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -8374,9 +8375,13 @@ class CandidateStrategyDetectorsV16M5B27Tests(unittest.TestCase):
 
     def test_trend_pullback_bullish_setup(self):
         candles, now = self._candles()
-        candles[-2].low = 100.0
-        candles[-1].close = candles[-2].high + 2.0
-        candles[-1].high = candles[-1].close + 0.5
+        candles[-2] = replace(candles[-2], low=100.0)
+        latest_close = candles[-2].high + 2.0
+        candles[-1] = replace(
+            candles[-1],
+            close=latest_close,
+            high=latest_close + 0.5,
+        )
         regime = {
             "status": "READY",
             "regime": "TREND",
@@ -8435,10 +8440,15 @@ class CandidateStrategyDetectorsV16M5B27Tests(unittest.TestCase):
     def test_breakout_bullish_setup(self):
         candles, now = self._candles(count=21, step=0.1)
         prior_high = max(c.high for c in candles[:-1] if c.high is not None)
-        candles[-1].open = prior_high - 0.1
-        candles[-1].close = prior_high + 2.0
-        candles[-1].low = candles[-1].open - 0.1
-        candles[-1].high = candles[-1].close + 0.1
+        latest_open = prior_high - 0.1
+        latest_close = prior_high + 2.0
+        candles[-1] = replace(
+            candles[-1],
+            open=latest_open,
+            close=latest_close,
+            low=latest_open - 0.1,
+            high=latest_close + 0.1,
+        )
         regime = {
             "status": "READY",
             "regime": "TREND",
@@ -8451,10 +8461,15 @@ class CandidateStrategyDetectorsV16M5B27Tests(unittest.TestCase):
     def test_breakout_bearish_setup(self):
         candles, now = self._candles(count=21, start_price=120.0, step=-0.1)
         prior_low = min(c.low for c in candles[:-1] if c.low is not None)
-        candles[-1].open = prior_low + 0.1
-        candles[-1].close = prior_low - 2.0
-        candles[-1].high = candles[-1].open + 0.1
-        candles[-1].low = candles[-1].close - 0.1
+        latest_open = prior_low + 0.1
+        latest_close = prior_low - 2.0
+        candles[-1] = replace(
+            candles[-1],
+            open=latest_open,
+            close=latest_close,
+            high=latest_open + 0.1,
+            low=latest_close - 0.1,
+        )
         regime = {
             "status": "READY",
             "regime": "TREND",

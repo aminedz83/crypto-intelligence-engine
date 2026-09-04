@@ -362,6 +362,68 @@ class ServerClosedCandleHistoryFreshnessFixTests(unittest.TestCase):
         self.assertIn("auto_queue", source)
 
 
+
+class DynamicCryptoUniverseFrontendV16M5B28AUiTests(unittest.TestCase):
+    """Frontend consumes only the server-authoritative dynamic crypto universe."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_crypto_symbols_start_empty(self):
+        self.assertIn("var CRYPTO_SYMBOLS=[];", self.html)
+
+    def test_no_legacy_six_symbol_array(self):
+        legacy = '["BTC-USD","ETH-USD","SOL-USD","XRP-USD","LTC-USD","ADA-USD"]'
+        self.assertNotIn(legacy, self.html)
+
+    def test_crypto_universe_endpoint_is_consumed(self):
+        self.assertIn('/api/v1/market/crypto-universe', self.html)
+
+    def test_active_symbols_are_server_driven(self):
+        self.assertIn("d.active_symbols", self.html)
+
+    def test_dynamic_symbols_are_validated_as_usd_pairs(self):
+        self.assertIn('/^[A-Z0-9]+-USD$/.test(sym)', self.html)
+
+    def test_universe_failure_does_not_invent_symbols(self):
+        self.assertIn('CRYPTO_SYMBOLS=[];', self.html)
+        self.assertIn('status:"UNAVAILABLE"', self.html)
+
+    def test_markets_render_from_dynamic_symbols(self):
+        self.assertIn('CRYPTO_SYMBOLS.forEach(function(sym)', self.html)
+
+    def test_market_tickers_use_dynamic_symbols(self):
+        marker = 'market/ticker/"+encodeURIComponent(sym)'
+        self.assertIn(marker, self.html)
+
+    def test_signal_filter_uses_dynamic_symbols(self):
+        self.assertIn('var symbols=[""].concat(CRYPTO_SYMBOLS)', self.html)
+
+    def test_realtime_ticker_subscription_uses_dynamic_symbols(self):
+        marker = '{channel:"ticker",products:CRYPTO_SYMBOLS}'
+        self.assertIn(marker, self.html)
+
+    def test_realtime_candle_subscription_uses_dynamic_symbols(self):
+        marker = '{channel:"candles",products:CRYPTO_SYMBOLS}'
+        self.assertIn(marker, self.html)
+
+    def test_realtime_polling_uses_dynamic_symbols(self):
+        self.assertIn('symbols=CRYPTO_SYMBOLS.slice()', self.html)
+
+    def test_universe_load_precedes_realtime_start(self):
+        marker = 'loadCryptoUniverse().then(function(){setView("dashboard");startCryptoRealtime()})'
+        self.assertIn(marker, self.html)
+
+    def test_market_ui_exposes_active_count(self):
+        self.assertIn('"Actifs actifs: "+String(CRYPTO_SYMBOLS.length)', self.html)
+
+    def test_market_ui_identifies_coinbase_source(self):
+        self.assertIn('" · source Coinbase"', self.html)
+
+    def test_empty_universe_is_fail_safe(self):
+        self.assertIn('"Aucun symbole Coinbase vérifié n’est actif."', self.html)
+
 if __name__ == "__main__":
     unittest.main()
 

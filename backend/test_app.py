@@ -9060,3 +9060,25 @@ class DynamicUiControlHardeningV16M5B28B3Tests(unittest.TestCase):
 
     def test_menu_is_closed_when_view_changes(self):
         self.assertIn("function setView(id){closeMarketMenu();current=id;", self.html)
+
+
+class PaperTradingTabIosFixV16M5B28B3FixTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_paper_tabs_have_explicit_data_attribute(self):
+        self.assertIn('attrs["data-paper-tab"]=id;', self.html)
+
+    def test_paper_tabs_are_button_type(self):
+        self.assertIn('type:"button"', self.html)
+
+    def test_ios_touchend_delegation_exists(self):
+        self.assertIn('document.addEventListener("touchend"', self.html)
+        self.assertIn('closest("[data-paper-tab]")', self.html)
+
+    def test_paper_tab_ids_are_guarded(self):
+        self.assertIn(
+            'if(id!=="account"&&id!=="positions"&&id!=="history")return;',
+            self.html,
+        )

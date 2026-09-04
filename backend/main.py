@@ -5620,7 +5620,7 @@ def coinbase_product_is_eligible(symbol: str, payload: object) -> Tuple[bool, st
     return True, "COINBASE_PRODUCT_VERIFIED"
 
 
-def _positive_decimal(value: object) -> Optional[Decimal]:
+def _positive_product_decimal(value: object) -> Optional[Decimal]:
     try:
         parsed = Decimal(str(value))
     except (ArithmeticError, ValueError):
@@ -5645,7 +5645,7 @@ def select_coinbase_top_usd_spot_products(
         eligible, _reason = coinbase_product_is_eligible(symbol, raw)
         if not eligible:
             continue
-        volume = _positive_decimal(
+        volume = _positive_product_decimal(
             raw.get("approximate_quote_24h_volume", raw.get("volume_24h"))
         )
         if volume is None:

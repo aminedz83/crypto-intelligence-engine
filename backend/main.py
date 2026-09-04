@@ -5340,6 +5340,179 @@ async def get_paper_performance_matrix(period: str = "ALL") -> Dict[str, object]
     }
 
 
+# V16-M5B30D — Adaptive Edge Ranking Engine V1.
+# Observation-only: ranks persisted paper evidence but never changes signal,
+# sizing, risk, order generation, or execution behavior.
+ADAPTIVE_EDGE_RANKING_VERSION = "SERVER_ADAPTIVE_EDGE_RANKING_V1"
+ADAPTIVE_EDGE_MIN_SAMPLE = PAPER_PERFORMANCE_MATRIX_MIN_SAMPLE
+
+
+def _edge_decimal(value: object, default: Decimal = Decimal("0")) -> Decimal:
+    if value is None:
+        return default
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return default
+
+
+def _edge_clamp(value: Decimal, low: Decimal, high: Decimal) -> Decimal:
+    return max(low, min(high, value))
+
+
+def adaptive_edge_score(metrics: Dict[str, object]) -> Dict[str, object]:
+    """Return a transparent heuristic score from persisted paper metrics only."""
+    trades = int(str(metrics.get("closed_trades") or 0))
+    if trades < ADAPTIVE_EDGE_MIN_SAMPLE:
+        return {
+            "eligible": False,
+            "score": None,
+            "reason": "INSUFFICIENT_SAMPLE",
+            "components": {},
+        }
+
+    profit_factor = _edge_decimal(metrics.get("profit_factor"))
+    win_rate = _edge_decimal(metrics.get("win_rate_percent"))
+    average_rr = _edge_decimal(metrics.get("average_realized_rr"))
+    drawdown = _edge_decimal(metrics.get("max_drawdown_percent"))
+
+    # 20 points: evidence depth. Full credit at 50 persisted closed trades.
+    sample_points = _edge_clamp(
+        Decimal(trades - ADAPTIVE_EDGE_MIN_SAMPLE)
+        / Decimal(50 - ADAPTIVE_EDGE_MIN_SAMPLE)
+        * Decimal("20"),
+        Decimal("0"),
+        Decimal("20"),
+    )
+    # 25 points: profit factor. PF 1.0 starts contributing; PF 2.0 is capped.
+    pf_points = _edge_clamp(
+        (profit_factor - Decimal("1")) * Decimal("25"),
+        Decimal("0"),
+        Decimal("25"),
+    )
+    # 25 points: realized expectancy in R, using the existing average RR metric.
+    rr_points = _edge_clamp(
+        average_rr * Decimal("25"), Decimal("0"), Decimal("25")
+    )
+    # 10 points: win-rate support. It is deliberately a smaller component.
+    win_points = _edge_clamp(
+        win_rate / Decimal("100") * Decimal("10"),
+        Decimal("0"),
+        Decimal("10"),
+    )
+    # 20 points: drawdown discipline. Zero DD gets full credit; >=20% gets zero.
+    drawdown_points = _edge_clamp(
+        Decimal("20") - drawdown, Decimal("0"), Decimal("20")
+    )
+    total = sample_points + pf_points + rr_points + win_points + drawdown_points
+    score = total.quantize(Decimal("0.01"))
+    return {
+        "eligible": True,
+        "score": str(score),
+        "reason": "EVIDENCE_RANKABLE",
+        "components": {
+            "sample": str(sample_points.quantize(Decimal("0.01"))),
+            "profit_factor": str(pf_points.quantize(Decimal("0.01"))),
+            "realized_rr": str(rr_points.quantize(Decimal("0.01"))),
+            "win_rate": str(win_points.quantize(Decimal("0.01"))),
+            "drawdown": str(drawdown_points.quantize(Decimal("0.01"))),
+        },
+    }
+
+
+def build_adaptive_edge_ranking(
+    cells: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """Rank strategies only against peers in the same persisted market context."""
+    groups: Dict[tuple[str, str, str, str], List[Dict[str, object]]] = {}
+    for cell in cells:
+        if not bool(cell.get("context_complete")):
+            continue
+        symbol = str(cell.get("symbol") or "")
+        timeframe = str(cell.get("timeframe") or "")
+        session = str(cell.get("session") or "")
+        regime = str(cell.get("regime") or "")
+        if not all((symbol, timeframe, session, regime)):
+            continue
+        metrics_raw = cell.get("metrics")
+        metrics = metrics_raw if isinstance(metrics_raw, dict) else {}
+        scored = adaptive_edge_score(metrics)
+        item = dict(cell)
+        item["edge"] = scored
+        groups.setdefault((symbol, timeframe, session, regime), []).append(item)
+
+    rankings: List[Dict[str, object]] = []
+    for context in sorted(groups):
+        candidates = groups[context]
+        rankable = [
+            item
+            for item in candidates
+            if isinstance(item.get("edge"), dict)
+            and bool(item["edge"].get("eligible"))
+        ]
+
+        def ranking_key(item: Dict[str, object]) -> tuple[Decimal, str, str]:
+            edge = item.get("edge")
+            score = edge.get("score") if isinstance(edge, dict) else None
+            return (
+                -_edge_decimal(score),
+                str(item.get("strategy_id") or ""),
+                str(item.get("strategy_version") or ""),
+            )
+
+        rankable.sort(key=ranking_key)
+        ranked_entries: List[Dict[str, object]] = []
+        for rank, item in enumerate(rankable, start=1):
+            ranked = dict(item)
+            ranked["rank"] = rank
+            ranked_entries.append(ranked)
+        unranked = [item for item in candidates if item not in rankable]
+        unranked.sort(key=lambda item: str(item.get("strategy_id") or ""))
+        for item in unranked:
+            pending = dict(item)
+            pending["rank"] = None
+            ranked_entries.append(pending)
+        rankings.append(
+            {
+                "symbol": context[0],
+                "timeframe": context[1],
+                "session": context[2],
+                "regime": context[3],
+                "ranked_strategies": ranked_entries,
+            }
+        )
+    return rankings
+
+
+@api_router.get("/paper/adaptive-edge/ranking")
+async def get_adaptive_edge_ranking(period: str = "ALL") -> Dict[str, object]:
+    """Expose observation-only adaptive ranking from the validated matrix."""
+    matrix = await get_paper_performance_matrix(period)
+    cells = list(matrix.get("cells") or [])
+    rankings = build_adaptive_edge_ranking(cells)
+    return {
+        "status": "OK",
+        "validation": ADAPTIVE_EDGE_RANKING_VERSION,
+        "period": matrix["period"],
+        "period_start": matrix["period_start"],
+        "minimum_sample": ADAPTIVE_EDGE_MIN_SAMPLE,
+        "ranking_scope": "SYMBOL_X_TIMEFRAME_X_SESSION_X_REGIME",
+        "score_scale": "0_TO_100_HEURISTIC",
+        "score_components_max": {
+            "sample": 20,
+            "profit_factor": 25,
+            "realized_rr": 25,
+            "win_rate": 10,
+            "drawdown": 20,
+        },
+        "context_coverage": matrix["context_coverage"],
+        "rankings": rankings,
+        "paper_only": True,
+        "observation_only": True,
+        "execution": False,
+    }
+
+
 @api_router.get("/paper/performance/breakdown")
 async def get_paper_performance_breakdown(
     group_by: str = "SYMBOL",

@@ -38,7 +38,7 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "1413"
+      EXPECTED_TESTS: "1429"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -216,3 +216,5 @@ jobs:
 
 # V16-M5B28A: EXPECTED_TESTS=1397 (16 live-verified crypto universe tests)
 # V16-M5B28A-UI: EXPECTED_TESTS=1413 (16 dynamic crypto frontend synchronization tests)
+
+# V16-M5B28B1: EXPECTED_TESTS=1429 (16 Trend Pullback paper-execution tests)

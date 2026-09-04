@@ -5023,7 +5023,7 @@ async def get_paper_performance(
                 "p.risk_money, p.closed_at, fx.quote_to_usd "
                 "FROM paper_positions p LEFT JOIN paper_fx_conversion_snapshots fx "
                 "ON fx.position_id=p.position_id AND fx.phase='CLOSE' "
-                "WHERE p.status='CLOSED' AND p.close_price IS NOT NULL"
+                "WHERE status='CLOSED' AND p.close_price IS NOT NULL"
             )
             params: Dict[str, object] = {}
             if canonical is not None:
@@ -5136,7 +5136,7 @@ async def get_paper_performance_breakdown(
                 "p.risk_money, p.closed_at, fx.quote_to_usd "
                 "FROM paper_positions p LEFT JOIN paper_fx_conversion_snapshots fx "
                 "ON fx.position_id=p.position_id AND fx.phase='CLOSE' "
-                "WHERE p.status='CLOSED' AND p.close_price IS NOT NULL"
+                "WHERE status='CLOSED' AND p.close_price IS NOT NULL"
             )
             params: Dict[str, object] = {}
             if period_start is not None:

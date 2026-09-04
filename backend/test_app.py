@@ -8997,3 +8997,66 @@ class TestV16M5B28B2BreakoutExpansionPaperExecution(unittest.TestCase):
         source = inspect.getsource(main.auto_entry_orchestrator_loop)
         self.assertIn("run_breakout_expansion_paper_generation_once", source)
 
+
+
+class DynamicUiControlHardeningV16M5B28B3Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = FRONTEND_INDEX.read_text(encoding="utf-8")
+
+    def test_trading_tabs_have_state(self):
+        self.assertIn('var paperActiveTab="account";', self.html)
+
+    def test_positions_tab_calls_setter(self):
+        self.assertIn('tabButton("Positions","positions",paperActiveTab,setPaperTab)', self.html)
+
+    def test_history_tab_calls_setter(self):
+        self.assertIn('tabButton("Historique","history",paperActiveTab,setPaperTab)', self.html)
+
+    def test_account_tab_calls_setter(self):
+        self.assertIn('tabButton("Compte","account",paperActiveTab,setPaperTab)', self.html)
+
+    def test_paper_tab_rerenders_trading(self):
+        self.assertIn("function setPaperTab(id)", self.html)
+        self.assertIn("paperActiveTab=id;", self.html)
+
+    def test_hamburger_has_click_handler(self):
+        self.assertIn('onclick="toggleMarketMenu(this)"', self.html)
+
+    def test_notification_button_opens_signals(self):
+        self.assertIn("onclick=\"setView('signals')\"", self.html)
+
+    def test_intelligence_tabs_use_real_setter(self):
+        self.assertIn("setIntelligenceTab", self.html)
+        self.assertIn("intelligenceActiveTab", self.html)
+
+    def test_settings_tabs_use_real_setter(self):
+        self.assertIn("setSettingsTab", self.html)
+        self.assertIn("settingsActiveTab", self.html)
+
+    def test_mobile_metric_grid_uses_minmax(self):
+        self.assertIn(
+            ".metric-strip{grid-template-columns:minmax(0,1fr) minmax(0,1fr)!important}",
+            self.html,
+        )
+
+    def test_mobile_grid_two_prevents_overflow(self):
+        self.assertIn(".grid-2{grid-template-columns:minmax(0,1fr)!important}", self.html)
+
+    def test_long_values_can_wrap(self):
+        self.assertIn("overflow-wrap:anywhere", self.html)
+
+    def test_paper_times_are_montreal_localized(self):
+        self.assertIn('["Ouverture · Montréal"]', self.html)
+        self.assertIn("formatMontrealTime(p.opened_at)", self.html)
+
+    def test_paper_strategy_is_separate_from_market_source(self):
+        self.assertIn('["Stratégie"]', self.html)
+        self.assertIn('["Source marché"]', self.html)
+
+    def test_closed_trade_shows_close_reason(self):
+        self.assertIn('["Clôture"]', self.html)
+        self.assertIn("p.close_reason", self.html)
+
+    def test_menu_is_closed_when_view_changes(self):
+        self.assertIn("function setView(id){closeMarketMenu();current=id;", self.html)

@@ -1718,6 +1718,186 @@ async def get_paper_instrument_specs(symbol: str) -> Dict[str, object]:
     return specs
 
 
+
+# V16-M5B29A — Multi-Asset Verified Paper Sizing Foundation (non-executing)
+# This increment intentionally DOES NOT authorize Forex/Metal/Index entries.
+# It establishes explicit sizing/readiness semantics without inventing broker
+# contract metadata. USD-quoted spot instruments can be preview-sized in native
+# units because P&L is mathematically quote-currency units per price move; all
+# broker-dependent contracts and non-USD quote conversions stay fail-closed.
+MULTI_ASSET_SIZING_VERSION = "SERVER_MULTI_ASSET_SIZING_FOUNDATION_V1"
+
+
+class MultiAssetSizingPreviewRequest(BaseModel):
+    symbol: str = Field(min_length=3, max_length=32)
+    capital: Decimal = Field(gt=Decimal("0"))
+    risk_percent: Decimal = Field(gt=Decimal("0"), le=Decimal("100"))
+    entry: Decimal = Field(gt=Decimal("0"))
+    stop_loss: Decimal = Field(gt=Decimal("0"))
+
+
+def multi_asset_sizing_readiness(symbol: str) -> Dict[str, object]:
+    """Describe what is objectively safe to size without broker assumptions.
+
+    CRYPTO keeps its existing Coinbase verified-specs path and is reported as
+    delegated. Forex/metal/index readiness is deliberately conservative:
+    - USD-quoted spot FX: native BASE_UNITS preview can be calculated in USD.
+    - XAU-USD spot: native XAU_UNITS preview can be calculated in USD.
+    - non-USD quoted FX requires a real FX conversion source before sizing.
+    - cash indices require a verified contract/tick-value model before sizing.
+    This function never opens or queues a paper position.
+    """
+    canonical = symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    observed_at = utcnow()
+    base: Dict[str, object] = {
+        "validation": MULTI_ASSET_SIZING_VERSION,
+        "symbol": canonical,
+        "observed_at": observed_at.isoformat(),
+        "paper_only": True,
+        "execution": False,
+        "auto_entry_authorized": False,
+    }
+    if instrument is None:
+        return {**base, "status": "UNAVAILABLE", "reason": "INSTRUMENT_NOT_REGISTERED"}
+
+    base.update(
+        {
+            "asset_class": instrument.asset_class.value,
+            "base_asset": instrument.base_asset,
+            "quote_asset": instrument.quote_asset,
+            "market_calendar": instrument.market_calendar.value,
+        }
+    )
+
+    if instrument.asset_class == AssetClass.CRYPTO:
+        return {
+            **base,
+            "status": "DELEGATED",
+            "reason": "USE_EXISTING_VERIFIED_CRYPTO_SPECS",
+            "sizing_mode": "BASE_UNITS",
+            "specs_endpoint": f"/api/v1/paper/instrument-specs/{canonical}",
+        }
+
+    # We require a configured calendar before any future multi-asset execution.
+    if instrument.market_calendar == MarketCalendarPolicy.NOT_CONFIGURED:
+        return {
+            **base,
+            "status": "BLOCKED",
+            "reason": "MARKET_CALENDAR_NOT_CONFIGURED",
+            "sizing_mode": None,
+        }
+
+    if instrument.asset_class == AssetClass.FOREX:
+        if instrument.quote_asset != "USD":
+            return {
+                **base,
+                "status": "BLOCKED",
+                "reason": "ACCOUNT_CURRENCY_CONVERSION_NOT_IMPLEMENTED",
+                "sizing_mode": None,
+            }
+        return {
+            **base,
+            "status": "PREVIEW_READY",
+            "reason": "USD_QUOTED_SPOT_UNIT_PNL",
+            "sizing_mode": "BASE_UNITS",
+            "pnl_currency": "USD",
+            "requires_broker_contract_specs_for_live_lots": True,
+        }
+
+    if instrument.asset_class == AssetClass.METAL:
+        if canonical != "XAU-USD" or instrument.quote_asset != "USD":
+            return {
+                **base,
+                "status": "BLOCKED",
+                "reason": "METAL_SIZING_MODEL_NOT_VERIFIED",
+                "sizing_mode": None,
+            }
+        # Currently XAU-USD is registered with NOT_CONFIGURED calendar, so the
+        # calendar guard above intentionally blocks it until the session model is
+        # independently implemented/validated.
+        return {
+            **base,
+            "status": "PREVIEW_READY",
+            "reason": "USD_QUOTED_SPOT_UNIT_PNL",
+            "sizing_mode": "XAU_UNITS",
+            "pnl_currency": "USD",
+            "requires_broker_contract_specs_for_live_lots": True,
+        }
+
+    if instrument.asset_class == AssetClass.INDEX:
+        return {
+            **base,
+            "status": "BLOCKED",
+            "reason": "VERIFIED_INDEX_CONTRACT_VALUE_NOT_IMPLEMENTED",
+            "sizing_mode": None,
+        }
+
+    return {**base, "status": "BLOCKED", "reason": "ASSET_CLASS_NOT_SUPPORTED"}
+
+
+def calculate_multi_asset_unit_size(
+    capital: Decimal,
+    risk_percent: Decimal,
+    entry: Decimal,
+    stop_loss: Decimal,
+    readiness: Dict[str, object],
+) -> Dict[str, object]:
+    """Preview unit sizing for objectively USD-quoted spot instruments only."""
+    if readiness.get("status") != "PREVIEW_READY":
+        return {
+            "status": "BLOCKED",
+            "reason": str(readiness.get("reason") or "SIZING_NOT_READY"),
+            "execution": False,
+        }
+    if capital <= 0 or risk_percent <= 0 or risk_percent > Decimal("100"):
+        return {"status": "BLOCKED", "reason": "RISK_INVALID", "execution": False}
+    distance = abs(entry - stop_loss)
+    if distance <= 0 or entry <= 0:
+        return {"status": "BLOCKED", "reason": "STOP_DISTANCE_INVALID", "execution": False}
+
+    risk_money = capital * risk_percent / Decimal("100")
+    raw_units = risk_money / distance
+    if raw_units <= 0:
+        return {"status": "BLOCKED", "reason": "SIZE_INVALID", "execution": False}
+    return {
+        "status": "VALID",
+        "validation": MULTI_ASSET_SIZING_VERSION,
+        "size": raw_units,
+        "size_unit": readiness.get("sizing_mode"),
+        "risk_money": risk_money,
+        "risk_percent": risk_percent,
+        "stop_distance": distance,
+        "pnl_currency": readiness.get("pnl_currency"),
+        "broker_contract_size_applied": False,
+        "paper_only": True,
+        "execution": False,
+    }
+
+
+@api_router.get("/paper/multi-asset-sizing/readiness/{symbol}")
+async def get_multi_asset_sizing_readiness(symbol: str) -> Dict[str, object]:
+    return multi_asset_sizing_readiness(symbol)
+
+
+@api_router.post("/paper/multi-asset-sizing/preview")
+async def preview_multi_asset_sizing(
+    req: MultiAssetSizingPreviewRequest,
+) -> Dict[str, object]:
+    readiness = multi_asset_sizing_readiness(req.symbol)
+    sizing = calculate_multi_asset_unit_size(
+        req.capital, req.risk_percent, req.entry, req.stop_loss, readiness
+    )
+    return {
+        "status": sizing.get("status", "BLOCKED"),
+        "symbol": req.symbol.upper().replace("/", "-"),
+        "readiness": readiness,
+        "sizing": sizing,
+        "paper_only": True,
+        "execution": False,
+        "auto_entry_authorized": False,
+    }
+
 def evaluate_server_signal(req: ServerSignalRequest) -> Dict[str, object]:
     canonical = req.symbol.upper().replace("/", "-")
     reasons: List[str] = []

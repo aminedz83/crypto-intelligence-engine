@@ -847,39 +847,34 @@ function renderTrading(){
 
 function renderStrategies(){
   var v=byId("view-strategies");clear(v);
-  v.appendChild(pageHead("Stratégies","Bibliothèque, versions, validation, performances et Adaptive Edge.","UI HYPER FULL"));
-  v.appendChild(h("div",{class:"subtabs"},[
-    h("button",{class:"subtab active"},["Bibliothèque"]),h("button",{class:"subtab"},["Backtests"]),
-    h("button",{class:"subtab"},["OOS"]),h("button",{class:"subtab"},["Performances"]),
-    h("button",{class:"subtab"},["Adaptive Edge"]),h("button",{class:"subtab"},["Versions"])
-  ]));
-  var g=h("div",{class:"grid-2"},[]);
-  [
-    ["SMC Liquidity Sweep + Structure Reversal","Sweep → displacement → structure → OB/FVG → retest."],
-    ["Value-Area Order Flow Reversal","Value, absorption, delta/CVD, trapped participants."],
-    ["POC Retest","POC + contexte + confirmation, jamais POC seul."],
-    ["Top-Down Swing Structure","Weekly/Daily/H4 avec trigger H1 optionnel."],
-    ["Fair Value 3-Touch / Reclaim","Range, sweep/reclaim et structure."],
-    ["Auction Market / LVN Scalping","LVN/HVN/POC + order flow quand disponible."]
-  ].forEach(function(x){
-    g.appendChild(h("div",{class:"card tool-card"},[
-      h("div",{},[h("div",{class:"tool-name"},[x[0]]),h("div",{class:"tool-desc"},[x[1]])]),
-      h("div",{class:"tool-foot"},[h("span",{class:"status-pill future"},["CANDIDATE"]),h("span",{class:"info"},["i"])])
-    ]))
+  v.appendChild(pageHead("Stratégies","3 familles objectives · validation et replay sur données réelles.","PAPER ONLY"));
+  var host=h("div",{id:"strategy-live"},[loading("Chargement du registre de stratégies…")]);
+  v.appendChild(host);
+  api("/api/v1/strategies/overview").then(function(r){
+    clear(host);
+    if(!r.ok||!r.data){host.appendChild(emptyState("Registre indisponible",errorMessage(r)));return}
+    var d=r.data, strategies=Array.isArray(d.strategies)?d.strategies:[];
+    host.appendChild(h("div",{class:"card"},[
+      h("div",{class:"kv"},[h("span",{class:"k"},["Politique"]),h("b",{},[(d.portfolio&&d.portfolio.policy)||"—"])]),
+      h("div",{class:"kv"},[h("span",{class:"k"},["Ranking"]),h("span",{},[(d.portfolio&&d.portfolio.ranker)||"—"])]),
+      h("div",{class:"kv"},[h("span",{class:"k"},["Minimum OOS"]),h("span",{},[String(d.minimum_oos_trades==null?"—":d.minimum_oos_trades)+" trades"])]),
+      h("div",{class:"kv"},[h("span",{class:"k"},["Paper forward"]),h("span",{},[String(d.minimum_paper_forward_trades==null?"—":d.minimum_paper_forward_trades)+" trades"])] )
+    ]));
+    var g=h("div",{class:"grid-2"},[]);
+    strategies.forEach(function(st){
+      var regimes=Array.isArray(st.allowed_regimes)?st.allowed_regimes.join(" · "):"—";
+      var tfs=Array.isArray(st.timeframes)?st.timeframes.join(" · "):"—";
+      g.appendChild(h("div",{class:"card tool-card"},[
+        h("div",{},[h("div",{class:"tool-name"},[st.strategy_id||"—"]),h("div",{class:"tool-desc"},[(st.family||"—")+" · v"+(st.version||"—")]),h("div",{class:"sub"},["TF: "+tfs+" · Régimes: "+regimes])]),
+        h("div",{class:"tool-foot"},[h("span",{class:"status-pill future"},[st.validation_state||"CANDIDATE"]),h("span",{class:"sub"},[st.ranking_eligible?"RANKING ELIGIBLE":"RANKING LOCKED"])])
+      ]));
+    });
+    host.appendChild(g);
+    host.appendChild(modCard("Validation statistique","SERVER-AUTHORITATIVE",h("div",{class:"section-stack"},[
+      h("div",{class:"journal-card"},[h("h4",{},["Règle"]),h("p",{},["Aucune stratégie n’est déclarée rentable sans échantillon OOS suffisant. INSUFFICIENT_SAMPLE bloque le ranking plutôt que d’inventer une performance."])]),
+      h("div",{class:"journal-card"},[h("h4",{},["Replay"]),h("p",{},["Le backend expose un replay déterministe sur bougies Coinbase fermées avec coûts exprimés en R."])])
+    ])));
   });
-  v.appendChild(g);
-  v.appendChild(modCard("Performance Matrix","NOT IMPLEMENTED",h("div",{class:"section-stack"},[
-    h("table",{class:"compact-table"},[
-      h("thead",{},[h("tr",{},[h("th",{},["Actif"]),h("th",{},["Stratégie"]),h("th",{},["TF"]),h("th",{},["Session"]),h("th",{},["Régime"]),h("th",{},["PF"]),h("th",{},["Expectancy"])])]),
-      h("tbody",{},[h("tr",{},[h("td",{},["—"]),h("td",{},["—"]),h("td",{},["—"]),h("td",{},["—"]),h("td",{},["—"]),h("td",{},["—"]),h("td",{},["—"])])])
-    ])
-  ])));
-  v.appendChild(modCard("Validation & Robustesse","NOT IMPLEMENTED",h("div",{class:"info-grid"},[
-    h("div",{class:"journal-card"},[h("h4",{},["Backtest"]),h("p",{},["Échantillon d'entraînement, frais/slippage, métriques."])]),
-    h("div",{class:"journal-card"},[h("h4",{},["Out-of-sample"]),h("p",{},["Validation hors échantillon avant activation."])]),
-    h("div",{class:"journal-card"},[h("h4",{},["Robustesse"]),h("p",{},["Sensibilité aux paramètres, périodes et régimes."])]),
-    h("div",{class:"journal-card"},[h("h4",{},["Versioning"]),h("p",{},["Chaque décision garde stratégie + version exacte."])])
-  ])));
 }
 
 function renderIntelligence(){

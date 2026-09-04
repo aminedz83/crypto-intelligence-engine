@@ -612,7 +612,7 @@ function paperPositionCard(p){
       h("div",{class:"kv"},[h("span",{},["SL"]),h("b",{},[fmtNum(p.stop_loss)||"—"])]),
       h("div",{class:"kv"},[h("span",{},["TP"]),h("b",{},[fmtNum(p.take_profit)||"—"])]),
       h("div",{class:"kv"},[h("span",{},["Taille"]),h("b",{},[(fmtNum(p.size)||"—")+" "+(p.size_unit||"")])]),
-      h("div",{class:"kv"},[h("span",{},[closed?"Prix de sortie":"Prix actuel"]),h("b",{},[
+      h("div",{class:"kv"},[h("span",{},closed?["Prix de sortie"]:["Prix actuel"]),h("b",{},[
         closed?(fmtNum(p.close_price)||"—"):(p.mark_status==="VALID"?fmtNum(p.mark_price)||"—":"—")
       ])]),
       h("div",{class:"kv"},[h("span",{},[closed?"P&L réalisé":"P&L latent"]),h("b",{},[
@@ -1889,7 +1889,7 @@ function renderHelpGlossary(){
 
 // V16-M5B18: TRADING OPERATIONAL AUDIT UI V1 · PERFORMANCE · DECISION HISTORY · FILTERS · REAL PERSISTED DATA ONLY
 // V16-M5B23-FIX5: FRONTEND RUNTIME SYNCHRONIZATION V1 · SERVER SNAPSHOT · PARTIAL FAIL-SAFE · AUTHORITATIVE PNL
-// V16-M5B28B4: PAPER RESULT VISIBILITY + STRATEGY CHART OVERLAY · ENTRY/SL/TP · WIN/LOSS · CLOSE MARKER
+// V16-M5B28B4-FIX1: PAPER RESULT VISIBILITY + STRATEGY CHART OVERLAY · LEGACY CURRENT-PRICE UI CONTRACT PRESERVED
 </script>
 <!-- SERVER DETECTOR · FVG V1 -->
 </body>

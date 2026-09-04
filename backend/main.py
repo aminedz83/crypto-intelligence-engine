@@ -1466,6 +1466,26 @@ paper_position_context_table = Table(
     Column("captured_at", DateTime(timezone=True), nullable=False),
 )
 
+
+# V16-M5B30E — audit log for explicit shadow-gate evaluations.
+paper_adaptive_edge_shadow_table = Table(
+    "paper_adaptive_edge_shadow",
+    metadata,
+    Column("decision_id", String, primary_key=True),
+    Column("symbol", String, nullable=False),
+    Column("strategy_id", String, nullable=False),
+    Column("timeframe", String, nullable=False),
+    Column("session", String, nullable=False),
+    Column("market_regime", String, nullable=False),
+    Column("period", String, nullable=False),
+    Column("action", String, nullable=False),
+    Column("reason", String, nullable=False),
+    Column("evidence", String, nullable=True),
+    Column("rank", Integer, nullable=True),
+    Column("score", Numeric(10, 2), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+
 candles_table = Table(
     "candles",
     metadata,
@@ -5511,6 +5531,160 @@ async def get_adaptive_edge_ranking(period: str = "ALL") -> Dict[str, object]:
         "rankings": rankings,
         "paper_only": True,
         "observation_only": True,
+        "execution": False,
+    }
+
+
+# V16-M5B30E — Adaptive Edge Gating Shadow Mode.
+# Advisory only: this evaluates what an evidence gate WOULD do. It never changes
+# signal validity, sizing, risk guards, order generation, or paper execution.
+ADAPTIVE_EDGE_SHADOW_VERSION = "SERVER_ADAPTIVE_EDGE_GATING_SHADOW_V1"
+
+
+def adaptive_edge_shadow_decision(
+    rankings: List[Dict[str, object]],
+    symbol: str,
+    strategy_id: str,
+    timeframe: str,
+    session: str,
+    regime: str,
+) -> Dict[str, object]:
+    """Return a fail-neutral hypothetical gate from persisted ranking evidence."""
+    canonical = symbol.upper().replace("/", "-")
+    target_context = (canonical, timeframe, session, regime)
+    for ranking in rankings:
+        context = (
+            str(ranking.get("symbol") or "").upper(),
+            str(ranking.get("timeframe") or ""),
+            str(ranking.get("session") or ""),
+            str(ranking.get("regime") or ""),
+        )
+        if context != target_context:
+            continue
+        entries_raw = ranking.get("ranked_strategies")
+        entries = entries_raw if isinstance(entries_raw, list) else []
+        for raw_entry in entries:
+            if not isinstance(raw_entry, dict):
+                continue
+            if str(raw_entry.get("strategy_id") or "") != strategy_id:
+                continue
+            evidence = str(raw_entry.get("evidence") or "INSUFFICIENT_SAMPLE")
+            edge_raw = raw_entry.get("edge")
+            edge = edge_raw if isinstance(edge_raw, dict) else {}
+            rank_raw = raw_entry.get("rank")
+            rank = int(str(rank_raw)) if rank_raw is not None else None
+            if evidence == "WEAK":
+                action = "WOULD_BLOCK"
+                reason = "WEAK_PERSISTED_EDGE"
+            elif evidence in {"PROMISING", "ROBUST"} and rank == 1:
+                action = "WOULD_FAVOR"
+                reason = "TOP_RANKED_POSITIVE_EDGE"
+            elif evidence == "INSUFFICIENT_SAMPLE":
+                action = "NEUTRAL"
+                reason = "INSUFFICIENT_SAMPLE"
+            else:
+                action = "NEUTRAL"
+                reason = "EVIDENCE_NOT_DECISIVE"
+            return {
+                "action": action,
+                "reason": reason,
+                "evidence": evidence,
+                "rank": rank,
+                "score": edge.get("score"),
+                "eligible": bool(edge.get("eligible")),
+            }
+    return {
+        "action": "NEUTRAL",
+        "reason": "NO_MATCHING_PERSISTED_CONTEXT",
+        "evidence": None,
+        "rank": None,
+        "score": None,
+        "eligible": False,
+    }
+
+
+@api_router.get("/paper/adaptive-edge/shadow")
+async def get_adaptive_edge_shadow(
+    symbol: str,
+    strategy_id: str,
+    timeframe: str,
+    session: str,
+    regime: str,
+    period: str = "ALL",
+) -> Dict[str, object]:
+    """Expose the hypothetical adaptive gate without changing execution behavior."""
+    ranking_payload = await get_adaptive_edge_ranking(period)
+    rankings_raw = ranking_payload.get("rankings")
+    rankings: List[Dict[str, object]] = []
+    if isinstance(rankings_raw, list):
+        rankings = [item for item in rankings_raw if isinstance(item, dict)]
+    decision = adaptive_edge_shadow_decision(
+        rankings, symbol, strategy_id, timeframe, session, regime
+    )
+    canonical = symbol.upper().replace("/", "-")
+    created_at = utcnow()
+    decision_seed = (
+        f"{canonical}|{strategy_id}|{timeframe}|{session}|{regime}|"
+        f"{ranking_payload.get('period')}|{created_at.isoformat()}"
+    )
+    decision_id = "edge-shadow-" + hashlib.sha256(decision_seed.encode()).hexdigest()[:24]
+    score_raw = decision.get("score")
+    score = Decimal(str(score_raw)) if score_raw is not None else None
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                pg_insert(paper_adaptive_edge_shadow_table).values(
+                    decision_id=decision_id,
+                    symbol=canonical,
+                    strategy_id=strategy_id,
+                    timeframe=timeframe,
+                    session=session,
+                    market_regime=regime,
+                    period=str(ranking_payload.get("period") or period.upper()),
+                    action=str(decision.get("action") or "NEUTRAL"),
+                    reason=str(decision.get("reason") or "UNKNOWN"),
+                    evidence=(
+                        str(decision.get("evidence"))
+                        if decision.get("evidence") is not None
+                        else None
+                    ),
+                    rank=(
+                        int(str(decision.get("rank")))
+                        if decision.get("rank") is not None
+                        else None
+                    ),
+                    score=score,
+                    created_at=created_at,
+                )
+            )
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "shadow audit persistence failed"},
+        ) from exc
+    return {
+        "status": "OK",
+        "validation": ADAPTIVE_EDGE_SHADOW_VERSION,
+        "decision_id": decision_id,
+        "period": ranking_payload.get("period"),
+        "context": {
+            "symbol": symbol.upper().replace("/", "-"),
+            "strategy_id": strategy_id,
+            "timeframe": timeframe,
+            "session": session,
+            "regime": regime,
+        },
+        "shadow_gate": decision,
+        "policy": {
+            "WEAK": "WOULD_BLOCK",
+            "TOP_RANKED_PROMISING_OR_ROBUST": "WOULD_FAVOR",
+            "INSUFFICIENT_SAMPLE": "NEUTRAL",
+            "NO_MATCHING_CONTEXT": "NEUTRAL",
+        },
+        "paper_only": True,
+        "shadow_mode": True,
+        "changes_execution": False,
         "execution": False,
     }
 

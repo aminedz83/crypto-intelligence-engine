@@ -132,6 +132,14 @@ body.workspace-mode main{padding-top:14px}
 .trade-overlay-label{font-size:11px;font-weight:800;paint-order:stroke;stroke:#020610;stroke-width:3px;stroke-linejoin:round}.trade-overlay-entry-label{fill:#51e7ff}.trade-overlay-sl-label{fill:#ff4e5f}.trade-overlay-tp-label{fill:#28ef62}.trade-overlay-strategy-label{fill:#ff9b08}.trade-overlay-time-label{fill:#c7a9ff}
 .trade-overlay-banner{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0 0}.trade-overlay-banner .status-pill{max-width:100%;overflow-wrap:anywhere}
 
+
+/* V16-M5B28B5 · MOBILE COMPACT PAPER HISTORY */
+.paper-history-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:10px}
+.paper-history-kpi{padding:10px;border:1px solid #203149;border-radius:12px;background:#06101b;min-width:0}.paper-history-kpi span{display:block;color:#8997aa;font-size:8px}.paper-history-kpi b{display:block;margin-top:3px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.paper-history-filters{display:flex;gap:7px;overflow-x:auto;margin:0 0 10px;padding-bottom:2px}.paper-history-filter{min-height:38px;padding:0 14px;border:1px solid #203149;border-radius:999px;background:#06101b;color:#9aa8ba;font-weight:800}.paper-history-filter.active{border-color:rgba(81,231,255,.55);color:var(--cyan);background:rgba(81,231,255,.08)}
+.paper-history-list{display:grid;gap:9px}.paper-trade-compact{border:1px solid #203149;border-radius:13px;background:#06101b;overflow:hidden}.paper-trade-compact>summary{list-style:none;padding:12px;cursor:pointer;-webkit-tap-highlight-color:transparent}.paper-trade-compact>summary::-webkit-details-marker{display:none}.paper-trade-top{display:flex;align-items:flex-start;gap:7px;min-width:0}.paper-trade-symbol{font-size:14px;font-weight:900;line-height:1.2;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.paper-trade-result{margin-left:auto;text-align:right;white-space:nowrap}.paper-trade-result b{display:block;font-size:13px}.paper-trade-result span{display:block;font-size:8px;margin-top:2px}.paper-trade-meta{margin-top:6px;color:#8997aa;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.paper-trade-levels{display:grid;grid-template-columns:1fr 1fr;gap:5px 12px;margin-top:9px}.paper-trade-level{display:flex;justify-content:space-between;gap:8px;font-size:8px}.paper-trade-level span{color:#8997aa}.paper-trade-level b{font-size:9px}.paper-trade-outcome{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-top:9px;padding-top:8px;border-top:1px solid #18283c;font-size:8px}.paper-trade-more{color:var(--cyan);font-weight:800}.paper-trade-details{padding:0 12px 12px;border-top:1px solid #18283c}.paper-trade-details .section-stack{padding-top:8px}.paper-trade-compact[open] .paper-trade-more:after{content:" · ouvert"}
+@media(min-width:760px){.paper-history-summary{grid-template-columns:repeat(4,minmax(0,1fr))}.paper-history-list{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
 </style>
 
 <style id="v4-reference-tuning">
@@ -612,12 +620,8 @@ function paperPositionCard(p){
       h("div",{class:"kv"},[h("span",{},["SL"]),h("b",{},[fmtNum(p.stop_loss)||"—"])]),
       h("div",{class:"kv"},[h("span",{},["TP"]),h("b",{},[fmtNum(p.take_profit)||"—"])]),
       h("div",{class:"kv"},[h("span",{},["Taille"]),h("b",{},[(fmtNum(p.size)||"—")+" "+(p.size_unit||"")])]),
-      h("div",{class:"kv"},[h("span",{},closed?["Prix de sortie"]:["Prix actuel"]),h("b",{},[
-        closed?(fmtNum(p.close_price)||"—"):(p.mark_status==="VALID"?fmtNum(p.mark_price)||"—":"—")
-      ])]),
-      h("div",{class:"kv"},[h("span",{},[closed?"P&L réalisé":"P&L latent"]),h("b",{},[
-        closed&&pnl!==null&&pnl!==undefined?paperMoney(pnl):(!closed&&p.mark_status==="VALID"?paperMoney(p.unrealized_pnl):"—")
-      ])]),
+      h("div",{class:"kv"},[h("span",{},closed?["Prix de sortie"]:["Prix actuel"]),h("b",{},[closed?(fmtNum(p.close_price)||"—"):(p.mark_status==="VALID"?fmtNum(p.mark_price)||"—":"—")])]),
+      h("div",{class:"kv"},[h("span",{},[closed?"P&L réalisé":"P&L latent"]),h("b",{},[closed&&pnl!==null&&pnl!==undefined?paperMoney(pnl):(!closed&&p.mark_status==="VALID"?paperMoney(p.unrealized_pnl):"—")])]),
       closed?h("div",{class:"kv"},[h("span",{},["Résultat"]),h("b",{class:result.klass},[result.label+" · "+result.reason])]):null,
       closed?h("div",{class:"kv"},[h("span",{},["RR réalisé"]),h("b",{},[rr===null?"—":rr.toFixed(2)+"R"])]):null,
       h("div",{class:"kv"},[h("span",{},["Stratégie"]),h("b",{},[paperStrategyLabel(p)])]),
@@ -626,11 +630,52 @@ function paperPositionCard(p){
       closed?h("div",{class:"kv"},[h("span",{},["Clôture"]),h("b",{},[p.close_reason||"—"])]):null,
       h("div",{class:"kv"},[h("span",{},["Ouverture · Montréal"]),h("b",{},[formatMontrealTime(p.opened_at)])]),
       closed?h("div",{class:"kv"},[h("span",{},["Fermeture · Montréal"]),h("b",{},[formatMontrealTime(p.closed_at)])]):null,
-      h("button",{type:"button",class:"trade-chart-btn",onclick:function(){openPaperTradeChart(p)}},[
-        closed?"Voir le graphique du trade":"Voir le graphique de la position"
-      ])
+      h("button",{type:"button",class:"trade-chart-btn",onclick:function(){openPaperTradeChart(p)}},[closed?"Voir le graphique du trade":"Voir le graphique de la position"])
     ])
   ]);
+}
+function paperTradeDuration(p){
+  var a=Date.parse(p.opened_at||""),b=Date.parse(p.closed_at||"");if(!Number.isFinite(a)||!Number.isFinite(b)||b<a)return "—";
+  var m=Math.round((b-a)/60000),d=Math.floor(m/1440),h0=Math.floor((m%1440)/60),mm=m%60;
+  return (d?d+"j ":"")+(h0?h0+"h ":"")+mm+"min";
+}
+function paperCompactHistoryCard(p){
+  var result=paperResultInfo(p),rr=paperRealizedRR(p),pnl=Number(p.realized_pnl),pnlText=Number.isFinite(pnl)?paperMoney(pnl):"—";
+  var details=h("details",{class:"paper-trade-compact","data-paper-history-card":result.label},[
+    h("summary",{},[
+      h("div",{class:"paper-trade-top"},[
+        h("div",{class:"paper-trade-symbol"},[p.symbol||"—"]),
+        h("span",{class:"status-pill "+(p.side==="LONG"?"ready":"future")},[p.side||"—"]),
+        h("div",{class:"paper-trade-result"},[h("b",{class:result.klass},[pnlText]),h("span",{class:result.klass},[result.label])])
+      ]),
+      h("div",{class:"paper-trade-meta"},[paperStrategyLabel(p)+" · "+formatMontrealTime(p.opened_at)]),
+      h("div",{class:"paper-trade-levels"},[
+        h("div",{class:"paper-trade-level"},[h("span",{},["Entry"]),h("b",{},[fmtNum(p.entry)||"—"])]),
+        h("div",{class:"paper-trade-level"},[h("span",{},["Exit"]),h("b",{},[fmtNum(p.close_price)||"—"])]),
+        h("div",{class:"paper-trade-level"},[h("span",{},[result.reason==="STOP_LOSS"?"SL":"TP"]),h("b",{},[fmtNum(result.reason==="STOP_LOSS"?p.stop_loss:p.take_profit)||"—"])]),
+        h("div",{class:"paper-trade-level"},[h("span",{},["RR"]),h("b",{},[rr===null?"—":(rr>=0?"+":"")+rr.toFixed(2)+"R"])])
+      ]),
+      h("div",{class:"paper-trade-outcome"},[h("b",{class:result.klass},[(result.label==="WIN"?"✓ ":result.label==="LOSS"?"✕ ":"")+result.reason.replaceAll("_"," ")]),h("span",{},[paperTradeDuration(p)]),h("span",{class:"paper-trade-more"},["Détails ›"])])
+    ]),
+    h("div",{class:"paper-trade-details"},[paperPositionCard(p)])
+  ]);
+  return details;
+}
+function paperHistorySummary(closed,perf){
+  var wins=closed.filter(function(p){return paperResultInfo(p).label==="WIN"}).length,total=closed.length;
+  var winRate=perf&&perf.win_rate_percent!==undefined?paperMetric(perf.win_rate_percent," %"):(total?((wins/total)*100).toFixed(1)+" %":"—");
+  var net=perf&&perf.net_pnl!==undefined?paperMoney(perf.net_pnl):paperMoney(closed.reduce(function(a,p){var n=Number(p.realized_pnl);return a+(Number.isFinite(n)?n:0)},0));
+  var avgR=perf&&perf.average_realized_rr!==undefined?paperMetric(perf.average_realized_rr," R"):"—";
+  var pf=perf&&perf.profit_factor!==undefined?paperMetric(perf.profit_factor,""):"—";
+  return h("div",{class:"paper-history-summary"},[
+    h("div",{class:"paper-history-kpi"},[h("span",{},["Trades"]),h("b",{},[String(total)])]),
+    h("div",{class:"paper-history-kpi"},[h("span",{},["Win Rate"]),h("b",{},[winRate])]),
+    h("div",{class:"paper-history-kpi"},[h("span",{},["P&L net"]),h("b",{},[net])]),
+    h("div",{class:"paper-history-kpi"},[h("span",{},["RR moyen · PF"]),h("b",{},[avgR+" · "+pf])])
+  ]);
+}
+function paperHistoryFilters(){
+  return h("div",{class:"paper-history-filters"},["ALL","WIN","LOSS"].map(function(id){return h("button",{type:"button",class:"paper-history-filter "+(paperHistoryFilter===id?"active":""),onclick:function(){paperHistoryFilter=id;renderTrading()}},[id==="ALL"?"Tous":id])}));
 }
 
 function errorMessage(r){if(r.netError==="timeout")return"Délai dépassé.";if(r.netError==="network")return"Backend inaccessible depuis cet aperçu.";var reason=(r.data&&(r.data.reason||(r.data.detail&&r.data.detail.reason)))||null;if(r.status===403)return"Données indisponibles — accès refusé par le fournisseur (403).";if(r.status===429)return"Trop de requêtes.";if(r.status===503)return reason||"Provider indisponible.";return reason||("Erreur ("+r.status+").")}
@@ -785,6 +830,7 @@ function renderSignals(){
 
 
 var paperActiveTab="account";
+var paperHistoryFilter="ALL";
 var intelligenceActiveTab="regime";
 var settingsActiveTab="interface";
 
@@ -929,10 +975,13 @@ function renderTradingContent(){
         placeholder("Aucune position ouverte",
           "Le moteur n’invente aucune position. Une position apparaît après création paper persistée.")));
   }else{
-    v.appendChild(modCard("Historique",closed.length+" CLOSED",
-      closed.length?h("div",{class:"grid-2"},closed.map(paperPositionCard)):
-        placeholder("Aucune position clôturée",
-          "Les fermetures SL/TP persistées apparaîtront ici avec leur P&L réalisé.")));
+    var historyRows=closed.filter(function(p){return paperHistoryFilter==="ALL"||paperResultInfo(p).label===paperHistoryFilter});
+    v.appendChild(modCard("Historique",closed.length+" CLOSED",closed.length?h("div",{},[
+      paperHistorySummary(closed,perf),
+      paperHistoryFilters(),
+      historyRows.length?h("div",{class:"paper-history-list"},historyRows.map(paperCompactHistoryCard)):
+        placeholder("Aucun trade pour ce filtre","Choisis Tous, WIN ou LOSS.")
+    ]):placeholder("Aucune position clôturée","Les fermetures SL/TP persistées apparaîtront ici avec leur P&L réalisé.")));
     v.appendChild(modCard("Historique des décisions","POSTGRES · 50 DERNIÈRES",h("div",{class:"section-stack"},[
       paperDecisionFilters(),
       paperUiState.decisions.length?h("div",{class:"grid-2"},paperUiState.decisions.map(paperDecisionCard)):

@@ -7990,7 +7990,8 @@ def detect_trend_pullback_candidate(
     }
     context = evaluate_candidate_strategy_context("TREND_PULLBACK", regime)
     if context.get("status") != "CONTEXT_ELIGIBLE":
-        return {**base, "status": "WAIT", "reason": str(context.get("reason", "CONTEXT_NOT_ELIGIBLE"))}
+        reason = str(context.get("reason", "CONTEXT_NOT_ELIGIBLE"))
+        return {**base, "status": "WAIT", "reason": reason}
     closed = closed_valid_candles(candles, now)
     if len(closed) < TREND_PULLBACK_EMA_PERIOD + 2:
         return {**base, "status": "WAIT", "reason": "INSUFFICIENT_CLOSED_CANDLES"}
@@ -8041,24 +8042,39 @@ def detect_breakout_expansion_candidate(
     }
     context = evaluate_candidate_strategy_context("BREAKOUT_EXPANSION", regime)
     if context.get("status") != "CONTEXT_ELIGIBLE":
-        return {**base, "status": "WAIT", "reason": str(context.get("reason", "CONTEXT_NOT_ELIGIBLE"))}
+        reason = str(context.get("reason", "CONTEXT_NOT_ELIGIBLE"))
+        return {**base, "status": "WAIT", "reason": reason}
     closed = closed_valid_candles(candles, now)
     if len(closed) < BREAKOUT_LOOKBACK + 1:
         return {**base, "status": "WAIT", "reason": "INSUFFICIENT_CLOSED_CANDLES"}
     prior = closed[-(BREAKOUT_LOOKBACK + 1):-1]
     latest = closed[-1]
-    if any(item.high is None or item.low is None or item.open is None or item.close is None for item in prior):
+    if any(
+        item.high is None
+        or item.low is None
+        or item.open is None
+        or item.close is None
+        for item in prior
+    ):
         return {**base, "status": "WAIT", "reason": "INVALID_BREAKOUT_HISTORY"}
     if latest.high is None or latest.low is None or latest.open is None or latest.close is None:
         return {**base, "status": "WAIT", "reason": "INVALID_BREAKOUT_CANDLE"}
     range_high = max(float(item.high) for item in prior if item.high is not None)
     range_low = min(float(item.low) for item in prior if item.low is not None)
-    bodies = [abs(float(item.close) - float(item.open)) for item in prior if item.close is not None and item.open is not None]
+    bodies = [
+        abs(float(item.close) - float(item.open))
+        for item in prior
+        if item.close is not None and item.open is not None
+    ]
     mean_body = sum(bodies) / len(bodies) if bodies else 0.0
     body = abs(float(latest.close) - float(latest.open))
     candle_range = float(latest.high) - float(latest.low)
     body_ratio = body / candle_range if candle_range > 0 else 0.0
-    displaced = mean_body > 0 and body >= BREAKOUT_BODY_MULTIPLIER * mean_body and body_ratio >= BREAKOUT_MIN_BODY_RANGE_RATIO
+    displaced = (
+        mean_body > 0
+        and body >= BREAKOUT_BODY_MULTIPLIER * mean_body
+        and body_ratio >= BREAKOUT_MIN_BODY_RANGE_RATIO
+    )
     bullish = float(latest.close) > range_high and float(latest.close) > float(latest.open)
     bearish = float(latest.close) < range_low and float(latest.close) < float(latest.open)
     if not bullish and not bearish:
@@ -8087,10 +8103,18 @@ async def get_candidate_strategy_detections(symbol: str) -> Dict[str, object]:
     if instrument is None:
         return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "INSTRUMENT_NOT_REGISTERED"}
     if instrument.asset_class != AssetClass.CRYPTO:
-        return {"status": "NOT_SUPPORTED", "symbol": canonical, "reason": "CANDIDATE_DETECTORS_CRYPTO_ONLY_V1"}
+        return {
+            "status": "NOT_SUPPORTED",
+            "symbol": canonical,
+            "reason": "CANDIDATE_DETECTORS_CRYPTO_ONLY_V1",
+        }
     provider_symbol = provider_symbol_map.to_provider("coinbase", canonical)
     if provider_symbol is None:
-        return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "PROVIDER_SYMBOL_NOT_MAPPED"}
+        return {
+            "status": "UNAVAILABLE",
+            "symbol": canonical,
+            "reason": "PROVIDER_SYMBOL_NOT_MAPPED",
+        }
     try:
         candles, quality = await market_provider.get_candles(
             provider_symbol, SERVER_SETUP_GRANULARITY, SERVER_SETUP_CANDLE_LIMIT
@@ -8098,10 +8122,20 @@ async def get_candidate_strategy_detections(symbol: str) -> Dict[str, object]:
     except (httpx.HTTPError, ValueError):
         return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "CANDLES_UNAVAILABLE"}
     if quality != DataQualityStatus.VALID:
-        return {"status": "WAIT", "symbol": canonical, "reason": "CANDLES_NOT_VALID", "quality": quality.value}
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "reason": "CANDLES_NOT_VALID",
+            "quality": quality.value,
+        }
     latest_quality = _latest_quality(candles)
     if latest_quality != DataQualityStatus.VALID.value:
-        return {"status": "WAIT", "symbol": canonical, "reason": "LATEST_CANDLE_NOT_FRESH", "quality": latest_quality}
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "reason": "LATEST_CANDLE_NOT_FRESH",
+            "quality": latest_quality,
+        }
     now = utcnow()
     regime = classify_server_market_regime(candles, now)
     detections = [

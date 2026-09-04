@@ -8738,3 +8738,143 @@ class CryptoUniverseExpansionV16M5B28ATests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"paper_only": True', source)
         self.assertIn('"execution": False', source)
 
+
+class TestV16M5B28B1TrendPullbackPaperExecution(unittest.TestCase):
+    def _candles(self, bullish=True):
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        items = []
+        base = 100.0
+        for index in range(24):
+            start = now - timedelta(minutes=5 * (24 - index))
+            price = base + index * (0.5 if bullish else -0.5)
+            items.append(main.Candle(
+                start=start,
+                open=price,
+                high=price + 1.0,
+                low=price - 1.0,
+                close=price + (0.4 if bullish else -0.4),
+                volume=10.0,
+                status=main.DataQualityStatus.VALID,
+            ))
+        return items, now
+
+    def _ticker(self, value, now):
+        return main.MarketDatum(
+            symbol="BTC-USD",
+            value=value,
+            timestamp=now,
+            source="coinbase",
+            status=main.DataQualityStatus.VALID,
+        )
+
+    def test_version_is_explicit(self):
+        self.assertEqual(main.TREND_PULLBACK_PAPER_VERSION, "0.2-paper")
+
+    def test_rr_rule_is_two(self):
+        self.assertEqual(main.TREND_PULLBACK_RISK_REWARD, Decimal("2"))
+
+    def test_non_setup_is_wait(self):
+        candles, now = self._candles()
+        result = main.build_trend_pullback_paper_plan(
+            candles, now, {"status": "WAIT"}, self._ticker(112.0, now)
+        )
+        self.assertEqual(result["reason"], "TREND_SETUP_NOT_READY")
+
+    def test_invalid_ticker_is_wait(self):
+        candles, now = self._candles()
+        ticker = self._ticker(112.0, now)
+        ticker.status = main.DataQualityStatus.INVALID
+        result = main.build_trend_pullback_paper_plan(
+            candles, now, {"status": "SETUP"}, ticker
+        )
+        self.assertEqual(result["reason"], "REALTIME_TICKER_NOT_VALID")
+
+    def test_bullish_plan_uses_pullback_low(self):
+        candles, now = self._candles()
+        detection = {
+            "status": "SETUP", "direction": "BULLISH",
+            "latest_closed_timestamp": candles[-1].start.isoformat(),
+        }
+        result = main.build_trend_pullback_paper_plan(
+            candles, now, detection, self._ticker(112.0, now)
+        )
+        self.assertEqual(result["status"], "ENTRY_NOW")
+        self.assertEqual(result["stop_loss"], Decimal(str(candles[-2].low)))
+
+    def test_bullish_plan_is_long(self):
+        candles, now = self._candles()
+        detection = {"status": "SETUP", "direction": "BULLISH"}
+        result = main.build_trend_pullback_paper_plan(
+            candles, now, detection, self._ticker(112.0, now)
+        )
+        self.assertEqual(result["side"], "LONG")
+
+    def test_bullish_target_is_two_r(self):
+        candles, now = self._candles()
+        detection = {"status": "SETUP", "direction": "BULLISH"}
+        result = main.build_trend_pullback_paper_plan(
+            candles, now, detection, self._ticker(112.0, now)
+        )
+        risk = result["entry"] - result["stop_loss"]
+        self.assertEqual(result["take_profit"], result["entry"] + Decimal("2") * risk)
+
+    def test_bearish_plan_uses_pullback_high(self):
+        candles, now = self._candles(bullish=False)
+        detection = {"status": "SETUP", "direction": "BEARISH"}
+        result = main.build_trend_pullback_paper_plan(
+            candles, now, detection, self._ticker(88.0, now)
+        )
+        self.assertEqual(result["status"], "ENTRY_NOW")
+        self.assertEqual(result["stop_loss"], Decimal(str(candles[-2].high)))
+
+    def test_bearish_plan_is_short(self):
+        candles, now = self._candles(bullish=False)
+        detection = {"status": "SETUP", "direction": "BEARISH"}
+        result = main.build_trend_pullback_paper_plan(
+            candles, now, detection, self._ticker(88.0, now)
+        )
+        self.assertEqual(result["side"], "SHORT")
+
+    def test_bearish_target_is_two_r(self):
+        candles, now = self._candles(bullish=False)
+        detection = {"status": "SETUP", "direction": "BEARISH"}
+        result = main.build_trend_pullback_paper_plan(
+            candles, now, detection, self._ticker(88.0, now)
+        )
+        risk = result["stop_loss"] - result["entry"]
+        self.assertEqual(result["take_profit"], result["entry"] - Decimal("2") * risk)
+
+    def test_plan_declares_real_ticker_source(self):
+        candles, now = self._candles()
+        result = main.build_trend_pullback_paper_plan(
+            candles, now, {"status": "SETUP", "direction": "BULLISH"},
+            self._ticker(112.0, now),
+        )
+        self.assertIn("REAL_COINBASE_TICKER", result["plan_source"])
+
+    def test_plan_is_paper_only(self):
+        candles, now = self._candles()
+        result = main.build_trend_pullback_paper_plan(
+            candles, now, {"status": "SETUP", "direction": "BULLISH"},
+            self._ticker(112.0, now),
+        )
+        self.assertTrue(result["paper_only"])
+        self.assertFalse(result["execution"])
+
+    def test_strategy_position_id_is_deterministic(self):
+        one = main.build_strategy_paper_position_id("TREND_PULLBACK", "BTC-USD", "LONG", "x")
+        two = main.build_strategy_paper_position_id("TREND_PULLBACK", "BTC-USD", "LONG", "x")
+        self.assertEqual(one, two)
+
+    def test_strategy_position_id_changes_by_strategy(self):
+        one = main.build_strategy_paper_position_id("TREND_PULLBACK", "BTC-USD", "LONG", "x")
+        two = main.build_strategy_paper_position_id("OTHER", "BTC-USD", "LONG", "x")
+        self.assertNotEqual(one, two)
+
+    def test_orchestrator_calls_trend_generation(self):
+        source = inspect.getsource(main.auto_entry_orchestrator_loop)
+        self.assertIn("run_trend_pullback_paper_generation_once", source)
+
+    def test_status_route_is_registered(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/strategies/trend-pullback/paper-status", paths)

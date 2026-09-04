@@ -8530,7 +8530,7 @@ class CryptoUniverseExpansionV16M5B28ATests(unittest.IsolatedAsyncioTestCase):
         self._to_provider = dict(main.provider_symbol_map._to_provider)
         self._to_canonical = dict(main.provider_symbol_map._to_canonical)
         self._activation = dict(main.crypto_universe_activation)
-        self._get_product_specs = main.market_provider.get_product_specs
+        self._list_products = main.market_provider.list_public_spot_products
 
     def tearDown(self):
         main.instrument_registry._by_canonical = self._instruments
@@ -8538,12 +8538,13 @@ class CryptoUniverseExpansionV16M5B28ATests(unittest.IsolatedAsyncioTestCase):
         main.provider_symbol_map._to_canonical = self._to_canonical
         main.crypto_universe_activation.clear()
         main.crypto_universe_activation.update(self._activation)
-        main.market_provider.get_product_specs = self._get_product_specs
+        main.market_provider.list_public_spot_products = self._list_products
 
     @staticmethod
-    def _product(symbol="DOGE-USD", **overrides):
+    def _product(symbol="DOGE-USD", volume="1000", **overrides):
         payload = {
             "product_id": symbol,
+            "product_type": "SPOT",
             "base_increment": "0.1",
             "quote_increment": "0.01",
             "base_min_size": "1",
@@ -8552,31 +8553,36 @@ class CryptoUniverseExpansionV16M5B28ATests(unittest.IsolatedAsyncioTestCase):
             "quote_max_size": "10000000",
             "trading_disabled": False,
             "view_only": False,
+            "approximate_quote_24h_volume": volume,
         }
         payload.update(overrides)
         return payload
 
-    def test_candidate_universe_expands_beyond_original_six(self):
-        self.assertGreaterEqual(len(main.CRYPTO_UNIVERSE_CANDIDATES), 18)
+    def test_target_is_exactly_one_hundred(self):
+        self.assertEqual(main.CRYPTO_UNIVERSE_TARGET_SIZE, 100)
 
-    def test_candidates_are_usd_products(self):
-        self.assertTrue(all(s.endswith("-USD") for s in main.CRYPTO_UNIVERSE_CANDIDATES))
+    def test_public_list_requests_spot_volume_ranking(self):
+        source = inspect.getsource(main.CoinbaseProvider.list_public_spot_products)
+        self.assertIn('"product_type": "SPOT"', source)
+        self.assertIn("PRODUCTS_SORT_ORDER_VOLUME_24H_DESCENDING", source)
 
-    def test_candidates_do_not_duplicate_original_six(self):
-        original = {"BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "LTC-USD", "ADA-USD"}
-        self.assertTrue(original.isdisjoint(main.CRYPTO_UNIVERSE_CANDIDATES))
-
-    def test_product_eligibility_accepts_verified_product(self):
+    def test_product_eligibility_accepts_verified_spot_usd(self):
         ok, reason = main.coinbase_product_is_eligible("DOGE-USD", self._product())
         self.assertTrue(ok)
         self.assertEqual(reason, "COINBASE_PRODUCT_VERIFIED")
 
-    def test_product_eligibility_rejects_id_mismatch(self):
+    def test_product_eligibility_rejects_non_spot(self):
         ok, reason = main.coinbase_product_is_eligible(
-            "DOGE-USD", self._product(product_id="AVAX-USD")
+            "DOGE-USD", self._product(product_type="FUTURE")
         )
         self.assertFalse(ok)
-        self.assertEqual(reason, "PRODUCT_ID_MISMATCH")
+        self.assertEqual(reason, "PRODUCT_NOT_SPOT")
+
+    def test_product_eligibility_rejects_non_usd(self):
+        product = self._product(symbol="DOGE-EUR")
+        ok, reason = main.coinbase_product_is_eligible("DOGE-EUR", product)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "QUOTE_NOT_USD")
 
     def test_product_eligibility_rejects_disabled(self):
         ok, reason = main.coinbase_product_is_eligible(
@@ -8585,19 +8591,40 @@ class CryptoUniverseExpansionV16M5B28ATests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok)
         self.assertEqual(reason, "TRADING_DISABLED")
 
-    def test_product_eligibility_rejects_view_only(self):
-        ok, reason = main.coinbase_product_is_eligible(
-            "DOGE-USD", self._product(view_only=True)
-        )
-        self.assertFalse(ok)
-        self.assertEqual(reason, "VIEW_ONLY")
-
     def test_product_eligibility_rejects_invalid_specs(self):
         ok, reason = main.coinbase_product_is_eligible(
             "DOGE-USD", self._product(base_increment="0")
         )
         self.assertFalse(ok)
         self.assertEqual(reason, "PRODUCT_SPECS_INVALID")
+
+    def test_selector_orders_by_real_quote_volume(self):
+        payload = {"products": [
+            self._product("DOGE-USD", "10"),
+            self._product("LINK-USD", "100"),
+            self._product("AVAX-USD", "50"),
+        ]}
+        selected = main.select_coinbase_top_usd_spot_products(payload, target=3)
+        self.assertEqual(
+            [item["product_id"] for item in selected],
+            ["LINK-USD", "AVAX-USD", "DOGE-USD"],
+        )
+
+    def test_selector_caps_at_target(self):
+        products = [self._product(f"C{i}-USD", str(1000 - i)) for i in range(120)]
+        selected = main.select_coinbase_top_usd_spot_products(
+            {"products": products}, target=100
+        )
+        self.assertEqual(len(selected), 100)
+
+    def test_selector_rejects_missing_or_zero_volume(self):
+        zero = self._product("ZERO-USD", "0")
+        missing = self._product("MISS-USD")
+        missing.pop("approximate_quote_24h_volume")
+        selected = main.select_coinbase_top_usd_spot_products(
+            {"products": [zero, missing]}
+        )
+        self.assertEqual(selected, [])
 
     def test_verified_registration_enters_registry_and_mapping(self):
         self.assertTrue(main.register_verified_coinbase_crypto("DOGE-USD"))
@@ -8607,29 +8634,26 @@ class CryptoUniverseExpansionV16M5B28ATests(unittest.IsolatedAsyncioTestCase):
             "DOGE-USD",
         )
 
-    def test_registration_rejects_non_usd_symbol(self):
-        self.assertFalse(main.register_verified_coinbase_crypto("DOGE-EUR"))
+    async def test_activation_registers_dynamic_ranked_products(self):
+        async def fake_list(limit=250):
+            return {"products": [
+                self._product("DOGE-USD", "10"),
+                self._product("LINK-USD", "100"),
+            ]}
 
-    async def test_activation_registers_only_live_verified_candidates(self):
-        async def fake_specs(symbol):
-            if symbol == "DOGE-USD":
-                return self._product(symbol)
-            return self._product(symbol, trading_disabled=True)
-
-        main.market_provider.get_product_specs = fake_specs
+        main.market_provider.list_public_spot_products = fake_list
         result = await main.activate_verified_crypto_universe()
-        self.assertIn("DOGE-USD", result["activated"])
-        self.assertIsNotNone(main.instrument_registry.get("DOGE-USD"))
-        self.assertNotIn("AVAX-USD", result["activated"])
+        self.assertEqual(result["activated"], ["LINK-USD", "DOGE-USD"])
+        self.assertEqual(result["ranking"], "COINBASE_24H_QUOTE_VOLUME_DESC")
 
     async def test_activation_fails_closed_on_provider_error(self):
-        async def fake_specs(symbol):
+        async def fake_list(limit=250):
             raise httpx.ConnectError("offline")
 
-        main.market_provider.get_product_specs = fake_specs
+        main.market_provider.list_public_spot_products = fake_list
         result = await main.activate_verified_crypto_universe()
+        self.assertEqual(result["status"], "DEGRADED")
         self.assertEqual(result["activated"], [])
-        self.assertEqual(len(result["rejected"]), len(main.CRYPTO_UNIVERSE_CANDIDATES))
 
     def test_lifespan_activates_universe_before_websocket(self):
         source = inspect.getsource(main.lifespan)
@@ -8637,20 +8661,18 @@ class CryptoUniverseExpansionV16M5B28ATests(unittest.IsolatedAsyncioTestCase):
         websocket = source.index("start_server_crypto_market_stream")
         self.assertLess(activation, websocket)
 
-    def test_websocket_population_is_registry_driven(self):
-        source = inspect.getsource(main.start_server_crypto_market_stream)
-        self.assertIn("instrument_registry.all()", source)
-        self.assertNotIn("BTC-USD\", \"ETH-USD", source)
+    def test_scanner_and_websocket_are_registry_driven(self):
+        ws_source = inspect.getsource(main.start_server_crypto_market_stream)
+        scan_source = inspect.getsource(main.run_server_auto_paper_generation_once)
+        self.assertIn("instrument_registry.all()", ws_source)
+        self.assertIn("instrument_registry.all()", scan_source)
 
-    def test_auto_scanner_population_is_registry_driven(self):
-        source = inspect.getsource(main.run_server_auto_paper_generation_once)
-        self.assertIn("instrument_registry.all()", source)
-        self.assertIn("AssetClass.CRYPTO", source)
-
-    def test_universe_endpoint_is_observable_and_paper_only(self):
+    def test_universe_endpoint_exposes_real_ranking_and_paper_only(self):
         paths = {route.path for route in main.api_router.routes}
         self.assertIn("/market/crypto-universe", paths)
         source = inspect.getsource(main.get_crypto_universe)
-        self.assertIn('"source": "coinbase_public_product"', source)
+        self.assertIn('"source": "coinbase_public_products"', source)
+        self.assertIn("COINBASE_24H_QUOTE_VOLUME_DESC", source)
         self.assertIn('"paper_only": True', source)
         self.assertIn('"execution": False', source)
+

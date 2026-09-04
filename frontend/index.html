@@ -493,84 +493,46 @@ function clear(n){while(n&&n.firstChild)n.removeChild(n.firstChild)}function byI
 function apiRequest(path,options){var ctrl=new AbortController(),to=setTimeout(function(){ctrl.abort()},8000),opts=options||{};opts.headers=Object.assign({"Accept":"application/json"},opts.headers||{});opts.signal=ctrl.signal;return fetch(path,opts).then(function(res){clearTimeout(to);return res.text().then(function(txt){var data=null;try{data=txt?JSON.parse(txt):null}catch(e){}return{ok:res.ok,status:res.status,data:data}})}).catch(function(err){clearTimeout(to);return{ok:false,status:0,data:null,netError:err&&err.name==="AbortError"?"timeout":"network"}})}
 function api(path){return apiRequest(path,{method:"GET"})}
 function apiPost(path,body){return apiRequest(path,{method:"POST",headers:{"Content-Type":"application/json"},body:body===undefined?undefined:JSON.stringify(body)})}
-var paperUiState={account:null,positions:[],performance:null,decisions:[],watchdog:null,runtime:null,error:null,sectionErrors:{},loading:false,updatedAt:null,serverSnapshotAt:null,decisionSymbol:"",decisionState:""};
-function paperMetric(v,suffix){
-  if(v===null||v===undefined||v===""||!Number.isFinite(Number(v)))return "—";
-  return Number(v).toLocaleString("en-US",{maximumFractionDigits:2})+(suffix||"");
-}
+var paperUiState={account:null,positions:[],error:null,loading:false,updatedAt:null};
 function paperMoney(v){
   if(v===null||v===undefined||v===""||!Number.isFinite(Number(v)))return "—";
   return Number(v).toLocaleString("en-US",{style:"currency",currency:"USD",
     minimumFractionDigits:2,maximumFractionDigits:2});
 }
-function snapshotSection(snapshot,name){
-  var section=snapshot&&snapshot.sections&&snapshot.sections[name];
-  return section&&section.status==="OK"?section.data:null;
+function paperPositionPnl(p){
+  if(!p||p.status!=="CLOSED"||p.close_price===null||p.close_price===undefined)return null;
+  var entry=Number(p.entry),close=Number(p.close_price),size=Number(p.size);
+  if(![entry,close,size].every(Number.isFinite))return null;
+  return (p.side==="LONG"?close-entry:entry-close)*size;
 }
 function refreshPaperTrading(){
   if(paperUiState.loading)return Promise.resolve();
   paperUiState.loading=true;
-  var snapshotPath="/api/v1/paper/ui-snapshot",snapshotParams=[];
-  if(paperUiState.decisionSymbol)snapshotParams.push("symbol="+encodeURIComponent(paperUiState.decisionSymbol));
-  if(paperUiState.decisionState)snapshotParams.push("state="+encodeURIComponent(paperUiState.decisionState));
-  if(snapshotParams.length)snapshotPath+="?"+snapshotParams.join("&");
-  return api(snapshotPath).then(function(result){
-    if(!result.ok||!result.data){paperUiState.error=errorMessage(result);return;}
-    var snap=result.data,sections=snap.sections||{};
-    paperUiState.serverSnapshotAt=snap.snapshot_at||null;
-    paperUiState.sectionErrors={};
-    Object.keys(sections).forEach(function(name){
-      if(sections[name]&&sections[name].status!=="OK"){
-        paperUiState.sectionErrors[name]=sections[name].reason||"UNAVAILABLE";
+  return Promise.all([api("/api/v1/paper/account/live"),api("/api/v1/paper/positions"),
+    api("/api/v1/paper/positions/live")])
+    .then(function(results){
+      var account=results[0],positions=results[1],live=results[2];
+      if(!account.ok||!positions.ok||!live.ok){
+        paperUiState.error=errorMessage(!account.ok?account:(!positions.ok?positions:live));
+        return;
       }
-    });
-    var account=snapshotSection(snap,"account");
-    var positions=snapshotSection(snap,"positions");
-    var live=snapshotSection(snap,"live_positions");
-    var performance=snapshotSection(snap,"performance");
-    var decisions=snapshotSection(snap,"decision_history");
-    var watchdog=snapshotSection(snap,"watchdog");
-    var runtime=snapshotSection(snap,"runtime");
-    if(account)paperUiState.account=account;
-    if(performance)paperUiState.performance=performance;
-    if(decisions)paperUiState.decisions=decisions.items||[];
-    if(watchdog)paperUiState.watchdog=watchdog;
-    if(runtime)paperUiState.runtime=runtime;
-    if(positions){
-      var persisted=positions.positions||[],liveRows=live&&live.positions||[],liveById={};
-      liveRows.forEach(function(row){liveById[row.position_id]=row});
-      paperUiState.positions=persisted.map(function(row){
-        return row.status==="OPEN"&&liveById[row.position_id]?liveById[row.position_id]:row;
+      paperUiState.account=account.data||null;
+      var persisted=(positions.data&&positions.data.positions)||[];
+      var liveRows=(live.data&&live.data.positions)||[];
+      var liveById={};
+      liveRows.forEach(function(p){liveById[p.position_id]=p});
+      paperUiState.positions=persisted.map(function(p){
+        return p.status==="OPEN"&&liveById[p.position_id]?liveById[p.position_id]:p;
       });
-    }
-    paperUiState.error=null;
-    paperUiState.updatedAt=new Date().toISOString();
-  }).finally(function(){
-    paperUiState.loading=false;
-    if(current==="trading")renderTrading();
-    if(current==="signals")renderSignals();
-    if(current==="dashboard")renderDashboard();
-  });
-}
-
-function paperDecisionCard(d){
-  return h("div",{class:"help-card"},[
-    h("div",{class:"kv"},[h("b",{},[d.symbol||"—"]),h("b",{},[d.state||"—"])]),
-    h("p",{},[d.reason||"Aucune raison persistée"]),
-    h("div",{class:"muted"},[(d.timestamp||"—")+(d.setup_state?" · setup "+d.setup_state:"")])
-  ]);
-}
-function paperDecisionFilters(){
-  var symbols=[""].concat(CRYPTO_SYMBOLS),states=["","WAIT","ENTRY_NOW","BLOCKED","INVALIDATED","EXPIRED"];
-  var symbol=h("select",{class:"subtab","aria-label":"Filtre symbole"},symbols.map(function(x){return h("option",{value:x},[x||"Tous symboles"])}));
-  var state=h("select",{class:"subtab","aria-label":"Filtre état"},states.map(function(x){return h("option",{value:x},[x||"Tous états"])}));
-  symbol.value=paperUiState.decisionSymbol;state.value=paperUiState.decisionState;
-  symbol.addEventListener("change",function(){paperUiState.decisionSymbol=symbol.value;paperUiState.updatedAt=null;refreshPaperTrading()});
-  state.addEventListener("change",function(){paperUiState.decisionState=state.value;paperUiState.updatedAt=null;refreshPaperTrading()});
-  return h("div",{class:"subtabs"},[symbol,state]);
+      paperUiState.error=null;
+      paperUiState.updatedAt=new Date().toISOString();
+    }).finally(function(){
+      paperUiState.loading=false;
+      if(current==="trading")renderTrading();
+    });
 }
 function paperPositionCard(p){
-  var closed=p.status==="CLOSED",pnl=p.realized_pnl;
+  var closed=p.status==="CLOSED",pnl=paperPositionPnl(p);
   return h("div",{class:"journal-card"},[
     h("div",{class:"tool-foot"},[
       h("b",{},[p.symbol||"—"]),
@@ -587,7 +549,7 @@ function paperPositionCard(p){
       h("div",{class:"kv"},[h("span",{},["Prix actuel"]),
         h("b",{},[!closed&&p.mark_status==="VALID"?fmtNum(p.mark_price)||"—":"—"])]),
       h("div",{class:"kv"},[h("span",{},[closed?"P&L réalisé":"P&L latent"]),
-        h("b",{},[closed&&pnl!==null&&pnl!==undefined?paperMoney(pnl):
+        h("b",{},[closed&&pnl!==null?paperMoney(pnl):
           (!closed&&p.mark_status==="VALID"?paperMoney(p.unrealized_pnl):"—")])]),
       h("div",{class:"kv"},[h("span",{},["Mark"]),
         h("b",{},[closed?"CLOSED":(p.mark_status||"UNAVAILABLE")])]),
@@ -628,13 +590,11 @@ function kpi(label,value,foot,cls){return h("div",{class:"card kpi"},[h("div",{c
 
 function renderDashboard(){
  var v=byId("view-dashboard");clear(v);
- var dashAccount=paperUiState.account;
- var activeSignals=paperUiState.decisions.filter(function(d){return d.state==="ENTRY_NOW"}).length;
  v.appendChild(h("div",{class:"kpis"},[
   kpi("Marché","…","Crypto · Forex · Métaux · Indices","green"),
-  kpi("Signaux ENTRY_NOW",String(activeSignals),"Historique serveur · 50 dernières"),
-  kpi("Capital virtuel",dashAccount?paperMoney(dashAccount.current_capital):"—","PostgreSQL paper"),
-  kpi("Exposition",dashAccount?String(dashAccount.open_positions):"—","Positions OPEN")
+  kpi("Signaux actifs","—","NOT IMPLEMENTED"),
+  kpi("Capital virtuel","—","NOT IMPLEMENTED"),
+  kpi("Exposition","—","NOT IMPLEMENTED")
  ]));
  v.appendChild(h("div",{class:"card hours",id:"dash-hours"},[loading("État du marché…")]));
  var fav=h("div",{class:"card fav"},[
@@ -644,12 +604,11 @@ function renderDashboard(){
  fav.appendChild(favRow("BTC-USD","Bitcoin","crypto"));fav.appendChild(favRow("ETH-USD","Ethereum","crypto"));fav.appendChild(favRow("SOL-USD","Solana","crypto"));fav.appendChild(favRow("XAU-USD","Gold Spot","metal"));fav.appendChild(favRow("US30","Dow Jones 30","index"));v.appendChild(fav);
  v.appendChild(h("div",{class:"actions"},[
   h("div",{class:"card action",onclick:function(){setView("intelligence")}},[h("div",{class:"aico blue",html:iconSvg("scanner")},[]),h("b",{},["Scanner"]),h("span",{class:"blue"},["Opportunités"])]),
-  h("div",{class:"card action",onclick:function(){setView("signals")}},[h("div",{class:"aico purple",html:iconSvg("signals")},[]),h("b",{},["Signaux"]),h("span",{class:"purple"},["Serveur"])]),
+  h("div",{class:"card action",onclick:function(){setView("signals")}},[h("div",{class:"aico purple",html:iconSvg("signals")},[]),h("b",{},["Signaux"]),h("span",{class:"purple"},["À venir"])]),
   h("div",{class:"card action",onclick:function(){if(detailCtx){setView("detail")}else{setView("markets")}}},[h("div",{class:"aico green",html:iconSvg("charts")},[]),h("b",{},["Graphiques"]),h("span",{class:"green"},["À venir"])]),
-  h("div",{class:"card action",onclick:function(){setView("trading")}},[h("div",{class:"aico orange",html:iconSvg("paper")},[]),h("b",{},["Paper Trading"]),h("span",{class:"orange"},["Actif"])])
+  h("div",{class:"card action",onclick:function(){setView("trading")}},[h("div",{class:"aico orange",html:iconSvg("paper")},[]),h("b",{},["Paper Trading"]),h("span",{class:"orange"},["À venir"])])
  ]));
- v.appendChild(h("div",{class:"note"},["Les champs indisponibles restent vides : aucune donnée inventée."]));
- if(!paperUiState.loading&&!paperUiState.updatedAt)refreshPaperTrading();
+ v.appendChild(h("div",{class:"note"},["Les champs non implémentés restent vides : aucune donnée inventée."]));
  refreshDashboard()
 }
 
@@ -718,34 +677,28 @@ function placeholder(title,sub){
 
 function renderSignals(){
   var v=byId("view-signals");clear(v);
-  var watchdog=paperUiState.watchdog||{},runtime=paperUiState.runtime||{};
-  var rows=paperUiState.decisions.filter(function(d){
-    return (!paperUiState.decisionSymbol||d.symbol===paperUiState.decisionSymbol)&&
-      (!paperUiState.decisionState||d.state===paperUiState.decisionState);
-  });
-  v.appendChild(pageHead("Signaux","Décisions SMC serveur persistées et état du scanner.","SERVER AUTHORITATIVE"));
-  v.appendChild(modCard("Signal Engine",watchdog.status||"UNKNOWN",h("div",{class:"section-stack"},[
-    h("div",{class:"kv"},[h("span",{},["Watchdog scanner"]),h("b",{},[watchdog.status||"—"])]),
-    h("div",{class:"kv"},[h("span",{},["Dernier cycle"]),h("b",{},[runtime.last_completed_at||"—"])]),
-    h("div",{class:"kv"},[h("span",{},["Itérations"]),h("b",{},[runtime.iterations===undefined?"—":String(runtime.iterations)])]),
+  v.appendChild(pageHead("Signaux","Setups structurés, cycle de validation, raisons d'entrée et d'invalidation.","UI HYPER FULL"));
+  v.appendChild(h("div",{class:"subtabs"},[
+    h("button",{class:"subtab active"},["Actifs"]),h("button",{class:"subtab"},["Watchlist"]),
+    h("button",{class:"subtab"},["Historique"]),h("button",{class:"subtab"},["Alertes"]),h("button",{class:"subtab"},["Explications"])
+  ]));
+  v.appendChild(modCard("Signal Engine","NOT IMPLEMENTED",h("div",{class:"section-stack"},[
+    placeholder("Aucun signal réel disponible","Le moteur backend n'est pas encore branché. Aucun LONG/SHORT fictif n'est généré."),
     h("div",{class:"pipeline"},[
-      h("div",{class:"pipe"},[h("b",{},["1. CONTEXTE"]),"Régime + structure"]),
-      h("div",{class:"pipe"},[h("b",{},["2. LIQUIDITÉ"]),"Sweep"]),
-      h("div",{class:"pipe"},[h("b",{},["3. CONFIRMATION"]),"Displacement + BOS/CHoCH + OB/FVG"]),
-      h("div",{class:"pipe"},[h("b",{},["4. GATE"]),"Retest + ENTRY_NOW"])
+      h("div",{class:"pipe"},[h("b",{},["1. CONTEXTE"]),"Régime + HTF"]),
+      h("div",{class:"pipe"},[h("b",{},["2. LIQUIDITÉ"]),"Niveaux + sweep"]),
+      h("div",{class:"pipe"},[h("b",{},["3. STRUCTURE"]),"BOS / CHoCH / MSS"]),
+      h("div",{class:"pipe"},[h("b",{},["4. ENTRÉE"]),"Retest + revalidation"])
     ])
   ])));
-  v.appendChild(modCard("Historique des décisions","POSTGRES · 50 DERNIÈRES",h("div",{class:"section-stack"},[
-    paperDecisionFilters(),
-    rows.length?h("div",{class:"grid-2"},rows.map(paperDecisionCard)):
-      placeholder("Aucune décision correspondante","Le scanner reste WAIT tant que les confirmations strictes ne sont pas réunies.")
+  v.appendChild(modCard("Fiche signal","NOT IMPLEMENTED",h("div",{class:"info-grid"},[
+    h("div",{class:"journal-card"},[h("h4",{},["Direction & actif"]),h("p",{},["LONG / SHORT / WAIT, actif, timeframe, session."])]),
+    h("div",{class:"journal-card"},[h("h4",{},["Entry / SL / TP"]),h("p",{},["Zone d'entrée, invalidation structurelle, objectifs de liquidité."])]),
+    h("div",{class:"journal-card"},[h("h4",{},["Confirmations"]),h("p",{},["Sweep, displacement, BOS/CHoCH/MSS, OB, FVG, retest."])]),
+    h("div",{class:"journal-card"},[h("h4",{},["Qualité des données"]),h("p",{},["Source, freshness, sync, état du marché, limitations."])])
   ])));
-  v.appendChild(modCard("Synchronisation","SERVER SNAPSHOT",h("div",{class:"section-stack"},[
-    h("div",{class:"kv"},[h("span",{},["Snapshot serveur"]),h("b",{},[paperUiState.serverSnapshotAt||"—"])]),
-    h("div",{class:"kv"},[h("span",{},["Lecture navigateur"]),h("b",{},[paperUiState.updatedAt||"—"])]),
-    h("div",{class:"kv"},[h("span",{},["Exécution réelle"]),h("b",{},["DÉSACTIVÉE"])])
-  ])));
-  if(!paperUiState.loading&&!paperUiState.updatedAt)refreshPaperTrading();
+  v.appendChild(modCard("Historique des décisions","NOT IMPLEMENTED",
+    placeholder("Historique indisponible","Chaque signal futur conservera timestamp, stratégie/version, régime, confirmations et résultat.")));
 }
 
 function renderTradingContent(){
@@ -789,22 +742,6 @@ function renderTradingContent(){
   }
   var open=paperUiState.positions.filter(function(p){return p.status==="OPEN"});
   var closed=paperUiState.positions.filter(function(p){return p.status==="CLOSED"});
-  var perf=paperUiState.performance&&paperUiState.performance.metrics;
-  v.appendChild(modCard("Performance paper","PERSISTÉE",perf?h("div",{class:"metric-strip"},[
-    h("div",{class:"metric-mini"},[h("span",{},["Trades clôturés"]),h("b",{},[String(perf.closed_trades)])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Win Rate"]),h("b",{},[paperMetric(perf.win_rate_percent," %")])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Profit Factor"]),h("b",{},[paperMetric(perf.profit_factor,"")])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Expectancy"]),h("b",{},[paperMoney(perf.expectancy)])]),
-    h("div",{class:"metric-mini"},[h("span",{},["P&L net"]),h("b",{},[paperMoney(perf.net_pnl)])]),
-    h("div",{class:"metric-mini"},[h("span",{},["RR réalisé moyen"]),h("b",{},[paperMetric(perf.average_realized_rr," R")])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Max Drawdown"]),h("b",{},[paperMoney(perf.max_drawdown)])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Max DD %"]),h("b",{},[paperMetric(perf.max_drawdown_percent," %")])])
-  ]):placeholder("Performance indisponible","Aucune métrique n’est inventée sans historique CLOSED persisté.")));
-  v.appendChild(modCard("Historique des décisions","POSTGRES · 50 DERNIÈRES",h("div",{class:"section-stack"},[
-    paperDecisionFilters(),
-    paperUiState.decisions.length?h("div",{class:"grid-2"},paperUiState.decisions.map(paperDecisionCard)):
-      placeholder("Aucune décision persistée","WAIT / ENTRY_NOW / BLOCKED / INVALIDATED / EXPIRED apparaîtront ici après le scanner réel.")
-  ])));
   v.appendChild(modCard("Positions ouvertes",open.length+" OPEN",
     open.length?h("div",{class:"grid-2"},open.map(paperPositionCard)):
       placeholder("Aucune position ouverte",
@@ -816,12 +753,8 @@ function renderTradingContent(){
   v.appendChild(modCard("Sécurité","PAPER ONLY",h("div",{class:"section-stack"},[
     h("div",{class:"kv"},[h("span",{},["Exécution broker / MT5"]),h("b",{},["DÉSACTIVÉE"])]),
     h("div",{class:"kv"},[h("span",{},["Données inventées"]),h("b",{},["AUCUNE"])]),
-    h("div",{class:"kv"},[h("span",{},["Snapshot serveur"]),
-      h("b",{},[paperUiState.serverSnapshotAt||"—"])]),
     h("div",{class:"kv"},[h("span",{},["Dernière lecture UI"]),
-      h("b",{},[paperUiState.updatedAt||"—"])]),
-    h("div",{class:"kv"},[h("span",{},["Sections indisponibles"]),
-      h("b",{},[Object.keys(paperUiState.sectionErrors).join(", ")||"AUCUNE"])])
+      h("b",{},[paperUiState.updatedAt||"—"])])
   ])));
   if(!paperUiState.loading&&!paperUiState.updatedAt)refreshPaperTrading();
 }
@@ -1653,7 +1586,7 @@ setInterval(applyOfficialAssetLogos,500);setTimeout(applyOfficialAssetLogos,0);
 
 function renderHelpGlossary(){
   return modCard("Glossaire intégré","NOT IMPLEMENTED",h("div",{class:"help-grid"},[
-    h("div",{class:"help-card"},[h("b",{},["BOS"]),h("p",{},["Break of Structure : rupture structurale selon les règles du moteur."])]),h("div",{class:"help-card"},[h("b",{},["CHoCH / MSS"]),h("p",{},["Changement potentiel de caractère/structure : cassure à la clôture du dernier swing opposé après un biais HH+HL ou LH+LL confirmé."])]),h("div",{class:"help-card"},[h("b",{},["Liquidity Sweep"]),h("p",{},["BSL : prise de liquidité au-dessus d’un Swing High confirmé avec clôture sous le niveau. SSL : prise sous un Swing Low confirmé avec clôture au-dessus."])]),h("div",{class:"help-card"},[h("b",{},["Displacement"]),h("p",{},["Impulsion normalisée : corps ≥ 1,5× moyenne des 20 corps précédents, corps/range ≥ 70 %, clôture dans les 20 % de l’extrémité directionnelle. Seuils à valider par backtest/OOS."])]),h("div",{class:"help-card"},[h("b",{},["FVG"]),h("p",{},["Fair Value Gap strict sur 3 bougies closes. La zone est suivie OPEN → PARTIALLY_MITIGATED → MITIGATED. Le badge DISP est séparé : un FVG seul n’est pas une entrée."])]),h("div",{class:"help-card"},[h("b",{},["Server Market Detector V16-M5B1"]),h("p",{},["Le backend lit maintenant les vraies candles Coinbase 5m, ignore la candle encore ouverte, conserve uniquement les candles VALID et calcule des swings confirmés strength=2 puis un état BULLISH / BEARISH / RANGE. Le détecteur serveur enchaîne maintenant structure, sweep, displacement, FVG, Order Block, retest, trade plan et ENTRY_NOW sans look-ahead."])]),h("div",{class:"help-card"},[h("b",{},["Auto Entry Orchestrator V16-M5A"]),h("p",{},["Une boucle serveur revalide automatiquement les candidats server-side et appelle M4 toutes les 5 secondes. Elle suit le cycle de vie du backend et reste PAPER ONLY. La détection autonome complète des setups SMC est active côté serveur et reste PAPER ONLY : aucun signal n’est inventé."])]),h("div",{class:"help-card"},[h("b",{},["Verified Auto Paper Entry V16-M4"]),h("p",{},["Le backend peut maintenant ouvrir une position PAPER automatiquement uniquement si le signal serveur est READY et les specs Coinbase sont VALID. Le sizing part du risque, est arrondi vers le bas au base_increment, respecte les minimums/maximums et ne dépasse pas le capital disponible en notionnel. Un ID déterministe empêche de recréer le même signal. Aucun ordre broker ou MT5 n’est envoyé."])]),h("div",{class:"help-card"},[h("b",{},["Server Instrument Specs V16-M3"]),h("p",{},["Pour les cryptos Coinbase mappées, le backend lit maintenant les incréments et limites de taille depuis le produit public Coinbase. Les valeurs ne sont jamais codées en dur. Forex, Gold et Indices restent NOT_SUPPORTED pour le sizing automatique tant qu’une source vérifiée équivalente n’est pas intégrée. L’auto-entry reste bloqué jusqu’à la consommation atomique de ce snapshot par le gate."])]),h("div",{class:"help-card"},[h("b",{},["Server Signal Engine V16-M2"]),h("p",{},["Le backend dérive maintenant LONG / SHORT / WAIT à partir d’un setup ENTRY_NOW, structure + displacement + Order Block confirmés, Entry/SL/TP/RR cohérents et timestamp VALID. La décision du navigateur n’est pas considérée comme autoritaire. L’auto-entry reste bloqué jusqu’aux spécifications instrument serveur vérifiées."])]),h("div",{class:"help-card"},[h("b",{},["Auto Paper Entry Gate V16-M1"]),h("p",{},["La barrière serveur est active mais bloque volontairement toute ouverture automatique tant que le Signal Engine n’est pas autoritaire côté backend et que les spécifications de sizing de l’instrument ne sont pas vérifiées côté serveur. Le navigateur ne peut pas déclarer lui-même ces preuves comme fiables. Aucun trade n’est créé par M1."])]),h("div",{class:"help-card"},[h("b",{},["Paper Live Equity V1"]),h("p",{},["Équité live = capital réalisé + P&L latent des positions OPEN dont le mark multi-actifs est VALID. Si au moins une position OPEN n’a pas de mark valide, l’équité et le P&L latent globaux restent — avec statut PARTIAL au lieu d’inventer une valeur."])]),h("div",{class:"help-card"},[h("b",{},["Paper Account V1"]),h("p",{},["Le compte paper est initialisé une seule fois en PostgreSQL avec 1 000 USD, indépendamment des positions. Le capital actuel = capital initial + P&L réalisé. Le capital n’est pas réinitialisé lors d’un redémarrage."])]),h("div",{class:"help-card"},[h("b",{},["Paper Trading UI V1"]),h("p",{},["La page Trading lit /paper/account, /paper/positions et /paper/positions/live. Pour chaque position OPEN, le snapshot réutilise le vrai mark multi-actifs qualifié VALID et calcule le P&L latent. Si aucun mark valide n’existe, Prix actuel et P&L latent restent — avec Mark UNAVAILABLE."])]),h("div",{class:"help-card"},[h("b",{},["Paper Multi-Asset V1"]),h("p",{},["Le moniteur paper accepte maintenant les flux backend réels déjà disponibles : Crypto/Coinbase, Forex/Massive BBO, Gold/Twelve Data price et Indices/Massive Value. Chaque donnée doit être VALID. Pour Forex, le mark paper utilise le milieu du vrai bid/ask reçu ; aucun OHLC ni prix manquant n’est synthétisé. Les indices conservent la nature 15 minutes delayed du flux Massive actuel."])]),h("div",{class:"help-card"},[h("b",{},["Paper Auto Loop V1"]),h("p",{},["Le serveur lance maintenant automatiquement le moniteur paper pendant son cycle de vie. La cadence minimale est 1 seconde. Chaque itération reste fail-safe : si PostgreSQL ou le ticker VALID est indisponible, aucun prix n’est inventé et la boucle continue. À l’arrêt du serveur, la tâche reçoit un signal d’arrêt et se termine avant les connexions marché."])]),h("div",{class:"help-card"},[h("b",{},["Paper Realtime Monitor V1"]),h("p",{},["Le moniteur lit les positions OPEN et utilise uniquement un ticker backend déjà qualifié VALID. Si le flux est absent, stale/invalide ou non pris en charge, la position n’est pas marquée et reste ouverte. V1 branche d’abord Crypto/Coinbase ; Forex, Gold et Indices restent explicitement indisponibles jusqu’à leur adaptation sans donnée synthétique."])]),h("div",{class:"help-card"},[h("b",{},["Paper P&L V1"]),h("p",{},["Le backend peut maintenant marquer une position OPEN avec un prix réel fourni avec source et timestamp. Tant que SL/TP ne sont pas atteints, il renvoie le P&L non réalisé. Au SL ou TP, il ferme atomiquement la position en PostgreSQL et renvoie le P&L réalisé. Aucun ordre broker/MT5."])]),h("div",{class:"help-card"},[h("b",{},["Paper Persistence V1"]),h("p",{},["Les positions paper peuvent maintenant être enregistrées durablement dans PostgreSQL via le backend. L’API refuse l’écriture si la persistance est indisponible, valide LONG/SHORT et les niveaux, préserve les Decimal sous forme exacte côté base et interdit les doublons de position_id. Aucun ordre broker/MT5 n’est créé."])]),h("div",{class:"help-card"},[h("b",{},["Paper Position V1"]),h("p",{},["Une position virtuelle OPEN n’est créée que si le candidat Risk est READY, la taille est VALID et l’instrument possède symbole, source et timestamp. LONG exige SL<Entry<TP ; SHORT exige TP<Entry<SL. Le suivi peut marquer STOP LOSS ou TAKE PROFIT avec un prix observé et son timestamp. Si SL et TP sont simultanément ambigus, l’état devient CONFLICT au lieu d’inventer un résultat. Aucun ordre broker/MT5 n’est envoyé."])]),h("div",{class:"help-card"},[h("b",{},["Instrument Specs V1"]),h("p",{},["Le sizing final reste bloqué tant qu’une source et son timestamp, la classe d’actif, le mode de sizing et les règles de volume ne sont pas disponibles. En mode contrat, tick size, tick value et contract size sont aussi obligatoires. Aucune valeur broker n’est inventée. La normalisation respecte volume min/step uniquement après validation."])]),h("div",{class:"help-card"},[h("b",{},["Paper Risk V1"]),h("p",{},["Prépare un candidat paper uniquement pour LONG/SHORT. Capital virtuel V1 = 1 000 USD, risque par défaut = 1 %. Le risque monétaire et une taille brute en unités sont calculés depuis la distance Entry–SL. Cette taille reste UNVALIDATED_INSTRUMENT_SPECS tant que pip/tick/contract size, volume min/step et conversion devise ne sont pas prouvés. Aucun ordre paper n’est encore ouvert."])]),h("div",{class:"help-card"},[h("b",{},["Signal Quality V1"]),h("p",{},["Score explicite 0–100 basé sur les preuves déjà confirmées : Displacement 20, Structure 20, Order Block 20, FVG 10, ENTRY NOW 20, RR valide 10. Grades A≥80, B≥60, C≥40, D<40. Ces poids sont des paramètres V1 à valider par backtest/OOS ; ils ne modifient pas LONG/SHORT/WAIT et ne promettent aucune performance."])]),h("div",{class:"help-card"},[h("b",{},["Signal Engine"]),h("p",{},["LONG/SHORT uniquement si le setup est ENTRY NOW et possède un plan Entry + SL + TP + RR valide. Setup incomplet, expiré, invalidé, cible absente ou RR invalide = WAIT. Aucune exécution automatique."])]),h("div",{class:"help-card"},[h("b",{},["Chart Clean / Couches"]),h("p",{},["Mode CLEAN par défaut : Structure, BOS/CHoCH, Sweeps et Order Blocks visibles. Displacement et FVG restent calculés mais sont masqués. Les FVG MITIGATED et OB INVALIDATED ne sont plus dessinés. Le mode ALL réactive toutes les couches sans modifier la détection."])]),h("div",{class:"help-card"},[h("b",{},["SL / TP / RR"]),h("p",{},["Plan calculé seulement pour ENTRY NOW. Entrée = clôture du retest ; SL = invalidation structurelle de l’OB ; TP = plus proche liquidité opposée confirmée antérieure. Sans cible prouvée : TP UNAVAILABLE et RR indisponible. Aucun ordre n’est exécuté."])]),h("div",{class:"help-card"},[h("b",{},["Entry Lifecycle"]),h("p",{},["WAIT = confirmations incomplètes. ENTRY NOW = retest OB confirmé sur bougie close dans la fenêtre autorisée. EXPIRED = fenêtre dépassée. INVALIDATED = clôture au-delà de l’OB. Aucun ordre réel ou paper n’est encore envoyé par cet état."])]),h("div",{class:"help-card"},[h("b",{},["SMC State Machine"]),h("p",{},["Enchaîne les événements dans l’ordre : Sweep → Displacement → Structure → Entry Zone → Retest/Invalidation. SSL implique un scénario bullish ; BSL un scénario bearish. Les fenêtres 12/6 bougies sont des paramètres de recherche à valider, pas une promesse de performance. ENTRY_ZONE et RETESTED ne déclenchent encore aucun ordre."])]),h("div",{class:"help-card"},[h("b",{},["Order Block"]),h("p",{},["Dernière bougie opposée avant un Displacement confirmé avec BOS ou CHoCH/MSS de même direction. Zone High/Low réelle, suivie FRESH → RETESTED → INVALIDATED. La profondeur du retest est mesurée de 0 à 100 %. Qualité d’évidence : CORE, CONFIRMED ou CONFLUENT ; INVALID si la zone est cassée en clôture. Ce niveau n’est pas une probabilité de gain."])]),
+    h("div",{class:"help-card"},[h("b",{},["BOS"]),h("p",{},["Break of Structure : rupture structurale selon les règles du moteur."])]),h("div",{class:"help-card"},[h("b",{},["CHoCH / MSS"]),h("p",{},["Changement potentiel de caractère/structure : cassure à la clôture du dernier swing opposé après un biais HH+HL ou LH+LL confirmé."])]),h("div",{class:"help-card"},[h("b",{},["Liquidity Sweep"]),h("p",{},["BSL : prise de liquidité au-dessus d’un Swing High confirmé avec clôture sous le niveau. SSL : prise sous un Swing Low confirmé avec clôture au-dessus."])]),h("div",{class:"help-card"},[h("b",{},["Displacement"]),h("p",{},["Impulsion normalisée : corps ≥ 1,5× moyenne des 20 corps précédents, corps/range ≥ 70 %, clôture dans les 20 % de l’extrémité directionnelle. Seuils à valider par backtest/OOS."])]),h("div",{class:"help-card"},[h("b",{},["FVG"]),h("p",{},["Fair Value Gap strict sur 3 bougies closes. La zone est suivie OPEN → PARTIALLY_MITIGATED → MITIGATED. Le badge DISP est séparé : un FVG seul n’est pas une entrée."])]),h("div",{class:"help-card"},[h("b",{},["Server Market Detector V16-M5B1"]),h("p",{},["Le backend lit maintenant les vraies candles Coinbase 5m, ignore la candle encore ouverte, conserve uniquement les candles VALID et calcule des swings confirmés strength=2 puis un état BULLISH / BEARISH / RANGE. Cette première brique reste WAIT pour l’auto-entry : CHoCH, sweep, displacement, FVG, Order Block et trade plan serveur doivent encore être portés avant de générer un candidat automatiquement."])]),h("div",{class:"help-card"},[h("b",{},["Auto Entry Orchestrator V16-M5A"]),h("p",{},["Une boucle serveur revalide automatiquement les candidats server-side et appelle M4 toutes les 5 secondes. Elle suit le cycle de vie du backend et reste PAPER ONLY. La détection autonome complète des setups SMC depuis les candles serveur reste explicitement NOT_IMPLEMENTED : aucun signal n’est inventé."])]),h("div",{class:"help-card"},[h("b",{},["Verified Auto Paper Entry V16-M4"]),h("p",{},["Le backend peut maintenant ouvrir une position PAPER automatiquement uniquement si le signal serveur est READY et les specs Coinbase sont VALID. Le sizing part du risque, est arrondi vers le bas au base_increment, respecte les minimums/maximums et ne dépasse pas le capital disponible en notionnel. Un ID déterministe empêche de recréer le même signal. Aucun ordre broker ou MT5 n’est envoyé."])]),h("div",{class:"help-card"},[h("b",{},["Server Instrument Specs V16-M3"]),h("p",{},["Pour les cryptos Coinbase mappées, le backend lit maintenant les incréments et limites de taille depuis le produit public Coinbase. Les valeurs ne sont jamais codées en dur. Forex, Gold et Indices restent NOT_SUPPORTED pour le sizing automatique tant qu’une source vérifiée équivalente n’est pas intégrée. L’auto-entry reste bloqué jusqu’à la consommation atomique de ce snapshot par le gate."])]),h("div",{class:"help-card"},[h("b",{},["Server Signal Engine V16-M2"]),h("p",{},["Le backend dérive maintenant LONG / SHORT / WAIT à partir d’un setup ENTRY_NOW, structure + displacement + Order Block confirmés, Entry/SL/TP/RR cohérents et timestamp VALID. La décision du navigateur n’est pas considérée comme autoritaire. L’auto-entry reste bloqué jusqu’aux spécifications instrument serveur vérifiées."])]),h("div",{class:"help-card"},[h("b",{},["Auto Paper Entry Gate V16-M1"]),h("p",{},["La barrière serveur est active mais bloque volontairement toute ouverture automatique tant que le Signal Engine n’est pas autoritaire côté backend et que les spécifications de sizing de l’instrument ne sont pas vérifiées côté serveur. Le navigateur ne peut pas déclarer lui-même ces preuves comme fiables. Aucun trade n’est créé par M1."])]),h("div",{class:"help-card"},[h("b",{},["Paper Live Equity V1"]),h("p",{},["Équité live = capital réalisé + P&L latent des positions OPEN dont le mark multi-actifs est VALID. Si au moins une position OPEN n’a pas de mark valide, l’équité et le P&L latent globaux restent — avec statut PARTIAL au lieu d’inventer une valeur."])]),h("div",{class:"help-card"},[h("b",{},["Paper Account V1"]),h("p",{},["Le compte paper est initialisé une seule fois en PostgreSQL avec 1 000 USD, indépendamment des positions. Le capital actuel = capital initial + P&L réalisé. Le capital n’est pas réinitialisé lors d’un redémarrage."])]),h("div",{class:"help-card"},[h("b",{},["Paper Trading UI V1"]),h("p",{},["La page Trading lit /paper/account, /paper/positions et /paper/positions/live. Pour chaque position OPEN, le snapshot réutilise le vrai mark multi-actifs qualifié VALID et calcule le P&L latent. Si aucun mark valide n’existe, Prix actuel et P&L latent restent — avec Mark UNAVAILABLE."])]),h("div",{class:"help-card"},[h("b",{},["Paper Multi-Asset V1"]),h("p",{},["Le moniteur paper accepte maintenant les flux backend réels déjà disponibles : Crypto/Coinbase, Forex/Massive BBO, Gold/Twelve Data price et Indices/Massive Value. Chaque donnée doit être VALID. Pour Forex, le mark paper utilise le milieu du vrai bid/ask reçu ; aucun OHLC ni prix manquant n’est synthétisé. Les indices conservent la nature 15 minutes delayed du flux Massive actuel."])]),h("div",{class:"help-card"},[h("b",{},["Paper Auto Loop V1"]),h("p",{},["Le serveur lance maintenant automatiquement le moniteur paper pendant son cycle de vie. La cadence minimale est 1 seconde. Chaque itération reste fail-safe : si PostgreSQL ou le ticker VALID est indisponible, aucun prix n’est inventé et la boucle continue. À l’arrêt du serveur, la tâche reçoit un signal d’arrêt et se termine avant les connexions marché."])]),h("div",{class:"help-card"},[h("b",{},["Paper Realtime Monitor V1"]),h("p",{},["Le moniteur lit les positions OPEN et utilise uniquement un ticker backend déjà qualifié VALID. Si le flux est absent, stale/invalide ou non pris en charge, la position n’est pas marquée et reste ouverte. V1 branche d’abord Crypto/Coinbase ; Forex, Gold et Indices restent explicitement indisponibles jusqu’à leur adaptation sans donnée synthétique."])]),h("div",{class:"help-card"},[h("b",{},["Paper P&L V1"]),h("p",{},["Le backend peut maintenant marquer une position OPEN avec un prix réel fourni avec source et timestamp. Tant que SL/TP ne sont pas atteints, il renvoie le P&L non réalisé. Au SL ou TP, il ferme atomiquement la position en PostgreSQL et renvoie le P&L réalisé. Aucun ordre broker/MT5."])]),h("div",{class:"help-card"},[h("b",{},["Paper Persistence V1"]),h("p",{},["Les positions paper peuvent maintenant être enregistrées durablement dans PostgreSQL via le backend. L’API refuse l’écriture si la persistance est indisponible, valide LONG/SHORT et les niveaux, préserve les Decimal sous forme exacte côté base et interdit les doublons de position_id. Aucun ordre broker/MT5 n’est créé."])]),h("div",{class:"help-card"},[h("b",{},["Paper Position V1"]),h("p",{},["Une position virtuelle OPEN n’est créée que si le candidat Risk est READY, la taille est VALID et l’instrument possède symbole, source et timestamp. LONG exige SL<Entry<TP ; SHORT exige TP<Entry<SL. Le suivi peut marquer STOP LOSS ou TAKE PROFIT avec un prix observé et son timestamp. Si SL et TP sont simultanément ambigus, l’état devient CONFLICT au lieu d’inventer un résultat. Aucun ordre broker/MT5 n’est envoyé."])]),h("div",{class:"help-card"},[h("b",{},["Instrument Specs V1"]),h("p",{},["Le sizing final reste bloqué tant qu’une source et son timestamp, la classe d’actif, le mode de sizing et les règles de volume ne sont pas disponibles. En mode contrat, tick size, tick value et contract size sont aussi obligatoires. Aucune valeur broker n’est inventée. La normalisation respecte volume min/step uniquement après validation."])]),h("div",{class:"help-card"},[h("b",{},["Paper Risk V1"]),h("p",{},["Prépare un candidat paper uniquement pour LONG/SHORT. Capital virtuel V1 = 1 000 USD, risque par défaut = 1 %. Le risque monétaire et une taille brute en unités sont calculés depuis la distance Entry–SL. Cette taille reste UNVALIDATED_INSTRUMENT_SPECS tant que pip/tick/contract size, volume min/step et conversion devise ne sont pas prouvés. Aucun ordre paper n’est encore ouvert."])]),h("div",{class:"help-card"},[h("b",{},["Signal Quality V1"]),h("p",{},["Score explicite 0–100 basé sur les preuves déjà confirmées : Displacement 20, Structure 20, Order Block 20, FVG 10, ENTRY NOW 20, RR valide 10. Grades A≥80, B≥60, C≥40, D<40. Ces poids sont des paramètres V1 à valider par backtest/OOS ; ils ne modifient pas LONG/SHORT/WAIT et ne promettent aucune performance."])]),h("div",{class:"help-card"},[h("b",{},["Signal Engine"]),h("p",{},["LONG/SHORT uniquement si le setup est ENTRY NOW et possède un plan Entry + SL + TP + RR valide. Setup incomplet, expiré, invalidé, cible absente ou RR invalide = WAIT. Aucune exécution automatique."])]),h("div",{class:"help-card"},[h("b",{},["Chart Clean / Couches"]),h("p",{},["Mode CLEAN par défaut : Structure, BOS/CHoCH, Sweeps et Order Blocks visibles. Displacement et FVG restent calculés mais sont masqués. Les FVG MITIGATED et OB INVALIDATED ne sont plus dessinés. Le mode ALL réactive toutes les couches sans modifier la détection."])]),h("div",{class:"help-card"},[h("b",{},["SL / TP / RR"]),h("p",{},["Plan calculé seulement pour ENTRY NOW. Entrée = clôture du retest ; SL = invalidation structurelle de l’OB ; TP = plus proche liquidité opposée confirmée antérieure. Sans cible prouvée : TP UNAVAILABLE et RR indisponible. Aucun ordre n’est exécuté."])]),h("div",{class:"help-card"},[h("b",{},["Entry Lifecycle"]),h("p",{},["WAIT = confirmations incomplètes. ENTRY NOW = retest OB confirmé sur bougie close dans la fenêtre autorisée. EXPIRED = fenêtre dépassée. INVALIDATED = clôture au-delà de l’OB. Aucun ordre réel ou paper n’est encore envoyé par cet état."])]),h("div",{class:"help-card"},[h("b",{},["SMC State Machine"]),h("p",{},["Enchaîne les événements dans l’ordre : Sweep → Displacement → Structure → Entry Zone → Retest/Invalidation. SSL implique un scénario bullish ; BSL un scénario bearish. Les fenêtres 12/6 bougies sont des paramètres de recherche à valider, pas une promesse de performance. ENTRY_ZONE et RETESTED ne déclenchent encore aucun ordre."])]),h("div",{class:"help-card"},[h("b",{},["Order Block"]),h("p",{},["Dernière bougie opposée avant un Displacement confirmé avec BOS ou CHoCH/MSS de même direction. Zone High/Low réelle, suivie FRESH → RETESTED → INVALIDATED. La profondeur du retest est mesurée de 0 à 100 %. Qualité d’évidence : CORE, CONFIRMED ou CONFLUENT ; INVALID si la zone est cassée en clôture. Ce niveau n’est pas une probabilité de gain."])]),
     h("div",{class:"help-card"},[h("b",{},["CHoCH / MSS"]),h("p",{},["Changement de caractère / market structure shift."])]),
     h("div",{class:"help-card"},[h("b",{},["FVG"]),h("p",{},["Fair Value Gap : déséquilibre de prix à formaliser."])]),
     h("div",{class:"help-card"},[h("b",{},["Order Block"]),h("p",{},["Zone institutionnelle candidate, jamais utilisée seule."])]),
@@ -1662,25 +1595,36 @@ function renderHelpGlossary(){
   ]))
 }
 
-// V16-M5B18: TRADING OPERATIONAL AUDIT UI V1 · PERFORMANCE · DECISION HISTORY · FILTERS · REAL PERSISTED DATA ONLY
-// V16-M5B23-FIX5: FRONTEND RUNTIME SYNCHRONIZATION V1 · SERVER SNAPSHOT · PARTIAL FAIL-SAFE · AUTHORITATIVE PNL
+
+
+/* ================= FINAL operational workspace ================= */
+function finalPill(text,good){return h("span",{class:"status-pill "+(good?"ready":"future")},[text])}
+function finalValue(v){return v===null||v===undefined||v===""?"—":String(v)}
+function renderDashboard(){
+ var v=byId("view-dashboard");clear(v);v.appendChild(loading("Synchronisation du moteur…"));
+ Promise.all([api("/api/v1/paper/ui-snapshot"),api("/api/v1/strategies/overview"),api("/api/v1/paper/auto-entry/watchdog-status")]).then(function(rs){
+  clear(v);var snap=rs[0].data||{},sec=snap.sections||{},acc=(sec.account&&sec.account.data)||{},pos=(sec.positions&&sec.positions.data)||{},watch=rs[2].data||{};
+  v.appendChild(h("div",{class:"kpis"},[kpi("Capital paper",finalValue(acc.current_capital||acc.initial_capital)+" $","Persisté PostgreSQL","green"),kpi("Positions ouvertes",finalValue(acc.open_positions||0),"Paper uniquement"),kpi("Stratégies", "3","Reversal · Trend · Expansion"),kpi("Scanner",finalValue(watch.state||watch.status),"Watchdog serveur") ]));
+  v.appendChild(modCard("État opérationnel","LIVE BACKEND",h("div",{class:"info-grid"},[info("Snapshot",finalValue(snap.status)),info("Horodatage",finalValue(snap.snapshot_at)),info("Positions",finalValue((pos.items||pos.positions||[]).length||acc.open_positions||0)),info("Exécution","PAPER ONLY")])));
+  v.appendChild(modCard("Moteur multi-stratégies","REGIME GATED",h("div",{class:"section-stack"},[h("div",{class:"badge-row"},[finalPill("SMC REVERSAL",true),finalPill("TREND PULLBACK",true),finalPill("BREAKOUT / EXPANSION",true)]),h("div",{class:"tool-foot"},[h("span",{},["Le classement reste verrouillé tant que l’échantillon OOS est insuffisant."])])])));
+ })
+}
+function renderSignals(){
+ var v=byId("view-signals");clear(v);v.appendChild(loading("Lecture des décisions serveur…"));
+ Promise.all([api("/api/v1/paper/auto-entry/decision-history?limit=50"),api("/api/v1/strategies/catalog")]).then(function(rs){clear(v);var d=rs[0].data||{},items=d.items||d.decisions||d.history||[];
+  v.appendChild(modCard("Signal Engine","SERVER AUTHORITATIVE",items.length?h("div",{class:"section-stack"},items.slice(0,20).map(function(x){return h("div",{class:"info-grid"},[info(finalValue(x.symbol),finalValue(x.state||x.setup_state)),info("Raison",finalValue(x.reason)),info("Heure",finalValue(x.timestamp||x.created_at))])})):emptyState("Aucune décision persistée","Le scanner n’invente aucun signal.")));
+  v.appendChild(modCard("Pipeline d’autorisation","PAPER ONLY",h("div",{class:"badge-row"},[finalPill("DATA",true),finalPill("REGIME",true),finalPill("STRATEGY",true),finalPill("SETUP",true),finalPill("HTF",true),finalPill("FILL",true),finalPill("RISK",true),finalPill("PERSISTENCE",true)])));
+ })
+}
+function renderStrategies(){
+ var v=byId("view-strategies");clear(v);v.appendChild(loading("Chargement du registre…"));
+ Promise.all([api("/api/v1/strategies/overview"),api("/api/v1/paper/performance/breakdown?group=SYMBOL&period=ALL")]).then(function(rs){clear(v);var o=rs[0].data||{},ss=o.strategies||[];
+  v.appendChild(modCard("Strategy Registry","VERSIONED",h("div",{class:"section-stack"},ss.map(function(x){return h("div",{class:"info-grid"},[info(x.strategy_id,x.family),info("Version",x.version),info("Régimes",(x.allowed_regimes||[]).join(" · ")),info("Validation",x.validation_state||"CANDIDATE")])}))));
+  v.appendChild(modCard("Validation statistique","ANTI CURVE-FIT",h("div",{class:"info-grid"},[info("Minimum OOS",finalValue(o.minimum_oos_trades)+" trades"),info("Paper forward",finalValue(o.minimum_paper_forward_trades)+" trades"),info("Ranker",(o.portfolio&&o.portfolio.ranker)||"LOCKED"),info("Politique","INSUFFICIENT_SAMPLE = aucun classement")])));
+ })
+}
+function renderIntelligence(){var v=byId("view-intelligence");clear(v);v.appendChild(modCard("Research / Intelligence","REAL SOURCES ONLY",h("div",{class:"section-stack"},[emptyState("Aucun flux news configuré","L’application n’affiche pas de nouvelles fictives. Branche un provider vérifié pour activer cette section."),h("div",{class:"info-grid"},[info("Market Regime","Actif"),info("Sessions / Calendar","Actif"),info("HTF Context","Actif"),info("News","PROVIDER NOT CONFIGURED")])])))}
+function renderSettings(){var v=byId("view-settings");clear(v);v.appendChild(modCard("Configuration runtime","SAFE DEFAULTS",h("div",{class:"info-grid"},[info("Trading réel","DÉSACTIVÉ"),info("Mode","PAPER ONLY"),info("Capital initial","1 000 USD"),info("Données crypto","Coinbase REST + WebSocket"),info("Forex","Massive · clé requise"),info("Gold","Twelve Data · clé requise"),info("Indices","Massive · entitlement requis"),info("Horloge interne","UTC")])))}
 </script>
-<!-- SERVER DETECTOR · FVG V1 -->
 </body>
 </html>
-<!-- V16-M5B5 — server FVG detector -->
-
-<!-- SERVER DETECTOR · ORDER BLOCK V1 -->
-
-<!-- SERVER DETECTOR · RETEST REVALIDATION V1 -->
-<!-- SERVER BUILDER · TRADE PLAN V1 -->
-<!-- SERVER GATE · ENTRY NOW V1 -->
-<!-- SERVER AUTO PAPER POSITION V1 · ENTRY_NOW → VERIFIED SIZING → PERSISTED OPEN -->
-<!-- PAPER LIFECYCLE HARDENING V1 · STALE-MARK GUARD · IDEMPOTENT CLOSE · BATCH ISOLATION -->
-<!-- PAPER PORTFOLIO RISK GUARD V1 · MAX 5 OPEN · MAX 5% OPEN RISK · ONE OPEN/SYMBOL -->
-<!-- AUTO PAPER E2E READINESS V1 · REAL DATA → ENTRY_NOW → PAPER → SL/TP → HISTORY -->
-<!-- CONTINUOUS AUTO SCAN V1 · HEARTBEAT · PAPER ONLY · NO BROKER EXECUTION -->
-<!-- DECISION TRACE V1 · WAIT/ENTRY_NOW/BLOCKED/INVALIDATED/EXPIRED · EXPLAINABLE -->
-<!-- SIGNAL DECISION HISTORY V1 · POSTGRES DURABLE · FILTERABLE · PAPER ONLY -->
-
-<!-- V16-M5B16-FIX2 · synchronized regression fix bundle -->

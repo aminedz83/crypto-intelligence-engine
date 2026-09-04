@@ -5088,6 +5088,149 @@ def build_paper_performance_breakdown(
     ]
 
 
+# V16-M5B30A — persisted paper performance matrix foundation.
+# Only dimensions that are actually persisted are scored. TIMEFRAME / SESSION /
+# REGIME remain explicitly deferred rather than inferred from current market state.
+PAPER_PERFORMANCE_MATRIX_VERSION = "SERVER_PAPER_PERFORMANCE_MATRIX_V1"
+PAPER_PERFORMANCE_MATRIX_MIN_SAMPLE = 20
+
+
+def paper_strategy_from_source(source: object) -> Dict[str, Optional[str]]:
+    """Parse persisted strategy attribution without inventing missing metadata."""
+    raw = str(source or "").strip()
+    if not raw.startswith("strategy:"):
+        return {"strategy_id": None, "strategy_version": None}
+    attribution = raw[len("strategy:"):]
+    if "@" not in attribution:
+        return {"strategy_id": attribution or None, "strategy_version": None}
+    strategy_id, strategy_version = attribution.split("@", 1)
+    return {
+        "strategy_id": strategy_id or None,
+        "strategy_version": strategy_version or None,
+    }
+
+
+def paper_performance_matrix_label(metrics: Dict[str, object]) -> str:
+    """Conservative evidence label; small samples never receive an edge claim."""
+    trades = int(metrics.get("closed_trades") or 0)
+    if trades < PAPER_PERFORMANCE_MATRIX_MIN_SAMPLE:
+        return "INSUFFICIENT_SAMPLE"
+    expectancy_raw = metrics.get("expectancy")
+    pf_raw = metrics.get("profit_factor")
+    expectancy = Decimal(str(expectancy_raw)) if expectancy_raw is not None else Decimal("0")
+    profit_factor = Decimal(str(pf_raw)) if pf_raw is not None else None
+    if expectancy <= 0 or (profit_factor is not None and profit_factor < Decimal("1")):
+        return "WEAK"
+    if trades >= 50 and profit_factor is not None and profit_factor >= Decimal("1.25"):
+        return "ROBUST"
+    return "PROMISING"
+
+
+def build_paper_performance_matrix(
+    closed_positions: List[Dict[str, object]], initial_capital: Decimal
+) -> List[Dict[str, object]]:
+    """Build SYMBOL x persisted STRATEGY cells from closed paper positions."""
+    grouped: Dict[tuple[str, str, str], List[Dict[str, object]]] = {}
+    for position in closed_positions:
+        symbol = str(position.get("symbol") or "").upper()
+        attribution = paper_strategy_from_source(position.get("source"))
+        strategy_id = attribution["strategy_id"]
+        strategy_version = attribution["strategy_version"]
+        if not symbol or strategy_id is None:
+            continue
+        key = (symbol, strategy_id, strategy_version or "UNKNOWN")
+        grouped.setdefault(key, []).append(position)
+
+    cells: List[Dict[str, object]] = []
+    for symbol, strategy_id, strategy_version in sorted(grouped):
+        metrics = calculate_paper_performance_metrics(
+            grouped[(symbol, strategy_id, strategy_version)], initial_capital
+        )
+        cells.append(
+            {
+                "symbol": symbol,
+                "strategy_id": strategy_id,
+                "strategy_version": strategy_version,
+                "timeframe": None,
+                "session": None,
+                "regime": None,
+                "metrics": metrics,
+                "evidence": paper_performance_matrix_label(metrics),
+            }
+        )
+    return cells
+
+
+@api_router.get("/paper/performance/matrix")
+async def get_paper_performance_matrix(period: str = "ALL") -> Dict[str, object]:
+    """Return an evidence-only matrix from persisted CLOSED paper trades."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+    normalized_period = period.upper()
+    try:
+        period_start = paper_performance_period_start(normalized_period)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "unsupported performance period"},
+        ) from exc
+    try:
+        async with engine.connect() as conn:
+            account_result = await conn.execute(
+                text(
+                    "SELECT initial_capital FROM paper_account "
+                    "WHERE account_id=:account_id"
+                ),
+                {"account_id": PAPER_ACCOUNT_ID},
+            )
+            account = account_result.fetchone()
+            if account is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"status": "UNAVAILABLE", "reason": "paper account not initialized"},
+                )
+            sql = (
+                "SELECT p.position_id, p.symbol, p.side, p.entry, p.close_price, p.size, "
+                "p.risk_money, p.closed_at, p.source, fx.quote_to_usd "
+                "FROM paper_positions p LEFT JOIN paper_fx_conversion_snapshots fx "
+                "ON fx.position_id=p.position_id AND fx.phase='CLOSE' "
+                "WHERE status='CLOSED' AND p.close_price IS NOT NULL"
+            )
+            params: Dict[str, object] = {}
+            if period_start is not None:
+                sql += " AND p.closed_at>=:period_start"
+                params["period_start"] = period_start
+            sql += " ORDER BY p.closed_at ASC, p.position_id ASC"
+            result = await conn.execute(text(sql), params)
+            rows = [dict(row._mapping) for row in result.fetchall()]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"},
+        ) from exc
+
+    initial_capital = Decimal(str(account._mapping["initial_capital"]))
+    cells = build_paper_performance_matrix(rows, initial_capital)
+    return {
+        "status": "OK",
+        "validation": PAPER_PERFORMANCE_MATRIX_VERSION,
+        "period": normalized_period,
+        "period_start": period_start.isoformat() if period_start is not None else None,
+        "minimum_sample": PAPER_PERFORMANCE_MATRIX_MIN_SAMPLE,
+        "dimensions_available": ["SYMBOL", "STRATEGY"],
+        "dimensions_deferred": ["TIMEFRAME", "SESSION", "REGIME"],
+        "cells": cells,
+        "paper_only": True,
+        "execution": False,
+    }
+
+
 @api_router.get("/paper/performance/breakdown")
 async def get_paper_performance_breakdown(
     group_by: str = "SYMBOL",

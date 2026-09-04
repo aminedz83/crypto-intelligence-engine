@@ -3876,9 +3876,11 @@ async def auto_entry_orchestrator_loop() -> None:
         try:
             generation = await run_server_auto_paper_generation_once()
             trend_generation = await run_trend_pullback_paper_generation_once()
+            breakout_generation = await run_breakout_expansion_paper_generation_once()
             queue = await run_auto_entry_orchestrator_once()
             auto_scan_runtime["last_generation"] = generation
             auto_scan_runtime["last_trend_pullback_generation"] = trend_generation
+            auto_scan_runtime["last_breakout_expansion_generation"] = breakout_generation
             auto_scan_runtime["last_queue"] = queue
         except asyncio.CancelledError:
             raise
@@ -8543,6 +8545,203 @@ async def trend_pullback_paper_status() -> Dict[str, object]:
         "risk_percent": "1",
         "risk_reward_rule": str(TREND_PULLBACK_RISK_REWARD),
         "stop_rule": "CLOSED_PULLBACK_STRUCTURE",
+        "entry_source": "REAL_COINBASE_TICKER",
+        "paper_only": True,
+        "live_trading": False,
+        "execution": False,
+    }
+
+
+# V16-M5B28B2 — Breakout Expansion paper execution (paper-only)
+BREAKOUT_EXPANSION_PAPER_VERSION = "0.2-paper"
+BREAKOUT_EXPANSION_RISK_REWARD = Decimal("2")
+
+
+def build_breakout_expansion_paper_plan(
+    detection: Dict[str, object],
+    ticker: MarketDatum,
+    now: datetime,
+) -> Dict[str, object]:
+    """Build a breakout plan from confirmed closed-candle range + real ticker."""
+    base = {
+        "strategy_id": "BREAKOUT_EXPANSION",
+        "strategy_version": BREAKOUT_EXPANSION_PAPER_VERSION,
+        "paper_only": True,
+        "execution": False,
+    }
+    if detection.get("status") != "SETUP":
+        return {**base, "status": "WAIT", "reason": "BREAKOUT_SETUP_NOT_READY"}
+    if ticker.status != DataQualityStatus.VALID or ticker.value is None:
+        return {**base, "status": "WAIT", "reason": "REALTIME_TICKER_NOT_VALID"}
+    if ticker.timestamp is None or ticker.timestamp.tzinfo is None:
+        return {**base, "status": "WAIT", "reason": "REALTIME_TICKER_TIMESTAMP_INVALID"}
+    if classify_freshness(
+        ticker.timestamp, settings.ticker_max_age_seconds, now=now
+    ) != DataQualityStatus.VALID:
+        return {**base, "status": "WAIT", "reason": "REALTIME_TICKER_NOT_FRESH"}
+    try:
+        entry = Decimal(str(ticker.value))
+        range_high = Decimal(str(detection["range_high"]))
+        range_low = Decimal(str(detection["range_low"]))
+    except (KeyError, ValueError, InvalidOperation):
+        return {**base, "status": "WAIT", "reason": "BREAKOUT_STRUCTURE_INVALID"}
+    direction = str(detection.get("direction") or "")
+    if direction == "BULLISH":
+        stop = range_high
+        if stop <= 0 or entry <= stop:
+            return {**base, "status": "WAIT", "reason": "BULLISH_BREAKOUT_NOT_HELD"}
+        risk = entry - stop
+        target = entry + BREAKOUT_EXPANSION_RISK_REWARD * risk
+        side = "LONG"
+    elif direction == "BEARISH":
+        stop = range_low
+        if entry <= 0 or stop <= entry:
+            return {**base, "status": "WAIT", "reason": "BEARISH_BREAKOUT_NOT_HELD"}
+        risk = stop - entry
+        target = entry - BREAKOUT_EXPANSION_RISK_REWARD * risk
+        if target <= 0:
+            return {**base, "status": "WAIT", "reason": "BEARISH_TARGET_INVALID"}
+        side = "SHORT"
+    else:
+        return {**base, "status": "WAIT", "reason": "BREAKOUT_DIRECTION_INVALID"}
+    return {
+        **base,
+        "status": "ENTRY_NOW",
+        "side": side,
+        "direction": direction,
+        "entry": entry,
+        "stop_loss": stop,
+        "take_profit": target,
+        "risk_reward": BREAKOUT_EXPANSION_RISK_REWARD,
+        "source_timestamp": ticker.timestamp,
+        "setup_timestamp": detection.get("latest_closed_timestamp"),
+        "plan_source": "CLOSED_BREAKOUT_RANGE+REAL_COINBASE_TICKER",
+    }
+
+
+async def execute_breakout_expansion_paper_plan(
+    symbol: str, plan: Dict[str, object]
+) -> Dict[str, object]:
+    """Persist one prevalidated Breakout Expansion position with existing guards."""
+    if not persistence_state.ready:
+        return {"status": "BLOCKED", "reason": "PERSISTENCE_NOT_READY"}
+    if plan.get("status") != "ENTRY_NOW":
+        return {"status": "BLOCKED", "reason": "BREAKOUT_PLAN_NOT_ENTRY_NOW"}
+    canonical = symbol.upper().replace("/", "-")
+    try:
+        entry = Decimal(str(plan["entry"]))
+        stop = Decimal(str(plan["stop_loss"]))
+        target = Decimal(str(plan["take_profit"]))
+        source_timestamp = plan["source_timestamp"]
+    except (KeyError, ValueError, InvalidOperation):
+        return {"status": "BLOCKED", "reason": "BREAKOUT_PLAN_INVALID"}
+    if not isinstance(source_timestamp, datetime) or source_timestamp.tzinfo is None:
+        return {"status": "BLOCKED", "reason": "BREAKOUT_SOURCE_TIMESTAMP_INVALID"}
+    side = str(plan.get("side"))
+    if side == "LONG" and not stop < entry < target:
+        return {"status": "BLOCKED", "reason": "BREAKOUT_LONG_LEVELS_INVALID"}
+    if side == "SHORT" and not target < entry < stop:
+        return {"status": "BLOCKED", "reason": "BREAKOUT_SHORT_LEVELS_INVALID"}
+    if side not in {"LONG", "SHORT"}:
+        return {"status": "BLOCKED", "reason": "BREAKOUT_SIDE_INVALID"}
+    specs = await get_paper_instrument_specs(canonical)
+    if specs.get("status") != "VALID":
+        return {"status": "BLOCKED", "reason": "SERVER_INSTRUMENT_SPECS_NOT_VALID"}
+    account = await get_paper_account()
+    capital = Decimal(str(account["current_capital"]))
+    sizing = calculate_verified_crypto_size(capital, Decimal("1"), entry, stop, specs)
+    if sizing.get("status") != "VALID":
+        return {"status": "BLOCKED", "reason": str(sizing.get("reason"))}
+    async with auto_paper_portfolio_lock:
+        open_positions = await get_open_paper_risk_snapshot()
+        guard = evaluate_paper_portfolio_risk_guard(
+            open_positions, canonical, Decimal(str(sizing["risk_money"])), capital
+        )
+        if guard.get("status") != "VALID":
+            return {"status": "BLOCKED", "reason": str(guard.get("reason"))}
+        position = PaperPositionCreate(
+            position_id=build_strategy_paper_position_id(
+                "BREAKOUT_EXPANSION", canonical, side, plan.get("setup_timestamp")
+            ),
+            symbol=canonical,
+            side=side,
+            entry=entry,
+            stop_loss=stop,
+            take_profit=target,
+            size=Decimal(str(sizing["size"])),
+            size_unit="BASE_UNITS",
+            risk_money=Decimal(str(sizing["risk_money"])),
+            risk_percent=Decimal(str(sizing["risk_percent"])),
+            capital_before=capital,
+            source=f"strategy:BREAKOUT_EXPANSION@{BREAKOUT_EXPANSION_PAPER_VERSION}",
+            source_timestamp=source_timestamp,
+            opened_at=utcnow(),
+        )
+        created = await create_paper_position(position)
+    return {
+        "status": "OPENED",
+        "strategy_id": "BREAKOUT_EXPANSION",
+        "strategy_version": BREAKOUT_EXPANSION_PAPER_VERSION,
+        "position": created,
+        "paper_only": True,
+        "execution": False,
+    }
+
+
+async def run_breakout_expansion_paper_generation_once() -> Dict[str, int]:
+    """Scan the real crypto registry for Breakout Expansion paper entries."""
+    stats = {"checked": 0, "setups": 0, "opened": 0, "blocked": 0}
+    if not persistence_state.ready:
+        return stats
+    for instrument in instrument_registry.all():
+        if instrument.asset_class != AssetClass.CRYPTO:
+            continue
+        symbol = instrument.canonical_symbol
+        stats["checked"] += 1
+        provider_symbol = provider_symbol_map.to_provider("coinbase", symbol)
+        if provider_symbol is None:
+            stats["blocked"] += 1
+            continue
+        try:
+            candles, quality = await market_provider.get_candles(
+                provider_symbol, SERVER_SETUP_GRANULARITY, SERVER_SETUP_CANDLE_LIMIT
+            )
+            if quality != DataQualityStatus.VALID:
+                continue
+            now = utcnow()
+            regime = classify_server_market_regime(candles, now)
+            detection = detect_breakout_expansion_candidate(candles, now, regime)
+            if detection.get("status") != "SETUP":
+                continue
+            stats["setups"] += 1
+            ticker = await market_provider.get_ticker(provider_symbol)
+            plan = build_breakout_expansion_paper_plan(detection, ticker, now)
+            if plan.get("status") != "ENTRY_NOW":
+                stats["blocked"] += 1
+                continue
+            result = await execute_breakout_expansion_paper_plan(symbol, plan)
+            if result.get("status") == "OPENED":
+                stats["opened"] += 1
+            else:
+                stats["blocked"] += 1
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                stats["blocked"] += 1
+        except Exception as exc:  # noqa: BLE001
+            log.error("Breakout Expansion paper generation failed for %s: %s", symbol, exc)
+            stats["blocked"] += 1
+    return stats
+
+
+@api_router.get("/strategies/breakout-expansion/paper-status")
+async def breakout_expansion_paper_status() -> Dict[str, object]:
+    return {
+        "status": "ACTIVE_PAPER",
+        "strategy_id": "BREAKOUT_EXPANSION",
+        "strategy_version": BREAKOUT_EXPANSION_PAPER_VERSION,
+        "risk_percent": "1",
+        "risk_reward_rule": str(BREAKOUT_EXPANSION_RISK_REWARD),
+        "stop_rule": "PRIOR_CLOSED_RANGE_BOUNDARY",
         "entry_source": "REAL_COINBASE_TICKER",
         "paper_only": True,
         "live_trading": False,

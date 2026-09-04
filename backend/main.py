@@ -1487,6 +1487,26 @@ paper_adaptive_edge_shadow_table = Table(
     Column("created_at", DateTime(timezone=True), nullable=False),
 )
 
+# V16-M5B30F — immutable audit of active PAPER-only adaptive gate decisions.
+paper_adaptive_edge_active_table = Table(
+    "paper_adaptive_edge_active",
+    metadata,
+    Column("decision_id", String, primary_key=True),
+    Column("symbol", String, nullable=False),
+    Column("strategy_id", String, nullable=False),
+    Column("timeframe", String, nullable=True),
+    Column("session", String, nullable=True),
+    Column("market_regime", String, nullable=True),
+    Column("period", String, nullable=False),
+    Column("action", String, nullable=False),
+    Column("reason", String, nullable=False),
+    Column("evidence", String, nullable=True),
+    Column("rank", Integer, nullable=True),
+    Column("score", Numeric(10, 2), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+
+
 candles_table = Table(
     "candles",
     metadata,
@@ -2170,6 +2190,15 @@ async def _verified_auto_paper_entry_unlocked(
             "execution": False,
         }
 
+    edge_gate = await evaluate_adaptive_edge_active_gate(
+        req.symbol, "SMC_LIQUIDITY_REVERSAL", req.performance_timeframe,
+        req.performance_session, req.performance_market_regime,
+    )
+    if edge_gate.get("action") == "BLOCKED":
+        return {
+            "status": "BLOCKED", "reason": "ADAPTIVE_EDGE_WEAK",
+            "adaptive_edge_gate": edge_gate, "paper_only": True, "execution": False,
+        }
     specs = await get_paper_instrument_specs(req.symbol)
     if specs.get("status") != "VALID":
         return {
@@ -5687,6 +5716,88 @@ async def get_adaptive_edge_shadow(
         "shadow_mode": True,
         "changes_execution": False,
         "execution": False,
+    }
+
+
+# V16-M5B30F — Active Adaptive Edge Gate for PAPER execution only.
+ADAPTIVE_EDGE_ACTIVE_VERSION = "SERVER_ADAPTIVE_EDGE_ACTIVE_PAPER_V1"
+
+
+async def evaluate_adaptive_edge_active_gate(
+    symbol: str, strategy_id: str, timeframe: object, session: object,
+    regime: object, period: str = "ALL",
+) -> Dict[str, object]:
+    canonical = symbol.upper().replace("/", "-")
+    context_values = (timeframe, session, regime)
+    if any(value is None or not str(value).strip() for value in context_values):
+        return {
+            "action": "ALLOWED", "reason": "CONTEXT_NOT_PERSISTED_FAIL_NEUTRAL",
+            "evidence": None, "rank": None, "score": None, "active": True,
+        }
+    tf, sess, reg = str(timeframe), str(session), str(regime)
+    try:
+        payload = await get_adaptive_edge_ranking(period)
+        raw = payload.get("rankings")
+        rankings: List[Dict[str, object]] = []
+        if isinstance(raw, list):
+            rankings = [item for item in raw if isinstance(item, dict)]
+        advisory = adaptive_edge_shadow_decision(
+            rankings, canonical, strategy_id, tf, sess, reg
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Adaptive edge active gate fail-neutral: %s", type(exc).__name__)
+        return {
+            "action": "ALLOWED", "reason": "RANKING_UNAVAILABLE_FAIL_NEUTRAL",
+            "evidence": None, "rank": None, "score": None, "active": True,
+        }
+    shadow_action = str(advisory.get("action") or "NEUTRAL")
+    if shadow_action == "WOULD_BLOCK":
+        action, reason = "BLOCKED", "WEAK_PERSISTED_EDGE"
+    elif shadow_action == "WOULD_FAVOR":
+        action, reason = "FAVORED", "TOP_RANKED_POSITIVE_EDGE"
+    else:
+        action = "ALLOWED"
+        reason = str(advisory.get("reason") or "EVIDENCE_NOT_DECISIVE")
+    created_at = utcnow()
+    seed = f"{canonical}|{strategy_id}|{tf}|{sess}|{reg}|{period}|{created_at.isoformat()}"
+    decision_id = "edge-active-" + hashlib.sha256(seed.encode()).hexdigest()[:24]
+    score_raw = advisory.get("score")
+    score = Decimal(str(score_raw)) if score_raw is not None else None
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(pg_insert(paper_adaptive_edge_active_table).values(
+                decision_id=decision_id, symbol=canonical, strategy_id=strategy_id,
+                timeframe=tf, session=sess, market_regime=reg, period=period.upper(),
+                action=action, reason=reason,
+                evidence=(str(advisory.get("evidence"))
+                          if advisory.get("evidence") is not None else None),
+                rank=(int(str(advisory.get("rank")))
+                      if advisory.get("rank") is not None else None),
+                score=score, created_at=created_at,
+            ))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Adaptive edge active audit unavailable: %s", type(exc).__name__)
+    return {**advisory, "decision_id": decision_id, "action": action,
+            "reason": reason, "active": True, "paper_only": True}
+
+
+@api_router.get("/paper/adaptive-edge/active")
+async def get_adaptive_edge_active(
+    symbol: str, strategy_id: str, timeframe: str, session: str, regime: str,
+    period: str = "ALL",
+) -> Dict[str, object]:
+    gate = await evaluate_adaptive_edge_active_gate(
+        symbol, strategy_id, timeframe, session, regime, period
+    )
+    return {
+        "status": "OK", "validation": ADAPTIVE_EDGE_ACTIVE_VERSION, "gate": gate,
+        "policy": {
+            "WEAK": "BLOCKED",
+            "TOP_RANKED_PROMISING_OR_ROBUST": "FAVORED",
+            "INSUFFICIENT_SAMPLE": "ALLOWED_NEUTRAL",
+            "MISSING_CONTEXT_OR_RANKING": "ALLOWED_FAIL_NEUTRAL",
+        },
+        "paper_only": True, "live_trading": False,
     }
 
 
@@ -10286,6 +10397,15 @@ async def execute_multi_asset_paper_plan(
         return {"status": "BLOCKED", "reason": "SHORT_LEVELS_INVALID"}
     if side not in {"LONG", "SHORT"}:
         return {"status": "BLOCKED", "reason": "SIDE_INVALID"}
+    edge_gate = await evaluate_adaptive_edge_active_gate(
+        canonical, str(plan.get("strategy_id") or "MULTI_ASSET"), plan.get("performance_timeframe"),
+        plan.get("performance_session"), plan.get("performance_market_regime"),
+    )
+    if edge_gate.get("action") == "BLOCKED":
+        return {
+            "status": "BLOCKED", "reason": "ADAPTIVE_EDGE_WEAK",
+            "adaptive_edge_gate": edge_gate,
+        }
 
     if classify_freshness(
         source_timestamp, settings.ticker_max_age_seconds, now=utcnow()
@@ -10773,6 +10893,15 @@ async def execute_trend_pullback_paper_plan(
         return {"status": "BLOCKED", "reason": "TREND_SHORT_LEVELS_INVALID"}
     if side not in {"LONG", "SHORT"}:
         return {"status": "BLOCKED", "reason": "TREND_SIDE_INVALID"}
+    edge_gate = await evaluate_adaptive_edge_active_gate(
+        canonical, "TREND_PULLBACK", plan.get("performance_timeframe"),
+        plan.get("performance_session"), plan.get("performance_market_regime"),
+    )
+    if edge_gate.get("action") == "BLOCKED":
+        return {
+            "status": "BLOCKED", "reason": "ADAPTIVE_EDGE_WEAK",
+            "adaptive_edge_gate": edge_gate,
+        }
     specs = await get_paper_instrument_specs(canonical)
     if specs.get("status") != "VALID":
         return {"status": "BLOCKED", "reason": "SERVER_INSTRUMENT_SPECS_NOT_VALID"}
@@ -10999,6 +11128,15 @@ async def execute_breakout_expansion_paper_plan(
         return {"status": "BLOCKED", "reason": "BREAKOUT_SHORT_LEVELS_INVALID"}
     if side not in {"LONG", "SHORT"}:
         return {"status": "BLOCKED", "reason": "BREAKOUT_SIDE_INVALID"}
+    edge_gate = await evaluate_adaptive_edge_active_gate(
+        canonical, "BREAKOUT_EXPANSION", plan.get("performance_timeframe"),
+        plan.get("performance_session"), plan.get("performance_market_regime"),
+    )
+    if edge_gate.get("action") == "BLOCKED":
+        return {
+            "status": "BLOCKED", "reason": "ADAPTIVE_EDGE_WEAK",
+            "adaptive_edge_gate": edge_gate,
+        }
     specs = await get_paper_instrument_specs(canonical)
     if specs.get("status") != "VALID":
         return {"status": "BLOCKED", "reason": "SERVER_INSTRUMENT_SPECS_NOT_VALID"}

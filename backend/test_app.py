@@ -8883,3 +8883,117 @@ class TestV16M5B28B1TrendPullbackPaperExecution(unittest.TestCase):
     def test_status_route_is_registered(self):
         paths = {route.path for route in main.api_router.routes}
         self.assertIn("/strategies/trend-pullback/paper-status", paths)
+
+class TestV16M5B28B2BreakoutExpansionPaperExecution(unittest.TestCase):
+    def _ticker(self, value, now, status=main.DataQualityStatus.VALID):
+        return main.MarketDatum(
+            symbol="BTC-USD", value=value, timestamp=now,
+            source="coinbase", status=status,
+        )
+
+    def _setup(self, direction="BULLISH"):
+        return {
+            "status": "SETUP", "direction": direction,
+            "range_high": 110.0, "range_low": 90.0,
+            "latest_closed_timestamp": "2026-09-04T03:00:00+00:00",
+        }
+
+    def test_version_is_explicit(self):
+        self.assertEqual(main.BREAKOUT_EXPANSION_PAPER_VERSION, "0.2-paper")
+
+    def test_rr_rule_is_two(self):
+        self.assertEqual(main.BREAKOUT_EXPANSION_RISK_REWARD, Decimal("2"))
+
+    def test_non_setup_is_wait(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            {"status": "WAIT"}, self._ticker(112.0, now), now
+        )
+        self.assertEqual(result["reason"], "BREAKOUT_SETUP_NOT_READY")
+
+    def test_invalid_ticker_is_wait(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup(), self._ticker(112.0, now, main.DataQualityStatus.INVALID), now
+        )
+        self.assertEqual(result["reason"], "REALTIME_TICKER_NOT_VALID")
+
+    def test_bullish_plan_is_long(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup(), self._ticker(112.0, now), now
+        )
+        self.assertEqual(result["side"], "LONG")
+
+    def test_bullish_stop_is_range_high(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup(), self._ticker(112.0, now), now
+        )
+        self.assertEqual(result["stop_loss"], Decimal("110.0"))
+
+    def test_bullish_target_is_two_r(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup(), self._ticker(112.0, now), now
+        )
+        self.assertEqual(result["take_profit"], Decimal("116.0"))
+
+    def test_bullish_breakout_must_hold(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup(), self._ticker(109.0, now), now
+        )
+        self.assertEqual(result["reason"], "BULLISH_BREAKOUT_NOT_HELD")
+
+    def test_bearish_plan_is_short(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup("BEARISH"), self._ticker(88.0, now), now
+        )
+        self.assertEqual(result["side"], "SHORT")
+
+    def test_bearish_stop_is_range_low(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup("BEARISH"), self._ticker(88.0, now), now
+        )
+        self.assertEqual(result["stop_loss"], Decimal("90.0"))
+
+    def test_bearish_target_is_two_r(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup("BEARISH"), self._ticker(88.0, now), now
+        )
+        self.assertEqual(result["take_profit"], Decimal("84.0"))
+
+    def test_bearish_breakout_must_hold(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup("BEARISH"), self._ticker(91.0, now), now
+        )
+        self.assertEqual(result["reason"], "BEARISH_BREAKOUT_NOT_HELD")
+
+    def test_plan_declares_real_ticker_source(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup(), self._ticker(112.0, now), now
+        )
+        self.assertEqual(result["plan_source"], "CLOSED_BREAKOUT_RANGE+REAL_COINBASE_TICKER")
+
+    def test_plan_is_paper_only(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup(), self._ticker(112.0, now), now
+        )
+        self.assertTrue(result["paper_only"])
+        self.assertFalse(result["execution"])
+
+    def test_status_route_is_registered(self):
+        paths = {route.path for route in main.app.routes}
+        self.assertIn("/api/v1/strategies/breakout-expansion/paper-status", paths)
+
+    def test_orchestrator_calls_breakout_generation(self):
+        source = inspect.getsource(main.auto_entry_orchestrator_loop)
+        self.assertIn("run_breakout_expansion_paper_generation_once", source)
+

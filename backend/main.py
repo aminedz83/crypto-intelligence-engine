@@ -1419,6 +1419,14 @@ paper_positions_table = Table(
     Column("closed_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("strategy_id", String, nullable=True),
+    Column("strategy_version", String, nullable=True),
+    Column("params_hash", String, nullable=True),
+    Column("timeframe", String, nullable=True),
+    Column("regime_at_entry", String, nullable=True),
+    Column("session_at_entry", String, nullable=True),
+    Column("signal_candle_time", DateTime(timezone=True), nullable=True),
+    Column("entry_reason", String, nullable=True),
 )
 
 candles_table = Table(
@@ -1560,6 +1568,14 @@ class PaperPositionCreate(BaseModel):
     source: str = Field(min_length=1, max_length=64)
     source_timestamp: datetime
     opened_at: datetime
+    strategy_id: Optional[str] = "SMC_LIQUIDITY_REVERSAL"
+    strategy_version: Optional[str] = "1.0.0"
+    params_hash: Optional[str] = None
+    timeframe: Optional[str] = "5m"
+    regime_at_entry: Optional[str] = None
+    session_at_entry: Optional[str] = None
+    signal_candle_time: Optional[datetime] = None
+    entry_reason: Optional[str] = None
 
 
 def validate_paper_position_create(req: PaperPositionCreate) -> None:
@@ -1620,7 +1636,10 @@ def paper_position_to_dict(row: Any) -> Dict[str, object]:
     ):
         if data.get(key) is not None:
             data[key] = str(data[key])
-    for key in ("source_timestamp", "opened_at", "closed_at", "created_at", "updated_at"):
+    for key in (
+        "source_timestamp", "opened_at", "closed_at", "created_at", "updated_at",
+        "signal_candle_time",
+    ):
         if data.get(key) is not None:
             data[key] = data[key].isoformat()
     data["realized_pnl"] = str(realized_pnl) if realized_pnl is not None else None
@@ -4038,6 +4057,11 @@ async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
         "source_timestamp": req.source_timestamp, "opened_at": req.opened_at,
         "close_reason": None, "close_price": None, "closed_at": None,
         "created_at": now, "updated_at": now,
+        "strategy_id": req.strategy_id, "strategy_version": req.strategy_version,
+        "params_hash": req.params_hash, "timeframe": req.timeframe,
+        "regime_at_entry": req.regime_at_entry, "session_at_entry": req.session_at_entry,
+        "signal_candle_time": req.signal_candle_time or req.source_timestamp,
+        "entry_reason": req.entry_reason,
     }
     try:
         async with engine.begin() as conn:
@@ -4869,6 +4893,18 @@ async def init_candle_schema() -> None:
     so it is NEVER swallowed into a silent false success."""
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
+        # Forward-compatible attribution migration for databases created before M5B26.
+        for ddl in (
+            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS strategy_id VARCHAR",
+            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS strategy_version VARCHAR",
+            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS params_hash VARCHAR",
+            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS timeframe VARCHAR",
+            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS regime_at_entry VARCHAR",
+            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS session_at_entry VARCHAR",
+            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS signal_candle_time TIMESTAMPTZ",
+            "ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS entry_reason VARCHAR",
+        ):
+            await conn.execute(text(ddl))
         now = utcnow()
         stmt = pg_insert(paper_account_table).values(
             account_id=PAPER_ACCOUNT_ID,
@@ -7811,6 +7847,240 @@ async def market_session_context_endpoint(symbol: str) -> dict:
         raise HTTPException(status_code=404, detail=result)
     return result
 
+
+# ============================ FINAL multi-strategy foundation ============================
+# Pure, deterministic strategy contracts shared by replay and runtime-facing APIs.
+import hashlib
+import math
+import random
+import statistics
+from collections import defaultdict
+
+STRATEGY_MIN_OOS_TRADES = 100
+STRATEGY_MIN_PAPER_TRADES = 30
+
+@dataclass(frozen=True)
+class StrategyDefinition:
+    strategy_id: str
+    version: str
+    family: str
+    timeframes: Tuple[str, ...]
+    allowed_regimes: Tuple[str, ...]
+    params: Dict[str, object]
+
+    @property
+    def params_hash(self) -> str:
+        payload = json.dumps(self.params, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "strategy_id": self.strategy_id, "version": self.version,
+            "family": self.family, "timeframes": list(self.timeframes),
+            "allowed_regimes": list(self.allowed_regimes), "params": self.params,
+            "params_hash": self.params_hash,
+        }
+
+STRATEGY_REGISTRY: Dict[str, StrategyDefinition] = {
+    "SMC_LIQUIDITY_REVERSAL": StrategyDefinition(
+        "SMC_LIQUIDITY_REVERSAL", "1.0.0", "REVERSAL", ("5m",),
+        ("RANGE", "TRANSITION"), {"implementation": "SERVER_SMC_EXISTING_RULES"},
+    ),
+    "TREND_PULLBACK_CONTINUATION": StrategyDefinition(
+        "TREND_PULLBACK_CONTINUATION", "1.0.0", "TREND", ("5m", "15m"),
+        ("TREND",), {"ema_fast": 20, "ema_slow": 50, "atr_period": 14,
+        "pullback_atr_max": 1.25, "min_rr": 1.5},
+    ),
+    "BREAKOUT_EXPANSION_RETEST": StrategyDefinition(
+        "BREAKOUT_EXPANSION_RETEST", "1.0.0", "EXPANSION", ("5m", "15m"),
+        ("TRANSITION",), {"range_lookback": 20, "atr_period": 14,
+        "expansion_atr": 1.25, "retest_atr": 0.35, "min_rr": 1.5},
+    ),
+}
+
+def _strategy_ready_candles(candles: List[Candle], now: datetime, minimum: int) -> List[Candle]:
+    values = closed_valid_candles(candles, now)
+    return values if len(values) >= minimum else []
+
+def _ema(values: List[float], period: int) -> float:
+    alpha = 2.0 / (period + 1.0)
+    result = values[0]
+    for value in values[1:]:
+        result = alpha * value + (1.0 - alpha) * result
+    return result
+
+def _atr(candles: List[Candle], period: int) -> Optional[float]:
+    if len(candles) < period + 1:
+        return None
+    trs: List[float] = []
+    for i in range(len(candles) - period, len(candles)):
+        c, prev = candles[i], candles[i - 1]
+        if c.high is None or c.low is None or prev.close is None:
+            return None
+        trs.append(max(c.high-c.low, abs(c.high-prev.close), abs(c.low-prev.close)))
+    return sum(trs) / len(trs) if trs else None
+
+def evaluate_trend_pullback(candles: List[Candle], now: datetime) -> Dict[str, object]:
+    spec = STRATEGY_REGISTRY["TREND_PULLBACK_CONTINUATION"]
+    closed = _strategy_ready_candles(candles, now, 55)
+    if not closed:
+        return {"setup_state":"WAIT", "reason":"INSUFFICIENT_CLOSED_CANDLES"}
+    closes = [float(c.close) for c in closed if c.close is not None]
+    if len(closes) != len(closed):
+        return {"setup_state":"WAIT", "reason":"INVALID_CLOSE_SERIES"}
+    fast, slow = _ema(closes[-50:], 20), _ema(closes[-50:], 50)
+    atr = _atr(closed, 14)
+    last, prev = closed[-1], closed[-2]
+    if atr is None or atr <= 0 or last.close is None or last.low is None or last.high is None:
+        return {"setup_state":"WAIT", "reason":"ATR_NOT_READY"}
+    direction = "LONG" if fast > slow else "SHORT" if fast < slow else None
+    if direction is None:
+        return {"setup_state":"NO_SETUP", "reason":"TREND_NOT_ESTABLISHED"}
+    if direction == "LONG":
+        touched = last.low <= fast and fast-last.low <= atr*float(spec.params["pullback_atr_max"])
+        confirmed = prev.close is not None and last.close > fast and last.close > prev.close
+        sl = last.low - atr*0.15
+        risk = last.close-sl
+        tp = last.close + risk*float(spec.params["min_rr"])
+    else:
+        touched = last.high >= fast and last.high-fast <= atr*float(spec.params["pullback_atr_max"])
+        confirmed = prev.close is not None and last.close < fast and last.close < prev.close
+        sl = last.high + atr*0.15
+        risk = sl-last.close
+        tp = last.close - risk*float(spec.params["min_rr"])
+    if not touched:
+        return {"setup_state":"WAIT", "reason":"PULLBACK_NOT_IN_ZONE", "direction":direction}
+    if not confirmed or risk <= 0:
+        return {"setup_state":"WAIT", "reason":"PULLBACK_NOT_CONFIRMED", "direction":direction}
+    return {"setup_state":"ENTRY_NOW", "reason":"TREND_PULLBACK_CONFIRMED", "direction":direction,
+            "entry":last.close, "stop_loss":sl, "take_profit":tp,
+            "risk_reward":float(spec.params["min_rr"]), "signal_candle_time":last.start.isoformat() if last.start else None}
+
+def evaluate_breakout_expansion(candles: List[Candle], now: datetime) -> Dict[str, object]:
+    spec = STRATEGY_REGISTRY["BREAKOUT_EXPANSION_RETEST"]
+    closed = _strategy_ready_candles(candles, now, 40)
+    if not closed:
+        return {"setup_state":"WAIT", "reason":"INSUFFICIENT_CLOSED_CANDLES"}
+    atr = _atr(closed[:-1], 14)
+    last = closed[-1]
+    lookback = int(spec.params["range_lookback"])
+    prior = closed[-(lookback+1):-1]
+    if atr is None or atr <= 0 or not prior or last.close is None or last.high is None or last.low is None:
+        return {"setup_state":"WAIT", "reason":"ATR_NOT_READY"}
+    highs=[float(c.high) for c in prior if c.high is not None]; lows=[float(c.low) for c in prior if c.low is not None]
+    if len(highs)!=len(prior) or len(lows)!=len(prior):
+        return {"setup_state":"WAIT", "reason":"INVALID_RANGE_SERIES"}
+    ceiling, floor=max(highs), min(lows)
+    body=abs(float(last.close)-float(last.open or last.close))
+    expanded=body >= atr*float(spec.params["expansion_atr"])
+    direction = "LONG" if last.close > ceiling else "SHORT" if last.close < floor else None
+    if direction is None or not expanded:
+        return {"setup_state":"WAIT", "reason":"BREAKOUT_NOT_CONFIRMED"}
+    level=ceiling if direction=="LONG" else floor
+    distance=abs(last.close-level)
+    if distance > atr*float(spec.params["retest_atr"]):
+        return {"setup_state":"WAIT", "reason":"RETEST_PENDING", "direction":direction}
+    if direction=="LONG": sl=min(last.low, level-atr*0.15); risk=last.close-sl; tp=last.close+risk*float(spec.params["min_rr"])
+    else: sl=max(last.high, level+atr*0.15); risk=sl-last.close; tp=last.close-risk*float(spec.params["min_rr"])
+    if risk<=0: return {"setup_state":"WAIT", "reason":"INVALID_RISK_GEOMETRY"}
+    return {"setup_state":"ENTRY_NOW", "reason":"BREAKOUT_EXPANSION_RETEST_CONFIRMED", "direction":direction,
+            "entry":last.close,"stop_loss":sl,"take_profit":tp,"risk_reward":float(spec.params["min_rr"]),
+            "signal_candle_time":last.start.isoformat() if last.start else None}
+
+def evaluate_strategy(strategy_id: str, candles: List[Candle], now: datetime) -> Dict[str, object]:
+    if strategy_id == "SMC_LIQUIDITY_REVERSAL":
+        return detect_server_market_structure(candles, now)
+    if strategy_id == "TREND_PULLBACK_CONTINUATION": return evaluate_trend_pullback(candles, now)
+    if strategy_id == "BREAKOUT_EXPANSION_RETEST": return evaluate_breakout_expansion(candles, now)
+    return {"setup_state":"WAIT", "reason":"STRATEGY_NOT_REGISTERED"}
+
+def strategy_metrics_r(r_values: List[float]) -> Dict[str, object]:
+    n=len(r_values); wins=sum(x>0 for x in r_values); losses=sum(x<0 for x in r_values)
+    gp=sum(x for x in r_values if x>0); gl=-sum(x for x in r_values if x<0)
+    expectancy=sum(r_values)/n if n else None; pf=gp/gl if gl>0 else None
+    equity=peak=dd=maxdd=0.0
+    for r in r_values:
+        equity += r; peak=max(peak,equity); dd=peak-equity; maxdd=max(maxdd,dd)
+    downside=[min(0.0,x) for x in r_values]
+    downside_dev=math.sqrt(sum(x*x for x in downside)/n) if n else 0.0
+    sortino=(expectancy/downside_dev*math.sqrt(n)) if expectancy is not None and downside_dev>0 else None
+    sharpe=(statistics.mean(r_values)/statistics.stdev(r_values)*math.sqrt(n)) if n>1 and statistics.stdev(r_values)>0 else None
+    top3=sum(sorted([x for x in r_values if x>0], reverse=True)[:3]); concentration=top3/gp if gp>0 else None
+    return {"trades":n,"wins":wins,"losses":losses,"win_rate":wins/n if n else None,"expectancy_r":expectancy,
+            "profit_factor":pf,"max_drawdown_r":maxdd,"sharpe":sharpe,"sortino":sortino,
+            "top3_profit_concentration":concentration,"sample_status":"ELIGIBLE" if n>=STRATEGY_MIN_OOS_TRADES else "INSUFFICIENT_SAMPLE"}
+
+def bootstrap_expectancy_ci(r_values: List[float], samples: int=1000, seed: int=17) -> Optional[Tuple[float,float]]:
+    if len(r_values)<2: return None
+    rng=random.Random(seed); means=[]; n=len(r_values)
+    for _ in range(samples): means.append(sum(rng.choice(r_values) for _ in range(n))/n)
+    means.sort(); return means[int(samples*.025)], means[min(samples-1,int(samples*.975))]
+
+def deterministic_replay(strategy_id: str, candles: List[Candle], cost_r: float=0.02) -> Dict[str, object]:
+    """Chronological next-candle conservative replay; ambiguous SL/TP resolves to SL."""
+    trades=[]; minimum=60
+    for i in range(minimum, len(candles)-1):
+        now=(candles[i].start or utcnow()) + timedelta(seconds=301)
+        decision=evaluate_strategy(strategy_id, candles[:i+1], now)
+        if decision.get("setup_state")!="ENTRY_NOW": continue
+        try: entry=float(str(decision["entry"])); sl=float(str(decision["stop_loss"])); tp=float(str(decision["take_profit"])); direction=str(decision["direction"])
+        except (KeyError,TypeError,ValueError): continue
+        next_c=candles[i+1]
+        if None in (next_c.open,next_c.high,next_c.low): continue
+        fill=float(next_c.open); risk=abs(fill-sl)
+        if risk<=0: continue
+        outcome=None
+        for j in range(i+1,len(candles)):
+            c=candles[j]
+            if c.high is None or c.low is None: continue
+            hit_sl=c.low<=sl if direction=="LONG" else c.high>=sl
+            hit_tp=c.high>=tp if direction=="LONG" else c.low<=tp
+            if hit_sl: outcome=-1.0-cost_r; break
+            if hit_tp: outcome=abs(tp-fill)/risk-cost_r; break
+        if outcome is not None: trades.append(outcome)
+    metrics=strategy_metrics_r(trades); metrics["expectancy_ci95"]=bootstrap_expectancy_ci(trades)
+    return {"strategy_id":strategy_id,"trades_r":trades,"metrics":metrics,"fill_policy":"NEXT_CANDLE_OPEN_CONSERVATIVE_SL_FIRST","cost_r":cost_r,"lookahead":False}
+
+@api_router.get("/strategies/catalog")
+async def strategy_catalog() -> Dict[str, object]:
+    return {"status":"OK","strategies":[x.to_dict() for x in STRATEGY_REGISTRY.values()],"paper_only":True,"execution":False}
+
+@api_router.get("/strategies/evaluate/{strategy_id}/{symbol}")
+async def strategy_evaluate_endpoint(strategy_id: str, symbol: str, timeframe: str="5m") -> Dict[str, object]:
+    sid=strategy_id.upper(); spec=STRATEGY_REGISTRY.get(sid)
+    if spec is None: raise HTTPException(404, detail={"reason":"STRATEGY_NOT_REGISTERED"})
+    canonical=symbol.upper().replace("/","-"); provider=provider_symbol_map.to_provider("coinbase",canonical)
+    if provider is None: raise HTTPException(404, detail={"reason":"PROVIDER_SYMBOL_NOT_MAPPED"})
+    candles,quality=await market_provider.get_candles(provider,timeframe,120)
+    if quality!=DataQualityStatus.VALID: return {"status":"WAIT","reason":"CANDLES_NOT_VALID","quality":quality.value}
+    regime=classify_server_market_regime(candles,utcnow()); current=str(regime.get("regime","UNKNOWN"))
+    if current not in spec.allowed_regimes:
+        return {"status":"WAIT","strategy":spec.to_dict(),"reason":"REGIME_NOT_ALLOWED","regime":regime,"paper_only":True}
+    result=evaluate_strategy(sid,candles,utcnow())
+    return {"status":"OK","strategy":spec.to_dict(),"regime":regime,"decision":result,"paper_only":True,"execution":False}
+
+@api_router.get("/strategies/backtest/{strategy_id}/{symbol}")
+async def strategy_backtest_endpoint(strategy_id: str, symbol: str, timeframe: str="5m", limit: int=300, cost_r: float=0.02) -> Dict[str, object]:
+    sid=strategy_id.upper()
+    if sid not in STRATEGY_REGISTRY: raise HTTPException(404,detail={"reason":"STRATEGY_NOT_REGISTERED"})
+    canonical=symbol.upper().replace("/","-"); provider=provider_symbol_map.to_provider("coinbase",canonical)
+    if provider is None: raise HTTPException(404,detail={"reason":"PROVIDER_SYMBOL_NOT_MAPPED"})
+    candles,quality=await market_provider.get_candles(provider,timeframe,max(100,min(limit,350)))
+    if quality!=DataQualityStatus.VALID: return {"status":"WAIT","reason":"CANDLES_NOT_VALID","quality":quality.value}
+    replay=deterministic_replay(sid,candles,cost_r=max(0.0,cost_r))
+    replay_metrics = replay.get("metrics")
+    sample_status = (
+        replay_metrics.get("sample_status")
+        if isinstance(replay_metrics, dict)
+        else "INSUFFICIENT_SAMPLE"
+    )
+    return {"status":"OK","symbol":canonical,"timeframe":timeframe,"source":"coinbase","replay":replay,"validation_state":"CANDIDATE" if sample_status=="INSUFFICIENT_SAMPLE" else "OOS_REVIEW_REQUIRED","paper_only":True,"execution":False}
+
+@api_router.get("/strategies/overview")
+async def strategies_overview() -> Dict[str, object]:
+    return {"status":"OK","portfolio":{"families":3,"policy":"REGIME_GATED","ranker":"LOCKED_UNTIL_SUFFICIENT_OOS_SAMPLE"},
+            "strategies":[{**s.to_dict(),"validation_state":"CANDIDATE","ranking_eligible":False} for s in STRATEGY_REGISTRY.values()],
+            "minimum_oos_trades":STRATEGY_MIN_OOS_TRADES,"minimum_paper_forward_trades":STRATEGY_MIN_PAPER_TRADES,"paper_only":True,"execution":False}
 
 # App must be built only after every router decorator above has executed.
 app = create_app()

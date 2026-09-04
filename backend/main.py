@@ -6153,6 +6153,87 @@ async def get_adaptive_edge_counterfactual_replay(limit: int = 100) -> Dict[str,
     }
 
 
+ADAPTIVE_POLICY_CALIBRATION_VERSION = "SERVER_ADAPTIVE_POLICY_CALIBRATION_V1"
+ADAPTIVE_POLICY_CALIBRATION_MIN_EXECUTED = 20
+ADAPTIVE_POLICY_CALIBRATION_MIN_BLOCKED = 20
+
+
+def adaptive_policy_calibration_recommendation(
+    linked: Dict[str, object],
+    blocked: Dict[str, object],
+) -> Dict[str, object]:
+    """Evidence-only recommendation. It never changes the active gate."""
+    linked_n = int(str(linked.get("closed_trades") or 0))
+    blocked_n = int(str(blocked.get("resolved") or 0))
+    linked_rr = Decimal(str(linked.get("average_realized_rr") or "0"))
+    blocked_rr = Decimal(str(blocked.get("average_realized_rr") or "0"))
+    enough = (
+        linked_n >= ADAPTIVE_POLICY_CALIBRATION_MIN_EXECUTED
+        and blocked_n >= ADAPTIVE_POLICY_CALIBRATION_MIN_BLOCKED
+    )
+    if not enough:
+        return {
+            "recommendation": "HOLD_CURRENT_POLICY",
+            "reason": "INSUFFICIENT_PROSPECTIVE_SAMPLE",
+            "eligible_for_activation": False,
+        }
+    if linked_rr > 0 and blocked_rr <= 0:
+        return {
+            "recommendation": "KEEP_CURRENT_POLICY",
+            "reason": "GATE_SEPARATION_POSITIVE",
+            "eligible_for_activation": False,
+        }
+    if blocked_rr > linked_rr:
+        return {
+            "recommendation": "REVIEW_BLOCK_THRESHOLD",
+            "reason": "BLOCKED_COHORT_OUTPERFORMS_EXECUTED_COHORT",
+            "eligible_for_activation": False,
+        }
+    return {
+        "recommendation": "REVIEW_FAVOR_THRESHOLD",
+        "reason": "GATE_SEPARATION_NOT_PROVEN",
+        "eligible_for_activation": False,
+    }
+
+
+@api_router.get("/paper/adaptive-edge/policy-calibration")
+async def get_adaptive_policy_calibration(period: str = "ALL") -> Dict[str, object]:
+    """Controlled V1 calibration: recommendation only, no automatic policy mutation."""
+    impact = await get_adaptive_edge_impact_validation(period)
+    observed_raw = impact.get("observed")
+    observed = observed_raw if isinstance(observed_raw, dict) else {}
+    linked_raw = observed.get("linked_executed")
+    linked = linked_raw if isinstance(linked_raw, dict) else {}
+    blocked_raw = impact.get("blocked_counterfactual")
+    blocked = blocked_raw if isinstance(blocked_raw, dict) else {}
+    recommendation = adaptive_policy_calibration_recommendation(linked, blocked)
+    return {
+        "status": "OK",
+        "validation": ADAPTIVE_POLICY_CALIBRATION_VERSION,
+        "mode": "RECOMMENDED",
+        "active_policy_changed": False,
+        "automatic_activation": False,
+        "minimum_samples": {
+            "linked_executed": ADAPTIVE_POLICY_CALIBRATION_MIN_EXECUTED,
+            "blocked_resolved": ADAPTIVE_POLICY_CALIBRATION_MIN_BLOCKED,
+        },
+        "samples": {
+            "linked_executed": int(str(linked.get("closed_trades") or 0)),
+            "blocked_resolved": int(str(blocked.get("resolved") or 0)),
+        },
+        "evidence": {
+            "linked_average_realized_rr": linked.get("average_realized_rr"),
+            "linked_profit_factor": linked.get("profit_factor"),
+            "linked_expectancy": linked.get("expectancy"),
+            "blocked_average_realized_rr": blocked.get("average_realized_rr"),
+            "blocked_win_rate_percent": blocked.get("win_rate_percent"),
+        },
+        **recommendation,
+        "paper_only": True,
+        "live_trading": False,
+    }
+
+
 @api_router.get("/paper/adaptive-edge/impact-validation")
 async def get_adaptive_edge_impact_validation(period: str = "ALL") -> Dict[str, object]:
     """Observed paper impact only; blocked-trade counterfactual P&L is never invented."""

@@ -7813,6 +7813,150 @@ async def market_session_context_endpoint(symbol: str) -> dict:
     return result
 
 
+# V16-M5B26 — Multi-strategy candidate foundation (paper-only, non-executing)
+# New strategy families are observational candidates until independently validated.
+MULTI_STRATEGY_ENGINE_VERSION = "SERVER_MULTI_STRATEGY_CANDIDATES_V1"
+STRATEGY_MIN_VALIDATION_TRADES = 30
+
+
+def server_strategy_registry() -> List[Dict[str, object]]:
+    """Return the objective server-side strategy catalogue.
+
+    SMC remains the only execution-capable family inherited from the validated
+    pipeline. New families are CANDIDATE and cannot auto-queue paper entries.
+    """
+    return [
+        {
+            "strategy_id": "SMC_LIQUIDITY_REVERSAL",
+            "version": "1.0",
+            "status": "ACTIVE_VALIDATED_PIPELINE",
+            "family": "REVERSAL",
+            "preferred_regimes": ["TREND", "RANGE", "TRANSITION"],
+            "execution_eligible": True,
+            "paper_only": True,
+        },
+        {
+            "strategy_id": "TREND_PULLBACK",
+            "version": "0.1-candidate",
+            "status": "CANDIDATE",
+            "family": "CONTINUATION",
+            "preferred_regimes": ["TREND"],
+            "execution_eligible": False,
+            "paper_only": True,
+        },
+        {
+            "strategy_id": "BREAKOUT_EXPANSION",
+            "version": "0.1-candidate",
+            "status": "CANDIDATE",
+            "family": "BREAKOUT",
+            "preferred_regimes": ["TREND", "TRANSITION"],
+            "preferred_volatility": ["EXPANSION"],
+            "execution_eligible": False,
+            "paper_only": True,
+        },
+    ]
+
+
+def evaluate_candidate_strategy_context(
+    strategy_id: str, regime: Dict[str, object]
+) -> Dict[str, object]:
+    """Regime gate only; this function never creates a trade or signal."""
+    catalogue = {str(item["strategy_id"]): item for item in server_strategy_registry()}
+    strategy = catalogue.get(strategy_id.upper())
+    if strategy is None:
+        return {
+            "status": "NOT_SUPPORTED",
+            "reason": "STRATEGY_NOT_REGISTERED",
+            "auto_queue": False,
+            "execution": False,
+        }
+    if regime.get("status") != "READY":
+        return {
+            "status": "WAIT",
+            "strategy_id": strategy["strategy_id"],
+            "reason": "REGIME_NOT_READY",
+            "auto_queue": False,
+            "execution": False,
+        }
+    allowed_regimes = strategy.get("preferred_regimes", [])
+    regime_name = regime.get("regime")
+    if isinstance(allowed_regimes, list) and regime_name not in allowed_regimes:
+        return {
+            "status": "WAIT",
+            "strategy_id": strategy["strategy_id"],
+            "reason": "REGIME_NOT_ELIGIBLE",
+            "regime": regime_name,
+            "auto_queue": False,
+            "execution": False,
+        }
+    allowed_volatility = strategy.get("preferred_volatility")
+    volatility = regime.get("volatility")
+    if isinstance(allowed_volatility, list) and volatility not in allowed_volatility:
+        return {
+            "status": "WAIT",
+            "strategy_id": strategy["strategy_id"],
+            "reason": "VOLATILITY_NOT_ELIGIBLE",
+            "regime": regime_name,
+            "volatility": volatility,
+            "auto_queue": False,
+            "execution": False,
+        }
+    return {
+        "status": "CONTEXT_ELIGIBLE",
+        "strategy_id": strategy["strategy_id"],
+        "reason": "REGIME_CONTEXT_MATCH",
+        "regime": regime_name,
+        "volatility": volatility,
+        "candidate_only": not bool(strategy["execution_eligible"]),
+        "auto_queue": False,
+        "execution": False,
+    }
+
+
+def strategy_validation_gate(closed_trades: int) -> Dict[str, object]:
+    """Anti-small-sample gate for future promotion; no performance is invented."""
+    count = max(int(closed_trades), 0)
+    ready = count >= STRATEGY_MIN_VALIDATION_TRADES
+    return {
+        "status": "SAMPLE_READY" if ready else "INSUFFICIENT_SAMPLE",
+        "closed_trades": count,
+        "minimum_closed_trades": STRATEGY_MIN_VALIDATION_TRADES,
+        "promotion_authorized": False,
+        "execution": False,
+        "marker": MULTI_STRATEGY_ENGINE_VERSION,
+    }
+
+
+@api_router.get("/strategies")
+async def get_server_strategies() -> Dict[str, object]:
+    return {
+        "status": "READY",
+        "strategies": server_strategy_registry(),
+        "marker": MULTI_STRATEGY_ENGINE_VERSION,
+        "paper_only": True,
+        "live_trading": False,
+    }
+
+
+@api_router.get("/strategies/context/{symbol}")
+async def get_strategy_context(symbol: str) -> Dict[str, object]:
+    canonical = symbol.upper().replace("/", "-")
+    regime = await get_server_market_regime(canonical)
+    evaluations = [
+        evaluate_candidate_strategy_context(str(item["strategy_id"]), regime)
+        for item in server_strategy_registry()
+    ]
+    return {
+        "status": "READY" if regime.get("status") == "READY" else "WAIT",
+        "symbol": canonical,
+        "regime": regime,
+        "strategies": evaluations,
+        "auto_queue": False,
+        "execution": False,
+        "marker": MULTI_STRATEGY_ENGINE_VERSION,
+    }
+
+
 # App must be built only after every router decorator above has executed.
 app = create_app()
 

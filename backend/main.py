@@ -45,6 +45,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Integer,
     MetaData,
     Numeric,
     String,

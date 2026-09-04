@@ -822,30 +822,23 @@ function iconFor(sym){
   if(sym==="XAU-USD")return h("span",{class:"coin gold"},["Au"]);
   if(sym==="US30"||sym==="SPX500"||sym==="NAS100")return h("span",{class:"coin idx"},["I"]);
 
-  // V16-M5B28B7: real crypto logos for the dynamic Coinbase universe.
-  // CoinCap hosts symbol-based PNG assets. If an asset is absent/mismatched,
-  // the image is hidden and the deterministic ticker fallback remains visible.
+  // V16-M5B28B7-FIX3: same-origin dynamic logo resolver. The browser only
+  // requests our backend. The backend resolves/caches the real image and 404s
+  // cleanly when no exact ticker logo can be proven; initials remain as fallback.
   var wrap=h("span",{class:"coin crypto-logo",title:base},[]);
   var fallback=h("span",{class:"crypto-logo-fallback"},[base.slice(0,2)||"?"]);
   var img=h("img",{
     class:"crypto-logo-img",
-    src:"//cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/128/color/"+base.toLowerCase()+".png",
+    src:"/api/v1/market/crypto-logo/"+encodeURIComponent(base),
     alt:base+" logo",
     loading:"lazy",
-    referrerpolicy:"no-referrer"
+    decoding:"async"
   },[]);
+  img.addEventListener("load",function(){wrap.classList.add("logo-loaded")});
   img.addEventListener("error",function(){
-    if(img.getAttribute("data-fallback-tried")!=="1"){
-      img.setAttribute("data-fallback-tried","1");
-      img.src="//cdn.jsdelivr.net/gh/atomiclabs/cryptocurrency-icons@master/128/color/"+base.toLowerCase()+".png";
-      return;
-    }
     img.style.display="none";
     wrap.classList.remove("logo-loaded");
   });
-  img.addEventListener("load",function(){wrap.classList.add("logo-loaded")});
-  img.addEventListener("load",function(){wrap.classList.add("logo-loaded")});
-  img.addEventListener("error",function(){img.style.display="none"});
   wrap.appendChild(img);wrap.appendChild(fallback);
   return wrap;
 }
@@ -2103,6 +2096,7 @@ function renderHelpGlossary(){
 <!-- SERVER DETECTOR · FVG V1 -->
 <!-- V16-M5B28B6 · MOBILE UI POLISH · COMPACT OPEN POSITIONS · SIGNAL SUMMARY · DASHBOARD PAPER PULSE -->
 <!-- V16-M5B28B7 · DYNAMIC CRYPTO LOGOS · COINCAP CDN + TICKER FALLBACK -->
+<!-- V16-M5B28B7-FIX3 · SAME-ORIGIN DYNAMIC CRYPTO LOGO PROXY -->
 </body>
 </html>
 <!-- V16-M5B5 — server FVG detector -->

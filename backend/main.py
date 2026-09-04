@@ -1434,6 +1434,22 @@ paper_positions_table = Table(
     Column("updated_at", DateTime(timezone=True), nullable=False),
 )
 
+
+paper_fx_conversion_snapshots_table = Table(
+    "paper_fx_conversion_snapshots",
+    metadata,
+    Column("position_id", String, primary_key=True),
+    Column("phase", String, primary_key=True),
+    Column("quote_currency", String, nullable=False),
+    Column("quote_to_usd", Numeric(38, 18), nullable=False),
+    Column("conversion_symbol", String, nullable=False),
+    Column("conversion_price", Numeric(38, 18), nullable=True),
+    Column("inverse", Boolean, nullable=False),
+    Column("source", String, nullable=False),
+    Column("source_timestamp", DateTime(timezone=True), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+
 candles_table = Table(
     "candles",
     metadata,
@@ -1573,6 +1589,13 @@ class PaperPositionCreate(BaseModel):
     source: str = Field(min_length=1, max_length=64)
     source_timestamp: datetime
     opened_at: datetime
+    fx_quote_currency: Optional[str] = None
+    fx_quote_to_usd: Optional[Decimal] = None
+    fx_conversion_symbol: Optional[str] = None
+    fx_conversion_price: Optional[Decimal] = None
+    fx_conversion_inverse: Optional[bool] = None
+    fx_conversion_source: Optional[str] = None
+    fx_conversion_source_timestamp: Optional[datetime] = None
 
 
 def validate_paper_position_create(req: PaperPositionCreate) -> None:
@@ -1593,6 +1616,24 @@ def validate_paper_position_create(req: PaperPositionCreate) -> None:
         raise HTTPException(
             status_code=400, detail={"status": "INVALID", "reason": "CAPITAL_INVALID"}
         )
+    fx_fields = (
+        req.fx_quote_currency,
+        req.fx_quote_to_usd,
+        req.fx_conversion_symbol,
+        req.fx_conversion_inverse,
+        req.fx_conversion_source,
+    )
+    if any(value is not None for value in fx_fields):
+        if any(value is None for value in fx_fields):
+            raise HTTPException(
+                status_code=400,
+                detail={"status": "INVALID", "reason": "FX_SNAPSHOT_INCOMPLETE"},
+            )
+        if req.fx_quote_to_usd is None or req.fx_quote_to_usd <= Decimal("0"):
+            raise HTTPException(
+                status_code=400,
+                detail={"status": "INVALID", "reason": "FX_CONVERSION_INVALID"},
+            )
     if req.side == "LONG" and not (req.stop_loss < req.entry < req.take_profit):
         raise HTTPException(
             status_code=400,
@@ -4249,6 +4290,22 @@ async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
                 raise HTTPException(
                     status_code=409, detail={"status": "CONFLICT", "reason": "POSITION_ID_EXISTS"}
                 )
+            if req.fx_quote_to_usd is not None:
+                fx_values = {
+                    "position_id": req.position_id,
+                    "phase": "OPEN",
+                    "quote_currency": str(req.fx_quote_currency),
+                    "quote_to_usd": req.fx_quote_to_usd,
+                    "conversion_symbol": str(req.fx_conversion_symbol),
+                    "conversion_price": req.fx_conversion_price,
+                    "inverse": bool(req.fx_conversion_inverse),
+                    "source": str(req.fx_conversion_source),
+                    "source_timestamp": req.fx_conversion_source_timestamp,
+                    "created_at": now,
+                }
+                await conn.execute(
+                    pg_insert(paper_fx_conversion_snapshots_table).values(fx_values)
+                )
     except HTTPException:
         raise
     except Exception as exc:
@@ -4449,6 +4506,62 @@ def calculate_paper_pnl(side: str, entry: Decimal, exit_price: Decimal,
     return delta * size
 
 
+def paper_position_quote_to_usd_required(symbol: str) -> bool:
+    instrument = instrument_registry.get(symbol.upper().replace("/", "-"))
+    return bool(
+        instrument is not None
+        and instrument.asset_class == AssetClass.FOREX
+        and instrument.quote_asset != "USD"
+    )
+
+
+def calculate_paper_pnl_usd(
+    side: str,
+    entry: Decimal,
+    exit_price: Decimal,
+    size: Decimal,
+    quote_to_usd: Decimal = Decimal("1"),
+) -> Decimal:
+    if quote_to_usd <= 0:
+        raise ValueError("quote_to_usd must be positive")
+    return calculate_paper_pnl(side, entry, exit_price, size) * quote_to_usd
+
+
+async def persist_paper_fx_conversion_snapshot(
+    conn: Any, position_id: str, phase: str, conversion: Dict[str, object]
+) -> None:
+    rate = conversion.get("quote_to_usd")
+    if not isinstance(rate, Decimal) or rate <= 0:
+        raise ValueError("valid quote_to_usd required")
+    values = {
+        "position_id": position_id,
+        "phase": phase,
+        "quote_currency": str(conversion.get("quote_currency") or ""),
+        "quote_to_usd": rate,
+        "conversion_symbol": str(conversion.get("conversion_symbol") or ""),
+        "conversion_price": conversion.get("conversion_price"),
+        "inverse": bool(conversion.get("inverse", False)),
+        "source": str(conversion.get("source") or "identity"),
+        "source_timestamp": conversion.get("source_timestamp"),
+        "created_at": utcnow(),
+    }
+    stmt = pg_insert(paper_fx_conversion_snapshots_table).values(values)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["position_id", "phase"],
+        set_={
+            "quote_currency": stmt.excluded.quote_currency,
+            "quote_to_usd": stmt.excluded.quote_to_usd,
+            "conversion_symbol": stmt.excluded.conversion_symbol,
+            "conversion_price": stmt.excluded.conversion_price,
+            "inverse": stmt.excluded.inverse,
+            "source": stmt.excluded.source,
+            "source_timestamp": stmt.excluded.source_timestamp,
+            "created_at": stmt.excluded.created_at,
+        },
+    )
+    await conn.execute(stmt)
+
+
 @api_router.post("/paper/positions/{position_id}/mark")
 async def mark_paper_position(position_id: str, req: PaperPositionMark) -> Dict[str, object]:
     if not persistence_state.ready:
@@ -4473,6 +4586,28 @@ async def mark_paper_position(position_id: str, req: PaperPositionMark) -> Dict[
             data = dict(row._mapping)
             if data["status"] != "OPEN":
                 return paper_position_to_dict(row)
+            fx_conversion: Optional[Dict[str, object]] = None
+            quote_to_usd = Decimal("1")
+            if paper_position_quote_to_usd_required(str(data["symbol"])):
+                fx_conversion = await realtime_fx_quote_to_usd(str(data["symbol"]))
+                if fx_conversion.get("status") != "VALID":
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "status": "CONFLICT",
+                            "reason": "FX_CONVERSION_UNAVAILABLE",
+                        },
+                    )
+                conversion_rate = fx_conversion.get("quote_to_usd")
+                if not isinstance(conversion_rate, Decimal) or conversion_rate <= 0:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "status": "CONFLICT",
+                            "reason": "FX_CONVERSION_INVALID",
+                        },
+                    )
+                quote_to_usd = conversion_rate
             if not paper_mark_temporally_valid(req, data["opened_at"]):
                 raise HTTPException(
                     status_code=409,
@@ -4487,15 +4622,27 @@ async def mark_paper_position(position_id: str, req: PaperPositionMark) -> Dict[
                 payload["mark_observed_at"] = req.observed_at.isoformat()
                 payload["mark_source"] = req.source
                 payload["mark_source_timestamp"] = req.source_timestamp.isoformat()
-                payload["unrealized_pnl"] = str(
-                    calculate_paper_pnl(
-                        data["side"], data["entry"], req.current_price, data["size"]
-                    )
+                raw_pnl = calculate_paper_pnl(
+                    data["side"], data["entry"], req.current_price, data["size"]
                 )
+                payload["unrealized_pnl"] = str(raw_pnl * quote_to_usd)
+                payload["unrealized_pnl_currency"] = "USD"
+                if fx_conversion is not None:
+                    payload["fx_quote_to_usd"] = str(quote_to_usd)
+                    payload["fx_conversion_symbol"] = fx_conversion.get(
+                        "conversion_symbol"
+                    )
                 return payload
             reason, close_price = outcome
-            pnl = calculate_paper_pnl(data["side"], data["entry"], close_price, data["size"])
+            raw_pnl = calculate_paper_pnl(
+                data["side"], data["entry"], close_price, data["size"]
+            )
+            pnl = raw_pnl * quote_to_usd
             now = utcnow()
+            if fx_conversion is not None:
+                await persist_paper_fx_conversion_snapshot(
+                    conn, position_id, "CLOSE", fx_conversion
+                )
             await conn.execute(
                 text(
                     "UPDATE paper_positions SET status='CLOSED', close_reason=:reason, "
@@ -4513,6 +4660,12 @@ async def mark_paper_position(position_id: str, req: PaperPositionMark) -> Dict[
             )
             payload = paper_position_to_dict(type("Row", (), {"_mapping": data})())
             payload["realized_pnl"] = str(pnl)
+            payload["realized_pnl_currency"] = "USD"
+            if fx_conversion is not None:
+                payload["fx_quote_to_usd_close"] = str(quote_to_usd)
+                payload["fx_conversion_symbol_close"] = fx_conversion.get(
+                    "conversion_symbol"
+                )
             payload["close_source"] = req.source
             payload["close_source_timestamp"] = req.source_timestamp.isoformat()
             return payload
@@ -4560,14 +4713,26 @@ async def get_live_paper_positions() -> Dict[str, object]:
             payload["mark_price"] = str(mark.current_price)
             payload["mark_source"] = mark.source
             payload["mark_source_timestamp"] = mark.source_timestamp.isoformat()
-            payload["unrealized_pnl"] = str(
-                calculate_paper_pnl(
-                    row._mapping["side"],
-                    row._mapping["entry"],
-                    mark.current_price,
-                    row._mapping["size"],
-                )
+            raw_pnl = calculate_paper_pnl(
+                row._mapping["side"],
+                row._mapping["entry"],
+                mark.current_price,
+                row._mapping["size"],
             )
+            if paper_position_quote_to_usd_required(str(row._mapping["symbol"])):
+                conversion = await realtime_fx_quote_to_usd(str(row._mapping["symbol"]))
+                rate = conversion.get("quote_to_usd")
+                if conversion.get("status") == "VALID" and isinstance(rate, Decimal):
+                    payload["unrealized_pnl"] = str(raw_pnl * rate)
+                    payload["fx_quote_to_usd"] = str(rate)
+                    payload["fx_conversion_status"] = "VALID"
+                else:
+                    payload["unrealized_pnl"] = None
+                    payload["fx_conversion_status"] = str(
+                        conversion.get("reason") or "UNAVAILABLE"
+                    )
+            else:
+                payload["unrealized_pnl"] = str(raw_pnl)
         positions.append(payload)
     return {
         "status": "OK",
@@ -4610,9 +4775,18 @@ async def get_live_paper_account() -> Dict[str, object]:
         if mark is None:
             unavailable += 1
             continue
-        unrealized += calculate_paper_pnl(
+        raw_pnl = calculate_paper_pnl(
             data["side"], data["entry"], mark.current_price, data["size"]
         )
+        if paper_position_quote_to_usd_required(str(data["symbol"])):
+            conversion = await realtime_fx_quote_to_usd(str(data["symbol"]))
+            rate = conversion.get("quote_to_usd")
+            if conversion.get("status") != "VALID" or not isinstance(rate, Decimal):
+                unavailable += 1
+                continue
+            unrealized += raw_pnl * rate
+        else:
+            unrealized += raw_pnl
         marked += 1
 
     current_capital = Decimal(str(account["current_capital"]))
@@ -4648,8 +4822,11 @@ async def get_paper_account() -> Dict[str, object]:
             account = account_result.fetchone()
             result = await conn.execute(
                 text(
-                    "SELECT status, side, entry, size, close_price "
-                    "FROM paper_positions ORDER BY opened_at ASC, position_id ASC"
+                    "SELECT p.position_id, p.symbol, p.status, p.side, p.entry, p.size, "
+                    "p.close_price, fx.quote_to_usd "
+                    "FROM paper_positions p LEFT JOIN paper_fx_conversion_snapshots fx "
+                    "ON fx.position_id=p.position_id AND fx.phase='CLOSE' "
+                    "ORDER BY p.opened_at ASC, p.position_id ASC"
                 )
             )
             rows = result.fetchall()
@@ -4673,9 +4850,21 @@ async def get_paper_account() -> Dict[str, object]:
             open_count += 1
         elif data["status"] == "CLOSED" and data["close_price"] is not None:
             closed_count += 1
-            realized += calculate_paper_pnl(
+            raw_pnl = calculate_paper_pnl(
                 data["side"], data["entry"], data["close_price"], data["size"]
             )
+            if paper_position_quote_to_usd_required(str(data["symbol"])):
+                if data["quote_to_usd"] is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "status": "UNAVAILABLE",
+                            "reason": "CLOSE_FX_SNAPSHOT_MISSING",
+                        },
+                    )
+                realized += raw_pnl * Decimal(str(data["quote_to_usd"]))
+            else:
+                realized += raw_pnl
     initial_capital = account._mapping["initial_capital"]
     current_capital = initial_capital + realized
     return {
@@ -4714,7 +4903,15 @@ def calculate_paper_performance_metrics(
         close_price = Decimal(str(position["close_price"]))
         size = Decimal(str(position["size"]))
         risk_money = Decimal(str(position["risk_money"]))
-        pnl = calculate_paper_pnl(side, entry, close_price, size)
+        raw_pnl = calculate_paper_pnl(side, entry, close_price, size)
+        symbol = str(position.get("symbol") or "")
+        stored_rate = position.get("quote_to_usd")
+        if paper_position_quote_to_usd_required(symbol):
+            if stored_rate is None:
+                raise ValueError("closed non-USD FX trade missing conversion snapshot")
+            pnl = raw_pnl * Decimal(str(stored_rate))
+        else:
+            pnl = raw_pnl
         net_pnl += pnl
         if pnl > 0:
             wins += 1
@@ -4822,18 +5019,20 @@ async def get_paper_performance(
                     detail={"status": "UNAVAILABLE", "reason": "paper account not initialized"},
                 )
             sql = (
-                "SELECT position_id, symbol, side, entry, close_price, size, risk_money, "
-                "closed_at FROM paper_positions WHERE status='CLOSED' "
-                "AND close_price IS NOT NULL"
+                "SELECT p.position_id, p.symbol, p.side, p.entry, p.close_price, p.size, "
+                "p.risk_money, p.closed_at, fx.quote_to_usd "
+                "FROM paper_positions p LEFT JOIN paper_fx_conversion_snapshots fx "
+                "ON fx.position_id=p.position_id AND fx.phase='CLOSE' "
+                "WHERE p.status='CLOSED' AND p.close_price IS NOT NULL"
             )
             params: Dict[str, object] = {}
             if canonical is not None:
-                sql += " AND symbol=:symbol"
+                sql += " AND p.symbol=:symbol"
                 params["symbol"] = canonical
             if period_start is not None:
-                sql += " AND closed_at>=:period_start"
+                sql += " AND p.closed_at>=:period_start"
                 params["period_start"] = period_start
-            sql += " ORDER BY closed_at ASC, position_id ASC"
+            sql += " ORDER BY p.closed_at ASC, p.position_id ASC"
             result = await conn.execute(text(sql), params)
             rows = [dict(row._mapping) for row in result.fetchall()]
     except HTTPException:
@@ -4933,15 +5132,17 @@ async def get_paper_performance_breakdown(
                     },
                 )
             sql = (
-                "SELECT position_id, symbol, side, entry, close_price, size, risk_money, "
-                "closed_at FROM paper_positions WHERE status='CLOSED' "
-                "AND close_price IS NOT NULL"
+                "SELECT p.position_id, p.symbol, p.side, p.entry, p.close_price, p.size, "
+                "p.risk_money, p.closed_at, fx.quote_to_usd "
+                "FROM paper_positions p LEFT JOIN paper_fx_conversion_snapshots fx "
+                "ON fx.position_id=p.position_id AND fx.phase='CLOSE' "
+                "WHERE p.status='CLOSED' AND p.close_price IS NOT NULL"
             )
             params: Dict[str, object] = {}
             if period_start is not None:
-                sql += " AND closed_at>=:period_start"
+                sql += " AND p.closed_at>=:period_start"
                 params["period_start"] = period_start
-            sql += " ORDER BY closed_at ASC, position_id ASC"
+            sql += " ORDER BY p.closed_at ASC, p.position_id ASC"
             result = await conn.execute(text(sql), params)
             rows = [dict(row._mapping) for row in result.fetchall()]
     except HTTPException:
@@ -4975,20 +5176,63 @@ async def list_paper_positions(status_filter: Optional[str] = None) -> Dict[str,
         raise HTTPException(
             status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
         )
-    sql = "SELECT * FROM paper_positions"
+    sql = (
+        "SELECT p.*, fx.quote_currency AS fx_quote_currency, "
+        "fx.quote_to_usd AS fx_quote_to_usd_close, "
+        "fx.conversion_symbol AS fx_conversion_symbol_close, "
+        "fx.conversion_price AS fx_conversion_price_close, "
+        "fx.inverse AS fx_conversion_inverse_close, "
+        "fx.source AS fx_conversion_source_close, "
+        "fx.source_timestamp AS fx_conversion_source_timestamp_close "
+        "FROM paper_positions p LEFT JOIN paper_fx_conversion_snapshots fx "
+        "ON fx.position_id=p.position_id AND fx.phase='CLOSE'"
+    )
     params: Dict[str, object] = {}
     if status_filter is not None:
         if status_filter not in {"OPEN", "CLOSED", "CONFLICT"}:
             raise HTTPException(
                 status_code=400, detail={"status": "INVALID", "reason": "STATUS_INVALID"}
             )
-        sql += " WHERE status = :status"
+        sql += " WHERE p.status = :status"
         params["status"] = status_filter
-    sql += " ORDER BY opened_at DESC, position_id DESC"
+    sql += " ORDER BY p.opened_at DESC, p.position_id DESC"
     try:
         async with engine.connect() as conn:
             result = await conn.execute(text(sql), params)
-            rows = [paper_position_to_dict(row) for row in result.fetchall()]
+            rows = []
+            for row in result.fetchall():
+                payload = paper_position_to_dict(row)
+                data = row._mapping
+                if (
+                    data.get("status") == "CLOSED"
+                    and data.get("close_price") is not None
+                    and paper_position_quote_to_usd_required(str(data.get("symbol") or ""))
+                ):
+                    rate = data.get("fx_quote_to_usd_close")
+                    if rate is None:
+                        payload["realized_pnl"] = None
+                        payload["fx_conversion_status"] = "CLOSE_SNAPSHOT_MISSING"
+                    else:
+                        pnl = calculate_paper_pnl_usd(
+                            str(data["side"]),
+                            data["entry"],
+                            data["close_price"],
+                            data["size"],
+                            Decimal(str(rate)),
+                        )
+                        payload["realized_pnl"] = str(pnl)
+                        payload["realized_pnl_currency"] = "USD"
+                        payload["fx_quote_to_usd_close"] = str(rate)
+                        for key in (
+                            "fx_conversion_price_close",
+                            "fx_conversion_source_timestamp_close",
+                        ):
+                            value = data.get(key)
+                            if isinstance(value, Decimal):
+                                payload[key] = str(value)
+                            elif isinstance(value, datetime):
+                                payload[key] = value.isoformat()
+                rows.append(payload)
     except Exception as exc:
         persistence_state.mark_runtime_error(str(exc))
         raise HTTPException(
@@ -9070,8 +9314,8 @@ async def get_multi_asset_strategy_analysis_universe() -> Dict[str, object]:
 # Paper-only models below never claim broker lots/contracts. Gold is sized in
 # native XAU units. Cash indices use an explicit INTERNAL PAPER POINT UNIT where
 # one unit earns/loses USD 1 per index point; this is not a broker contract spec.
-# Non-USD quoted FX conversion is exposed/validated but remains execution-blocked
-# until conversion snapshots can be persisted with each position for exact P&L.
+# Non-USD quoted FX is authorized only when a fresh quote-to-USD conversion can be
+# snapshotted atomically with the paper position; close snapshots preserve USD P&L.
 MULTI_ASSET_EXTENDED_SIZING_VERSION = "SERVER_MULTI_ASSET_EXTENDED_SIZING_V1"
 
 
@@ -9209,11 +9453,47 @@ async def get_realtime_fx_quote_to_usd(symbol: str) -> Dict[str, object]:
     return await realtime_fx_quote_to_usd(symbol)
 
 
+@api_router.get("/paper/fx-conversion-snapshots/{position_id}")
+async def get_paper_fx_conversion_snapshots(position_id: str) -> Dict[str, object]:
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT phase, quote_currency, quote_to_usd, conversion_symbol, "
+                "conversion_price, inverse, source, source_timestamp, created_at "
+                "FROM paper_fx_conversion_snapshots WHERE position_id=:position_id "
+                "ORDER BY phase"
+            ),
+            {"position_id": position_id},
+        )
+        rows = []
+        for row in result.fetchall():
+            item = dict(row._mapping)
+            for key in ("quote_to_usd", "conversion_price"):
+                if item.get(key) is not None:
+                    item[key] = str(item[key])
+            for key in ("source_timestamp", "created_at"):
+                if item.get(key) is not None:
+                    item[key] = item[key].isoformat()
+            rows.append(item)
+    return {
+        "status": "OK",
+        "position_id": position_id,
+        "snapshots": rows,
+        "paper_only": True,
+        "execution": False,
+    }
+
+
 # V16-M5B29C — Multi-Asset Paper Execution Foundation
 # First executable multi-asset slice: USD-quoted spot Forex in native base units.
 # This is PAPER ONLY. Gold, cash indices, and non-USD-quoted FX remain fail-closed
 # until their missing calendar / contract-value / account-currency rules are verified.
-MULTI_ASSET_PAPER_EXECUTION_VERSION = "SERVER_MULTI_ASSET_PAPER_EXECUTION_V2"
+MULTI_ASSET_PAPER_EXECUTION_VERSION = "SERVER_MULTI_ASSET_PAPER_EXECUTION_V3_PERSISTED_FX"
 MULTI_ASSET_PAPER_RISK_PERCENT = Decimal("1")
 
 
@@ -9244,10 +9524,27 @@ def multi_asset_paper_execution_readiness(symbol: str) -> Dict[str, object]:
         if str(session.get("market_state") or "UNKNOWN") != "OPEN":
             return {**base, "status": "BLOCKED", "reason": "MARKET_CLOSED", "session": session}
         if instrument.quote_asset != "USD":
+            route = _fx_quote_to_usd_conversion_symbol(canonical)
+            if route is None:
+                return {
+                    **base,
+                    "status": "BLOCKED",
+                    "reason": "CONVERSION_ROUTE_NOT_REGISTERED",
+                    "session": session,
+                }
             return {
-                **base, "status": "BLOCKED",
-                "reason": "FX_CONVERSION_SNAPSHOT_PERSISTENCE_REQUIRED",
-                "conversion_preview_available": True, "session": session,
+                **base,
+                "status": "READY",
+                "reason": "FX_CONVERSION_SNAPSHOT_REQUIRED_AT_ENTRY",
+                "sizing_mode": "BASE_UNITS",
+                "pnl_currency": "USD",
+                "quote_currency": instrument.quote_asset,
+                "conversion_symbol": route[0],
+                "conversion_inverse": route[1],
+                "risk_percent": str(MULTI_ASSET_PAPER_RISK_PERCENT),
+                "session": session,
+                "auto_entry_authorized": True,
+                "requires_conversion_snapshot": True,
             }
         sizing = multi_asset_extended_sizing_readiness(canonical)
         return {
@@ -9396,12 +9693,38 @@ async def execute_multi_asset_paper_plan(
     account = await get_paper_account()
     capital = Decimal(str(account["current_capital"]))
     sizing_readiness = multi_asset_extended_sizing_readiness(canonical)
+    quote_to_usd = Decimal("1")
+    fx_conversion: Optional[Dict[str, object]] = None
+    fx_conversion_price: Optional[Decimal] = None
+    fx_conversion_source_timestamp: Optional[datetime] = None
+    if paper_position_quote_to_usd_required(canonical):
+        fx_conversion = await realtime_fx_quote_to_usd(canonical)
+        if fx_conversion.get("status") != "VALID":
+            return {
+                "status": "BLOCKED",
+                "reason": str(
+                    fx_conversion.get("reason") or "FX_CONVERSION_UNAVAILABLE"
+                ),
+                "conversion": fx_conversion,
+            }
+        conversion_rate = fx_conversion.get("quote_to_usd")
+        if not isinstance(conversion_rate, Decimal) or conversion_rate <= 0:
+            return {"status": "BLOCKED", "reason": "FX_CONVERSION_INVALID"}
+        quote_to_usd = conversion_rate
+        raw_conversion_price = fx_conversion.get("conversion_price")
+        if isinstance(raw_conversion_price, Decimal):
+            fx_conversion_price = raw_conversion_price
+        raw_conversion_timestamp = fx_conversion.get("source_timestamp")
+        if isinstance(raw_conversion_timestamp, datetime):
+            fx_conversion_source_timestamp = raw_conversion_timestamp
+        sizing_readiness = {**sizing_readiness, "status": "PREVIEW_READY"}
     sizing = calculate_extended_paper_size(
         capital,
         MULTI_ASSET_PAPER_RISK_PERCENT,
         entry,
         stop,
         sizing_readiness,
+        quote_to_usd=quote_to_usd,
     )
     if sizing.get("status") != "VALID":
         return {"status": "BLOCKED", "reason": str(sizing.get("reason") or "SIZING_INVALID")}
@@ -9438,6 +9761,23 @@ async def execute_multi_asset_paper_plan(
             source=f"strategy:{strategy_id}@{strategy_version}",
             source_timestamp=source_timestamp,
             opened_at=utcnow(),
+            fx_quote_currency=(
+                str(fx_conversion.get("quote_currency")) if fx_conversion else None
+            ),
+            fx_quote_to_usd=quote_to_usd if fx_conversion else None,
+            fx_conversion_symbol=(
+                str(fx_conversion.get("conversion_symbol")) if fx_conversion else None
+            ),
+            fx_conversion_price=fx_conversion_price,
+            fx_conversion_inverse=(
+                bool(fx_conversion.get("inverse", False)) if fx_conversion else None
+            ),
+            fx_conversion_source=(
+                str(fx_conversion.get("source") or "identity")
+                if fx_conversion
+                else None
+            ),
+            fx_conversion_source_timestamp=fx_conversion_source_timestamp,
         )
         created = await create_paper_position(position)
     return {

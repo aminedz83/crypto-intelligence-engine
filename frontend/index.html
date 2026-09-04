@@ -370,6 +370,15 @@ body{padding-bottom:calc(102px + var(--safe-b))!important}
 </style>
 
 
+
+<style id="v16-m5b28b7-crypto-logos">
+.coin.crypto-logo{position:relative;overflow:hidden;background:#0b1b2c;border:1px solid #20354d;color:#dce7f4}
+.coin.crypto-logo .crypto-logo-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:50%;display:block}
+.coin.crypto-logo .crypto-logo-fallback{position:relative;z-index:0;font-size:8px;font-weight:900;letter-spacing:-.3px}
+.coin.crypto-logo.logo-loaded .crypto-logo-fallback{visibility:hidden}
+@media(max-width:430px){.coin.crypto-logo .crypto-logo-fallback{font-size:7px}}
+</style>
+
 <style id="v11-full-ui-shell">
 .app-section{display:none}.app-section.active{display:block}
 .page-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:2px 0 12px}
@@ -808,7 +817,28 @@ function emptyState(t,s){return h("div",{class:"state"},[h("strong",{},[t]),s||"
 
 function refreshHealth(){return api("/health").then(function(r){var dot=byId("health-dot"),lab=byId("health-label");dot.className="dot";if(!r.ok||!r.data){dot.className="dot down";lab.textContent="backend indisponible";return}var o=r.data.overall||"UNKNOWN";dot.className="dot "+(o==="UP"?"up":o==="DEGRADED"?"deg":o==="DOWN"?"down":"");lab.textContent="backend "+o.toLowerCase()})}
 
-function iconFor(sym){var cls=sym==="BTC-USD"?"btc":sym==="ETH-USD"?"eth":sym==="SOL-USD"?"sol":sym==="XAU-USD"?"gold":"idx";var tx=sym==="BTC-USD"?"₿":sym==="ETH-USD"?"◆":sym==="SOL-USD"?"S":sym==="XAU-USD"?"Au":"I";return h("span",{class:"coin "+cls},[tx])}
+function iconFor(sym){
+  var base=String(sym||"").split("-")[0].toUpperCase();
+  if(sym==="XAU-USD")return h("span",{class:"coin gold"},["Au"]);
+  if(sym==="US30"||sym==="SPX500"||sym==="NAS100")return h("span",{class:"coin idx"},["I"]);
+
+  // V16-M5B28B7: real crypto logos for the dynamic Coinbase universe.
+  // CoinCap hosts symbol-based PNG assets. If an asset is absent/mismatched,
+  // the image is hidden and the deterministic ticker fallback remains visible.
+  var wrap=h("span",{class:"coin crypto-logo",title:base},[]);
+  var fallback=h("span",{class:"crypto-logo-fallback"},[base.slice(0,2)||"?"]);
+  var img=h("img",{
+    class:"crypto-logo-img",
+    src:"https://assets.coincap.io/assets/icons/"+base.toLowerCase()+"@2x.png",
+    alt:base+" logo",
+    loading:"lazy",
+    referrerpolicy:"no-referrer"
+  },[]);
+  img.addEventListener("load",function(){wrap.classList.add("logo-loaded")});
+  img.addEventListener("error",function(){img.style.display="none"});
+  wrap.appendChild(img);wrap.appendChild(fallback);
+  return wrap;
+}
 function miniPlaceholder(){return h("div",{class:"mini",html:'<svg viewBox="0 0 100 30" preserveAspectRatio="none"><path d="M0 18 L15 18 L30 18 L45 18 L60 18 L75 18 L100 18" fill="none" stroke="#314057" stroke-width="1.3" stroke-dasharray="3 4"/></svg>'})}
 function favRow(sym,name,kind){
  var p="fav-p-"+sym,b="fav-b-"+sym;
@@ -2062,6 +2092,7 @@ function renderHelpGlossary(){
 </script>
 <!-- SERVER DETECTOR · FVG V1 -->
 <!-- V16-M5B28B6 · MOBILE UI POLISH · COMPACT OPEN POSITIONS · SIGNAL SUMMARY · DASHBOARD PAPER PULSE -->
+<!-- V16-M5B28B7 · DYNAMIC CRYPTO LOGOS · COINCAP CDN + TICKER FALLBACK -->
 </body>
 </html>
 <!-- V16-M5B5 — server FVG detector -->

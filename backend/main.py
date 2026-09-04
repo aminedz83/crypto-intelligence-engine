@@ -5843,7 +5843,7 @@ ADAPTIVE_POLICY_DEFINITIONS: Dict[str, Dict[str, bool]] = {
 
 async def get_adaptive_policy_state() -> Dict[str, object]:
     """Read active policy; missing/unavailable persistence fails safely to baseline."""
-    baseline = {
+    baseline: Dict[str, object] = {
         "policy_version": ADAPTIVE_POLICY_BASELINE,
         "previous_policy_version": None,
         "source": "BUILTIN_BASELINE",

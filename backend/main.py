@@ -9909,6 +9909,116 @@ async def get_multi_asset_paper_execution_status() -> Dict[str, object]:
     }
 
 
+# V16-M5B29F — Runtime validation + multi-asset monitoring
+MULTI_ASSET_MONITORING_VERSION = "SERVER_MULTI_ASSET_RUNTIME_MONITORING_V1"
+
+
+def _monitoring_detection_payload(detector: Dict[str, object]) -> Dict[str, object]:
+    state, reason = _multi_asset_detection_state(detector)
+    return {
+        "strategy_id": str(detector.get("strategy_id") or "UNKNOWN_STRATEGY"),
+        "strategy_version": str(detector.get("strategy_version") or "unknown"),
+        "state": state,
+        "reason": reason,
+        "direction": detector.get("direction"),
+        "latest_closed_timestamp": detector.get("latest_closed_timestamp"),
+        "setup_timestamp": detector.get("setup_timestamp"),
+    }
+
+
+@api_router.get("/paper/multi-asset-monitoring")
+async def get_multi_asset_runtime_monitoring() -> Dict[str, object]:
+    """One fail-safe UI payload for observed multi-asset analysis/execution state."""
+    observed_at = utcnow()
+    runtime_summary = multi_asset_analysis_runtime.get("last_summary")
+    analysis_by_symbol: Dict[str, Dict[str, object]] = {}
+    if isinstance(runtime_summary, dict):
+        raw_results = runtime_summary.get("results")
+        if isinstance(raw_results, list):
+            for item in raw_results:
+                if isinstance(item, dict) and item.get("symbol"):
+                    analysis_by_symbol[str(item["symbol"])] = item
+
+    open_by_symbol: Dict[str, List[Dict[str, object]]] = {}
+    persistence_reason: Optional[str] = None
+    if persistence_state.ready:
+        try:
+            open_payload = await list_paper_positions(status_filter="OPEN")
+            raw_positions = open_payload.get("positions")
+            if isinstance(raw_positions, list):
+                for row in raw_positions:
+                    if not isinstance(row, dict):
+                        continue
+                    symbol = str(row.get("symbol") or "")
+                    if symbol:
+                        open_by_symbol.setdefault(symbol, []).append(row)
+        except Exception as exc:  # noqa: BLE001 - monitoring must stay fail-safe
+            persistence_reason = type(exc).__name__
+    else:
+        persistence_reason = "PERSISTENCE_NOT_READY"
+
+    instruments: List[Dict[str, object]] = []
+    for instrument in sorted(
+        instrument_registry.all(), key=lambda item: item.canonical_symbol
+    ):
+        if instrument.asset_class == AssetClass.CRYPTO:
+            continue
+        canonical = instrument.canonical_symbol
+        analysis = analysis_by_symbol.get(canonical)
+        readiness = multi_asset_paper_execution_readiness(canonical)
+        detections: List[Dict[str, object]] = []
+        if isinstance(analysis, dict):
+            raw_detections = analysis.get("detections")
+            if isinstance(raw_detections, list):
+                detections = [
+                    _monitoring_detection_payload(detector)
+                    for detector in raw_detections
+                    if isinstance(detector, dict)
+                ]
+        quality = analysis.get("quality") if isinstance(analysis, dict) else None
+        session = analysis.get("session") if isinstance(analysis, dict) else None
+        instruments.append(
+            {
+                "symbol": canonical,
+                "display_name": instrument.display_name,
+                "asset_class": instrument.asset_class.value,
+                "provider": analysis.get("source") if isinstance(analysis, dict) else None,
+                "granularity": (
+                    analysis.get("granularity") if isinstance(analysis, dict) else None
+                ),
+                "analysis_status": (
+                    str(analysis.get("status") or "UNKNOWN")
+                    if isinstance(analysis, dict)
+                    else "NOT_SCANNED"
+                ),
+                "quality": quality,
+                "session": session,
+                "regime": analysis.get("regime") if isinstance(analysis, dict) else None,
+                "detections": detections,
+                "execution_readiness": readiness,
+                "open_positions": open_by_symbol.get(canonical, []),
+                "open_position_count": len(open_by_symbol.get(canonical, [])),
+            }
+        )
+
+    return {
+        "status": "READY" if instruments else "UNAVAILABLE",
+        "marker": MULTI_ASSET_MONITORING_VERSION,
+        "observed_at": observed_at.isoformat(),
+        "analysis_last_completed_at": multi_asset_analysis_runtime.get(
+            "last_completed_at"
+        ),
+        "analysis_runs": multi_asset_analysis_runtime.get("runs", 0),
+        "persistence_status": "READY" if persistence_reason is None else "DEGRADED",
+        "persistence_reason": persistence_reason,
+        "instruments": instruments,
+        "count": len(instruments),
+        "paper_only": True,
+        "live_trading": False,
+        "execution": False,
+    }
+
+
 # V16-M5B28B1 — Trend Pullback paper execution (paper-only)
 TREND_PULLBACK_PAPER_VERSION = "0.2-paper"
 TREND_PULLBACK_RISK_REWARD = Decimal("2")

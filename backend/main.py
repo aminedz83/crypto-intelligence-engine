@@ -503,6 +503,18 @@ class CoinbaseProvider:
         symbol = symbol.upper()
         return await self._get(f"/market/products/{symbol}")
 
+    async def list_public_spot_products(self, limit: int = 250) -> dict:
+        """List public SPOT products, explicitly ranked by 24h quote volume."""
+        limit = max(100, min(int(limit), 1000))
+        return await self._get(
+            "/market/products",
+            params={
+                "limit": limit,
+                "product_type": "SPOT",
+                "products_sort_order": "PRODUCTS_SORT_ORDER_VOLUME_24H_DESCENDING",
+            },
+        )
+
     async def get_candles(self, symbol: str, granularity: str, limit: int = CANDLE_MAX_LIMIT):
         """Fetch qualified candles from Coinbase Advanced Trade (public, no auth).
         Verified params: granularity string enum + start/end UNIX seconds, max 350."""
@@ -5572,36 +5584,19 @@ COINBASE_PROFILE = ProviderProfile(
 _register_coinbase_instruments()
 
 
-# V16-M5B28A — live-verified Coinbase crypto universe expansion.
-# The original six proven symbols stay registered. Additional symbols are
-# activated only after Coinbase's public product endpoint verifies that the
-# product exists, exposes usable sizing increments, and is not disabled/view-only.
-CRYPTO_UNIVERSE_VERSION = "SERVER_CRYPTO_UNIVERSE_V1"
-CRYPTO_UNIVERSE_CANDIDATES: Tuple[str, ...] = (
-    "DOGE-USD",
-    "AVAX-USD",
-    "LINK-USD",
-    "DOT-USD",
-    "BCH-USD",
-    "UNI-USD",
-    "AAVE-USD",
-    "NEAR-USD",
-    "SUI-USD",
-    "APT-USD",
-    "HBAR-USD",
-    "ICP-USD",
-    "ATOM-USD",
-    "FIL-USD",
-    "ALGO-USD",
-    "XLM-USD",
-    "SHIB-USD",
-    "ETC-USD",
-)
+# V16-M5B28A-TOP100 — dynamic, live-verified Coinbase crypto universe.
+# Coinbase public products are requested in explicit 24h quote-volume order.
+# Only real SPOT *-USD products with valid sizing metadata are eligible.
+# This is Coinbase's top USD spot universe by 24h quote volume, not a fabricated
+# global market-cap ranking. The original six remain registered as the proven base.
+CRYPTO_UNIVERSE_VERSION = "SERVER_CRYPTO_UNIVERSE_TOP100_V2"
+CRYPTO_UNIVERSE_TARGET_SIZE = 100
+CRYPTO_UNIVERSE_DISCOVERY_LIMIT = 250
 crypto_universe_activation: Dict[str, Dict[str, object]] = {}
 
 
 def coinbase_product_is_eligible(symbol: str, payload: object) -> Tuple[bool, str]:
-    """Fail closed unless Coinbase proves a usable public USD spot product."""
+    """Fail closed unless Coinbase proves a usable public USD SPOT product."""
     if not isinstance(payload, dict):
         return False, "PRODUCT_PAYLOAD_INVALID"
     canonical = symbol.upper().replace("/", "-")
@@ -5610,7 +5605,10 @@ def coinbase_product_is_eligible(symbol: str, payload: object) -> Tuple[bool, st
         return False, "PRODUCT_ID_MISMATCH"
     if not canonical.endswith("-USD"):
         return False, "QUOTE_NOT_USD"
-    if payload.get("trading_disabled") is True:
+    product_type = str(payload.get("product_type", "SPOT")).upper()
+    if product_type != "SPOT":
+        return False, "PRODUCT_NOT_SPOT"
+    if payload.get("trading_disabled") is True or payload.get("is_disabled") is True:
         return False, "TRADING_DISABLED"
     if payload.get("view_only") is True:
         return False, "VIEW_ONLY"
@@ -5618,6 +5616,42 @@ def coinbase_product_is_eligible(symbol: str, payload: object) -> Tuple[bool, st
     if specs.get("status") != "VALID":
         return False, "PRODUCT_SPECS_INVALID"
     return True, "COINBASE_PRODUCT_VERIFIED"
+
+
+def _positive_decimal(value: object) -> Optional[Decimal]:
+    try:
+        parsed = Decimal(str(value))
+    except (ArithmeticError, ValueError):
+        return None
+    return parsed if parsed.is_finite() and parsed > 0 else None
+
+
+def select_coinbase_top_usd_spot_products(
+    payload: object, target: int = CRYPTO_UNIVERSE_TARGET_SIZE
+) -> List[Dict[str, object]]:
+    """Select up to target eligible USD SPOT products by real 24h quote volume."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("products"), list):
+        return []
+    ranked: List[Tuple[Decimal, Dict[str, object]]] = []
+    seen: Set[str] = set()
+    for raw in payload["products"]:
+        if not isinstance(raw, dict):
+            continue
+        symbol = str(raw.get("product_id", "")).upper().replace("/", "-")
+        if symbol in seen:
+            continue
+        eligible, _reason = coinbase_product_is_eligible(symbol, raw)
+        if not eligible:
+            continue
+        volume = _positive_decimal(
+            raw.get("approximate_quote_24h_volume", raw.get("volume_24h"))
+        )
+        if volume is None:
+            continue
+        seen.add(symbol)
+        ranked.append((volume, raw))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [product for _volume, product in ranked[: max(1, int(target))]]
 
 
 def register_verified_coinbase_crypto(symbol: str) -> bool:
@@ -5645,17 +5679,31 @@ def register_verified_coinbase_crypto(symbol: str) -> bool:
 
 
 async def activate_verified_crypto_universe() -> Dict[str, object]:
-    """Probe Coinbase live; unavailable/invalid candidates never enter the scanner."""
+    """Discover Coinbase live and activate at most 100 verified USD spot products."""
     activated: List[str] = []
     rejected: Dict[str, str] = {}
-    for symbol in CRYPTO_UNIVERSE_CANDIDATES:
-        try:
-            payload = await market_provider.get_product_specs(symbol)
-            eligible, reason = coinbase_product_is_eligible(symbol, payload)
-        except asyncio.CancelledError:
-            raise
-        except (httpx.HTTPError, ValueError, KeyError):
-            eligible, reason = False, "COINBASE_PRODUCT_UNAVAILABLE"
+    crypto_universe_activation.clear()
+    try:
+        payload = await market_provider.list_public_spot_products(
+            CRYPTO_UNIVERSE_DISCOVERY_LIMIT
+        )
+    except asyncio.CancelledError:
+        raise
+    except (httpx.HTTPError, ValueError, KeyError):
+        return {
+            "status": "DEGRADED",
+            "reason": "COINBASE_PRODUCT_DISCOVERY_UNAVAILABLE",
+            "activated": [],
+            "rejected": {},
+            "target_count": CRYPTO_UNIVERSE_TARGET_SIZE,
+            "marker": CRYPTO_UNIVERSE_VERSION,
+            "paper_only": True,
+            "execution": False,
+        }
+    products = select_coinbase_top_usd_spot_products(payload)
+    for product in products:
+        symbol = str(product.get("product_id", "")).upper()
+        eligible, reason = coinbase_product_is_eligible(symbol, product)
         if eligible and register_verified_coinbase_crypto(symbol):
             activated.append(symbol)
         else:
@@ -5663,12 +5711,17 @@ async def activate_verified_crypto_universe() -> Dict[str, object]:
         crypto_universe_activation[symbol] = {
             "active": bool(eligible),
             "reason": reason,
+            "volume_24h_quote": str(
+                product.get("approximate_quote_24h_volume", product.get("volume_24h", ""))
+            ),
         }
     return {
         "status": "READY",
-        "activated": sorted(activated),
+        "activated": activated,
         "rejected": rejected,
-        "candidate_count": len(CRYPTO_UNIVERSE_CANDIDATES),
+        "target_count": CRYPTO_UNIVERSE_TARGET_SIZE,
+        "discovered_eligible_count": len(products),
+        "ranking": "COINBASE_24H_QUOTE_VOLUME_DESC",
         "marker": CRYPTO_UNIVERSE_VERSION,
         "paper_only": True,
         "execution": False,
@@ -5689,8 +5742,10 @@ async def get_crypto_universe() -> Dict[str, object]:
         "status": "READY",
         "active_symbols": active,
         "active_count": len(active),
+        "target_count": CRYPTO_UNIVERSE_TARGET_SIZE,
         "candidate_activation": dict(crypto_universe_activation),
-        "source": "coinbase_public_product",
+        "source": "coinbase_public_products",
+        "ranking": "COINBASE_24H_QUOTE_VOLUME_DESC",
         "marker": CRYPTO_UNIVERSE_VERSION,
         "paper_only": True,
         "execution": False,

@@ -442,14 +442,30 @@ body{padding-bottom:calc(102px + var(--safe-b))!important}
 <style id="chart-engine-v1-real">
 .chart-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.chart-head .filter-row{margin:0;flex:1}.chart-controls{display:flex;gap:4px;flex:none}.chart-controls button{width:29px;height:29px;border:1px solid #26364d;border-radius:8px;background:#081220;color:#b7c4d8;font-size:14px}.chart-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:#8392a8;font-size:7px}.real-chart{height:310px;position:relative;border:1px solid #1f3047;border-radius:11px;background:#050c16;overflow:hidden}.real-chart-svg{display:block;width:100%;height:100%;touch-action:none}.chart-grid{stroke:#24344a;stroke-width:1;opacity:.65}.chart-axis,.chart-time{fill:#8290a5;font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.candle-up{stroke:#20e878;fill:#20e878;stroke-width:1.5}.candle-down{stroke:#ff5573;fill:#ff5573;stroke-width:1.5}.cross-line{stroke:#9eabc0;stroke-width:1;stroke-dasharray:4 4;opacity:.7}.cross-dot{fill:#e6edf8}.chart-tip{position:absolute;left:8px;top:8px;max-width:calc(100% - 16px);padding:6px 8px;border:1px solid #344760;border-radius:7px;background:rgba(4,10,19,.94);color:#d9e2ef;font-size:7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;opacity:0;pointer-events:none;white-space:normal}.chart-tip.show{opacity:1}.swing-high{fill:#ffb020;stroke:#ffb020;stroke-width:1.5}.swing-low{fill:#35a7ff;stroke:#35a7ff;stroke-width:1.5}.swing-label{font-size:10px;font-weight:800;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.swing-high-label{fill:#ffb020}.swing-low-label{fill:#35a7ff}.structure-label{font-size:10px;font-weight:900;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.structure-bull{fill:#43ef83}.structure-bear{fill:#ff6f88}.structure-neutral{fill:#a8b4c6}.bos-line{stroke-width:1.4;stroke-dasharray:5 4;opacity:.85}.bos-bull{stroke:#43ef83;fill:#43ef83}.bos-bear{stroke:#ff6f88;fill:#ff6f88}.bos-label{font-size:9px;font-weight:900;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.choch-line{stroke-width:1.8;stroke-dasharray:2 3;opacity:.95}.choch-bull{stroke:#43ef83;fill:#43ef83}.choch-bear{stroke:#ff6f88;fill:#ff6f88}.choch-label{font-size:9px;font-weight:900;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.sweep-line{stroke-width:1.6;stroke-dasharray:5 3;opacity:.9}.sweep-buy{stroke:#ffb84d;fill:#ffb84d}.sweep-sell{stroke:#49d8ff;fill:#49d8ff}.sweep-label{font-size:8px;font-weight:900;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.disp-mark{stroke-width:2;opacity:.95}.disp-bull{stroke:#7cff9d;fill:#7cff9d}.disp-bear{stroke:#ff7b91;fill:#ff7b91}.disp-label{font-size:8px;font-weight:900;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.fvg-zone{stroke-width:1;stroke-dasharray:3 2;opacity:.16}.fvg-bull{stroke:#53e89b;fill:#53e89b}.fvg-bear{stroke:#ff718a;fill:#ff718a}.fvg-label{font-size:8px;font-weight:900;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ob-zone{stroke-width:1.2;stroke-dasharray:5 3;opacity:.13}.ob-bull{stroke:#9d7cff;fill:#9d7cff}.ob-bear{stroke:#ffb04d;fill:#ffb04d}.ob-label{font-size:8px;font-weight:900;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}@media(max-width:430px){.real-chart{height:260px}.chart-head{align-items:flex-start;flex-direction:column}.chart-controls{align-self:flex-end}.chart-axis,.chart-time{font-size:13px}}
 </style>
+
+<style id="v16-m5b28b3-ui-hardening">
+html,body{max-width:100%;overflow-x:hidden}
+.view,.card,.grid-2,.metric-strip,.metric-mini,.journal-card,.section-stack{min-width:0}
+.metric-mini b,.kv b,.kv span,.journal-card,.tool-desc,.muted{
+  overflow-wrap:anywhere;word-break:break-word
+}
+.subtab,.mtab,#nav button,.hamb,.bell{touch-action:manipulation}
+body.market-menu-open .market-tabs-wrap{display:block!important}
+@media(max-width:430px){
+  .metric-strip{grid-template-columns:minmax(0,1fr) minmax(0,1fr)!important}
+  .grid-2{grid-template-columns:minmax(0,1fr)!important}
+  .metric-mini{min-width:0}
+  .subtab{min-height:44px}
+}
+</style>
 </head>
 <body>
 <header class="header">
  <div class="header-row">
-  <button class="hamb" aria-label="Menu">☰</button>
+  <button class="hamb" aria-label="Menu" aria-expanded="false" onclick="toggleMarketMenu(this)">☰</button>
   <div class="brandline"><div class="logo">↗</div><div class="brand">Crypto Intelligence Engine<small>Markets · version de test</small></div></div>
   <div class="health"><span class="dot" id="health-dot"></span><span id="health-label">…</span></div>
-  <button class="bell" aria-label="Notifications">♧</button>
+  <button class="bell" aria-label="Notifications" onclick="setView('signals')">♧</button>
  </div>
  <div style="font-size:8px;color:#74839a;padding:2px 14px 5px">Auto-refresh · 5s (polling, pas de streaming)</div>
 </header>
@@ -590,11 +606,16 @@ function paperPositionCard(p){
       h("div",{class:"kv"},[h("span",{},[closed?"P&L réalisé":"P&L latent"]),
         h("b",{},[closed&&pnl!==null&&pnl!==undefined?paperMoney(pnl):
           (!closed&&p.mark_status==="VALID"?paperMoney(p.unrealized_pnl):"—")])]),
+      h("div",{class:"kv"},[h("span",{},["Stratégie"]),h("b",{},[paperStrategyLabel(p)])]),
+      h("div",{class:"kv"},[h("span",{},["Source marché"]),
+        h("b",{},[!closed&&p.mark_status==="VALID"?(p.mark_source||"—"):"—"])]),
       h("div",{class:"kv"},[h("span",{},["Mark"]),
         h("b",{},[closed?"CLOSED":(p.mark_status||"UNAVAILABLE")])]),
-      h("div",{class:"kv"},[h("span",{},["Source"]),
-        h("b",{},[!closed&&p.mark_status==="VALID"?(p.mark_source||"—"):(p.source||"—")])]),
-      h("div",{class:"kv"},[h("span",{},["Ouverture"]),h("b",{},[p.opened_at||"—"])])
+      closed?h("div",{class:"kv"},[h("span",{},["Clôture"]),h("b",{},[p.close_reason||"—"])]):null,
+      h("div",{class:"kv"},[h("span",{},["Ouverture · Montréal"]),
+        h("b",{},[formatMontrealTime(p.opened_at)])]),
+      closed?h("div",{class:"kv"},[h("span",{},["Fermeture · Montréal"]),
+        h("b",{},[formatMontrealTime(p.closed_at)])]):null
     ])
   ]);
 }
@@ -749,38 +770,65 @@ function renderSignals(){
   if(!paperUiState.loading&&!paperUiState.updatedAt)refreshPaperTrading();
 }
 
+
+var paperActiveTab="account";
+var intelligenceActiveTab="regime";
+var settingsActiveTab="interface";
+
+function tabButton(label,id,active,setter){
+  return h("button",{
+    class:"subtab "+(active===id?"active":""),
+    "data-tab":id,
+    "aria-selected":active===id?"true":"false",
+    onclick:function(){setter(id)}
+  },[label]);
+}
+function setPaperTab(id){
+  paperActiveTab=id;
+  renderTrading();
+}
+function setIntelligenceTab(id){
+  intelligenceActiveTab=id;
+  renderIntelligence();
+}
+function setSettingsTab(id){
+  settingsActiveTab=id;
+  renderSettings();
+}
+function toggleMarketMenu(button){
+  var open=!document.body.classList.contains("market-menu-open");
+  document.body.classList.toggle("market-menu-open",open);
+  if(button)button.setAttribute("aria-expanded",open?"true":"false");
+}
+function closeMarketMenu(){
+  document.body.classList.remove("market-menu-open");
+  var button=document.querySelector(".hamb");
+  if(button)button.setAttribute("aria-expanded","false");
+}
+function paperStrategyLabel(p){
+  var src=String(p&&p.source||"");
+  if(src.indexOf("strategy:")===0)return src.slice(9);
+  if(src.indexOf("server_signal")===0)return "SMC_LIQUIDITY_REVERSAL";
+  return src||"—";
+}
+
 function renderTradingContent(){
   var v=byId("view-trading");
   clear(v);
   var a=paperUiState.account;
+  var open=paperUiState.positions.filter(function(p){return p.status==="OPEN"});
+  var closed=paperUiState.positions.filter(function(p){return p.status==="CLOSED"});
+  var perf=paperUiState.performance&&paperUiState.performance.metrics;
+
   v.appendChild(pageHead("Paper Trading",
     "Compte virtuel persistant, positions ouvertes et historique réel du moteur paper.","PAPER ONLY"));
   v.setAttribute("data-paper-rendered","true");
-  v.appendChild(h("div",{class:"subtabs"},[
-    h("button",{class:"subtab active"},["Compte"]),
-    h("button",{class:"subtab"},["Positions"]),
-    h("button",{class:"subtab"},["Historique"])
+  v.appendChild(h("div",{class:"subtabs",role:"tablist"},[
+    tabButton("Compte","account",paperActiveTab,setPaperTab),
+    tabButton("Positions","positions",paperActiveTab,setPaperTab),
+    tabButton("Historique","history",paperActiveTab,setPaperTab)
   ]));
-  v.appendChild(h("div",{class:"metric-strip"},[
-    h("div",{class:"metric-mini"},[h("span",{},["Capital initial"]),
-      h("b",{},[a?paperMoney(a.initial_capital):"—"])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Capital réalisé"]),
-      h("b",{},[a?paperMoney(a.current_capital):"—"])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Équité live"]),
-      h("b",{},[a&&a.live_equity_status==="VALID"?paperMoney(a.live_equity):"—"])]),
-    h("div",{class:"metric-mini"},[h("span",{},["P&L latent"]),
-      h("b",{},[a&&a.live_equity_status==="VALID"?paperMoney(a.unrealized_pnl):"—"])])
-  ]));
-  v.appendChild(h("div",{class:"metric-strip"},[
-    h("div",{class:"metric-mini"},[h("span",{},["P&L réalisé"]),
-      h("b",{},[a?paperMoney(a.realized_pnl):"—"])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Positions OPEN"]),
-      h("b",{},[a?String(a.open_positions):"—"])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Marks VALID"]),
-      h("b",{},[a?String(a.marked_open_positions):"—"])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Marks indisponibles"]),
-      h("b",{},[a?String(a.unavailable_open_positions):"—"])])
-  ]));
+
   if(paperUiState.error){
     v.appendChild(modCard("État Paper Trading","UNAVAILABLE",
       placeholder("Données indisponibles",paperUiState.error)));
@@ -788,45 +836,58 @@ function renderTradingContent(){
     v.appendChild(modCard("État Paper Trading","CHARGEMENT",
       placeholder("Chargement","Lecture du compte et des positions persistées…")));
   }
-  var open=paperUiState.positions.filter(function(p){return p.status==="OPEN"});
-  var closed=paperUiState.positions.filter(function(p){return p.status==="CLOSED"});
-  var perf=paperUiState.performance&&paperUiState.performance.metrics;
-  v.appendChild(modCard("Performance paper","PERSISTÉE",perf?h("div",{class:"metric-strip"},[
-    h("div",{class:"metric-mini"},[h("span",{},["Trades clôturés"]),h("b",{},[String(perf.closed_trades)])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Win Rate"]),h("b",{},[paperMetric(perf.win_rate_percent," %")])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Profit Factor"]),h("b",{},[paperMetric(perf.profit_factor,"")])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Expectancy"]),h("b",{},[paperMoney(perf.expectancy)])]),
-    h("div",{class:"metric-mini"},[h("span",{},["P&L net"]),h("b",{},[paperMoney(perf.net_pnl)])]),
-    h("div",{class:"metric-mini"},[h("span",{},["RR réalisé moyen"]),h("b",{},[paperMetric(perf.average_realized_rr," R")])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Max Drawdown"]),h("b",{},[paperMoney(perf.max_drawdown)])]),
-    h("div",{class:"metric-mini"},[h("span",{},["Max DD %"]),h("b",{},[paperMetric(perf.max_drawdown_percent," %")])])
-  ]):placeholder("Performance indisponible","Aucune métrique n’est inventée sans historique CLOSED persisté.")));
-  v.appendChild(modCard("Historique des décisions","POSTGRES · 50 DERNIÈRES",h("div",{class:"section-stack"},[
-    paperDecisionFilters(),
-    paperUiState.decisions.length?h("div",{class:"grid-2"},paperUiState.decisions.map(paperDecisionCard)):
-      placeholder("Aucune décision persistée","WAIT / ENTRY_NOW / BLOCKED / INVALIDATED / EXPIRED apparaîtront ici après le scanner réel.")
-  ])));
-  v.appendChild(modCard("Positions ouvertes",open.length+" OPEN",
-    open.length?h("div",{class:"grid-2"},open.map(paperPositionCard)):
-      placeholder("Aucune position ouverte",
-        "Le moteur n’invente aucune position. Une position apparaît après création paper persistée.")));
-  v.appendChild(modCard("Historique",closed.length+" CLOSED",
-    closed.length?h("div",{class:"grid-2"},closed.map(paperPositionCard)):
-      placeholder("Aucune position clôturée",
-        "Les fermetures SL/TP persistées apparaîtront ici avec leur P&L réalisé.")));
-  v.appendChild(modCard("Sécurité","PAPER ONLY",h("div",{class:"section-stack"},[
-    h("div",{class:"kv"},[h("span",{},["Exécution broker / MT5"]),h("b",{},["DÉSACTIVÉE"])]),
-    h("div",{class:"kv"},[h("span",{},["Données inventées"]),h("b",{},["AUCUNE"])]),
-    h("div",{class:"kv"},[h("span",{},["Snapshot serveur"]),
-      h("b",{},[paperUiState.serverSnapshotAt||"—"])]),
-    h("div",{class:"kv"},[h("span",{},["Dernière lecture UI"]),
-      h("b",{},[paperUiState.updatedAt||"—"])]),
-    h("div",{class:"kv"},[h("span",{},["Sections indisponibles"]),
-      h("b",{},[Object.keys(paperUiState.sectionErrors).join(", ")||"AUCUNE"])])
-  ])));
+
+  if(paperActiveTab==="account"){
+    v.appendChild(h("div",{class:"metric-strip"},[
+      h("div",{class:"metric-mini"},[h("span",{},["Capital initial"]),h("b",{},[a?paperMoney(a.initial_capital):"—"])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Capital réalisé"]),h("b",{},[a?paperMoney(a.current_capital):"—"])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Équité live"]),h("b",{},[a&&a.live_equity_status==="VALID"?paperMoney(a.live_equity):"—"])]),
+      h("div",{class:"metric-mini"},[h("span",{},["P&L latent"]),h("b",{},[a&&a.live_equity_status==="VALID"?paperMoney(a.unrealized_pnl):"—"])])
+    ]));
+    v.appendChild(h("div",{class:"metric-strip"},[
+      h("div",{class:"metric-mini"},[h("span",{},["P&L réalisé"]),h("b",{},[a?paperMoney(a.realized_pnl):"—"])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Positions OPEN"]),h("b",{},[a?String(a.open_positions):"—"])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Marks VALID"]),h("b",{},[a?String(a.marked_open_positions):"—"])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Marks indisponibles"]),h("b",{},[a?String(a.unavailable_open_positions):"—"])])
+    ]));
+    v.appendChild(modCard("Performance paper","PERSISTÉE",perf?h("div",{class:"metric-strip"},[
+      h("div",{class:"metric-mini"},[h("span",{},["Trades clôturés"]),h("b",{},[String(perf.closed_trades)])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Win Rate"]),h("b",{},[paperMetric(perf.win_rate_percent," %")])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Profit Factor"]),h("b",{},[paperMetric(perf.profit_factor,"")])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Expectancy"]),h("b",{},[paperMoney(perf.expectancy)])]),
+      h("div",{class:"metric-mini"},[h("span",{},["P&L net"]),h("b",{},[paperMoney(perf.net_pnl)])]),
+      h("div",{class:"metric-mini"},[h("span",{},["RR réalisé moyen"]),h("b",{},[paperMetric(perf.average_realized_rr," R")])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Max Drawdown"]),h("b",{},[paperMoney(perf.max_drawdown)])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Max DD %"]),h("b",{},[paperMetric(perf.max_drawdown_percent," %")])])
+    ]):placeholder("Performance indisponible","Aucune métrique n’est inventée sans historique CLOSED persisté.")));
+    v.appendChild(modCard("Sécurité","PAPER ONLY",h("div",{class:"section-stack"},[
+      h("div",{class:"kv"},[h("span",{},["Exécution broker / MT5"]),h("b",{},["DÉSACTIVÉE"])]),
+      h("div",{class:"kv"},[h("span",{},["Données inventées"]),h("b",{},["AUCUNE"])]),
+      h("div",{class:"kv"},[h("span",{},["Snapshot serveur"]),h("b",{},[paperUiState.serverSnapshotAt||"—"])]),
+      h("div",{class:"kv"},[h("span",{},["Dernière lecture UI"]),
+        h("b",{},[paperUiState.updatedAt?formatMontrealTime(paperUiState.updatedAt):"—"])]),
+      h("div",{class:"kv"},[h("span",{},["Sections indisponibles"]),
+        h("b",{},[Object.keys(paperUiState.sectionErrors).join(", ")||"AUCUNE"])])
+    ])));
+  }else if(paperActiveTab==="positions"){
+    v.appendChild(modCard("Positions ouvertes",open.length+" OPEN",
+      open.length?h("div",{class:"grid-2"},open.map(paperPositionCard)):
+        placeholder("Aucune position ouverte",
+          "Le moteur n’invente aucune position. Une position apparaît après création paper persistée.")));
+  }else{
+    v.appendChild(modCard("Historique",closed.length+" CLOSED",
+      closed.length?h("div",{class:"grid-2"},closed.map(paperPositionCard)):
+        placeholder("Aucune position clôturée",
+          "Les fermetures SL/TP persistées apparaîtront ici avec leur P&L réalisé.")));
+    v.appendChild(modCard("Historique des décisions","POSTGRES · 50 DERNIÈRES",h("div",{class:"section-stack"},[
+      paperDecisionFilters(),
+      paperUiState.decisions.length?h("div",{class:"grid-2"},paperUiState.decisions.map(paperDecisionCard)):
+        placeholder("Aucune décision persistée",
+          "WAIT / ENTRY_NOW / BLOCKED / INVALIDATED / EXPIRED apparaîtront ici après le scanner réel.")
+    ])));
+  }
   if(!paperUiState.loading&&!paperUiState.updatedAt)refreshPaperTrading();
 }
-
 
 function renderTrading(){
   var v=byId("view-trading");
@@ -880,27 +941,37 @@ function renderStrategies(){
 
 function renderIntelligence(){
   var v=byId("view-intelligence");clear(v);
-  v.appendChild(pageHead("Intelligence","Contexte, structure, liquidité, zones, sessions et données alternatives.","UI HYPER FULL"));
-  v.appendChild(h("div",{class:"subtabs"},[
-    h("button",{class:"subtab active"},["Régime"]),h("button",{class:"subtab"},["Structure"]),
-    h("button",{class:"subtab"},["Liquidité"]),h("button",{class:"subtab"},["Zones"]),
-    h("button",{class:"subtab"},["Sessions"]),h("button",{class:"subtab"},["News/Macro"])
+  v.appendChild(pageHead("Intelligence",
+    "Contexte, structure, liquidité, zones, sessions et données alternatives.","UI HYPER FULL"));
+  v.appendChild(h("div",{class:"subtabs",role:"tablist"},[
+    tabButton("Régime","regime",intelligenceActiveTab,setIntelligenceTab),
+    tabButton("Structure","structure",intelligenceActiveTab,setIntelligenceTab),
+    tabButton("Liquidité","liquidity",intelligenceActiveTab,setIntelligenceTab),
+    tabButton("Zones","zones",intelligenceActiveTab,setIntelligenceTab),
+    tabButton("Sessions","sessions",intelligenceActiveTab,setIntelligenceTab),
+    tabButton("News/Macro","news",intelligenceActiveTab,setIntelligenceTab)
   ]));
+  var catalogue={
+    regime:[["Market Regime","Trend / range, volatilité, expansion / compression, risk-on/off."]],
+    structure:[["Market Structure","HH/HL, LH/LL, BOS, CHoCH/MSS avec timestamps."]],
+    liquidity:[["Liquidity Map","Daily/weekly highs-lows, equal highs/lows, sweeps, stop runs."]],
+    zones:[
+      ["Order Blocks","Bullish/Bearish, qualité, fraîcheur, retest, mitigation, invalidation."],
+      ["Fair Value Gaps","Création, remplissage, mitigation, invalidation."],
+      ["Supply & Demand","Zones + fraîcheur + retests + displacement."]
+    ],
+    sessions:[["Session Intelligence","Sydney/Tokyo/London/New York indicatif + calendars."]],
+    news:[["News / Macro","Événements, sentiment et contexte sans inventer de données."]]
+  };
   var g=h("div",{class:"grid-2"},[]);
-  [
-    ["Market Regime","Trend / range, volatilité, expansion / compression, risk-on/off."],
-    ["Market Structure","HH/HL, LH/LL, BOS, CHoCH/MSS avec timestamps."],
-    ["Liquidity Map","Daily/weekly highs-lows, equal highs/lows, sweeps, stop runs."],
-    ["Order Blocks","Bullish/Bearish, qualité, fraîcheur, retest, mitigation, invalidation."],
-    ["Fair Value Gaps","Création, remplissage, mitigation, invalidation."],
-    ["Supply & Demand","Zones + fraîcheur + retests + displacement."],
-    ["Session Intelligence","Sydney/Tokyo/London/New York indicatif + calendars."],
-    ["News / Macro","Événements, sentiment et contexte sans inventer de données."]
-  ].forEach(function(x){
+  (catalogue[intelligenceActiveTab]||catalogue.regime).forEach(function(x){
     g.appendChild(h("div",{class:"card tool-card"},[
       h("div",{},[h("div",{class:"tool-name"},[x[0]]),h("div",{class:"tool-desc"},[x[1]])]),
-      h("div",{class:"tool-foot"},[h("span",{class:"status-pill future"},["NOT IMPLEMENTED"]),h("span",{class:"info"},["i"])])
-    ]))
+      h("div",{class:"tool-foot"},[
+        h("span",{class:"status-pill future"},["NOT IMPLEMENTED"]),
+        h("span",{class:"info"},["i"])
+      ])
+    ]));
   });
   v.appendChild(g);
   v.appendChild(modCard("Qualité & synchronisation","NOT IMPLEMENTED",h("div",{class:"section-stack"},[
@@ -914,27 +985,67 @@ function renderIntelligence(){
 
 function renderSettings(){
   var v=byId("view-settings");clear(v);
-  v.appendChild(pageHead("Réglages","Configuration de l'interface, data layer, risque, alertes et sécurité.","UI HYPER FULL"));
-  v.appendChild(h("div",{class:"subtabs"},[
-    h("button",{class:"subtab active"},["Interface"]),h("button",{class:"subtab"},["Données"]),
-    h("button",{class:"subtab"},["Risque"]),h("button",{class:"subtab"},["Alertes"]),
-    h("button",{class:"subtab"},["Trading"]),h("button",{class:"subtab"},["Sécurité"])
+  v.appendChild(pageHead("Réglages",
+    "Configuration de l'interface, data layer, risque, alertes et sécurité.","UI HYPER FULL"));
+  v.appendChild(h("div",{class:"subtabs",role:"tablist"},[
+    tabButton("Interface","interface",settingsActiveTab,setSettingsTab),
+    tabButton("Données","data",settingsActiveTab,setSettingsTab),
+    tabButton("Risque","risk",settingsActiveTab,setSettingsTab),
+    tabButton("Alertes","alerts",settingsActiveTab,setSettingsTab),
+    tabButton("Trading","trading",settingsActiveTab,setSettingsTab),
+    tabButton("Sécurité","security",settingsActiveTab,setSettingsTab)
   ]));
-  v.appendChild(modCard("Interface","READY",h("div",{},[
-    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Fuseau d'affichage"]),h("small",{},["America/Toronto · Montréal"])]),h("span",{class:"status-pill ready"},["ACTIF"])]),
-    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Design premium"]),h("small",{},["Référence UI officielle"])]),h("span",{class:"status-pill ready"},["ACTIF"])]),
-    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Aide contextuelle ⓘ"]),h("small",{},["Définitions intégrées aux concepts trading."])]),h("span",{class:"status-pill future"},["À VENIR"])])
-  ])));
-  v.appendChild(modCard("Data Layer","NOT IMPLEMENTED",h("div",{},[
-    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Coinbase"]),h("small",{},["Crypto réel · backend existant"])]),h("span",{class:"status-pill ready"},["BACKEND"])]),
-    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Massive"]),h("small",{},["Forex / indices selon mapping & entitlement"])]),h("span",{class:"status-pill future"},["CONNECTEUR"])]),
-    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Twelve Data"]),h("small",{},["XAU/USD réel · backend existant"])]),h("span",{class:"status-pill ready"},["BACKEND"])])
-  ])));
-  v.appendChild(modCard("Trading & sécurité","NOT IMPLEMENTED",h("div",{},[
-    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Live trading"]),h("small",{},["Doit rester désactivé pendant la phase actuelle."])]),h("div",{class:"switch-off"})]),
-    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Kill switch"]),h("small",{},["Future protection globale d'exécution."])]),h("span",{class:"status-pill future"},["À VENIR"])]),
-    h("div",{class:"setting-row"},[h("div",{},[h("b",{},["Limites risque / exposition"]),h("small",{},["Max risque, positions, spread, slippage, sessions."])]),h("span",{class:"status-pill future"},["À VENIR"])])
-  ])));
+  if(settingsActiveTab==="interface"){
+    v.appendChild(modCard("Interface","READY",h("div",{},[
+      h("div",{class:"setting-row"},[
+        h("div",{},[h("b",{},["Fuseau d'affichage"]),h("small",{},["America/Toronto · Montréal"])]),
+        h("span",{class:"status-pill ready"},["ACTIF"])
+      ]),
+      h("div",{class:"setting-row"},[
+        h("div",{},[h("b",{},["Design premium"]),h("small",{},["Référence UI officielle"])]),
+        h("span",{class:"status-pill ready"},["ACTIF"])
+      ]),
+      h("div",{class:"setting-row"},[
+        h("div",{},[h("b",{},["Aide contextuelle ⓘ"]),
+          h("small",{},["Définitions intégrées aux concepts trading."])]),
+        h("span",{class:"status-pill future"},["À VENIR"])
+      ])
+    ])));
+  }else if(settingsActiveTab==="data"){
+    v.appendChild(modCard("Data Layer","BACKEND",h("div",{},[
+      h("div",{class:"setting-row"},[
+        h("div",{},[h("b",{},["Coinbase"]),h("small",{},["Crypto réel · backend existant"])]),
+        h("span",{class:"status-pill ready"},["BACKEND"])
+      ]),
+      h("div",{class:"setting-row"},[
+        h("div",{},[h("b",{},["Massive"]),
+          h("small",{},["Forex / indices selon mapping & entitlement"])]),
+        h("span",{class:"status-pill future"},["CONNECTEUR"])
+      ]),
+      h("div",{class:"setting-row"},[
+        h("div",{},[h("b",{},["Twelve Data"]),h("small",{},["XAU/USD réel · backend existant"])]),
+        h("span",{class:"status-pill ready"},["BACKEND"])
+      ])
+    ])));
+  }else if(settingsActiveTab==="trading"||settingsActiveTab==="security"){
+    v.appendChild(modCard("Trading & sécurité","PAPER ONLY",h("div",{},[
+      h("div",{class:"setting-row"},[
+        h("div",{},[h("b",{},["Live trading"]),
+          h("small",{},["Doit rester désactivé pendant la phase actuelle."])]),
+        h("div",{class:"switch-off"})
+      ]),
+      h("div",{class:"setting-row"},[
+        h("div",{},[h("b",{},["Kill switch"]),
+          h("small",{},["Future protection globale d'exécution."])]),
+        h("span",{class:"status-pill future"},["À VENIR"])
+      ])
+    ])));
+  }else{
+    var title=settingsActiveTab==="risk"?"Risque":"Alertes";
+    v.appendChild(modCard(title,"NOT IMPLEMENTED",
+      placeholder("À venir",
+        "Cette section n'est pas encore implémentée. Aucun réglage fictif n'est affiché.")));
+  }
 }
 
 var chartState={tf:"1h",candles:[],visible:60,offset:0,status:"IDLE",source:"",quality:"UNKNOWN"};
@@ -1626,7 +1737,7 @@ var BOTTOM=[
  {id:"settings",label:"Réglages",icon:"⚙"}
 ];
 function buildNav(){var n=byId("nav");clear(n);BOTTOM.forEach(function(x){n.appendChild(h("button",{"data-view":x.id,onclick:function(){setView(x.id)}},[h("span",{class:"ic"},[x.icon]),x.label]))})}
-function setView(id){current=id;var workspace=["signals","trading","strategies","intelligence","settings"].includes(id);document.body.classList.toggle("workspace-mode",workspace);document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading")renderTrading();else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
+function setView(id){closeMarketMenu();current=id;var workspace=["signals","trading","strategies","intelligence","settings"].includes(id);document.body.classList.toggle("workspace-mode",workspace);document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading")renderTrading();else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
 function poll(){refreshHealth();if(current==="dashboard")refreshDashboard();else if(current==="markets")refreshMarkets();else if(current==="forex")refreshForexMarket();else if(current==="system")renderSystem();else if(current==="trading")refreshPaperTrading();else if(current==="detail")refreshDetail()}
 function loadCryptoUniverse(){
   return api("/api/v1/market/crypto-universe").then(function(r){

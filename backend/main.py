@@ -1507,6 +1507,18 @@ paper_adaptive_edge_active_table = Table(
 )
 
 
+# V16-M5B30G — exact adaptive-edge evidence snapshot captured with each active gate.
+paper_adaptive_edge_explainability_table = Table(
+    "paper_adaptive_edge_explainability",
+    metadata,
+    Column("decision_id", String, primary_key=True),
+    Column("components_json", Text, nullable=False),
+    Column("metrics_json", Text, nullable=False),
+    Column("policy_version", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+
+
 candles_table = Table(
     "candles",
     metadata,
@@ -5615,6 +5627,10 @@ def adaptive_edge_shadow_decision(
             else:
                 action = "NEUTRAL"
                 reason = "EVIDENCE_NOT_DECISIVE"
+            components_raw = edge.get("components")
+            components = components_raw if isinstance(components_raw, dict) else {}
+            metrics_raw = raw_entry.get("metrics")
+            metrics = metrics_raw if isinstance(metrics_raw, dict) else {}
             return {
                 "action": action,
                 "reason": reason,
@@ -5622,6 +5638,8 @@ def adaptive_edge_shadow_decision(
                 "rank": rank,
                 "score": edge.get("score"),
                 "eligible": bool(edge.get("eligible")),
+                "components": components,
+                "metrics": metrics,
             }
     return {
         "action": "NEUTRAL",
@@ -5630,6 +5648,8 @@ def adaptive_edge_shadow_decision(
         "rank": None,
         "score": None,
         "eligible": False,
+        "components": {},
+        "metrics": {},
     }
 
 
@@ -5763,6 +5783,10 @@ async def evaluate_adaptive_edge_active_gate(
     decision_id = "edge-active-" + hashlib.sha256(seed.encode()).hexdigest()[:24]
     score_raw = advisory.get("score")
     score = Decimal(str(score_raw)) if score_raw is not None else None
+    components_raw = advisory.get("components")
+    components = components_raw if isinstance(components_raw, dict) else {}
+    metrics_raw = advisory.get("metrics")
+    metrics = metrics_raw if isinstance(metrics_raw, dict) else {}
     try:
         async with engine.begin() as conn:
             await conn.execute(pg_insert(paper_adaptive_edge_active_table).values(
@@ -5775,6 +5799,15 @@ async def evaluate_adaptive_edge_active_gate(
                       if advisory.get("rank") is not None else None),
                 score=score, created_at=created_at,
             ))
+            await conn.execute(
+                pg_insert(paper_adaptive_edge_explainability_table).values(
+                    decision_id=decision_id,
+                    components_json=json.dumps(components, sort_keys=True, default=str),
+                    metrics_json=json.dumps(metrics, sort_keys=True, default=str),
+                    policy_version=ADAPTIVE_EDGE_ACTIVE_VERSION,
+                    created_at=created_at,
+                )
+            )
     except Exception as exc:  # noqa: BLE001
         log.warning("Adaptive edge active audit unavailable: %s", type(exc).__name__)
     return {**advisory, "decision_id": decision_id, "action": action,
@@ -5798,6 +5831,91 @@ async def get_adaptive_edge_active(
             "MISSING_CONTEXT_OR_RANKING": "ALLOWED_FAIL_NEUTRAL",
         },
         "paper_only": True, "live_trading": False,
+    }
+
+
+ADAPTIVE_EDGE_REPLAY_VERSION = "SERVER_ADAPTIVE_EDGE_DECISION_REPLAY_V1"
+
+
+@api_router.get("/paper/adaptive-edge/decision-replay")
+async def get_adaptive_edge_decision_replay(
+    limit: int = 50,
+    symbol: Optional[str] = None,
+    action: Optional[str] = None,
+) -> Dict[str, object]:
+    """Read persisted active gate decisions with exact evidence snapshots."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+    safe_limit = max(1, min(limit, 200))
+    clauses: List[str] = []
+    params: Dict[str, object] = {"limit": safe_limit}
+    if symbol:
+        clauses.append("a.symbol = :symbol")
+        params["symbol"] = symbol.upper().replace("/", "-")
+    if action:
+        normalized_action = action.upper()
+        if normalized_action not in {"ALLOWED", "BLOCKED", "FAVORED"}:
+            raise HTTPException(
+                status_code=400,
+                detail={"status": "INVALID", "reason": "unsupported adaptive edge action"},
+            )
+        clauses.append("a.action = :action")
+        params["action"] = normalized_action
+    sql = (
+        "SELECT a.*, e.components_json, e.metrics_json, e.policy_version "
+        "FROM paper_adaptive_edge_active a "
+        "LEFT JOIN paper_adaptive_edge_explainability e "
+        "ON e.decision_id = a.decision_id"
+    )
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY a.created_at DESC, a.decision_id DESC LIMIT :limit"
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(text(sql), params)
+            items = [dict(row._mapping) for row in result.fetchall()]
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "adaptive edge replay failed"},
+        ) from exc
+    for item in items:
+        created_at = item.get("created_at")
+        if isinstance(created_at, datetime):
+            item["created_at"] = created_at.isoformat()
+        score_value = item.get("score")
+        if score_value is not None:
+            item["score"] = str(score_value)
+        for source_key, target_key in (
+            ("components_json", "components"),
+            ("metrics_json", "metrics"),
+        ):
+            raw = item.pop(source_key, None)
+            parsed: Dict[str, object] = {}
+            if isinstance(raw, str):
+                try:
+                    loaded = json.loads(raw)
+                    if isinstance(loaded, dict):
+                        parsed = loaded
+                except json.JSONDecodeError:
+                    parsed = {}
+            item[target_key] = parsed
+        item["snapshot_available"] = bool(
+            item.get("components") or item.get("metrics") or item.get("policy_version")
+        )
+    return {
+        "status": "OK",
+        "validation": ADAPTIVE_EDGE_REPLAY_VERSION,
+        "count": len(items),
+        "limit": safe_limit,
+        "items": items,
+        "paper_only": True,
+        "live_trading": False,
+        "read_only": True,
     }
 
 

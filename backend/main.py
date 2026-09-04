@@ -1519,6 +1519,17 @@ paper_adaptive_edge_explainability_table = Table(
 )
 
 
+# V16-M5B30H — links executed paper positions to the exact active edge gate.
+paper_adaptive_edge_trade_link_table = Table(
+    "paper_adaptive_edge_trade_link",
+    metadata,
+    Column("position_id", String, primary_key=True),
+    Column("decision_id", String, nullable=False),
+    Column("gate_action", String, nullable=False),
+    Column("linked_at", DateTime(timezone=True), nullable=False),
+)
+
+
 candles_table = Table(
     "candles",
     metadata,
@@ -2286,6 +2297,7 @@ async def _verified_auto_paper_entry_unlocked(
         performance_setup_context=req.performance_setup_context,
     )
     created = await create_paper_position(position)
+    await persist_adaptive_edge_trade_link(position_id, edge_gate)
     return {
         "status": "OPENED",
         "position": created,
@@ -5835,6 +5847,160 @@ async def get_adaptive_edge_active(
 
 
 ADAPTIVE_EDGE_REPLAY_VERSION = "SERVER_ADAPTIVE_EDGE_DECISION_REPLAY_V1"
+
+ADAPTIVE_EDGE_IMPACT_VERSION = "SERVER_ADAPTIVE_EDGE_IMPACT_VALIDATION_V1"
+
+
+async def persist_adaptive_edge_trade_link(
+    position_id: str, gate: Dict[str, object]
+) -> None:
+    """Audit-only link from an executed paper position to its active edge decision."""
+    decision_id = gate.get("decision_id")
+    action = str(gate.get("action") or "ALLOWED").upper()
+    if not isinstance(decision_id, str) or not decision_id:
+        return
+    if action not in {"ALLOWED", "FAVORED"}:
+        return
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                pg_insert(paper_adaptive_edge_trade_link_table).values(
+                    position_id=position_id,
+                    decision_id=decision_id,
+                    gate_action=action,
+                    linked_at=utcnow(),
+                ).on_conflict_do_nothing(index_elements=["position_id"])
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Adaptive edge trade link unavailable: %s", type(exc).__name__)
+
+
+
+
+def _impact_metrics_or_empty(
+    positions: List[Dict[str, object]], initial_capital: Decimal
+) -> Dict[str, object]:
+    if not positions:
+        return {
+            "closed_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate_percent": "0",
+            "profit_factor": None,
+            "expectancy": "0",
+            "average_realized_rr": "0",
+            "net_pnl": "0",
+            "max_drawdown_percent": "0",
+        }
+    return calculate_paper_performance_metrics(positions, initial_capital)
+
+
+@api_router.get("/paper/adaptive-edge/impact-validation")
+async def get_adaptive_edge_impact_validation(period: str = "ALL") -> Dict[str, object]:
+    """Observed paper impact only; blocked-trade counterfactual P&L is never invented."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+    try:
+        normalized_period, period_start = paper_performance_period_start(period, utcnow())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "unsupported performance period"},
+        ) from exc
+    params: Dict[str, object] = {}
+    date_filter = ""
+    if period_start is not None:
+        date_filter = " AND p.closed_at>=:period_start"
+        params["period_start"] = period_start
+    try:
+        async with engine.connect() as conn:
+            account_result = await conn.execute(
+                text(
+                    "SELECT initial_capital FROM paper_account "
+                    "WHERE account_id=:account_id"
+                ),
+                {"account_id": PAPER_ACCOUNT_ID},
+            )
+            account = account_result.fetchone()
+            if account is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"status": "UNAVAILABLE", "reason": "paper account not initialized"},
+                )
+            sql = (
+                "SELECT p.position_id, p.symbol, p.side, p.entry, p.close_price, p.size, "
+                "p.risk_money, p.closed_at, p.source, fx.quote_to_usd, "
+                "l.gate_action, l.decision_id "
+                "FROM paper_positions p "
+                "LEFT JOIN paper_fx_conversion_snapshots fx "
+                "ON fx.position_id=p.position_id AND fx.phase='CLOSE' "
+                "LEFT JOIN paper_adaptive_edge_trade_link l "
+                "ON l.position_id=p.position_id "
+                "WHERE status='CLOSED' AND p.close_price IS NOT NULL"
+                + date_filter
+                + " ORDER BY p.closed_at ASC, p.position_id ASC"
+            )
+            result = await conn.execute(text(sql), params)
+            rows = [dict(row._mapping) for row in result.fetchall()]
+            blocked_sql = (
+                "SELECT COUNT(*) AS count FROM paper_adaptive_edge_active "
+                "WHERE action='BLOCKED'"
+            )
+            blocked_params: Dict[str, object] = {}
+            if period_start is not None:
+                blocked_sql += " AND created_at>=:period_start"
+                blocked_params["period_start"] = period_start
+            blocked_result = await conn.execute(text(blocked_sql), blocked_params)
+            blocked_row = blocked_result.fetchone()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "impact validation failed"},
+        ) from exc
+
+    initial_capital = Decimal(str(account._mapping["initial_capital"]))
+    allowed = [row for row in rows if str(row.get("gate_action") or "") == "ALLOWED"]
+    favored = [row for row in rows if str(row.get("gate_action") or "") == "FAVORED"]
+    linked = allowed + favored
+    historical = [row for row in rows if row.get("decision_id") is None]
+    blocked_count = int(blocked_row._mapping["count"]) if blocked_row is not None else 0
+
+    return {
+        "status": "OK",
+        "validation": ADAPTIVE_EDGE_IMPACT_VERSION,
+        "period": normalized_period,
+        "period_start": period_start.isoformat() if period_start is not None else None,
+        "observed": {
+            "linked_executed": _impact_metrics_or_empty(linked, initial_capital),
+            "allowed": _impact_metrics_or_empty(allowed, initial_capital),
+            "favored": _impact_metrics_or_empty(favored, initial_capital),
+            "historical_unlinked": _impact_metrics_or_empty(historical, initial_capital),
+        },
+        "coverage": {
+            "closed_positions": len(rows),
+            "linked_closed_positions": len(linked),
+            "historical_unlinked_closed_positions": len(historical),
+            "blocked_gate_decisions": blocked_count,
+        },
+        "interpretation": {
+            "historical_baseline_is_causal_control": False,
+            "blocked_trade_outcomes_measured": False,
+            "blocked_counterfactual_status": "NOT_MEASURED",
+            "reason": (
+                "Blocked entries create no paper position, so hypothetical P&L is not "
+                "fabricated. This endpoint validates observed executed cohorts only."
+            ),
+        },
+        "paper_only": True,
+        "live_trading": False,
+        "changes_execution": False,
+    }
 
 
 @api_router.get("/paper/adaptive-edge/decision-replay")
@@ -10642,6 +10808,7 @@ async def execute_multi_asset_paper_plan(
             fx_conversion_source_timestamp=fx_conversion_source_timestamp,
         )
         created = await create_paper_position(position)
+        await persist_adaptive_edge_trade_link(position.position_id, edge_gate)
     return {
         "status": "OPENED",
         "strategy_id": strategy_id,
@@ -11076,6 +11243,7 @@ async def execute_trend_pullback_paper_plan(
             ),
         )
         created = await create_paper_position(position)
+        await persist_adaptive_edge_trade_link(position.position_id, edge_gate)
     return {
         "status": "OPENED",
         "strategy_id": "TREND_PULLBACK",
@@ -11311,6 +11479,7 @@ async def execute_breakout_expansion_paper_plan(
             ),
         )
         created = await create_paper_position(position)
+        await persist_adaptive_edge_trade_link(position.position_id, edge_gate)
     return {
         "status": "OPENED",
         "strategy_id": "BREAKOUT_EXPANSION",

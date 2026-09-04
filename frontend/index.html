@@ -558,6 +558,45 @@ body.market-menu-open .market-tabs-wrap{display:block!important}
 @media(max-width:430px){.dashboard-trade-card{grid-template-columns:38px minmax(0,1fr) auto;padding:12px;gap:9px}.dashboard-trade-card .coin{width:38px;height:38px}.dashboard-strategy-line{gap:5px}.strategy-badge{font-size:8px;min-height:26px;padding:0 7px}.strategy-version,.strategy-paper{font-size:8px;min-height:26px;padding:0 7px}.dashboard-trade-meta2{grid-template-columns:auto 1fr 1fr auto;gap:6px;font-size:8px}.dashboard-meta-item b{font-size:8px}}
 
 </style>
+
+<style id="v16-m5b28b9-history-decision-cards">
+/* V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA ONLY */
+.paper-trade-compact>summary{padding:13px}
+.paper-history-head{display:grid;grid-template-columns:38px minmax(0,1fr) auto;gap:9px;align-items:start}
+.paper-history-head .coin{width:38px;height:38px}
+.paper-history-main{min-width:0}
+.paper-history-symbol-line{display:flex;align-items:center;gap:6px;min-width:0}
+.paper-history-symbol-line .paper-trade-symbol{font-size:14px}
+.paper-history-strategy-row{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:6px}
+.paper-history-time{margin-top:6px;color:#78879b;font-size:7.5px}
+.paper-trade-result{align-self:start}
+.paper-trade-result b{font-size:14px}.paper-trade-result span{font-size:8px;font-weight:900;letter-spacing:.06em}
+.paper-trade-levels{margin-top:11px;padding-top:9px;border-top:1px solid #18283c}
+.strategy-badges-inline{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}
+.strategy-badges-inline .strategy-badge,.strategy-badges-inline .strategy-version,.strategy-badges-inline .strategy-paper{min-height:25px}
+.decision-premium-list{display:grid;gap:8px}
+.decision-premium-card{display:grid;grid-template-columns:38px minmax(0,1fr) auto;gap:9px;align-items:start;padding:12px;border:1px solid #203149;border-radius:13px;background:#06101b;min-width:0}
+.decision-premium-card .coin{width:38px;height:38px}
+.decision-main{min-width:0}
+.decision-top{display:flex;align-items:center;gap:6px;min-width:0}
+.decision-symbol{font-size:11px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.decision-strategy{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}
+.decision-reason{margin-top:8px;font-size:8px;color:#a5b1c3;font-weight:750;letter-spacing:.03em;overflow-wrap:anywhere}
+.decision-meta{display:flex;gap:9px;flex-wrap:wrap;margin-top:7px;color:#75849a;font-size:7.5px}
+.decision-state{align-self:start;white-space:nowrap}
+.decision-state.wait{color:#b9c5d6;border-color:#435773;background:#0a1727}
+.decision-state.entry_now{color:#48ff7d;border-color:#1f8b48;background:#0b2b18}
+.decision-state.blocked,.decision-state.invalidated,.decision-state.expired{color:#ff7885;border-color:#7f3640;background:#2a1117}
+.decision-state.other{color:#d3b6ff;border-color:#65508c;background:#21173a}
+.decision-setup{display:inline-flex;align-items:center;border:1px solid #2b3e58;border-radius:999px;padding:3px 6px;color:#8fa0b5;font-size:7px;font-weight:800}
+@media(max-width:430px){
+ .paper-history-head,.decision-premium-card{grid-template-columns:34px minmax(0,1fr) auto;gap:8px}
+ .paper-history-head .coin,.decision-premium-card .coin{width:34px;height:34px}
+ .paper-history-strategy-row .strategy-badge,.decision-strategy .strategy-badge{font-size:7px;min-height:24px;padding:0 6px}
+ .paper-history-strategy-row .strategy-version,.paper-history-strategy-row .strategy-paper,.decision-strategy .strategy-version,.decision-strategy .strategy-paper{font-size:7px;min-height:24px;padding:0 6px}
+}
+</style>
+
 </head>
 <body>
 <header class="header">
@@ -670,11 +709,49 @@ function refreshPaperTrading(){
   });
 }
 
+function parseStrategyMeta(raw){
+  raw=String(raw||"").trim();
+  var m=raw.match(/^([^@]+)(?:@([^-]+))?(?:-(.+))?$/);
+  var id=(m&&m[1]?m[1]:raw||"STRATEGY").replaceAll("_"," ");
+  return {id:id,version:(m&&m[2])?m[2]:"",mode:(m&&m[3])?m[3].toUpperCase():""};
+}
+function strategyBadges(raw,defaultMode){
+  var meta=parseStrategyMeta(raw),kids=[h("span",{class:"strategy-badge"},[meta.id])];
+  if(meta.version)kids.push(h("span",{class:"strategy-version"},[meta.version]));
+  var mode=meta.mode||defaultMode||"";
+  if(mode)kids.push(h("span",{class:"strategy-paper"},[mode]));
+  return h("div",{class:"strategy-badges-inline"},kids);
+}
+function decisionStrategyRaw(d){
+  if(d&&d.strategy_id){
+    return String(d.strategy_id)+(d.strategy_version?"@"+String(d.strategy_version):"")+(d.paper_only?"-paper":"");
+  }
+  var ctx=d&&d.detector_context;
+  if(typeof ctx==="string"){try{ctx=JSON.parse(ctx)}catch(e){ctx=null}}
+  if(ctx&&ctx.strategy_id)return String(ctx.strategy_id)+(ctx.strategy_version?"@"+String(ctx.strategy_version):"")+(d&&d.paper_only?"-paper":"");
+  if(ctx&&ctx.smc_confirmation)return "SMC_LIQUIDITY_REVERSAL-paper";
+  return "";
+}
+function humanDecisionReason(v){return String(v||"Aucune raison persistée").replaceAll("_"," ");}
 function paperDecisionCard(d){
-  return h("div",{class:"help-card"},[
-    h("div",{class:"kv"},[h("b",{},[d.symbol||"—"]),h("b",{},[d.state||"—"])]),
-    h("p",{},[d.reason||"Aucune raison persistée"]),
-    h("div",{class:"muted"},[(d.timestamp||"—")+(d.setup_state?" · setup "+d.setup_state:"")])
+  var state=String(d.state||"UNKNOWN").toUpperCase();
+  var stateClass=["WAIT","ENTRY_NOW","BLOCKED","INVALIDATED","EXPIRED"].indexOf(state)>=0?state.toLowerCase():"other";
+  var strategyRaw=decisionStrategyRaw(d);
+  return h("div",{class:"decision-premium-card","data-paper-decision-state":state},[
+    iconFor(d.symbol||""),
+    h("div",{class:"decision-main"},[
+      h("div",{class:"decision-top"},[
+        h("div",{class:"decision-symbol"},[d.symbol||"—"]),
+        d.setup_state?h("span",{class:"decision-setup"},["SETUP "+String(d.setup_state).replaceAll("_"," ")]):null
+      ]),
+      strategyRaw?h("div",{class:"decision-strategy"},[strategyBadges(strategyRaw,"PAPER")]):null,
+      h("div",{class:"decision-reason"},[humanDecisionReason(d.reason)]),
+      h("div",{class:"decision-meta"},[
+        h("span",{},["◷ "+formatMontrealTime(d.timestamp)]),
+        d.latest_closed_timestamp?h("span",{},["Bougie · "+formatMontrealTime(d.latest_closed_timestamp)]):null
+      ])
+    ]),
+    h("span",{class:"status-pill decision-state "+stateClass},[state.replaceAll("_"," ")])
   ]);
 }
 function paperDecisionFilters(){
@@ -801,7 +878,7 @@ function paperPositionCard(p){
       h("div",{class:"kv"},[h("span",{},[closed?"P&L réalisé":"P&L latent"]),h("b",{},[closed&&pnl!==null&&pnl!==undefined?paperMoney(pnl):(!closed&&p.mark_status==="VALID"?paperMoney(p.unrealized_pnl):"—")])]),
       closed?h("div",{class:"kv"},[h("span",{},["Résultat"]),h("b",{class:result.klass},[result.label+" · "+result.reason])]):null,
       closed?h("div",{class:"kv"},[h("span",{},["RR réalisé"]),h("b",{},[rr===null?"—":rr.toFixed(2)+"R"])]):null,
-      h("div",{class:"kv"},[h("span",{},["Stratégie"]),h("b",{},[paperStrategyLabel(p)])]),
+      h("div",{class:"kv"},[h("span",{},["Stratégie"]),strategyBadges(paperStrategyLabel(p),"PAPER")]),
       h("div",{class:"kv"},[h("span",{},["Source marché"]),h("b",{},[!closed&&p.mark_status==="VALID"?(p.mark_source||"—"):(p.source||"—")])]),
       h("div",{class:"kv"},[h("span",{},["Mark"]),h("b",{},[closed?"CLOSED":(p.mark_status||"UNAVAILABLE")])]),
       closed?h("div",{class:"kv"},[h("span",{},["Clôture"]),h("b",{},[p.close_reason||"—"])]):null,
@@ -818,14 +895,21 @@ function paperTradeDuration(p){
 }
 function paperCompactHistoryCard(p){
   var result=paperResultInfo(p),rr=paperRealizedRR(p),pnl=Number(p.realized_pnl),pnlText=Number.isFinite(pnl)?paperMoney(pnl):"—";
+  var strategyRaw=paperStrategyLabel(p);
   var details=h("details",{class:"paper-trade-compact","data-paper-history-card":result.label},[
     h("summary",{},[
-      h("div",{class:"paper-trade-top"},[
-        h("div",{class:"paper-trade-symbol"},[p.symbol||"—"]),
-        h("span",{class:"status-pill "+(p.side==="LONG"?"ready":"future")},[p.side||"—"]),
+      h("div",{class:"paper-history-head"},[
+        iconFor(p.symbol||""),
+        h("div",{class:"paper-history-main"},[
+          h("div",{class:"paper-history-symbol-line"},[
+            h("div",{class:"paper-trade-symbol"},[p.symbol||"—"]),
+            h("span",{class:"status-pill "+(p.side==="LONG"?"ready":"future")},[p.side||"—"])
+          ]),
+          h("div",{class:"paper-history-strategy-row"},[strategyBadges(strategyRaw,"PAPER")]),
+          h("div",{class:"paper-history-time"},["Ouverture · "+formatMontrealTime(p.opened_at)])
+        ]),
         h("div",{class:"paper-trade-result"},[h("b",{class:result.klass},[pnlText]),h("span",{class:result.klass},[result.label])])
       ]),
-      h("div",{class:"paper-trade-meta"},[paperStrategyLabel(p)+" · "+formatMontrealTime(p.opened_at)]),
       h("div",{class:"paper-trade-levels"},[
         h("div",{class:"paper-trade-level"},[h("span",{},["Entry"]),h("b",{},[fmtNum(p.entry)||"—"])]),
         h("div",{class:"paper-trade-level"},[h("span",{},["Exit"]),h("b",{},[fmtNum(p.close_price)||"—"])]),
@@ -1021,7 +1105,7 @@ function renderSignals(){
   ])));
   v.appendChild(modCard("Historique des décisions","POSTGRES · 50 DERNIÈRES",h("div",{class:"section-stack"},[
     paperDecisionFilters(),
-    rows.length?h("div",{class:"grid-2"},rows.map(paperDecisionCard)):
+    rows.length?h("div",{class:"decision-premium-list"},rows.map(paperDecisionCard)):
       placeholder("Aucune décision correspondante","Le scanner reste WAIT tant que les confirmations strictes ne sont pas réunies.")
   ])));
   v.appendChild(modCard("Synchronisation","SERVER SNAPSHOT",h("div",{class:"section-stack"},[
@@ -1189,7 +1273,7 @@ function renderTradingContent(){
     ]):placeholder("Aucune position clôturée","Les fermetures SL/TP persistées apparaîtront ici avec leur P&L réalisé.")));
     v.appendChild(modCard("Historique des décisions","POSTGRES · 50 DERNIÈRES",h("div",{class:"section-stack"},[
       paperDecisionFilters(),
-      paperUiState.decisions.length?h("div",{class:"grid-2"},paperUiState.decisions.map(paperDecisionCard)):
+      paperUiState.decisions.length?h("div",{class:"decision-premium-list"},paperUiState.decisions.map(paperDecisionCard)):
         placeholder("Aucune décision persistée",
           "WAIT / ENTRY_NOW / BLOCKED / INVALIDATED / EXPIRED apparaîtront ici après le scanner réel.")
     ])));
@@ -2151,6 +2235,7 @@ function renderHelpGlossary(){
 <!-- V16-M5B28B7-FIX3 · SAME-ORIGIN DYNAMIC CRYPTO LOGO PROXY -->
 </body>
 </html>
+<!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->
 <!-- V16-M5B5 — server FVG detector -->
 
 <!-- SERVER DETECTOR · ORDER BLOCK V1 -->

@@ -5444,12 +5444,11 @@ def build_adaptive_edge_ranking(
     rankings: List[Dict[str, object]] = []
     for context in sorted(groups):
         candidates = groups[context]
-        rankable = [
-            item
-            for item in candidates
-            if isinstance(item.get("edge"), dict)
-            and bool(item["edge"].get("eligible"))
-        ]
+        rankable: List[Dict[str, object]] = []
+        for item in candidates:
+            edge = item.get("edge")
+            if isinstance(edge, dict) and bool(edge.get("eligible")):
+                rankable.append(item)
 
         def ranking_key(item: Dict[str, object]) -> tuple[Decimal, str, str]:
             edge = item.get("edge")
@@ -5488,7 +5487,10 @@ def build_adaptive_edge_ranking(
 async def get_adaptive_edge_ranking(period: str = "ALL") -> Dict[str, object]:
     """Expose observation-only adaptive ranking from the validated matrix."""
     matrix = await get_paper_performance_matrix(period)
-    cells = list(matrix.get("cells") or [])
+    cells_raw = matrix.get("cells")
+    cells: List[Dict[str, object]] = []
+    if isinstance(cells_raw, list):
+        cells = [item for item in cells_raw if isinstance(item, dict)]
     rankings = build_adaptive_edge_ranking(cells)
     return {
         "status": "OK",

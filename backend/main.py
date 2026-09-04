@@ -1,4 +1,3 @@
-# V16-M5B28A-CI408-FIX1: resolve duplicate helper name.
 # CI395 recovery marker: cumulative V16-M5B25B-FIX2 backend baseline.
 """Crypto Intelligence Engine — single-file backend (Phase 1 + frontend serving).
 
@@ -3876,8 +3875,10 @@ async def auto_entry_orchestrator_loop() -> None:
         auto_scan_runtime["last_error"] = None
         try:
             generation = await run_server_auto_paper_generation_once()
+            trend_generation = await run_trend_pullback_paper_generation_once()
             queue = await run_auto_entry_orchestrator_once()
             auto_scan_runtime["last_generation"] = generation
+            auto_scan_runtime["last_trend_pullback_generation"] = trend_generation
             auto_scan_runtime["last_queue"] = queue
         except asyncio.CancelledError:
             raise
@@ -5619,7 +5620,7 @@ def coinbase_product_is_eligible(symbol: str, payload: object) -> Tuple[bool, st
     return True, "COINBASE_PRODUCT_VERIFIED"
 
 
-def _positive_product_decimal(value: object) -> Optional[Decimal]:
+def _positive_decimal(value: object) -> Optional[Decimal]:
     try:
         parsed = Decimal(str(value))
     except (ArithmeticError, ValueError):
@@ -5644,7 +5645,7 @@ def select_coinbase_top_usd_spot_products(
         eligible, _reason = coinbase_product_is_eligible(symbol, raw)
         if not eligible:
             continue
-        volume = _positive_product_decimal(
+        volume = _positive_decimal(
             raw.get("approximate_quote_24h_volume", raw.get("volume_24h"))
         )
         if volume is None:
@@ -8020,11 +8021,11 @@ def server_strategy_registry() -> List[Dict[str, object]]:
         },
         {
             "strategy_id": "TREND_PULLBACK",
-            "version": "0.1-candidate",
-            "status": "CANDIDATE",
+            "version": TREND_PULLBACK_PAPER_VERSION,
+            "status": "ACTIVE_PAPER_UNVALIDATED",
             "family": "CONTINUATION",
             "preferred_regimes": ["TREND"],
-            "execution_eligible": False,
+            "execution_eligible": True,
             "paper_only": True,
         },
         {
@@ -8340,6 +8341,213 @@ async def get_candidate_strategy_detections(symbol: str) -> Dict[str, object]:
         "marker": CANDIDATE_DETECTOR_VERSION,
     }
 
+
+
+# V16-M5B28B1 — Trend Pullback paper execution (paper-only)
+TREND_PULLBACK_PAPER_VERSION = "0.2-paper"
+TREND_PULLBACK_RISK_REWARD = Decimal("2")
+
+
+def build_trend_pullback_paper_plan(
+    candles: List[Candle],
+    now: datetime,
+    detection: Dict[str, object],
+    ticker: MarketDatum,
+) -> Dict[str, object]:
+    """Build an objective Trend Pullback plan from closed candles + real ticker."""
+    base = {
+        "strategy_id": "TREND_PULLBACK",
+        "strategy_version": TREND_PULLBACK_PAPER_VERSION,
+        "paper_only": True,
+        "execution": False,
+    }
+    if detection.get("status") != "SETUP":
+        return {**base, "status": "WAIT", "reason": "TREND_SETUP_NOT_READY"}
+    if ticker.status != DataQualityStatus.VALID or ticker.value is None:
+        return {**base, "status": "WAIT", "reason": "REALTIME_TICKER_NOT_VALID"}
+    if ticker.timestamp is None or ticker.timestamp.tzinfo is None:
+        return {**base, "status": "WAIT", "reason": "REALTIME_TICKER_TIMESTAMP_INVALID"}
+    if classify_freshness(
+        ticker.timestamp, settings.ticker_max_age_seconds, now=now
+    ) != DataQualityStatus.VALID:
+        return {**base, "status": "WAIT", "reason": "REALTIME_TICKER_NOT_FRESH"}
+    closed = closed_valid_candles(candles, now)
+    if len(closed) < 2:
+        return {**base, "status": "WAIT", "reason": "PULLBACK_STRUCTURE_MISSING"}
+    pullback = closed[-2]
+    if pullback.low is None or pullback.high is None:
+        return {**base, "status": "WAIT", "reason": "PULLBACK_STRUCTURE_INVALID"}
+    entry = Decimal(str(ticker.value))
+    direction = str(detection.get("direction") or "")
+    if direction == "BULLISH":
+        stop = Decimal(str(pullback.low))
+        if stop >= entry:
+            return {**base, "status": "WAIT", "reason": "BULLISH_STOP_INVALID"}
+        risk = entry - stop
+        target = entry + TREND_PULLBACK_RISK_REWARD * risk
+        side = "LONG"
+    elif direction == "BEARISH":
+        stop = Decimal(str(pullback.high))
+        if stop <= entry:
+            return {**base, "status": "WAIT", "reason": "BEARISH_STOP_INVALID"}
+        risk = stop - entry
+        target = entry - TREND_PULLBACK_RISK_REWARD * risk
+        if target <= 0:
+            return {**base, "status": "WAIT", "reason": "BEARISH_TARGET_INVALID"}
+        side = "SHORT"
+    else:
+        return {**base, "status": "WAIT", "reason": "TREND_DIRECTION_INVALID"}
+    return {
+        **base,
+        "status": "ENTRY_NOW",
+        "side": side,
+        "direction": direction,
+        "entry": entry,
+        "stop_loss": stop,
+        "take_profit": target,
+        "risk_reward": TREND_PULLBACK_RISK_REWARD,
+        "source_timestamp": ticker.timestamp,
+        "setup_timestamp": detection.get("latest_closed_timestamp"),
+        "plan_source": "CLOSED_PULLBACK_STRUCTURE+REAL_COINBASE_TICKER",
+    }
+
+
+def build_strategy_paper_position_id(
+    strategy_id: str, symbol: str, side: str, setup_timestamp: object
+) -> str:
+    raw = f"{strategy_id}|{symbol}|{side}|{setup_timestamp}".encode()
+    digest = hashlib.sha256(raw).hexdigest()[:24]
+    return f"strategy-{strategy_id.lower()}-{digest}"
+
+
+async def execute_trend_pullback_paper_plan(
+    symbol: str, plan: Dict[str, object]
+) -> Dict[str, object]:
+    """Persist one prevalidated Trend Pullback position using existing risk guards."""
+    if not persistence_state.ready:
+        return {"status": "BLOCKED", "reason": "PERSISTENCE_NOT_READY"}
+    if plan.get("status") != "ENTRY_NOW":
+        return {"status": "BLOCKED", "reason": "TREND_PLAN_NOT_ENTRY_NOW"}
+    canonical = symbol.upper().replace("/", "-")
+    try:
+        entry = Decimal(str(plan["entry"]))
+        stop = Decimal(str(plan["stop_loss"]))
+        target = Decimal(str(plan["take_profit"]))
+        source_timestamp = plan["source_timestamp"]
+    except (KeyError, ValueError, InvalidOperation):
+        return {"status": "BLOCKED", "reason": "TREND_PLAN_INVALID"}
+    if not isinstance(source_timestamp, datetime) or source_timestamp.tzinfo is None:
+        return {"status": "BLOCKED", "reason": "TREND_SOURCE_TIMESTAMP_INVALID"}
+    side = str(plan.get("side"))
+    if side == "LONG" and not stop < entry < target:
+        return {"status": "BLOCKED", "reason": "TREND_LONG_LEVELS_INVALID"}
+    if side == "SHORT" and not target < entry < stop:
+        return {"status": "BLOCKED", "reason": "TREND_SHORT_LEVELS_INVALID"}
+    if side not in {"LONG", "SHORT"}:
+        return {"status": "BLOCKED", "reason": "TREND_SIDE_INVALID"}
+    specs = await get_paper_instrument_specs(canonical)
+    if specs.get("status") != "VALID":
+        return {"status": "BLOCKED", "reason": "SERVER_INSTRUMENT_SPECS_NOT_VALID"}
+    account = await get_paper_account()
+    capital = Decimal(str(account["current_capital"]))
+    sizing = calculate_verified_crypto_size(capital, Decimal("1"), entry, stop, specs)
+    if sizing.get("status") != "VALID":
+        return {"status": "BLOCKED", "reason": str(sizing.get("reason"))}
+    async with auto_paper_portfolio_lock:
+        open_positions = await get_open_paper_risk_snapshot()
+        guard = evaluate_paper_portfolio_risk_guard(
+            open_positions, canonical, Decimal(str(sizing["risk_money"])), capital
+        )
+        if guard.get("status") != "VALID":
+            return {"status": "BLOCKED", "reason": str(guard.get("reason"))}
+        position = PaperPositionCreate(
+            position_id=build_strategy_paper_position_id(
+                "TREND_PULLBACK", canonical, side, plan.get("setup_timestamp")
+            ),
+            symbol=canonical,
+            side=side,
+            entry=entry,
+            stop_loss=stop,
+            take_profit=target,
+            size=Decimal(str(sizing["size"])),
+            size_unit="BASE_UNITS",
+            risk_money=Decimal(str(sizing["risk_money"])),
+            risk_percent=Decimal(str(sizing["risk_percent"])),
+            capital_before=capital,
+            source=f"strategy:TREND_PULLBACK@{TREND_PULLBACK_PAPER_VERSION}",
+            source_timestamp=source_timestamp,
+            opened_at=utcnow(),
+        )
+        created = await create_paper_position(position)
+    return {
+        "status": "OPENED",
+        "strategy_id": "TREND_PULLBACK",
+        "strategy_version": TREND_PULLBACK_PAPER_VERSION,
+        "position": created,
+        "paper_only": True,
+        "execution": False,
+    }
+
+
+async def run_trend_pullback_paper_generation_once() -> Dict[str, int]:
+    """Scan the real crypto registry for Trend Pullback paper entries."""
+    stats = {"checked": 0, "setups": 0, "opened": 0, "blocked": 0}
+    if not persistence_state.ready:
+        return stats
+    for instrument in instrument_registry.all():
+        if instrument.asset_class != AssetClass.CRYPTO:
+            continue
+        symbol = instrument.canonical_symbol
+        stats["checked"] += 1
+        provider_symbol = provider_symbol_map.to_provider("coinbase", symbol)
+        if provider_symbol is None:
+            stats["blocked"] += 1
+            continue
+        try:
+            candles, quality = await market_provider.get_candles(
+                provider_symbol, SERVER_SETUP_GRANULARITY, SERVER_SETUP_CANDLE_LIMIT
+            )
+            if quality != DataQualityStatus.VALID:
+                continue
+            now = utcnow()
+            regime = classify_server_market_regime(candles, now)
+            detection = detect_trend_pullback_candidate(candles, now, regime)
+            if detection.get("status") != "SETUP":
+                continue
+            stats["setups"] += 1
+            ticker = await market_provider.get_ticker(provider_symbol)
+            plan = build_trend_pullback_paper_plan(candles, now, detection, ticker)
+            if plan.get("status") != "ENTRY_NOW":
+                stats["blocked"] += 1
+                continue
+            result = await execute_trend_pullback_paper_plan(symbol, plan)
+            if result.get("status") == "OPENED":
+                stats["opened"] += 1
+            else:
+                stats["blocked"] += 1
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                stats["blocked"] += 1
+        except Exception as exc:  # noqa: BLE001
+            log.error("Trend Pullback paper generation failed for %s: %s", symbol, exc)
+            stats["blocked"] += 1
+    return stats
+
+
+@api_router.get("/strategies/trend-pullback/paper-status")
+async def trend_pullback_paper_status() -> Dict[str, object]:
+    return {
+        "status": "ACTIVE_PAPER",
+        "strategy_id": "TREND_PULLBACK",
+        "strategy_version": TREND_PULLBACK_PAPER_VERSION,
+        "risk_percent": "1",
+        "risk_reward_rule": str(TREND_PULLBACK_RISK_REWARD),
+        "stop_rule": "CLOSED_PULLBACK_STRUCTURE",
+        "entry_source": "REAL_COINBASE_TICKER",
+        "paper_only": True,
+        "live_trading": False,
+        "execution": False,
+    }
 
 # App must be built only after every router decorator above has executed.
 app = create_app()

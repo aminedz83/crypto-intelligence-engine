@@ -8522,3 +8522,135 @@ class CandidateStrategyDetectorsV16M5B27Tests(unittest.TestCase):
         self.assertIn('"auto_queue": False', source)
         self.assertIn('"execution": False', source)
         self.assertNotIn("create_paper_position", source)
+
+
+class CryptoUniverseExpansionV16M5B28ATests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._instruments = dict(main.instrument_registry._by_canonical)
+        self._to_provider = dict(main.provider_symbol_map._to_provider)
+        self._to_canonical = dict(main.provider_symbol_map._to_canonical)
+        self._activation = dict(main.crypto_universe_activation)
+        self._get_product_specs = main.market_provider.get_product_specs
+
+    def tearDown(self):
+        main.instrument_registry._by_canonical = self._instruments
+        main.provider_symbol_map._to_provider = self._to_provider
+        main.provider_symbol_map._to_canonical = self._to_canonical
+        main.crypto_universe_activation.clear()
+        main.crypto_universe_activation.update(self._activation)
+        main.market_provider.get_product_specs = self._get_product_specs
+
+    @staticmethod
+    def _product(symbol="DOGE-USD", **overrides):
+        payload = {
+            "product_id": symbol,
+            "base_increment": "0.1",
+            "quote_increment": "0.01",
+            "base_min_size": "1",
+            "base_max_size": "1000000",
+            "quote_min_size": "1",
+            "quote_max_size": "10000000",
+            "trading_disabled": False,
+            "view_only": False,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_candidate_universe_expands_beyond_original_six(self):
+        self.assertGreaterEqual(len(main.CRYPTO_UNIVERSE_CANDIDATES), 18)
+
+    def test_candidates_are_usd_products(self):
+        self.assertTrue(all(s.endswith("-USD") for s in main.CRYPTO_UNIVERSE_CANDIDATES))
+
+    def test_candidates_do_not_duplicate_original_six(self):
+        original = {"BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "LTC-USD", "ADA-USD"}
+        self.assertTrue(original.isdisjoint(main.CRYPTO_UNIVERSE_CANDIDATES))
+
+    def test_product_eligibility_accepts_verified_product(self):
+        ok, reason = main.coinbase_product_is_eligible("DOGE-USD", self._product())
+        self.assertTrue(ok)
+        self.assertEqual(reason, "COINBASE_PRODUCT_VERIFIED")
+
+    def test_product_eligibility_rejects_id_mismatch(self):
+        ok, reason = main.coinbase_product_is_eligible(
+            "DOGE-USD", self._product(product_id="AVAX-USD")
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "PRODUCT_ID_MISMATCH")
+
+    def test_product_eligibility_rejects_disabled(self):
+        ok, reason = main.coinbase_product_is_eligible(
+            "DOGE-USD", self._product(trading_disabled=True)
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "TRADING_DISABLED")
+
+    def test_product_eligibility_rejects_view_only(self):
+        ok, reason = main.coinbase_product_is_eligible(
+            "DOGE-USD", self._product(view_only=True)
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "VIEW_ONLY")
+
+    def test_product_eligibility_rejects_invalid_specs(self):
+        ok, reason = main.coinbase_product_is_eligible(
+            "DOGE-USD", self._product(base_increment="0")
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "PRODUCT_SPECS_INVALID")
+
+    def test_verified_registration_enters_registry_and_mapping(self):
+        self.assertTrue(main.register_verified_coinbase_crypto("DOGE-USD"))
+        self.assertIsNotNone(main.instrument_registry.get("DOGE-USD"))
+        self.assertEqual(
+            main.provider_symbol_map.to_provider("coinbase", "DOGE-USD"),
+            "DOGE-USD",
+        )
+
+    def test_registration_rejects_non_usd_symbol(self):
+        self.assertFalse(main.register_verified_coinbase_crypto("DOGE-EUR"))
+
+    async def test_activation_registers_only_live_verified_candidates(self):
+        async def fake_specs(symbol):
+            if symbol == "DOGE-USD":
+                return self._product(symbol)
+            return self._product(symbol, trading_disabled=True)
+
+        main.market_provider.get_product_specs = fake_specs
+        result = await main.activate_verified_crypto_universe()
+        self.assertIn("DOGE-USD", result["activated"])
+        self.assertIsNotNone(main.instrument_registry.get("DOGE-USD"))
+        self.assertNotIn("AVAX-USD", result["activated"])
+
+    async def test_activation_fails_closed_on_provider_error(self):
+        async def fake_specs(symbol):
+            raise httpx.ConnectError("offline")
+
+        main.market_provider.get_product_specs = fake_specs
+        result = await main.activate_verified_crypto_universe()
+        self.assertEqual(result["activated"], [])
+        self.assertEqual(len(result["rejected"]), len(main.CRYPTO_UNIVERSE_CANDIDATES))
+
+    def test_lifespan_activates_universe_before_websocket(self):
+        source = inspect.getsource(main.lifespan)
+        activation = source.index("activate_verified_crypto_universe")
+        websocket = source.index("start_server_crypto_market_stream")
+        self.assertLess(activation, websocket)
+
+    def test_websocket_population_is_registry_driven(self):
+        source = inspect.getsource(main.start_server_crypto_market_stream)
+        self.assertIn("instrument_registry.all()", source)
+        self.assertNotIn("BTC-USD\", \"ETH-USD", source)
+
+    def test_auto_scanner_population_is_registry_driven(self):
+        source = inspect.getsource(main.run_server_auto_paper_generation_once)
+        self.assertIn("instrument_registry.all()", source)
+        self.assertIn("AssetClass.CRYPTO", source)
+
+    def test_universe_endpoint_is_observable_and_paper_only(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/market/crypto-universe", paths)
+        source = inspect.getsource(main.get_crypto_universe)
+        self.assertIn('"source": "coinbase_public_product"', source)
+        self.assertIn('"paper_only": True', source)
+        self.assertIn('"execution": False', source)

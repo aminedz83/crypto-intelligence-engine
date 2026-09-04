@@ -8990,8 +8990,8 @@ class TestV16M5B28B2BreakoutExpansionPaperExecution(unittest.TestCase):
         self.assertFalse(result["execution"])
 
     def test_status_route_is_registered(self):
-        paths = {route.path for route in main.app.routes if hasattr(route, "path")}
-        self.assertIn("/api/v1/strategies/breakout-expansion/paper-status", paths)
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/strategies/breakout-expansion/paper-status", paths)
 
     def test_orchestrator_calls_breakout_generation(self):
         source = inspect.getsource(main.auto_entry_orchestrator_loop)

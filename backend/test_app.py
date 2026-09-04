@@ -8782,8 +8782,13 @@ class TestV16M5B28B1TrendPullbackPaperExecution(unittest.TestCase):
 
     def test_invalid_ticker_is_wait(self):
         candles, now = self._candles()
-        ticker = self._ticker(112.0, now)
-        ticker.status = main.DataQualityStatus.INVALID
+        ticker = main.MarketDatum(
+            symbol="BTC-USD",
+            value=112.0,
+            timestamp=now,
+            source="coinbase",
+            status=main.DataQualityStatus.INVALID,
+        )
         result = main.build_trend_pullback_paper_plan(
             candles, now, {"status": "SETUP"}, ticker
         )

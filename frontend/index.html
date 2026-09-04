@@ -1530,9 +1530,23 @@ function adaptiveEdgeImpactValidation(){
     ]),
     h("div",{class:"notice"},[
       h("b",{},["Contre-factuel BLOCKED : "]),
-      h("span",{},[i.blocked_counterfactual_status||"NOT_MEASURED"]),
+      h("span",{},[i.blocked_counterfactual_status||"PENDING"]),
+      h("div",{class:"metric-strip"},[
+        h("div",{class:"metric-mini"},[
+          h("span",{},["Résolus"]),
+          h("b",{},[String((d.blocked_counterfactual||{}).resolved||0)])
+        ]),
+        h("div",{class:"metric-mini"},[
+          h("span",{},["Win Rate"]),
+          h("b",{},[paperMetric((d.blocked_counterfactual||{}).win_rate_percent," %")])
+        ]),
+        h("div",{class:"metric-mini"},[
+          h("span",{},["RR moyen"]),
+          h("b",{},[paperMetric((d.blocked_counterfactual||{}).average_realized_rr," R")])
+        ])
+      ]),
       h("div",{class:"muted"},[
-        "Un trade bloqué n’a pas de résultat réel. L’application n’invente donc aucun P&L hypothétique."
+        "Zéro capital : suivi séparé des setups bloqués avec les marks marché réels futurs."
       ])
     ])
   ]));
@@ -2478,6 +2492,7 @@ function renderHelpGlossary(){
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->
 <!-- V16-M5B30G · ADAPTIVE EDGE DECISION REPLAY + EXPLAINABILITY UI -->
 <!-- V16-M5B30H · ADAPTIVE EDGE IMPACT VALIDATION · OBSERVED PAPER OUTCOMES ONLY -->
+<!-- V16-M5B30I · BLOCKED COUNTERFACTUAL REPLAY · ZERO CAPITAL / REAL MARKS -->
 <!-- V16-M5B5 — server FVG detector -->
 
 <!-- SERVER DETECTOR · ORDER BLOCK V1 -->

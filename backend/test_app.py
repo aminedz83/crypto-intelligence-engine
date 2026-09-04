@@ -9082,3 +9082,28 @@ class PaperTradingTabIosFixV16M5B28B3FixTests(unittest.TestCase):
             'if(id!=="account"&&id!=="positions"&&id!=="history")return;',
             self.html,
         )
+
+
+class PaperTradingNativeTabsV16M5B28B3NativeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_positions_is_native_hash_link(self):
+        self.assertIn('"#paper-positions"', self.html)
+
+    def test_history_is_native_hash_link(self):
+        self.assertIn('"#paper-history"', self.html)
+
+    def test_account_is_native_hash_link(self):
+        self.assertIn('"#paper-account"', self.html)
+
+    def test_hashchange_rerenders_trading(self):
+        self.assertIn('window.addEventListener("hashchange"', self.html)
+        self.assertIn('paperActiveTab=paperTabFromHash();', self.html)
+
+    def test_render_reads_tab_from_hash(self):
+        self.assertIn('paperActiveTab=paperTabFromHash();', self.html)
+
+    def test_visible_native_tabs_build_marker(self):
+        self.assertIn("UI M5B28B3 · NATIVE TABS", self.html)

@@ -829,11 +829,21 @@ function iconFor(sym){
   var fallback=h("span",{class:"crypto-logo-fallback"},[base.slice(0,2)||"?"]);
   var img=h("img",{
     class:"crypto-logo-img",
-    src:"//assets.coincap.io/assets/icons/"+base.toLowerCase()+"@2x.png",
+    src:"//cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/128/color/"+base.toLowerCase()+".png",
     alt:base+" logo",
     loading:"lazy",
     referrerpolicy:"no-referrer"
   },[]);
+  img.addEventListener("error",function(){
+    if(img.getAttribute("data-fallback-tried")!=="1"){
+      img.setAttribute("data-fallback-tried","1");
+      img.src="//cdn.jsdelivr.net/gh/atomiclabs/cryptocurrency-icons@master/128/color/"+base.toLowerCase()+".png";
+      return;
+    }
+    img.style.display="none";
+    wrap.classList.remove("logo-loaded");
+  });
+  img.addEventListener("load",function(){wrap.classList.add("logo-loaded")});
   img.addEventListener("load",function(){wrap.classList.add("logo-loaded")});
   img.addEventListener("error",function(){img.style.display="none"});
   wrap.appendChild(img);wrap.appendChild(fallback);

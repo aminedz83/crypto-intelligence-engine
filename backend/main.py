@@ -1556,6 +1556,30 @@ paper_adaptive_edge_counterfactual_table = Table(
 )
 
 
+paper_adaptive_edge_policy_state_table = Table(
+    "paper_adaptive_edge_policy_state",
+    metadata,
+    Column("state_id", String, primary_key=True),
+    Column("policy_version", String, nullable=False),
+    Column("previous_policy_version", String, nullable=True),
+    Column("activated_at", DateTime(timezone=True), nullable=False),
+    Column("reason", String, nullable=False),
+)
+
+
+paper_adaptive_edge_policy_audit_table = Table(
+    "paper_adaptive_edge_policy_audit",
+    metadata,
+    Column("audit_id", String, primary_key=True),
+    Column("action", String, nullable=False),
+    Column("from_policy", String, nullable=False),
+    Column("to_policy", String, nullable=False),
+    Column("calibration_recommendation", String, nullable=True),
+    Column("reason", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+
+
 candles_table = Table(
     "candles",
     metadata,
@@ -1682,6 +1706,12 @@ class PaperAutoEntryGateRequest(BaseModel):
     stop_loss: Optional[Decimal] = None
     take_profit: Optional[Decimal] = None
     risk_reward: Optional[Decimal] = None
+
+
+class AdaptivePolicyActivationRequest(BaseModel):
+    policy_version: str = Field(min_length=1, max_length=64)
+    confirm: bool = False
+    reason: str = Field(default="MANUAL_CONTROLLED_ACTIVATION", max_length=200)
 
 
 class PaperPositionCreate(BaseModel):
@@ -5798,6 +5828,68 @@ async def get_adaptive_edge_shadow(
     }
 
 
+# V16-M5B30K — Controlled Adaptive Policy Activation.
+ADAPTIVE_POLICY_ACTIVATION_VERSION = "SERVER_ADAPTIVE_POLICY_ACTIVATION_V1"
+ADAPTIVE_POLICY_BASELINE = "BASELINE_V1"
+ADAPTIVE_POLICY_WEAK_OBSERVE = "WEAK_OBSERVE_ONLY_V1"
+ADAPTIVE_POLICY_FAVOR_DISABLED = "FAVOR_DISABLED_V1"
+ADAPTIVE_POLICY_STATE_ID = "paper-adaptive-edge-active-policy"
+ADAPTIVE_POLICY_DEFINITIONS: Dict[str, Dict[str, bool]] = {
+    ADAPTIVE_POLICY_BASELINE: {"block_weak": True, "favor_top_positive": True},
+    ADAPTIVE_POLICY_WEAK_OBSERVE: {"block_weak": False, "favor_top_positive": True},
+    ADAPTIVE_POLICY_FAVOR_DISABLED: {"block_weak": True, "favor_top_positive": False},
+}
+
+
+async def get_adaptive_policy_state() -> Dict[str, object]:
+    """Read active policy; missing/unavailable persistence fails safely to baseline."""
+    baseline = {
+        "policy_version": ADAPTIVE_POLICY_BASELINE,
+        "previous_policy_version": None,
+        "source": "BUILTIN_BASELINE",
+    }
+    if not persistence_state.ready:
+        return baseline
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT policy_version, previous_policy_version, activated_at, reason "
+                    "FROM paper_adaptive_edge_policy_state WHERE state_id=:state_id"
+                ),
+                {"state_id": ADAPTIVE_POLICY_STATE_ID},
+            )
+            row = result.fetchone()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Adaptive policy state unavailable: %s", type(exc).__name__)
+        return baseline
+    if row is None:
+        return baseline
+    data = dict(row._mapping)
+    version = str(data.get("policy_version") or ADAPTIVE_POLICY_BASELINE)
+    if version not in ADAPTIVE_POLICY_DEFINITIONS:
+        return baseline
+    return {**data, "policy_version": version, "source": "PERSISTED"}
+
+
+def apply_adaptive_policy(
+    advisory: Dict[str, object], policy_version: str
+) -> tuple[str, str]:
+    definition = ADAPTIVE_POLICY_DEFINITIONS.get(
+        policy_version, ADAPTIVE_POLICY_DEFINITIONS[ADAPTIVE_POLICY_BASELINE]
+    )
+    shadow_action = str(advisory.get("action") or "NEUTRAL")
+    if shadow_action == "WOULD_BLOCK" and definition["block_weak"]:
+        return "BLOCKED", "WEAK_PERSISTED_EDGE"
+    if shadow_action == "WOULD_BLOCK":
+        return "ALLOWED", "WEAK_EDGE_OBSERVE_ONLY_POLICY"
+    if shadow_action == "WOULD_FAVOR" and definition["favor_top_positive"]:
+        return "FAVORED", "TOP_RANKED_POSITIVE_EDGE"
+    if shadow_action == "WOULD_FAVOR":
+        return "ALLOWED", "FAVOR_DISABLED_BY_POLICY"
+    return "ALLOWED", str(advisory.get("reason") or "EVIDENCE_NOT_DECISIVE")
+
+
 # V16-M5B30F — Active Adaptive Edge Gate for PAPER execution only.
 ADAPTIVE_EDGE_ACTIVE_VERSION = "SERVER_ADAPTIVE_EDGE_ACTIVE_PAPER_V1"
 
@@ -5829,14 +5921,11 @@ async def evaluate_adaptive_edge_active_gate(
             "action": "ALLOWED", "reason": "RANKING_UNAVAILABLE_FAIL_NEUTRAL",
             "evidence": None, "rank": None, "score": None, "active": True,
         }
-    shadow_action = str(advisory.get("action") or "NEUTRAL")
-    if shadow_action == "WOULD_BLOCK":
-        action, reason = "BLOCKED", "WEAK_PERSISTED_EDGE"
-    elif shadow_action == "WOULD_FAVOR":
-        action, reason = "FAVORED", "TOP_RANKED_POSITIVE_EDGE"
-    else:
-        action = "ALLOWED"
-        reason = str(advisory.get("reason") or "EVIDENCE_NOT_DECISIVE")
+    policy_state = await get_adaptive_policy_state()
+    policy_version = str(
+        policy_state.get("policy_version") or ADAPTIVE_POLICY_BASELINE
+    )
+    action, reason = apply_adaptive_policy(advisory, policy_version)
     created_at = utcnow()
     seed = f"{canonical}|{strategy_id}|{tf}|{sess}|{reg}|{period}|{created_at.isoformat()}"
     decision_id = "edge-active-" + hashlib.sha256(seed.encode()).hexdigest()[:24]
@@ -5863,14 +5952,21 @@ async def evaluate_adaptive_edge_active_gate(
                     decision_id=decision_id,
                     components_json=json.dumps(components, sort_keys=True, default=str),
                     metrics_json=json.dumps(metrics, sort_keys=True, default=str),
-                    policy_version=ADAPTIVE_EDGE_ACTIVE_VERSION,
+                    policy_version=policy_version,
                     created_at=created_at,
                 )
             )
     except Exception as exc:  # noqa: BLE001
         log.warning("Adaptive edge active audit unavailable: %s", type(exc).__name__)
-    return {**advisory, "decision_id": decision_id, "action": action,
-            "reason": reason, "active": True, "paper_only": True}
+    return {
+        **advisory,
+        "decision_id": decision_id,
+        "action": action,
+        "reason": reason,
+        "active": True,
+        "paper_only": True,
+        "policy_version": policy_version,
+    }
 
 
 @api_router.get("/paper/adaptive-edge/active")
@@ -6181,18 +6277,18 @@ def adaptive_policy_calibration_recommendation(
         return {
             "recommendation": "KEEP_CURRENT_POLICY",
             "reason": "GATE_SEPARATION_POSITIVE",
-            "eligible_for_activation": False,
+            "eligible_for_activation": True,
         }
     if blocked_rr > linked_rr:
         return {
             "recommendation": "REVIEW_BLOCK_THRESHOLD",
             "reason": "BLOCKED_COHORT_OUTPERFORMS_EXECUTED_COHORT",
-            "eligible_for_activation": False,
+            "eligible_for_activation": True,
         }
     return {
         "recommendation": "REVIEW_FAVOR_THRESHOLD",
         "reason": "GATE_SEPARATION_NOT_PROVEN",
-        "eligible_for_activation": False,
+        "eligible_for_activation": True,
     }
 
 
@@ -6229,6 +6325,181 @@ async def get_adaptive_policy_calibration(period: str = "ALL") -> Dict[str, obje
             "blocked_win_rate_percent": blocked.get("win_rate_percent"),
         },
         **recommendation,
+        "paper_only": True,
+        "live_trading": False,
+    }
+
+
+def adaptive_policy_candidate_for_recommendation(recommendation: str) -> str:
+    if recommendation == "REVIEW_BLOCK_THRESHOLD":
+        return ADAPTIVE_POLICY_WEAK_OBSERVE
+    if recommendation == "REVIEW_FAVOR_THRESHOLD":
+        return ADAPTIVE_POLICY_FAVOR_DISABLED
+    return ADAPTIVE_POLICY_BASELINE
+
+
+@api_router.get("/paper/adaptive-edge/policy")
+async def get_adaptive_policy() -> Dict[str, object]:
+    state = await get_adaptive_policy_state()
+    version = str(state.get("policy_version") or ADAPTIVE_POLICY_BASELINE)
+    return {
+        "status": "OK",
+        "validation": ADAPTIVE_POLICY_ACTIVATION_VERSION,
+        "mode": "CONTROLLED_MANUAL",
+        "state": state,
+        "definition": ADAPTIVE_POLICY_DEFINITIONS[version],
+        "available_policies": ADAPTIVE_POLICY_DEFINITIONS,
+        "automatic_activation": False,
+        "paper_only": True,
+        "live_trading": False,
+    }
+
+
+@api_router.post("/paper/adaptive-edge/policy/activate")
+async def activate_adaptive_policy(
+    req: AdaptivePolicyActivationRequest,
+) -> Dict[str, object]:
+    if not req.confirm:
+        raise HTTPException(status_code=409, detail="explicit confirmation required")
+    requested = req.policy_version.strip().upper()
+    if requested not in ADAPTIVE_POLICY_DEFINITIONS:
+        raise HTTPException(status_code=400, detail="unknown adaptive policy")
+    calibration = await get_adaptive_policy_calibration("ALL")
+    recommendation = str(calibration.get("recommendation") or "")
+    eligible = bool(calibration.get("eligible_for_activation"))
+    candidate = adaptive_policy_candidate_for_recommendation(recommendation)
+    if not eligible:
+        raise HTTPException(status_code=409, detail="calibration not activation-eligible")
+    if requested != candidate:
+        raise HTTPException(
+            status_code=409,
+            detail="requested policy does not match current calibration recommendation",
+        )
+    current = await get_adaptive_policy_state()
+    current_version = str(
+        current.get("policy_version") or ADAPTIVE_POLICY_BASELINE
+    )
+    if requested == current_version:
+        return {
+            "status": "NO_CHANGE",
+            "policy_version": requested,
+            "recommendation": recommendation,
+            "paper_only": True,
+        }
+    now = utcnow()
+    audit_seed = f"ACTIVATE|{current_version}|{requested}|{now.isoformat()}"
+    audit_id = "edge-policy-" + hashlib.sha256(audit_seed.encode()).hexdigest()[:24]
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                pg_insert(paper_adaptive_edge_policy_state_table).values(
+                    state_id=ADAPTIVE_POLICY_STATE_ID,
+                    policy_version=requested,
+                    previous_policy_version=current_version,
+                    activated_at=now,
+                    reason=req.reason,
+                ).on_conflict_do_update(
+                    index_elements=["state_id"],
+                    set_={
+                        "policy_version": requested,
+                        "previous_policy_version": current_version,
+                        "activated_at": now,
+                        "reason": req.reason,
+                    },
+                )
+            )
+            await conn.execute(
+                pg_insert(paper_adaptive_edge_policy_audit_table).values(
+                    audit_id=audit_id,
+                    action="ACTIVATE",
+                    from_policy=current_version,
+                    to_policy=requested,
+                    calibration_recommendation=recommendation,
+                    reason=req.reason,
+                    created_at=now,
+                )
+            )
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail="adaptive policy activation persistence failed",
+        ) from exc
+    return {
+        "status": "ACTIVATED",
+        "validation": ADAPTIVE_POLICY_ACTIVATION_VERSION,
+        "policy_version": requested,
+        "previous_policy_version": current_version,
+        "recommendation": recommendation,
+        "audit_id": audit_id,
+        "automatic": False,
+        "paper_only": True,
+        "live_trading": False,
+    }
+
+
+@api_router.post("/paper/adaptive-edge/policy/rollback")
+async def rollback_adaptive_policy(
+    req: AdaptivePolicyActivationRequest,
+) -> Dict[str, object]:
+    if not req.confirm:
+        raise HTTPException(status_code=409, detail="explicit confirmation required")
+    current = await get_adaptive_policy_state()
+    current_version = str(
+        current.get("policy_version") or ADAPTIVE_POLICY_BASELINE
+    )
+    previous = str(
+        current.get("previous_policy_version") or ADAPTIVE_POLICY_BASELINE
+    )
+    if previous not in ADAPTIVE_POLICY_DEFINITIONS:
+        previous = ADAPTIVE_POLICY_BASELINE
+    if current_version == previous:
+        return {"status": "NO_CHANGE", "policy_version": current_version}
+    now = utcnow()
+    audit_seed = f"ROLLBACK|{current_version}|{previous}|{now.isoformat()}"
+    audit_id = "edge-policy-" + hashlib.sha256(audit_seed.encode()).hexdigest()[:24]
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                pg_insert(paper_adaptive_edge_policy_state_table).values(
+                    state_id=ADAPTIVE_POLICY_STATE_ID,
+                    policy_version=previous,
+                    previous_policy_version=current_version,
+                    activated_at=now,
+                    reason=req.reason,
+                ).on_conflict_do_update(
+                    index_elements=["state_id"],
+                    set_={
+                        "policy_version": previous,
+                        "previous_policy_version": current_version,
+                        "activated_at": now,
+                        "reason": req.reason,
+                    },
+                )
+            )
+            await conn.execute(
+                pg_insert(paper_adaptive_edge_policy_audit_table).values(
+                    audit_id=audit_id,
+                    action="ROLLBACK",
+                    from_policy=current_version,
+                    to_policy=previous,
+                    calibration_recommendation=None,
+                    reason=req.reason,
+                    created_at=now,
+                )
+            )
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail="adaptive policy rollback persistence failed",
+        ) from exc
+    return {
+        "status": "ROLLED_BACK",
+        "validation": ADAPTIVE_POLICY_ACTIVATION_VERSION,
+        "policy_version": previous,
+        "previous_policy_version": current_version,
+        "audit_id": audit_id,
         "paper_only": True,
         "live_trading": False,
     }

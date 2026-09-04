@@ -8748,6 +8748,169 @@ async def breakout_expansion_paper_status() -> Dict[str, object]:
         "execution": False,
     }
 
+
+
+# V16-M5B28B7-FIX3 — same-origin dynamic crypto logo proxy.
+# The frontend never calls third-party origins directly. Logos are resolved on the
+# backend from a small deterministic provider chain, cached in memory, and
+# returned as image bytes. Missing logos fail closed with 404 so the UI can keep
+# its ticker-initial fallback.
+CRYPTO_LOGO_CACHE_TTL_SECONDS = 24 * 60 * 60
+CRYPTO_LOGO_NEGATIVE_TTL_SECONDS = 60 * 60
+CRYPTO_LOGO_MAX_BYTES = 512 * 1024
+CRYPTO_LOGO_SYMBOL_ALIASES = {
+    'JUPITER': 'JUP',
+}
+_crypto_logo_cache: Dict[str, Tuple[float, bytes, str]] = {}
+_crypto_logo_missing_until: Dict[str, float] = {}
+_crypto_logo_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _normalize_crypto_logo_symbol(symbol: str) -> str:
+    base = str(symbol or '').split('-')[0].strip().upper()
+    if not re.fullmatch(r'[A-Z0-9]{1,15}', base):
+        raise HTTPException(status_code=400, detail='INVALID_CRYPTO_SYMBOL')
+    return base
+
+
+def _crypto_logo_lock(base: str) -> asyncio.Lock:
+    lock = _crypto_logo_locks.get(base)
+    if lock is None:
+        lock = asyncio.Lock()
+        _crypto_logo_locks[base] = lock
+    return lock
+
+
+def _usable_logo_response(resp: httpx.Response) -> bool:
+    if resp.status_code != 200:
+        return False
+    content_type = str(resp.headers.get('content-type') or '').split(';')[0].lower()
+    if not content_type.startswith('image/'):
+        return False
+    length = len(resp.content)
+    return 0 < length <= CRYPTO_LOGO_MAX_BYTES
+
+
+async def _fetch_logo_bytes(url: str) -> Optional[Tuple[bytes, str]]:
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(5.0),
+            follow_redirects=True,
+            headers={'User-Agent': 'Crypto-Intelligence-Engine/1.0'},
+        ) as client:
+            resp = await client.get(url)
+        if not _usable_logo_response(resp):
+            return None
+        media_type = str(resp.headers.get('content-type') or 'image/png').split(';')[0]
+        return resp.content, media_type
+    except httpx.HTTPError:
+        return None
+
+
+async def _resolve_crypto_logo(base: str) -> Optional[Tuple[bytes, str]]:
+    lower = base.lower()
+    static_candidates = (
+        'https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/128/color/'
+        f'{lower}.png',
+        'https://cdn.jsdelivr.net/npm/cryptocurrency-icons@0.18.1/128/color/'
+        f'{lower}.png',
+    )
+    for candidate in static_candidates:
+        resolved = await _fetch_logo_bytes(candidate)
+        if resolved is not None:
+            return resolved
+
+    # Dynamic fallback for newer assets absent from the static icon packages.
+    # Search results are filtered to an exact ticker match before the returned
+    # image URL is fetched, which avoids guessing an asset by name.
+    search_symbols = [base]
+    alias = CRYPTO_LOGO_SYMBOL_ALIASES.get(base)
+    if alias and alias not in search_symbols:
+        search_symbols.append(alias)
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(5.0),
+            follow_redirects=True,
+            headers={'User-Agent': 'Crypto-Intelligence-Engine/1.0'},
+        ) as client:
+            for search_symbol in search_symbols:
+                search_url = (
+                    'https://api.coingecko.com/api/v3/search?query='
+                    + url_quote(search_symbol)
+                )
+                search_resp = await client.get(search_url)
+                if search_resp.status_code != 200:
+                    continue
+                payload = search_resp.json()
+                coins = payload.get('coins') if isinstance(payload, dict) else None
+                if not isinstance(coins, list):
+                    continue
+                exact = [
+                    coin
+                    for coin in coins
+                    if isinstance(coin, dict)
+                    and str(coin.get('symbol') or '').upper() == search_symbol
+                ]
+                exact.sort(
+                    key=lambda coin: (
+                        coin.get('market_cap_rank') is None,
+                        coin.get('market_cap_rank') or 10**9,
+                    )
+                )
+                for coin in exact[:4]:
+                    image_url = (
+                        coin.get('large') or coin.get('small') or coin.get('thumb')
+                    )
+                    if not isinstance(image_url, str) or not image_url.startswith('https://'):
+                        continue
+                    image_resp = await client.get(image_url)
+                    if _usable_logo_response(image_resp):
+                        media_type = str(
+                            image_resp.headers.get('content-type') or 'image/png'
+                        ).split(';')[0]
+                        return image_resp.content, media_type
+    except (httpx.HTTPError, ValueError, TypeError):
+        return None
+    return None
+
+
+@api_router.get('/market/crypto-logo/{symbol}')
+async def crypto_logo(symbol: str) -> Response:
+    base = _normalize_crypto_logo_symbol(symbol)
+    now = time.monotonic()
+    cached = _crypto_logo_cache.get(base)
+    if cached is not None and now - cached[0] < CRYPTO_LOGO_CACHE_TTL_SECONDS:
+        return Response(
+            content=cached[1],
+            media_type=cached[2],
+            headers={'Cache-Control': 'public, max-age=86400, immutable'},
+        )
+    if _crypto_logo_missing_until.get(base, 0.0) > now:
+        raise HTTPException(status_code=404, detail='CRYPTO_LOGO_NOT_FOUND')
+
+    async with _crypto_logo_lock(base):
+        now = time.monotonic()
+        cached = _crypto_logo_cache.get(base)
+        if cached is not None and now - cached[0] < CRYPTO_LOGO_CACHE_TTL_SECONDS:
+            return Response(
+                content=cached[1],
+                media_type=cached[2],
+                headers={'Cache-Control': 'public, max-age=86400, immutable'},
+            )
+        resolved = await _resolve_crypto_logo(base)
+        if resolved is None:
+            _crypto_logo_missing_until[base] = now + CRYPTO_LOGO_NEGATIVE_TTL_SECONDS
+            raise HTTPException(status_code=404, detail='CRYPTO_LOGO_NOT_FOUND')
+        content, media_type = resolved
+        _crypto_logo_cache[base] = (now, content, media_type)
+        _crypto_logo_missing_until.pop(base, None)
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={'Cache-Control': 'public, max-age=86400, immutable'},
+        )
+
+
 # App must be built only after every router decorator above has executed.
 app = create_app()
 

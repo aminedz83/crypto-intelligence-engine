@@ -9002,7 +9002,7 @@ class TestV16M5B28B2BreakoutExpansionPaperExecution(unittest.TestCase):
 class DynamicUiControlHardeningV16M5B28B3Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.html = FRONTEND_INDEX.read_text(encoding="utf-8")
+        cls.html = INDEX.read_text(encoding="utf-8")
 
     def test_trading_tabs_have_state(self):
         self.assertIn('var paperActiveTab="account";', self.html)

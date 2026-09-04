@@ -460,6 +460,10 @@ body.market-menu-open .market-tabs-wrap{display:block!important}
   .metric-mini{min-width:0}
   .subtab{min-height:44px}
 }
+
+.subtab[href^="#paper-"]{display:inline-flex;align-items:center;justify-content:center;text-decoration:none}
+.subtab[href^="#paper-"]:active{transform:scale(.98)}
+
 </style>
 </head>
 <body>
@@ -778,38 +782,38 @@ var paperActiveTab="account";
 var intelligenceActiveTab="regime";
 var settingsActiveTab="interface";
 
+function paperTabFromHash(){
+  if(location.hash==="#paper-positions")return "positions";
+  if(location.hash==="#paper-history")return "history";
+  return "account";
+}
 function tabButton(label,id,active,setter){
-  var attrs={
+  if(setter===setPaperTab){
+    return h("a",{
+      class:"subtab "+(active===id?"active":""),
+      "data-paper-tab":id,
+      "aria-selected":active===id?"true":"false",
+      href:id==="account"?"#paper-account":id==="positions"?"#paper-positions":"#paper-history"
+    },[label]);
+  }
+  return h("button",{
     type:"button",
     class:"subtab "+(active===id?"active":""),
     "data-tab":id,
     "aria-selected":active===id?"true":"false",
-    onclick:function(ev){
-      if(ev){ev.preventDefault();ev.stopPropagation()}
-      setter(id);
-    }
-  };
-  if(setter===setPaperTab)attrs["data-paper-tab"]=id;
-  return h("button",attrs,[label]);
+    onclick:function(){setter(id)}
+  },[label]);
 }
 function setPaperTab(id){
   if(id!=="account"&&id!=="positions"&&id!=="history")return;
   paperActiveTab=id;
-  renderTrading();
+  location.hash=id==="account"?"paper-account":id==="positions"?"paper-positions":"paper-history";
+  if(current==="trading")renderTrading();
 }
-var paperTabTouchAt=0;
-document.addEventListener("touchend",function(ev){
-  var target=ev.target&&ev.target.closest?ev.target.closest("[data-paper-tab]"):null;
-  if(!target)return;
-  paperTabTouchAt=Date.now();
-  ev.preventDefault();
-  setPaperTab(target.getAttribute("data-paper-tab"));
-},{passive:false});
-document.addEventListener("click",function(ev){
-  var target=ev.target&&ev.target.closest?ev.target.closest("[data-paper-tab]"):null;
-  if(!target||Date.now()-paperTabTouchAt<700)return;
-  ev.preventDefault();
-  setPaperTab(target.getAttribute("data-paper-tab"));
+window.addEventListener("hashchange",function(){
+  if(current!=="trading")return;
+  paperActiveTab=paperTabFromHash();
+  renderTrading();
 });
 function setIntelligenceTab(id){
   intelligenceActiveTab=id;
@@ -839,6 +843,7 @@ function paperStrategyLabel(p){
 function renderTradingContent(){
   var v=byId("view-trading");
   clear(v);
+  paperActiveTab=paperTabFromHash();
   var a=paperUiState.account;
   var open=paperUiState.positions.filter(function(p){return p.status==="OPEN"});
   var closed=paperUiState.positions.filter(function(p){return p.status==="CLOSED"});
@@ -846,6 +851,9 @@ function renderTradingContent(){
 
   v.appendChild(pageHead("Paper Trading",
     "Compte virtuel persistant, positions ouvertes et historique réel du moteur paper.","PAPER ONLY"));
+  v.appendChild(h("div",{class:"note","data-ui-build":"M5B28B3-NATIVE-TABS"},[
+    "UI M5B28B3 · NATIVE TABS"
+  ]));
   v.setAttribute("data-paper-rendered","true");
   v.appendChild(h("div",{class:"subtabs",role:"tablist"},[
     tabButton("Compte","account",paperActiveTab,setPaperTab),
@@ -862,6 +870,7 @@ function renderTradingContent(){
   }
 
   if(paperActiveTab==="account"){
+    v.appendChild(h("div",{id:"paper-account","data-paper-panel":"account"},[]));
     v.appendChild(h("div",{class:"metric-strip"},[
       h("div",{class:"metric-mini"},[h("span",{},["Capital initial"]),h("b",{},[a?paperMoney(a.initial_capital):"—"])]),
       h("div",{class:"metric-mini"},[h("span",{},["Capital réalisé"]),h("b",{},[a?paperMoney(a.current_capital):"—"])]),
@@ -894,11 +903,13 @@ function renderTradingContent(){
         h("b",{},[Object.keys(paperUiState.sectionErrors).join(", ")||"AUCUNE"])])
     ])));
   }else if(paperActiveTab==="positions"){
+    v.appendChild(h("div",{id:"paper-positions","data-paper-panel":"positions"},[]));
     v.appendChild(modCard("Positions ouvertes",open.length+" OPEN",
       open.length?h("div",{class:"grid-2"},open.map(paperPositionCard)):
         placeholder("Aucune position ouverte",
           "Le moteur n’invente aucune position. Une position apparaît après création paper persistée.")));
   }else{
+    v.appendChild(h("div",{id:"paper-history","data-paper-panel":"history"},[]));
     v.appendChild(modCard("Historique",closed.length+" CLOSED",
       closed.length?h("div",{class:"grid-2"},closed.map(paperPositionCard)):
         placeholder("Aucune position clôturée",

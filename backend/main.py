@@ -9065,105 +9065,227 @@ async def get_multi_asset_strategy_analysis_universe() -> Dict[str, object]:
     }
 
 
+# V16-M5B29D — FX conversion + Gold + cash-index paper sizing foundation
+# ---------------------------------------------------------------------------
+# Paper-only models below never claim broker lots/contracts. Gold is sized in
+# native XAU units. Cash indices use an explicit INTERNAL PAPER POINT UNIT where
+# one unit earns/loses USD 1 per index point; this is not a broker contract spec.
+# Non-USD quoted FX conversion is exposed/validated but remains execution-blocked
+# until conversion snapshots can be persisted with each position for exact P&L.
+MULTI_ASSET_EXTENDED_SIZING_VERSION = "SERVER_MULTI_ASSET_EXTENDED_SIZING_V1"
+
+
+def multi_asset_extended_sizing_readiness(symbol: str) -> Dict[str, object]:
+    canonical = symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    base: Dict[str, object] = {
+        "validation": MULTI_ASSET_EXTENDED_SIZING_VERSION,
+        "symbol": canonical,
+        "paper_only": True,
+        "live_trading": False,
+        "broker_contract_size_applied": False,
+    }
+    if instrument is None:
+        return {**base, "status": "BLOCKED", "reason": "INSTRUMENT_NOT_REGISTERED"}
+    base.update({
+        "asset_class": instrument.asset_class.value,
+        "base_asset": instrument.base_asset,
+        "quote_asset": instrument.quote_asset,
+    })
+    if instrument.asset_class == AssetClass.FOREX:
+        if instrument.quote_asset == "USD":
+            return {
+                **base, "status": "PREVIEW_READY",
+                "reason": "USD_QUOTED_SPOT_UNIT_PNL",
+                "sizing_mode": "BASE_UNITS", "pnl_currency": "USD",
+            }
+        return {
+            **base, "status": "CONVERSION_REQUIRED",
+            "reason": "REALTIME_QUOTE_TO_USD_CONVERSION_REQUIRED",
+            "sizing_mode": "BASE_UNITS",
+            "quote_currency": instrument.quote_asset,
+            "pnl_currency": "USD",
+        }
+    if instrument.asset_class == AssetClass.METAL and canonical == "XAU-USD":
+        return {
+            **base, "status": "PREVIEW_READY",
+            "reason": "XAU_USD_NATIVE_UNIT_PNL",
+            "sizing_mode": "XAU_UNITS", "pnl_currency": "USD",
+            "session_model": "WEEKDAY_SPOT_BASELINE_PLUS_FRESH_PROVIDER_MARK",
+        }
+    if instrument.asset_class == AssetClass.INDEX and instrument.quote_asset == "USD":
+        return {
+            **base, "status": "PREVIEW_READY",
+            "reason": "INTERNAL_PAPER_INDEX_POINT_MODEL",
+            "sizing_mode": "PAPER_POINT_UNITS", "pnl_currency": "USD",
+            "paper_point_value_usd": "1",
+            "broker_equivalent": False,
+        }
+    return {**base, "status": "BLOCKED", "reason": "SIZING_MODEL_NOT_SUPPORTED"}
+
+
+def _fx_quote_to_usd_conversion_symbol(symbol: str) -> Optional[Tuple[str, bool]]:
+    instrument = instrument_registry.get(symbol.upper().replace("/", "-"))
+    if instrument is None or instrument.asset_class != AssetClass.FOREX:
+        return None
+    quote = instrument.quote_asset
+    if quote == "USD":
+        return ("USD", False)
+    direct = f"{quote}-USD"
+    if instrument_registry.get(direct) is not None:
+        return (direct, False)
+    inverse = f"USD-{quote}"
+    if instrument_registry.get(inverse) is not None:
+        return (inverse, True)
+    return None
+
+
+async def realtime_fx_quote_to_usd(symbol: str) -> Dict[str, object]:
+    canonical = symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    base: Dict[str, object] = {
+        "symbol": canonical, "account_currency": "USD",
+        "paper_only": True, "execution": False,
+        "validation": MULTI_ASSET_EXTENDED_SIZING_VERSION,
+    }
+    if instrument is None or instrument.asset_class != AssetClass.FOREX:
+        return {**base, "status": "BLOCKED", "reason": "NOT_FOREX"}
+    if instrument.quote_asset == "USD":
+        return {
+            **base, "status": "VALID", "quote_currency": "USD",
+            "quote_to_usd": Decimal("1"), "conversion_symbol": "USD",
+        }
+    route = _fx_quote_to_usd_conversion_symbol(canonical)
+    if route is None:
+        return {**base, "status": "BLOCKED", "reason": "CONVERSION_ROUTE_NOT_REGISTERED"}
+    conversion_symbol, inverse = route
+    mark = await paper_mark_from_realtime(conversion_symbol)
+    if mark is None or mark.current_price <= 0:
+        return {**base, "status": "WAIT", "reason": "CONVERSION_MARK_UNAVAILABLE"}
+    if classify_freshness(
+        mark.source_timestamp, settings.ticker_max_age_seconds, now=utcnow()
+    ) != DataQualityStatus.VALID:
+        return {**base, "status": "WAIT", "reason": "CONVERSION_MARK_NOT_FRESH"}
+    rate = Decimal("1") / mark.current_price if inverse else mark.current_price
+    return {
+        **base, "status": "VALID", "quote_currency": instrument.quote_asset,
+        "quote_to_usd": rate, "conversion_symbol": conversion_symbol,
+        "conversion_price": mark.current_price, "inverse": inverse,
+        "source": mark.source, "source_timestamp": mark.source_timestamp,
+    }
+
+
+def calculate_extended_paper_size(
+    capital: Decimal, risk_percent: Decimal, entry: Decimal, stop_loss: Decimal,
+    readiness: Dict[str, object], quote_to_usd: Decimal = Decimal("1"),
+) -> Dict[str, object]:
+    if readiness.get("status") != "PREVIEW_READY":
+        return {"status": "BLOCKED", "reason": str(readiness.get("reason") or "SIZING_NOT_READY")}
+    distance = abs(entry - stop_loss)
+    if capital <= 0 or risk_percent <= 0 or risk_percent > Decimal("100"):
+        return {"status": "BLOCKED", "reason": "RISK_INVALID"}
+    if distance <= 0 or quote_to_usd <= 0:
+        return {"status": "BLOCKED", "reason": "STOP_OR_CONVERSION_INVALID"}
+    risk_money = capital * risk_percent / Decimal("100")
+    units = risk_money / (distance * quote_to_usd)
+    if units <= 0:
+        return {"status": "BLOCKED", "reason": "SIZE_INVALID"}
+    return {
+        "status": "VALID", "validation": MULTI_ASSET_EXTENDED_SIZING_VERSION,
+        "size": units, "size_unit": readiness.get("sizing_mode"),
+        "risk_money": risk_money, "risk_percent": risk_percent,
+        "stop_distance": distance, "quote_to_usd": quote_to_usd,
+        "pnl_currency": "USD", "paper_only": True, "live_trading": False,
+    }
+
+
+@api_router.get("/paper/multi-asset-sizing/extended-readiness/{symbol}")
+async def get_multi_asset_extended_sizing_readiness(symbol: str) -> Dict[str, object]:
+    return multi_asset_extended_sizing_readiness(symbol)
+
+
+@api_router.get("/paper/fx-conversion/{symbol}")
+async def get_realtime_fx_quote_to_usd(symbol: str) -> Dict[str, object]:
+    return await realtime_fx_quote_to_usd(symbol)
+
+
 # V16-M5B29C — Multi-Asset Paper Execution Foundation
 # First executable multi-asset slice: USD-quoted spot Forex in native base units.
 # This is PAPER ONLY. Gold, cash indices, and non-USD-quoted FX remain fail-closed
 # until their missing calendar / contract-value / account-currency rules are verified.
-MULTI_ASSET_PAPER_EXECUTION_VERSION = "SERVER_MULTI_ASSET_PAPER_EXECUTION_V1"
+MULTI_ASSET_PAPER_EXECUTION_VERSION = "SERVER_MULTI_ASSET_PAPER_EXECUTION_V2"
 MULTI_ASSET_PAPER_RISK_PERCENT = Decimal("1")
 
 
 def multi_asset_paper_execution_readiness(symbol: str) -> Dict[str, object]:
-    """Return explicit authorization state for multi-asset PAPER execution.
-
-    M5B29C authorizes only mathematically well-defined USD-quoted spot Forex
-    positions in native base units. It does not model broker lots/contracts and
-    never authorizes live trading.
-    """
+    """Authorize only paper models whose USD P&L is deterministic in this build."""
     canonical = symbol.upper().replace("/", "-")
     instrument = instrument_registry.get(canonical)
     observed_at = utcnow()
     base: Dict[str, object] = {
-        "validation": MULTI_ASSET_PAPER_EXECUTION_VERSION,
-        "symbol": canonical,
-        "observed_at": observed_at.isoformat(),
-        "paper_only": True,
-        "live_trading": False,
-        "execution": False,
-        "auto_entry_authorized": False,
+        "validation": MULTI_ASSET_PAPER_EXECUTION_VERSION, "symbol": canonical,
+        "observed_at": observed_at.isoformat(), "paper_only": True,
+        "live_trading": False, "execution": False, "auto_entry_authorized": False,
     }
     if instrument is None:
         return {**base, "status": "BLOCKED", "reason": "INSTRUMENT_NOT_REGISTERED"}
-
-    base.update(
-        {
-            "asset_class": instrument.asset_class.value,
-            "base_asset": instrument.base_asset,
-            "quote_asset": instrument.quote_asset,
-            "market_calendar": instrument.market_calendar.value,
-        }
-    )
+    base.update({
+        "asset_class": instrument.asset_class.value, "base_asset": instrument.base_asset,
+        "quote_asset": instrument.quote_asset, "market_calendar": instrument.market_calendar.value,
+    })
     if instrument.asset_class == AssetClass.CRYPTO:
+        return {**base, "status": "DELEGATED", "reason": "USE_EXISTING_CRYPTO_PAPER_PIPELINE"}
+    if instrument.asset_class == AssetClass.FOREX:
+        if instrument.market_calendar != MarketCalendarPolicy.FOREX_WEEK:
+            return {**base, "status": "BLOCKED", "reason": "MARKET_CALENDAR_NOT_VERIFIED"}
+        if provider_symbol_map.to_provider("massive", canonical) is None:
+            return {**base, "status": "BLOCKED", "reason": "PROVIDER_SYMBOL_NOT_MAPPED"}
+        session = market_session_context(canonical, observed_at)
+        if str(session.get("market_state") or "UNKNOWN") != "OPEN":
+            return {**base, "status": "BLOCKED", "reason": "MARKET_CLOSED", "session": session}
+        if instrument.quote_asset != "USD":
+            return {
+                **base, "status": "BLOCKED",
+                "reason": "FX_CONVERSION_SNAPSHOT_PERSISTENCE_REQUIRED",
+                "conversion_preview_available": True, "session": session,
+            }
+        sizing = multi_asset_extended_sizing_readiness(canonical)
         return {
-            **base,
-            "status": "DELEGATED",
-            "reason": "USE_EXISTING_CRYPTO_PAPER_PIPELINE",
+            **base, "status": "READY", "reason": "USD_QUOTED_SPOT_FOREX_PAPER_READY",
+            "sizing_mode": sizing.get("sizing_mode"), "pnl_currency": "USD",
+            "risk_percent": str(MULTI_ASSET_PAPER_RISK_PERCENT), "session": session,
+            "auto_entry_authorized": True,
         }
     if instrument.asset_class == AssetClass.METAL:
+        if canonical != "XAU-USD" or provider_symbol_map.to_provider("twelvedata", canonical) is None:
+            return {**base, "status": "BLOCKED", "reason": "METAL_PROVIDER_NOT_MAPPED"}
+        spot_session = forex_market_state(observed_at)
+        if str(spot_session.get("market_state") or "UNKNOWN") != "OPEN":
+            return {**base, "status": "BLOCKED", "reason": "MARKET_CLOSED", "session": spot_session}
+        sizing = multi_asset_extended_sizing_readiness(canonical)
         return {
-            **base,
-            "status": "BLOCKED",
-            "reason": "MARKET_CALENDAR_NOT_CONFIGURED",
+            **base, "status": "READY", "reason": "XAU_USD_PAPER_UNIT_MODEL_READY",
+            "sizing_mode": sizing.get("sizing_mode"), "pnl_currency": "USD",
+            "session": spot_session,
+            "session_model": "WEEKDAY_SPOT_BASELINE_PLUS_FRESH_PROVIDER_MARK",
+            "risk_percent": str(MULTI_ASSET_PAPER_RISK_PERCENT),
+            "auto_entry_authorized": True,
         }
     if instrument.asset_class == AssetClass.INDEX:
+        if provider_symbol_map.to_provider("massive", canonical) is None:
+            return {**base, "status": "BLOCKED", "reason": "INDEX_PROVIDER_NOT_MAPPED"}
+        session = market_session_context(canonical, observed_at)
+        if str(session.get("market_state") or "UNKNOWN") != "OPEN":
+            return {**base, "status": "BLOCKED", "reason": "MARKET_CLOSED", "session": session}
+        sizing = multi_asset_extended_sizing_readiness(canonical)
         return {
-            **base,
-            "status": "BLOCKED",
-            "reason": "VERIFIED_INDEX_CONTRACT_VALUE_NOT_IMPLEMENTED",
+            **base, "status": "READY", "reason": "INTERNAL_PAPER_INDEX_POINT_MODEL_READY",
+            "sizing_mode": sizing.get("sizing_mode"), "pnl_currency": "USD",
+            "paper_point_value_usd": "1", "broker_equivalent": False,
+            "session": session, "risk_percent": str(MULTI_ASSET_PAPER_RISK_PERCENT),
+            "auto_entry_authorized": True,
         }
-    if instrument.asset_class != AssetClass.FOREX:
-        return {**base, "status": "BLOCKED", "reason": "ASSET_CLASS_NOT_SUPPORTED"}
-    if instrument.market_calendar != MarketCalendarPolicy.FOREX_WEEK:
-        return {**base, "status": "BLOCKED", "reason": "MARKET_CALENDAR_NOT_VERIFIED"}
-    if instrument.quote_asset != "USD":
-        return {
-            **base,
-            "status": "BLOCKED",
-            "reason": "ACCOUNT_CURRENCY_CONVERSION_NOT_IMPLEMENTED",
-        }
-    if provider_symbol_map.to_provider("massive", canonical) is None:
-        return {**base, "status": "BLOCKED", "reason": "PROVIDER_SYMBOL_NOT_MAPPED"}
-
-    session = market_session_context(canonical, observed_at)
-    market_state = str(session.get("market_state") or "UNKNOWN")
-    if market_state != "OPEN":
-        return {
-            **base,
-            "status": "BLOCKED",
-            "reason": "MARKET_CLOSED" if market_state == "CLOSED" else "MARKET_STATE_UNKNOWN",
-            "session": session,
-        }
-
-    sizing = multi_asset_sizing_readiness(canonical)
-    if sizing.get("status") != "PREVIEW_READY":
-        return {
-            **base,
-            "status": "BLOCKED",
-            "reason": str(sizing.get("reason") or "SIZING_NOT_READY"),
-            "sizing": sizing,
-            "session": session,
-        }
-    return {
-        **base,
-        "status": "READY",
-        "reason": "USD_QUOTED_SPOT_FOREX_PAPER_READY",
-        "sizing_mode": "BASE_UNITS",
-        "pnl_currency": "USD",
-        "risk_percent": str(MULTI_ASSET_PAPER_RISK_PERCENT),
-        "broker_contract_size_applied": False,
-        "session": session,
-        "auto_entry_authorized": True,
-    }
+    return {**base, "status": "BLOCKED", "reason": "ASSET_CLASS_NOT_SUPPORTED"}
 
 
 @api_router.get("/paper/multi-asset-execution/readiness/{symbol}")
@@ -9270,8 +9392,8 @@ async def execute_multi_asset_paper_plan(
 
     account = await get_paper_account()
     capital = Decimal(str(account["current_capital"]))
-    sizing_readiness = multi_asset_sizing_readiness(canonical)
-    sizing = calculate_multi_asset_unit_size(
+    sizing_readiness = multi_asset_extended_sizing_readiness(canonical)
+    sizing = calculate_extended_paper_size(
         capital,
         MULTI_ASSET_PAPER_RISK_PERCENT,
         entry,
@@ -9329,7 +9451,7 @@ async def execute_multi_asset_paper_plan(
 
 
 async def run_multi_asset_paper_generation_once() -> Dict[str, int]:
-    """Auto-open only verified USD-quoted Forex paper setups from real data."""
+    """Auto-open verified paper setups from real Forex, Gold and index data."""
     stats = {
         "checked": 0,
         "ready": 0,
@@ -9434,7 +9556,8 @@ async def get_multi_asset_paper_execution_status() -> Dict[str, object]:
         "status": "ACTIVE_PAPER_FOUNDATION",
         "marker": MULTI_ASSET_PAPER_EXECUTION_VERSION,
         "risk_percent": str(MULTI_ASSET_PAPER_RISK_PERCENT),
-        "authorized_scope": "USD_QUOTED_SPOT_FOREX_BASE_UNITS_ONLY",
+        "authorized_scope": "USD_FX+XAU_UNITS+INTERNAL_INDEX_POINT_UNITS",
+        "non_usd_fx": "CONVERSION_PREVIEW_ONLY_UNTIL_SNAPSHOT_PERSISTENCE",
         "strategies": ["SMC_LIQUIDITY_REVERSAL", "TREND_PULLBACK", "BREAKOUT_EXPANSION"],
         "instruments": instruments,
         "paper_only": True,

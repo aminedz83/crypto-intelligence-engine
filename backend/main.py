@@ -8534,7 +8534,7 @@ async def get_candidate_strategy_detections(symbol: str) -> Dict[str, object]:
 # This layer deliberately does NOT create, queue or size a multi-asset paper trade.
 # M5B29A fail-closed sizing rules remain authoritative until a later execution
 # milestone independently validates conversions, contract values and SL/TP P&L.
-MULTI_ASSET_ANALYSIS_VERSION = "SERVER_MULTI_ASSET_STRATEGY_ANALYSIS_V1"
+MULTI_ASSET_ANALYSIS_VERSION = "SERVER_MULTI_ASSET_STRATEGY_ANALYSIS_V1_FIX1"
 MULTI_ASSET_ANALYSIS_INTERVAL_SECONDS = 300.0
 _multi_asset_analysis_last_run_monotonic = 0.0
 _multi_asset_decision_fingerprints: Dict[str, str] = {}
@@ -8655,7 +8655,9 @@ async def _fetch_multi_asset_analysis_candles(
             provider_symbol = provider_symbol_map.to_provider(source, canonical)
             if provider_symbol is None:
                 return {"status": "UNAVAILABLE", "reason": "PROVIDER_SYMBOL_NOT_MAPPED"}
-            candles, quality = await market_provider.get_candles(provider_symbol, granularity, limit)
+            candles, quality = await market_provider.get_candles(
+                provider_symbol, granularity, limit
+            )
             closed = _analysis_closed_candles(candles, granularity, now, limit)
             return {
                 "status": "OK" if closed else "EMPTY",
@@ -8673,32 +8675,36 @@ async def _fetch_multi_asset_analysis_candles(
 
         if instrument.asset_class == AssetClass.FOREX:
             source = "massive"
-            history = await fetch_forex_history(canonical, granularity, start, end)
-            provider_status = str(history.get("status") or "UNAVAILABLE")
+            forex_history = await fetch_forex_history(canonical, granularity, start, end)
+            provider_status = str(forex_history.get("status") or "UNAVAILABLE")
             provider_reason = (
-                str(history.get("reason")) if history.get("reason") is not None else None
+                str(forex_history.get("reason"))
+                if forex_history.get("reason") is not None
+                else None
             )
-            rows = history.get("candles")
+            rows = forex_history.get("candles")
             raw_rows = rows if isinstance(rows, list) else []
         elif instrument.asset_class == AssetClass.METAL:
             source = "twelvedata"
-            history = await fetch_metal_history(canonical, granularity, start, end)
-            provider_status = str(history.result.get("status") or "UNAVAILABLE")
+            metal_history = await fetch_metal_history(canonical, granularity, start, end)
+            provider_status = str(metal_history.result.get("status") or "UNAVAILABLE")
             provider_reason = (
-                str(history.result.get("reason"))
-                if history.result.get("reason") is not None
+                str(metal_history.result.get("reason"))
+                if metal_history.result.get("reason") is not None
                 else None
             )
-            rows = history.result.get("candles")
+            rows = metal_history.result.get("candles")
             raw_rows = rows if isinstance(rows, list) else []
         elif instrument.asset_class == AssetClass.INDEX:
             source = "massive"
-            history = await fetch_index_history(canonical, granularity, start, end)
-            provider_status = str(history.get("status") or "UNAVAILABLE")
+            index_history = await fetch_index_history(canonical, granularity, start, end)
+            provider_status = str(index_history.get("status") or "UNAVAILABLE")
             provider_reason = (
-                str(history.get("reason")) if history.get("reason") is not None else None
+                str(index_history.get("reason"))
+                if index_history.get("reason") is not None
+                else None
             )
-            rows = history.get("candles")
+            rows = index_history.get("candles")
             raw_rows = rows if isinstance(rows, list) else []
         else:
             return {"status": "UNAVAILABLE", "reason": "ASSET_CLASS_NOT_SUPPORTED"}
@@ -8944,7 +8950,11 @@ async def run_multi_asset_strategy_analysis_once(force: bool = False) -> Dict[st
     global _multi_asset_analysis_last_run_monotonic
     now_mono = time.monotonic()
     elapsed = now_mono - _multi_asset_analysis_last_run_monotonic
-    if not force and _multi_asset_analysis_last_run_monotonic and elapsed < MULTI_ASSET_ANALYSIS_INTERVAL_SECONDS:
+    if (
+        not force
+        and _multi_asset_analysis_last_run_monotonic
+        and elapsed < MULTI_ASSET_ANALYSIS_INTERVAL_SECONDS
+    ):
         return {
             "status": "SKIPPED",
             "reason": "ANALYSIS_INTERVAL_NOT_ELAPSED",
@@ -8969,7 +8979,8 @@ async def run_multi_asset_strategy_analysis_once(force: bool = False) -> Dict[st
         )
         for instrument in instruments:
             checked += 1
-            by_class[instrument.asset_class.value] = by_class.get(instrument.asset_class.value, 0) + 1
+            asset_class_value = instrument.asset_class.value
+            by_class[asset_class_value] = by_class.get(asset_class_value, 0) + 1
             result = await analyze_multi_asset_strategy_symbol(instrument.canonical_symbol)
             results.append(result)
             status_value = str(result.get("status") or "UNAVAILABLE")

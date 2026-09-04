@@ -450,6 +450,9 @@ html,body{max-width:100%;overflow-x:hidden}
   overflow-wrap:anywhere;word-break:break-word
 }
 .subtab,.mtab,#nav button,.hamb,.bell{touch-action:manipulation}
+.subtabs{position:relative;z-index:3}
+.subtab{position:relative;z-index:4;pointer-events:auto;-webkit-tap-highlight-color:transparent}
+.subtab[data-paper-tab]{cursor:pointer;user-select:none;-webkit-user-select:none}
 body.market-menu-open .market-tabs-wrap{display:block!important}
 @media(max-width:430px){
   .metric-strip{grid-template-columns:minmax(0,1fr) minmax(0,1fr)!important}
@@ -776,17 +779,38 @@ var intelligenceActiveTab="regime";
 var settingsActiveTab="interface";
 
 function tabButton(label,id,active,setter){
-  return h("button",{
+  var attrs={
+    type:"button",
     class:"subtab "+(active===id?"active":""),
     "data-tab":id,
     "aria-selected":active===id?"true":"false",
-    onclick:function(){setter(id)}
-  },[label]);
+    onclick:function(ev){
+      if(ev){ev.preventDefault();ev.stopPropagation()}
+      setter(id);
+    }
+  };
+  if(setter===setPaperTab)attrs["data-paper-tab"]=id;
+  return h("button",attrs,[label]);
 }
 function setPaperTab(id){
+  if(id!=="account"&&id!=="positions"&&id!=="history")return;
   paperActiveTab=id;
   renderTrading();
 }
+var paperTabTouchAt=0;
+document.addEventListener("touchend",function(ev){
+  var target=ev.target&&ev.target.closest?ev.target.closest("[data-paper-tab]"):null;
+  if(!target)return;
+  paperTabTouchAt=Date.now();
+  ev.preventDefault();
+  setPaperTab(target.getAttribute("data-paper-tab"));
+},{passive:false});
+document.addEventListener("click",function(ev){
+  var target=ev.target&&ev.target.closest?ev.target.closest("[data-paper-tab]"):null;
+  if(!target||Date.now()-paperTabTouchAt<700)return;
+  ev.preventDefault();
+  setPaperTab(target.getAttribute("data-paper-tab"));
+});
 function setIntelligenceTab(id){
   intelligenceActiveTab=id;
   renderIntelligence();

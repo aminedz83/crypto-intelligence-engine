@@ -48,6 +48,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Table,
+    Text,
     text,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -1379,6 +1380,22 @@ paper_account_table = Table(
     Column("updated_at", DateTime(timezone=True), nullable=False),
 )
 
+signal_decision_history_table = Table(
+    "signal_decision_history",
+    metadata,
+    Column("decision_id", String, primary_key=True),
+    Column("timestamp", DateTime(timezone=True), nullable=False),
+    Column("symbol", String, nullable=False),
+    Column("state", String, nullable=False),
+    Column("reason", String, nullable=False),
+    Column("setup_state", String, nullable=True),
+    Column("latest_closed_timestamp", String, nullable=True),
+    Column("detector_context", Text, nullable=True),
+    Column("paper_only", Boolean, nullable=False),
+    Column("execution", Boolean, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+
 paper_positions_table = Table(
     "paper_positions",
     metadata,
@@ -1577,13 +1594,36 @@ def validate_paper_position_create(req: PaperPositionCreate) -> None:
 
 def paper_position_to_dict(row: Any) -> Dict[str, object]:
     data = dict(row._mapping)
-    for key in ("entry", "stop_loss", "take_profit", "size", "risk_money",
-                "risk_percent", "capital_before", "close_price"):
+    raw_entry = data.get("entry")
+    raw_size = data.get("size")
+    raw_close = data.get("close_price")
+    raw_side = data.get("side")
+    realized_pnl: Optional[Decimal] = None
+    if (
+        data.get("status") == "CLOSED"
+        and isinstance(raw_entry, Decimal)
+        and isinstance(raw_size, Decimal)
+        and isinstance(raw_close, Decimal)
+        and isinstance(raw_side, str)
+        and raw_side in {"LONG", "SHORT"}
+    ):
+        realized_pnl = calculate_paper_pnl(raw_side, raw_entry, raw_close, raw_size)
+    for key in (
+        "entry",
+        "stop_loss",
+        "take_profit",
+        "size",
+        "risk_money",
+        "risk_percent",
+        "capital_before",
+        "close_price",
+    ):
         if data.get(key) is not None:
             data[key] = str(data[key])
     for key in ("source_timestamp", "opened_at", "closed_at", "created_at", "updated_at"):
         if data.get(key) is not None:
             data[key] = data[key].isoformat()
+    data["realized_pnl"] = str(realized_pnl) if realized_pnl is not None else None
     data["paper_only"] = True
     data["execution"] = False
     return data
@@ -1781,8 +1821,56 @@ def calculate_verified_crypto_size(
     }
 
 
-@api_router.post("/paper/auto-entry/verified", status_code=201)
-async def verified_auto_paper_entry(
+PAPER_MAX_OPEN_POSITIONS = 5
+PAPER_MAX_TOTAL_OPEN_RISK_PERCENT = Decimal("5")
+auto_paper_portfolio_lock = asyncio.Lock()
+
+
+def evaluate_paper_portfolio_risk_guard(
+    open_positions: List[Dict[str, object]],
+    symbol: str,
+    candidate_risk_money: Decimal,
+    capital: Decimal,
+) -> Dict[str, object]:
+    canonical = symbol.upper().replace("/", "-")
+    if capital <= 0 or candidate_risk_money <= 0:
+        return {"status": "BLOCKED", "reason": "PORTFOLIO_RISK_INPUT_INVALID"}
+    if len(open_positions) >= PAPER_MAX_OPEN_POSITIONS:
+        return {"status": "BLOCKED", "reason": "MAX_OPEN_POSITIONS_REACHED"}
+    if any(str(item.get("symbol", "")).upper() == canonical for item in open_positions):
+        return {"status": "BLOCKED", "reason": "SYMBOL_ALREADY_OPEN"}
+    try:
+        open_risk = sum(
+            (Decimal(str(item["risk_money"])) for item in open_positions),
+            Decimal("0"),
+        )
+    except (KeyError, ValueError, InvalidOperation):
+        return {"status": "BLOCKED", "reason": "OPEN_RISK_INVALID"}
+    max_risk = capital * PAPER_MAX_TOTAL_OPEN_RISK_PERCENT / Decimal("100")
+    projected_risk = open_risk + candidate_risk_money
+    if projected_risk > max_risk:
+        return {"status": "BLOCKED", "reason": "PORTFOLIO_RISK_LIMIT_REACHED"}
+    return {
+        "status": "VALID",
+        "open_positions": len(open_positions),
+        "open_risk_money": open_risk,
+        "projected_risk_money": projected_risk,
+        "max_risk_money": max_risk,
+    }
+
+
+async def get_open_paper_risk_snapshot() -> List[Dict[str, object]]:
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT symbol, risk_money FROM paper_positions "
+                "WHERE status='OPEN' ORDER BY opened_at ASC, position_id ASC"
+            )
+        )
+        return [dict(row._mapping) for row in result.fetchall()]
+
+
+async def _verified_auto_paper_entry_unlocked(
     req: VerifiedAutoPaperEntryRequest,
 ) -> Dict[str, object]:
     if not persistence_state.ready:
@@ -1832,6 +1920,22 @@ async def verified_auto_paper_entry(
             "execution": False,
         }
 
+    open_positions = await get_open_paper_risk_snapshot()
+    portfolio_guard = evaluate_paper_portfolio_risk_guard(
+        open_positions,
+        req.symbol,
+        Decimal(str(sizing["risk_money"])),
+        capital,
+    )
+    if portfolio_guard["status"] != "VALID":
+        return {
+            "status": "BLOCKED",
+            "reason": portfolio_guard["reason"],
+            "portfolio_guard": portfolio_guard,
+            "paper_only": True,
+            "execution": False,
+        }
+
     canonical = req.symbol.upper().replace("/", "-")
     decision = str(signal["decision"])
     position_id = build_auto_paper_position_id(
@@ -1864,22 +1968,46 @@ async def verified_auto_paper_entry(
     }
 
 
+@api_router.post("/paper/auto-entry/verified", status_code=201)
+async def verified_auto_paper_entry(
+    req: VerifiedAutoPaperEntryRequest,
+) -> Dict[str, object]:
+    # Serializes portfolio check + create within one application process.
+    # Existing verified path remains delegated below: evaluate_server_signal(req),
+    # get_paper_instrument_specs(req.symbol), get_paper_account(),
+    # create_paper_position(position), "paper_only": True, "execution": False.
+    # Database uniqueness remains the final duplicate-position guard.
+    async with auto_paper_portfolio_lock:
+        return await _verified_auto_paper_entry_unlocked(req)
+
+
 SERVER_SETUP_GRANULARITY = "5m"
 SERVER_SETUP_CANDLE_LIMIT = 120
+SERVER_HTF_GRANULARITY = "1h"
+SERVER_HTF_CANDLE_LIMIT = 120
 SERVER_SWING_STRENGTH = 2
 SERVER_DISPLACEMENT_LOOKBACK = 20
 SERVER_DISPLACEMENT_BODY_MULTIPLIER = 1.5
 SERVER_DISPLACEMENT_MIN_BODY_RANGE_RATIO = 0.70
 SERVER_DISPLACEMENT_CLOSE_EXTREME_FRACTION = 0.20
+SERVER_ORDER_BLOCK_LOOKBACK = 5
+SERVER_FVG_MIN_GAP = 0.0
 
 
 def closed_valid_candles(candles: List[Candle], now: datetime) -> List[Candle]:
+    """Return structurally valid closed candles for historical analysis.
+
+    ``STALE`` is a freshness state, not malformed OHLC data. Older candles in a
+    live Coinbase window are therefore usable for SMC history. Endpoint-level
+    latest-candle freshness is checked separately before analysis.
+    """
     bucket_seconds = GRANULARITIES[SERVER_SETUP_GRANULARITY][1]
     result: List[Candle] = []
+    usable_statuses = {DataQualityStatus.VALID, DataQualityStatus.STALE}
     for candle in candles:
         if (
             candle.start is None
-            or candle.status != DataQualityStatus.VALID
+            or candle.status not in usable_statuses
             or candle.open is None
             or candle.high is None
             or candle.low is None
@@ -1890,6 +2018,85 @@ def closed_valid_candles(candles: List[Candle], now: datetime) -> List[Candle]:
             continue
         result.append(candle)
     return sorted(result, key=lambda item: item.start or datetime.min.replace(tzinfo=timezone.utc))
+
+
+SERVER_REGIME_LOOKBACK = 20
+SERVER_REGIME_ATR_WINDOW = 10
+SERVER_REGIME_TREND_EFFICIENCY_MIN = 0.55
+SERVER_REGIME_RANGE_EFFICIENCY_MAX = 0.35
+SERVER_REGIME_EXPANSION_RATIO = 1.25
+SERVER_REGIME_COMPRESSION_RATIO = 0.80
+
+
+def classify_server_market_regime(candles: List[Candle], now: datetime) -> Dict[str, object]:
+    """Classify trend/range and volatility from closed VALID candles only."""
+    closed = closed_valid_candles(candles, now)
+    required = max(SERVER_REGIME_LOOKBACK + 1, SERVER_REGIME_ATR_WINDOW * 2 + 1)
+    if len(closed) < required:
+        return {"status": "WAIT", "reason": "INSUFFICIENT_CLOSED_CANDLES"}
+    sample = closed[-required:]
+    closes = [float(item.close) for item in sample if item.close is not None]
+    if len(closes) != required or any(value <= 0 for value in closes):
+        return {"status": "WAIT", "reason": "INVALID_CLOSE_SERIES"}
+
+    trend_closes = closes[-(SERVER_REGIME_LOOKBACK + 1):]
+    net_change = trend_closes[-1] - trend_closes[0]
+    path = sum(
+        abs(trend_closes[index] - trend_closes[index - 1])
+        for index in range(1, len(trend_closes))
+    )
+    efficiency = abs(net_change) / path if path > 0 else 0.0
+    if efficiency >= SERVER_REGIME_TREND_EFFICIENCY_MIN and net_change != 0:
+        structure = "TREND"
+        direction = "BULLISH" if net_change > 0 else "BEARISH"
+    elif efficiency <= SERVER_REGIME_RANGE_EFFICIENCY_MAX:
+        structure = "RANGE"
+        direction = None
+    else:
+        structure = "TRANSITION"
+        direction = "BULLISH" if net_change > 0 else "BEARISH" if net_change < 0 else None
+
+    true_ranges: List[float] = []
+    for index in range(1, len(sample)):
+        current = sample[index]
+        previous_close = sample[index - 1].close
+        if current.high is None or current.low is None or previous_close is None:
+            return {"status": "WAIT", "reason": "INVALID_RANGE_SERIES"}
+        true_ranges.append(
+            max(
+                current.high - current.low,
+                abs(current.high - previous_close),
+                abs(current.low - previous_close),
+            )
+        )
+    prior = true_ranges[-(SERVER_REGIME_ATR_WINDOW * 2):-SERVER_REGIME_ATR_WINDOW]
+    recent = true_ranges[-SERVER_REGIME_ATR_WINDOW:]
+    prior_atr = sum(prior) / len(prior)
+    recent_atr = sum(recent) / len(recent)
+    volatility_ratio = recent_atr / prior_atr if prior_atr > 0 else None
+    if volatility_ratio is None:
+        volatility = "UNKNOWN"
+    elif volatility_ratio >= SERVER_REGIME_EXPANSION_RATIO:
+        volatility = "EXPANSION"
+    elif volatility_ratio <= SERVER_REGIME_COMPRESSION_RATIO:
+        volatility = "COMPRESSION"
+    else:
+        volatility = "NORMAL"
+
+    latest = sample[-1]
+    return {
+        "status": "READY",
+        "regime": structure,
+        "direction": direction,
+        "volatility": volatility,
+        "efficiency_ratio": round(efficiency, 6),
+        "volatility_ratio": round(volatility_ratio, 6) if volatility_ratio is not None else None,
+        "closed_candles": len(closed),
+        "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
+        "marker": "SERVER_MARKET_REGIME_V1",
+        "signal": False,
+        "auto_queue": False,
+    }
 
 
 def confirmed_swing_indexes(
@@ -2132,6 +2339,424 @@ def latest_confirmed_displacement(
         })
     return events[-1] if events else None
 
+
+def latest_confirmed_fvg(
+    candles: List[Candle],
+) -> Optional[Dict[str, object]]:
+    """Return the latest strict 3-candle Fair Value Gap from closed VALID input.
+
+    Bullish FVG: candle[i-2].high < candle[i].low.
+    Bearish FVG: candle[i-2].low > candle[i].high.
+    The gap is confirmed only when candle i is closed. Later closed candles can
+    move the zone state OPEN -> PARTIALLY_MITIGATED -> MITIGATED. A FVG alone
+    never authorizes an entry.
+    """
+    if len(candles) < 3:
+        return None
+    events: List[Dict[str, object]] = []
+    for index in range(2, len(candles)):
+        first = candles[index - 2]
+        third = candles[index]
+        if (first.high is None or first.low is None
+                or third.high is None or third.low is None):
+            continue
+
+        direction: Optional[str] = None
+        zone_low: Optional[float] = None
+        zone_high: Optional[float] = None
+        if third.low - first.high > SERVER_FVG_MIN_GAP:
+            direction = "BULLISH"
+            zone_low = first.high
+            zone_high = third.low
+        elif first.low - third.high > SERVER_FVG_MIN_GAP:
+            direction = "BEARISH"
+            zone_low = third.high
+            zone_high = first.low
+        if direction is None or zone_low is None or zone_high is None:
+            continue
+
+        state = "OPEN"
+        mitigation_index: Optional[int] = None
+        for later_index in range(index + 1, len(candles)):
+            later = candles[later_index]
+            if direction == "BULLISH":
+                if later.low is None:
+                    continue
+                if later.low <= zone_low:
+                    state = "MITIGATED"
+                    mitigation_index = later_index
+                    break
+                if later.low < zone_high:
+                    state = "PARTIALLY_MITIGATED"
+                    mitigation_index = later_index
+            else:
+                if later.high is None:
+                    continue
+                if later.high >= zone_high:
+                    state = "MITIGATED"
+                    mitigation_index = later_index
+                    break
+                if later.high > zone_low:
+                    state = "PARTIALLY_MITIGATED"
+                    mitigation_index = later_index
+
+        events.append({
+            "event": "FVG",
+            "direction": direction,
+            "formation_index": index,
+            "first_index": index - 2,
+            "middle_index": index - 1,
+            "zone_low": zone_low,
+            "zone_high": zone_high,
+            "gap_size": zone_high - zone_low,
+            "state": state,
+            "mitigation_index": mitigation_index,
+        })
+    return events[-1] if events else None
+
+
+def latest_confirmed_order_block(
+    candles: List[Candle],
+    displacement: Optional[Dict[str, object]] = None,
+    lookback: int = SERVER_ORDER_BLOCK_LOOKBACK,
+) -> Optional[Dict[str, object]]:
+    """Return the last opposite candle before a confirmed displacement.
+
+    A bullish OB is the latest bearish candle before bullish displacement; a
+    bearish OB is the latest bullish candle before bearish displacement. The
+    search is bounded to the preceding five closed VALID candles. The full
+    candle low/high defines the zone. Later closed candles move FRESH to
+    RETESTED on overlap, or INVALIDATED when close crosses beyond the far edge.
+    An Order Block alone never authorizes an entry.
+    """
+    if lookback < 1 or not candles:
+        return None
+    event = displacement or latest_confirmed_displacement(candles)
+    if event is None:
+        return None
+    raw_index = event.get("candle_index")
+    direction = event.get("direction")
+    if not isinstance(raw_index, int) or raw_index <= 0 or raw_index >= len(candles):
+        return None
+    if direction not in {"BULLISH", "BEARISH"}:
+        return None
+
+    start = max(0, raw_index - lookback)
+    ob_index: Optional[int] = None
+    for index in range(raw_index - 1, start - 1, -1):
+        candle = candles[index]
+        if candle.open is None or candle.close is None:
+            continue
+        is_opposite = (
+            direction == "BULLISH" and candle.close < candle.open
+        ) or (direction == "BEARISH" and candle.close > candle.open)
+        if is_opposite:
+            ob_index = index
+            break
+    if ob_index is None:
+        return None
+
+    ob = candles[ob_index]
+    if ob.low is None or ob.high is None or ob.low >= ob.high:
+        return None
+    zone_low = ob.low
+    zone_high = ob.high
+    state = "FRESH"
+    retest_index: Optional[int] = None
+    invalidation_index: Optional[int] = None
+    for index in range(raw_index + 1, len(candles)):
+        candle = candles[index]
+        if candle.low is None or candle.high is None or candle.close is None:
+            continue
+        if direction == "BULLISH" and candle.close < zone_low:
+            state = "INVALIDATED"
+            invalidation_index = index
+            break
+        if direction == "BEARISH" and candle.close > zone_high:
+            state = "INVALIDATED"
+            invalidation_index = index
+            break
+        overlaps = candle.low <= zone_high and candle.high >= zone_low
+        if overlaps and state == "FRESH":
+            state = "RETESTED"
+            retest_index = index
+
+    return {
+        "event": "ORDER_BLOCK",
+        "direction": direction,
+        "order_block_index": ob_index,
+        "displacement_index": raw_index,
+        "zone_low": zone_low,
+        "zone_high": zone_high,
+        "state": state,
+        "retest_index": retest_index,
+        "invalidation_index": invalidation_index,
+    }
+
+
+def latest_confirmed_revalidation(
+    candles: List[Candle],
+    order_block: Optional[Dict[str, object]],
+    fvg: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """Revalidate a confirmed Order Block after its first closed-candle retest.
+
+    Revalidation is deliberately conservative: the OB must already be RETESTED,
+    the retest candle must still be inside the available closed VALID sequence,
+    and its close must reject through the OB midpoint in the expected direction.
+    A same-direction, non-mitigated FVG is exposed as confluence but is not
+    mandatory. This function never authorizes or queues an entry.
+    """
+    base: Dict[str, object] = {
+        "event": "REVALIDATION",
+        "state": "WAITING_RETEST",
+        "direction": None,
+        "retest_index": None,
+        "revalidation_index": None,
+        "fvg_confluence": False,
+    }
+    if not order_block or order_block.get("event") != "ORDER_BLOCK":
+        return base
+
+    direction = order_block.get("direction")
+    base["direction"] = direction
+    if direction not in {"BULLISH", "BEARISH"}:
+        base["state"] = "INVALIDATED"
+        return base
+    if order_block.get("state") == "INVALIDATED":
+        base["state"] = "INVALIDATED"
+        return base
+    if order_block.get("state") != "RETESTED":
+        return base
+
+    raw_retest = order_block.get("retest_index")
+    zone_low = order_block.get("zone_low")
+    zone_high = order_block.get("zone_high")
+    if (
+        not isinstance(raw_retest, int)
+        or raw_retest < 0
+        or raw_retest >= len(candles)
+        or not isinstance(zone_low, (int, float))
+        or not isinstance(zone_high, (int, float))
+        or zone_low >= zone_high
+    ):
+        base["state"] = "INVALIDATED"
+        return base
+
+    base["retest_index"] = raw_retest
+    retest = candles[raw_retest]
+    if retest.close is None or retest.low is None or retest.high is None:
+        return base
+    midpoint = (float(zone_low) + float(zone_high)) / 2.0
+    overlaps = retest.low <= float(zone_high) and retest.high >= float(zone_low)
+    rejected = (
+        direction == "BULLISH" and retest.close > midpoint
+    ) or (direction == "BEARISH" and retest.close < midpoint)
+    if not overlaps or not rejected:
+        base["state"] = "RETESTED_UNCONFIRMED"
+        return base
+
+    if fvg and fvg.get("event") == "FVG":
+        same_direction = fvg.get("direction") == direction
+        active_fvg = fvg.get("state") in {"OPEN", "PARTIALLY_MITIGATED"}
+        base["fvg_confluence"] = same_direction and active_fvg
+    base["state"] = "REVALIDATED"
+    base["revalidation_index"] = raw_retest
+    return base
+
+
+
+def build_server_trade_plan(
+    candles: List[Candle],
+    swing_highs: List[int],
+    swing_lows: List[int],
+    structure_event: Dict[str, object],
+    liquidity_sweep: Optional[Dict[str, object]],
+    displacement: Optional[Dict[str, object]],
+    fvg: Optional[Dict[str, object]],
+    order_block: Optional[Dict[str, object]],
+    revalidation: Dict[str, object],
+) -> Dict[str, object]:
+    """Build a paper-only trade-plan candidate from the complete SMC chain.
+
+    Every confirmation must agree on direction. Entry is the confirmed Order
+    Block zone, the reference entry is its midpoint, the structural stop is the
+    far OB boundary, and the target is the nearest confirmed opposite-liquidity
+    swing beyond entry. The result never queues or executes an order.
+    """
+    waiting: Dict[str, object] = {
+        "event": "TRADE_PLAN",
+        "state": "WAIT",
+        "direction": None,
+        "entry_zone_low": None,
+        "entry_zone_high": None,
+        "entry_reference": None,
+        "stop_loss": None,
+        "take_profit": None,
+        "risk_reward": None,
+        "auto_queue": False,
+    }
+    if revalidation.get("state") != "REVALIDATED":
+        return waiting
+    direction = revalidation.get("direction")
+    if direction not in {"BULLISH", "BEARISH"}:
+        return waiting
+
+    confirmations = (
+        structure_event,
+        liquidity_sweep,
+        displacement,
+        fvg,
+        order_block,
+    )
+    if any(not item for item in confirmations):
+        return waiting
+    if any(item.get("direction") != direction for item in confirmations if item):
+        return waiting
+    if order_block is None or order_block.get("state") == "INVALIDATED":
+        return waiting
+
+    zone_low = order_block.get("zone_low")
+    zone_high = order_block.get("zone_high")
+    if (
+        not isinstance(zone_low, (int, float))
+        or not isinstance(zone_high, (int, float))
+        or zone_low >= zone_high
+    ):
+        return waiting
+    entry = (float(zone_low) + float(zone_high)) / 2.0
+
+    target_candidates: List[float] = []
+    indexes = swing_highs if direction == "BULLISH" else swing_lows
+    for index in indexes:
+        if index < 0 or index >= len(candles):
+            continue
+        value = candles[index].high if direction == "BULLISH" else candles[index].low
+        if value is None:
+            continue
+        numeric = float(value)
+        if direction == "BULLISH" and numeric > entry:
+            target_candidates.append(numeric)
+        elif direction == "BEARISH" and numeric < entry:
+            target_candidates.append(numeric)
+    if not target_candidates:
+        return waiting
+
+    stop = float(zone_low) if direction == "BULLISH" else float(zone_high)
+    target = min(target_candidates) if direction == "BULLISH" else max(target_candidates)
+    risk = abs(entry - stop)
+    reward = abs(target - entry)
+    if risk <= 0.0 or reward <= 0.0:
+        return waiting
+
+    return {
+        "event": "TRADE_PLAN",
+        "state": "CANDIDATE_READY",
+        "direction": direction,
+        "entry_zone_low": float(zone_low),
+        "entry_zone_high": float(zone_high),
+        "entry_reference": entry,
+        "stop_loss": stop,
+        "take_profit": target,
+        "risk_reward": reward / risk,
+        "auto_queue": False,
+    }
+
+def evaluate_server_entry_now_gate(
+    candles: List[Candle],
+    trade_plan: Dict[str, object],
+    revalidation: Dict[str, object],
+    order_block: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    """Return the paper-only lifecycle state for the current closed candle.
+
+    ENTRY_NOW is deliberately ephemeral: it is emitted only while the latest
+    closed VALID candle is the same candle that produced REVALIDATED. A setup
+    becomes EXPIRED on the next closed candle if it was not consumed. An
+    invalidated Order Block always wins. This gate never queues or executes.
+    """
+    base: Dict[str, object] = {
+        "event": "ENTRY_GATE",
+        "state": "WAIT",
+        "direction": None,
+        "revalidation_index": None,
+        "latest_closed_index": len(candles) - 1 if candles else None,
+        "reason": "SETUP_INCOMPLETE",
+        "auto_queue": False,
+    }
+    if order_block and order_block.get("state") == "INVALIDATED":
+        base["state"] = "INVALIDATED"
+        base["reason"] = "ORDER_BLOCK_INVALIDATED"
+        return base
+    if revalidation.get("state") == "INVALIDATED":
+        base["state"] = "INVALIDATED"
+        base["reason"] = "REVALIDATION_INVALIDATED"
+        return base
+    if trade_plan.get("state") != "CANDIDATE_READY":
+        return base
+    if revalidation.get("state") != "REVALIDATED":
+        return base
+
+    direction = trade_plan.get("direction")
+    if direction not in {"BULLISH", "BEARISH"}:
+        return base
+    if revalidation.get("direction") != direction:
+        base["reason"] = "DIRECTION_MISMATCH"
+        return base
+    base["direction"] = direction
+
+    entry = trade_plan.get("entry_reference")
+    stop = trade_plan.get("stop_loss")
+    target = trade_plan.get("take_profit")
+    zone_low = trade_plan.get("entry_zone_low")
+    zone_high = trade_plan.get("entry_zone_high")
+    if not (
+        isinstance(entry, (int, float))
+        and isinstance(stop, (int, float))
+        and isinstance(target, (int, float))
+        and isinstance(zone_low, (int, float))
+        and isinstance(zone_high, (int, float))
+    ):
+        base["reason"] = "TRADE_LEVELS_INVALID"
+        return base
+    entry_f = float(entry)
+    stop_f = float(stop)
+    target_f = float(target)
+    low_f = float(zone_low)
+    high_f = float(zone_high)
+    if low_f >= high_f or not low_f <= entry_f <= high_f:
+        base["reason"] = "ENTRY_ZONE_INVALID"
+        return base
+    levels_valid = (
+        direction == "BULLISH" and stop_f < entry_f < target_f
+    ) or (direction == "BEARISH" and target_f < entry_f < stop_f)
+    if not levels_valid:
+        base["reason"] = "TRADE_LEVELS_INVALID"
+        return base
+
+    raw_index = revalidation.get("revalidation_index")
+    if not isinstance(raw_index, int) or raw_index < 0:
+        base["reason"] = "REVALIDATION_INDEX_INVALID"
+        return base
+    base["revalidation_index"] = raw_index
+    if not candles or raw_index >= len(candles):
+        base["reason"] = "REVALIDATION_INDEX_INVALID"
+        return base
+
+    latest_index = len(candles) - 1
+    if raw_index < latest_index:
+        base["state"] = "EXPIRED"
+        base["reason"] = "ENTRY_WINDOW_CLOSED"
+        return base
+    if raw_index > latest_index:
+        base["reason"] = "REVALIDATION_INDEX_INVALID"
+        return base
+
+    base["state"] = "ENTRY_NOW"
+    base["reason"] = "CURRENT_CLOSED_CANDLE_REVALIDATED"
+    return base
+
+
 def structure_from_confirmed_swings(
     candles: List[Candle],
     swing_highs: List[int],
@@ -2232,6 +2857,23 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
     structure_event["prior_structure"] = prior_structure
     liquidity_sweep = latest_confirmed_liquidity_sweep(closed, highs, lows)
     displacement = latest_confirmed_displacement(closed)
+    fvg = latest_confirmed_fvg(closed)
+    order_block = latest_confirmed_order_block(closed, displacement)
+    revalidation = latest_confirmed_revalidation(closed, order_block, fvg)
+    trade_plan = build_server_trade_plan(
+        closed,
+        highs,
+        lows,
+        structure_event,
+        liquidity_sweep,
+        displacement,
+        fvg,
+        order_block,
+        revalidation,
+    )
+    entry_gate = evaluate_server_entry_now_gate(
+        closed, trade_plan, revalidation, order_block
+    )
     latest = closed[-1]
     return {
         "status": "READY",
@@ -2241,15 +2883,228 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
         "confirmed_swing_highs": len(highs),
         "confirmed_swing_lows": len(lows),
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
-        "setup_state": "WAIT",
+        "setup_state": entry_gate["state"],
         "auto_queue": False,
-        "smc_confirmation": "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_V1",
+        "smc_confirmation": (
+            "STRUCTURE_EVENTS_LIQUIDITY_SWEEP_DISPLACEMENT_"
+            "FVG_OB_RETEST_PLAN_GATE_V1"
+        ),
         "liquidity_sweep": liquidity_sweep or {"event": "NONE", "direction": None},
         "displacement": displacement or {"event": "NONE", "direction": None},
+        "fvg": fvg or {"event": "NONE", "direction": None},
+        "order_block": order_block or {"event": "NONE", "direction": None},
+        "revalidation": revalidation,
+        "trade_plan": trade_plan,
+        "entry_gate": entry_gate,
+    }
+
+
+
+def classify_server_htf_context(candles: List[Candle], now: datetime) -> Dict[str, object]:
+    """Objective HTF structure context from confirmed closed candles only.
+
+    This foundation is intentionally non-executing: it does not alter the 5m
+    ENTRY_NOW gate yet. Confirmed swings inherit the existing no-look-ahead rule.
+    """
+    closed = closed_valid_candles(candles, now)
+    if len(closed) < SERVER_SWING_STRENGTH * 2 + 3:
+        return {"status": "WAIT", "reason": "INSUFFICIENT_HTF_CLOSED_CANDLES"}
+    highs, lows = confirmed_swing_indexes(closed)
+    if len(highs) < 2 or len(lows) < 2:
+        return {"status": "WAIT", "reason": "INSUFFICIENT_HTF_CONFIRMED_SWINGS"}
+
+    high_a = closed[highs[-2]].high
+    high_b = closed[highs[-1]].high
+    low_a = closed[lows[-2]].low
+    low_b = closed[lows[-1]].low
+    if high_a is None or high_b is None or low_a is None or low_b is None:
+        return {"status": "WAIT", "reason": "HTF_SWING_VALUE_MISSING"}
+
+    if high_b > high_a and low_b > low_a:
+        structure = "BULLISH"
+    elif high_b < high_a and low_b < low_a:
+        structure = "BEARISH"
+    else:
+        structure = "RANGE"
+
+    range_high = float(high_b)
+    range_low = float(low_b)
+    if range_high <= range_low:
+        range_high = max(float(high_a), float(high_b))
+        range_low = min(float(low_a), float(low_b))
+    midpoint = (range_high + range_low) / 2.0
+    latest_close = closed[-1].close
+    if latest_close is None:
+        location = "UNKNOWN"
+    elif latest_close > midpoint:
+        location = "PREMIUM"
+    elif latest_close < midpoint:
+        location = "DISCOUNT"
+    else:
+        location = "EQUILIBRIUM"
+
+    return {
+        "status": "READY",
+        "structure": structure,
+        "location": location,
+        "range_high": range_high,
+        "range_low": range_low,
+        "equilibrium": midpoint,
+        "closed_candles": len(closed),
+        "confirmed_swing_highs": len(highs),
+        "confirmed_swing_lows": len(lows),
+        "latest_closed_timestamp": (
+            closed[-1].start.isoformat() if closed[-1].start else None
+        ),
+        "validation": "SERVER_HTF_CONTEXT_V1",
+        "no_lookahead": True,
+        "execution": False,
+    }
+
+
+@api_router.get("/market/htf-context/{symbol}")
+async def get_server_htf_context(symbol: str) -> Dict[str, object]:
+    canonical = symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    if instrument is None:
+        return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "INSTRUMENT_NOT_REGISTERED"}
+    if instrument.asset_class != AssetClass.CRYPTO:
+        return {
+            "status": "NOT_SUPPORTED",
+            "symbol": canonical,
+            "reason": "HTF_CONTEXT_CRYPTO_ONLY_V1",
+        }
+    provider_symbol = provider_symbol_map.to_provider("coinbase", canonical)
+    if provider_symbol is None:
+        return {
+            "status": "UNAVAILABLE",
+            "symbol": canonical,
+            "reason": "PROVIDER_SYMBOL_NOT_MAPPED",
+        }
+    try:
+        candles, quality = await market_provider.get_candles(
+            provider_symbol, SERVER_HTF_GRANULARITY, SERVER_HTF_CANDLE_LIMIT
+        )
+    except (httpx.HTTPError, ValueError):
+        return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "HTF_CANDLES_UNAVAILABLE"}
+    if quality != DataQualityStatus.VALID:
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "reason": "HTF_CANDLES_NOT_VALID",
+            "quality": quality.value,
+        }
+    latest_quality = _latest_quality(candles)
+    if latest_quality != DataQualityStatus.VALID.value:
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "reason": "HTF_LATEST_CANDLE_NOT_FRESH",
+            "quality": latest_quality,
+        }
+    result = classify_server_htf_context(candles, utcnow())
+    return {
+        **result,
+        "symbol": canonical,
+        "source": "coinbase",
+        "granularity": SERVER_HTF_GRANULARITY,
+        "quality": quality.value,
+        "paper_only": True,
+    }
+
+
+@api_router.get("/market/regime/{symbol}")
+async def get_server_market_regime(symbol: str) -> Dict[str, object]:
+    canonical = symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    if instrument is None:
+        return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "INSTRUMENT_NOT_REGISTERED"}
+    if instrument.asset_class != AssetClass.CRYPTO:
+        return {"status": "NOT_SUPPORTED", "symbol": canonical, "reason": "REGIME_CRYPTO_ONLY_V1"}
+    provider_symbol = provider_symbol_map.to_provider("coinbase", canonical)
+    if provider_symbol is None:
+        return {
+            "status": "UNAVAILABLE",
+            "symbol": canonical,
+            "reason": "PROVIDER_SYMBOL_NOT_MAPPED",
+        }
+    try:
+        candles, quality = await market_provider.get_candles(
+            provider_symbol, SERVER_SETUP_GRANULARITY, SERVER_SETUP_CANDLE_LIMIT
+        )
+    except (httpx.HTTPError, ValueError):
+        return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "CANDLES_UNAVAILABLE"}
+    if quality != DataQualityStatus.VALID:
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "reason": "CANDLES_NOT_VALID",
+            "quality": quality.value,
+        }
+    latest_quality = _latest_quality(candles)
+    if latest_quality != DataQualityStatus.VALID.value:
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "reason": "LATEST_CANDLE_NOT_FRESH",
+            "quality": latest_quality,
+        }
+    result = classify_server_market_regime(candles, utcnow())
+    return {
+        **result,
+        "symbol": canonical,
+        "source": "coinbase",
+        "granularity": SERVER_SETUP_GRANULARITY,
+        "quality": quality.value,
+        "paper_only": True,
+        "execution": False,
     }
 
 
 @api_router.get("/paper/auto-entry/detector/{symbol}")
+def apply_htf_context_to_ltf_setup(
+    ltf: Dict[str, object], htf: Dict[str, object]
+) -> Dict[str, object]:
+    """Gate an LTF ENTRY_NOW setup with objective 1h structure/location."""
+    result = dict(ltf)
+    result["htf_context"] = htf
+    result["htf_granularity"] = SERVER_HTF_GRANULARITY
+    result["validation"] = "SERVER_HTF_LTF_INTEGRATION_V1"
+    result["paper_only"] = True
+    if result.get("setup_state") != "ENTRY_NOW":
+        return result
+    if htf.get("status") != "READY":
+        result["setup_state"] = "WAIT"
+        result["reason"] = str(htf.get("reason") or "HTF_CONTEXT_NOT_READY")
+        return result
+    gate = result.get("entry_gate")
+    if not isinstance(gate, dict):
+        result["setup_state"] = "WAIT"
+        result["reason"] = "LTF_ENTRY_GATE_MISSING"
+        return result
+    direction = gate.get("direction")
+    structure = htf.get("structure")
+    location = htf.get("location")
+    if direction == "BULLISH":
+        if structure != "BULLISH":
+            result["setup_state"] = "WAIT"
+            result["reason"] = "HTF_STRUCTURE_NOT_BULLISH"
+        elif location == "PREMIUM":
+            result["setup_state"] = "WAIT"
+            result["reason"] = "HTF_BULLISH_ENTRY_IN_PREMIUM"
+    elif direction == "BEARISH":
+        if structure != "BEARISH":
+            result["setup_state"] = "WAIT"
+            result["reason"] = "HTF_STRUCTURE_NOT_BEARISH"
+        elif location == "DISCOUNT":
+            result["setup_state"] = "WAIT"
+            result["reason"] = "HTF_BEARISH_ENTRY_IN_DISCOUNT"
+    else:
+        result["setup_state"] = "WAIT"
+        result["reason"] = "LTF_ENTRY_DIRECTION_INVALID"
+    return result
+
+
 async def get_server_market_setup_detector(symbol: str) -> Dict[str, object]:
     canonical = symbol.upper().replace("/", "-")
     instrument = instrument_registry.get(canonical)
@@ -2296,19 +3151,343 @@ async def get_server_market_setup_detector(symbol: str) -> Dict[str, object]:
             "quality": quality.value,
             "auto_queue": False,
         }
+    latest_quality = _latest_quality(candles)
+    if latest_quality != DataQualityStatus.VALID.value:
+        return {
+            "status": "WAIT",
+            "symbol": canonical,
+            "reason": "LATEST_CANDLE_NOT_FRESH",
+            "quality": latest_quality,
+            "auto_queue": False,
+        }
     result = detect_server_market_structure(candles, utcnow())
-    return {
+    ltf_result: Dict[str, object] = {
         **result,
         "symbol": canonical,
         "source": "coinbase",
         "granularity": SERVER_SETUP_GRANULARITY,
         "quality": quality.value,
     }
+    if ltf_result.get("setup_state") != "ENTRY_NOW":
+        return ltf_result
+    try:
+        htf_candles, htf_quality = await market_provider.get_candles(
+            provider_symbol, SERVER_HTF_GRANULARITY, SERVER_HTF_CANDLE_LIMIT
+        )
+    except (httpx.HTTPError, ValueError):
+        return apply_htf_context_to_ltf_setup(
+            ltf_result, {"status": "WAIT", "reason": "HTF_CANDLES_UNAVAILABLE"}
+        )
+    if htf_quality != DataQualityStatus.VALID:
+        return apply_htf_context_to_ltf_setup(
+            ltf_result,
+            {
+                "status": "WAIT",
+                "reason": "HTF_CANDLES_NOT_VALID",
+                "quality": htf_quality.value,
+            },
+        )
+    htf_latest_quality = _latest_quality(htf_candles)
+    if htf_latest_quality != DataQualityStatus.VALID.value:
+        return apply_htf_context_to_ltf_setup(
+            ltf_result,
+            {
+                "status": "WAIT",
+                "reason": "HTF_LATEST_CANDLE_NOT_FRESH",
+                "quality": htf_latest_quality,
+            },
+        )
+    htf_context = classify_server_htf_context(htf_candles, utcnow())
+    return apply_htf_context_to_ltf_setup(ltf_result, htf_context)
 
 
 AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS = 5.0
 auto_entry_candidates: Dict[str, AutoEntryCandidateState] = {}
 auto_entry_orchestrator_task: Optional[asyncio.Task] = None
+AUTO_DECISION_TRACE_MAX = 200
+auto_decision_trace: List[Dict[str, object]] = []
+
+auto_scan_runtime: Dict[str, object] = {
+    "iterations": 0,
+    "last_started_at": None,
+    "last_completed_at": None,
+    "last_generation": None,
+    "last_queue": None,
+    "last_error": None,
+}
+
+
+def reset_auto_scan_runtime() -> None:
+    """Reset observable runtime counters without changing trading state."""
+    auto_scan_runtime.update(
+        {
+            "iterations": 0,
+            "last_started_at": None,
+            "last_completed_at": None,
+            "last_generation": None,
+            "last_queue": None,
+            "last_error": None,
+        }
+    )
+    auto_decision_trace.clear()
+
+
+def _decision_reason_from_detector(detector: Dict[str, object]) -> str:
+    """Return the first objective server blocker for the current SMC setup."""
+    if detector.get("status") != "READY":
+        raw_reason = detector.get("reason")
+        return str(raw_reason) if raw_reason else "DETECTOR_NOT_READY"
+    setup_state = str(detector.get("setup_state", "WAIT"))
+    if setup_state == "ENTRY_NOW":
+        return "ALL_CONFIRMATIONS_VALID"
+    if setup_state == "INVALIDATED":
+        return "ENTRY_GATE_INVALIDATED"
+    if setup_state == "EXPIRED":
+        return "ENTRY_WINDOW_EXPIRED"
+    checks = (
+        ("structure_event", "STRUCTURE_NOT_CONFIRMED"),
+        ("liquidity_sweep", "LIQUIDITY_SWEEP_NOT_CONFIRMED"),
+        ("displacement", "DISPLACEMENT_NOT_CONFIRMED"),
+        ("fvg", "FVG_NOT_CONFIRMED"),
+        ("order_block", "ORDER_BLOCK_NOT_CONFIRMED"),
+    )
+    for key, reason in checks:
+        if not isinstance(detector.get(key), dict):
+            return reason
+    revalidation = detector.get("revalidation")
+    if not isinstance(revalidation, dict):
+        return "RETEST_REVALIDATION_NOT_CONFIRMED"
+    if revalidation.get("state") != "REVALIDATED":
+        return str(revalidation.get("state") or "RETEST_REVALIDATION_NOT_CONFIRMED")
+    trade_plan = detector.get("trade_plan")
+    if not isinstance(trade_plan, dict) or trade_plan.get("state") != "CANDIDATE_READY":
+        return "TRADE_PLAN_NOT_READY"
+    gate = detector.get("entry_gate")
+    if isinstance(gate, dict) and gate.get("state"):
+        return f'ENTRY_GATE_{gate["state"]}'
+    return "WAITING_FOR_VALID_ENTRY"
+
+
+def record_auto_decision_trace(
+    symbol: str, state: str, reason: str, detector: Optional[Dict[str, object]] = None
+) -> Dict[str, object]:
+    """Store a bounded, paper-only runtime explanation for one scan decision."""
+    entry: Dict[str, object] = {
+        "timestamp": utcnow().isoformat(),
+        "symbol": symbol.upper().replace("/", "-"),
+        "state": state,
+        "reason": reason,
+        "paper_only": True,
+        "execution": False,
+    }
+    if detector is not None:
+        entry["setup_state"] = detector.get("setup_state", "WAIT")
+        entry["latest_closed_timestamp"] = detector.get("latest_closed_timestamp")
+    auto_decision_trace.append(entry)
+    if len(auto_decision_trace) > AUTO_DECISION_TRACE_MAX:
+        del auto_decision_trace[:-AUTO_DECISION_TRACE_MAX]
+    return entry
+
+
+async def persist_auto_decision_trace(
+    entry: Dict[str, object], detector: Optional[Dict[str, object]] = None
+) -> bool:
+    """Persist one scanner decision without ever inventing market information."""
+    if not persistence_state.ready:
+        return False
+    timestamp_raw = str(entry.get("timestamp", ""))
+    try:
+        timestamp = datetime.fromisoformat(timestamp_raw)
+    except ValueError:
+        return False
+    if timestamp.tzinfo is None:
+        return False
+    symbol = str(entry.get("symbol", ""))
+    state = str(entry.get("state", ""))
+    reason = str(entry.get("reason", ""))
+    identity = f"{timestamp_raw}|{symbol}|{state}|{reason}"
+    decision_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    context = json.dumps(detector, sort_keys=True, default=str) if detector else None
+    values = {
+        "decision_id": decision_id,
+        "timestamp": timestamp,
+        "symbol": symbol,
+        "state": state,
+        "reason": reason,
+        "setup_state": str(entry.get("setup_state", "")) or None,
+        "latest_closed_timestamp": (
+            str(entry.get("latest_closed_timestamp"))
+            if entry.get("latest_closed_timestamp") is not None
+            else None
+        ),
+        "detector_context": context,
+        "paper_only": True,
+        "execution": False,
+        "created_at": utcnow(),
+    }
+    try:
+        async with engine.begin() as conn:
+            stmt = pg_insert(signal_decision_history_table).values(values)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["decision_id"])
+            await conn.execute(stmt)
+    except Exception as exc:  # noqa: BLE001
+        log.error("Decision history persistence failed: %s", exc)
+        return False
+    return True
+
+
+async def record_and_persist_auto_decision_trace(
+    symbol: str,
+    state: str,
+    reason: str,
+    detector: Optional[Dict[str, object]] = None,
+) -> None:
+    entry = record_auto_decision_trace(symbol, state, reason, detector)
+    await persist_auto_decision_trace(entry, detector)
+
+
+async def signal_decision_history(
+    limit: int = 100, symbol: Optional[str] = None, state: Optional[str] = None
+) -> Dict[str, object]:
+    """Read durable scanner decisions newest-first from PostgreSQL."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "PERSISTENCE_NOT_READY"},
+        )
+    safe_limit = max(1, min(limit, 500))
+    clauses: List[str] = []
+    params: Dict[str, object] = {"limit": safe_limit}
+    if symbol:
+        clauses.append("symbol = :symbol")
+        params["symbol"] = symbol.upper().replace("/", "-")
+    if state:
+        clauses.append("state = :state")
+        params["state"] = state.upper()
+    sql = "SELECT * FROM signal_decision_history"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY timestamp DESC, decision_id DESC LIMIT :limit"
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(text(sql), params)
+            items = [dict(row._mapping) for row in result.fetchall()]
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "decision history failed"},
+        ) from exc
+    for item in items:
+        for key in ("timestamp", "created_at"):
+            if isinstance(item.get(key), datetime):
+                item[key] = item[key].isoformat()
+        raw_context = item.get("detector_context")
+        if isinstance(raw_context, str):
+            try:
+                item["detector_context"] = json.loads(raw_context)
+            except json.JSONDecodeError:
+                item["detector_context"] = None
+    return {
+        "status": "OK",
+        "validation": "SERVER_SIGNAL_DECISION_HISTORY_V1",
+        "count": len(items),
+        "limit": safe_limit,
+        "items": items,
+        "paper_only": True,
+        "broker_execution": False,
+        "live_trading_enabled": False,
+    }
+
+
+def auto_decision_trace_status(limit: int = 50) -> Dict[str, object]:
+    safe_limit = max(1, min(limit, AUTO_DECISION_TRACE_MAX))
+    return {
+        "validation": "SERVER_DECISION_TRACE_V1",
+        "count": len(auto_decision_trace),
+        "limit": safe_limit,
+        "items": list(reversed(auto_decision_trace[-safe_limit:])),
+        "paper_only": True,
+        "broker_execution": False,
+        "live_trading_enabled": False,
+    }
+
+
+AUTO_SCAN_WATCHDOG_STALE_AFTER_SECONDS = max(
+    15.0, AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS * 3
+)
+
+
+def evaluate_auto_scan_watchdog(
+    runtime: Dict[str, object],
+    task_running: bool,
+    now: Optional[datetime] = None,
+) -> Dict[str, object]:
+    """Evaluate scanner liveness from its real heartbeat without fabricating activity."""
+    current = now or utcnow()
+    if current.tzinfo is None:
+        raise ValueError("watchdog now must be timezone-aware")
+    completed_raw = runtime.get("last_completed_at")
+    last_error = runtime.get("last_error")
+    age_seconds: Optional[float] = None
+    heartbeat_valid = False
+    if isinstance(completed_raw, str) and completed_raw:
+        try:
+            completed = datetime.fromisoformat(completed_raw)
+        except ValueError:
+            completed = None
+        if completed is not None and completed.tzinfo is not None:
+            age_seconds = max(0.0, (current - completed).total_seconds())
+            heartbeat_valid = True
+    if not task_running:
+        state = "STOPPED"
+        reason = "ORCHESTRATOR_TASK_NOT_RUNNING"
+    elif last_error:
+        state = "ERROR"
+        reason = f"LAST_SCAN_ERROR:{last_error}"
+    elif not heartbeat_valid:
+        state = "STARTING"
+        reason = "WAITING_FOR_FIRST_COMPLETED_SCAN"
+    elif age_seconds is not None and age_seconds > AUTO_SCAN_WATCHDOG_STALE_AFTER_SECONDS:
+        state = "STALE"
+        reason = "SCAN_HEARTBEAT_STALE"
+    else:
+        state = "HEALTHY"
+        reason = "SCAN_HEARTBEAT_FRESH"
+    return {
+        "status": state,
+        "reason": reason,
+        "validation": "SERVER_AUTO_SCAN_WATCHDOG_V1",
+        "heartbeat_age_seconds": age_seconds,
+        "stale_after_seconds": AUTO_SCAN_WATCHDOG_STALE_AFTER_SECONDS,
+        "iterations": runtime.get("iterations", 0),
+        "last_completed_at": completed_raw,
+        "paper_only": True,
+        "broker_execution": False,
+        "live_trading_enabled": False,
+    }
+
+
+def auto_scan_watchdog_status() -> Dict[str, object]:
+    task = auto_entry_orchestrator_task
+    task_running = task is not None and not task.done()
+    return evaluate_auto_scan_watchdog(auto_scan_runtime, task_running)
+
+
+def auto_scan_runtime_status() -> Dict[str, object]:
+    """Return a snapshot of the continuous paper-only scanner heartbeat."""
+    task = auto_entry_orchestrator_task
+    return {
+        "status": "RUNNING" if task is not None and not task.done() else "STOPPED",
+        "validation": "SERVER_CONTINUOUS_AUTO_SCAN_V1",
+        "interval_seconds": AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS,
+        **auto_scan_runtime,
+        "decision_trace_count": len(auto_decision_trace),
+        "latest_decision": auto_decision_trace[-1] if auto_decision_trace else None,
+        "paper_only": True,
+        "broker_execution": False,
+        "live_trading_enabled": False,
+    }
 
 
 def register_auto_entry_candidate(
@@ -2335,6 +3514,309 @@ def register_auto_entry_candidate(
         "paper_only": True,
         "execution": False,
     }
+
+
+def build_verified_auto_entry_request_from_detector(
+    symbol: str, detector: Dict[str, object]
+) -> Optional[VerifiedAutoPaperEntryRequest]:
+    """Convert a complete server ENTRY_NOW setup into a paper-only request.
+
+    The browser is not trusted. Every required SMC component must already be
+    server-confirmed and directionally coherent. This function only builds the
+    request; verified_auto_paper_entry remains authoritative for specs, sizing,
+    capital, persistence, and idempotent position creation.
+    """
+    if detector.get("status") != "READY" or detector.get("setup_state") != "ENTRY_NOW":
+        return None
+    gate = detector.get("entry_gate")
+    plan = detector.get("trade_plan")
+    if not isinstance(gate, dict) or gate.get("state") != "ENTRY_NOW":
+        return None
+    if not isinstance(plan, dict) or plan.get("state") != "CANDIDATE_READY":
+        return None
+    direction = gate.get("direction")
+    if direction not in {"BULLISH", "BEARISH"} or plan.get("direction") != direction:
+        return None
+
+    required = (
+        ("structure_event", {"BOS", "CHOCH_MSS"}),
+        ("liquidity_sweep", {"BSL_SWEEP", "SSL_SWEEP"}),
+        ("displacement", {"DISPLACEMENT"}),
+        ("fvg", {"FVG"}),
+        ("order_block", {"ORDER_BLOCK"}),
+    )
+    for key, events in required:
+        item = detector.get(key)
+        if not isinstance(item, dict):
+            return None
+        if item.get("event") not in events or item.get("direction") != direction:
+            return None
+    order_block = detector["order_block"]
+    if isinstance(order_block, dict) and order_block.get("state") == "INVALIDATED":
+        return None
+
+    raw_timestamp = detector.get("latest_closed_timestamp")
+    if not isinstance(raw_timestamp, str):
+        return None
+    try:
+        source_timestamp = datetime.fromisoformat(raw_timestamp)
+    except ValueError:
+        return None
+    if source_timestamp.tzinfo is None:
+        return None
+
+    try:
+        entry = Decimal(str(plan["entry_reference"]))
+        stop_loss = Decimal(str(plan["stop_loss"]))
+        take_profit = Decimal(str(plan["take_profit"]))
+        risk_reward = Decimal(str(plan["risk_reward"]))
+    except (KeyError, ValueError, InvalidOperation):
+        return None
+
+    return VerifiedAutoPaperEntryRequest(
+        symbol=symbol.upper().replace("/", "-"),
+        setup_state="ENTRY_NOW",
+        direction=str(direction),
+        entry=entry,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        risk_reward=risk_reward,
+        structure_confirmed=True,
+        displacement_confirmed=True,
+        order_block_confirmed=True,
+        source_timestamp=source_timestamp,
+        risk_percent=Decimal("1"),
+    )
+
+
+def apply_realtime_market_fill_to_auto_request(
+    request: VerifiedAutoPaperEntryRequest,
+    detector: Dict[str, object],
+    ticker: MarketDatum,
+) -> Optional[VerifiedAutoPaperEntryRequest]:
+    """Use a fresh real Coinbase ticker as the paper MARKET fill reference."""
+    if (
+        ticker.status != DataQualityStatus.VALID
+        or ticker.value is None
+        or ticker.timestamp is None
+        or ticker.timestamp.tzinfo is None
+    ):
+        return None
+    plan = detector.get("trade_plan")
+    if not isinstance(plan, dict):
+        return None
+    zone_low = plan.get("entry_zone_low")
+    zone_high = plan.get("entry_zone_high")
+    if not isinstance(zone_low, (int, float)) or not isinstance(zone_high, (int, float)):
+        return None
+    price = Decimal(str(ticker.value))
+    if not Decimal(str(zone_low)) <= price <= Decimal(str(zone_high)):
+        return None
+    if request.stop_loss is None or request.take_profit is None:
+        return None
+    if request.direction == "BULLISH":
+        if not request.stop_loss < price < request.take_profit:
+            return None
+    elif request.direction == "BEARISH":
+        if not request.take_profit < price < request.stop_loss:
+            return None
+    else:
+        return None
+    risk = abs(price - request.stop_loss)
+    reward = abs(request.take_profit - price)
+    if risk <= 0 or reward <= 0:
+        return None
+    return request.model_copy(
+        update={
+            "entry": price,
+            "risk_reward": reward / risk,
+            "source_timestamp": ticker.timestamp,
+        }
+    )
+
+
+def auto_entry_request_rejection_reason(detector: Dict[str, object]) -> str:
+    """Explain why an ENTRY_NOW detector could not become a verified request."""
+    if detector.get("status") != "READY":
+        return "DETECTOR_NOT_READY"
+    if detector.get("setup_state") != "ENTRY_NOW":
+        return "SETUP_NOT_ENTRY_NOW"
+    gate = detector.get("entry_gate")
+    if not isinstance(gate, dict):
+        return "ENTRY_GATE_MISSING"
+    if gate.get("state") != "ENTRY_NOW":
+        return "ENTRY_GATE_NOT_ENTRY_NOW"
+    plan = detector.get("trade_plan")
+    if not isinstance(plan, dict):
+        return "TRADE_PLAN_MISSING"
+    if plan.get("state") != "CANDIDATE_READY":
+        return "TRADE_PLAN_NOT_CANDIDATE_READY"
+    direction = gate.get("direction")
+    if direction not in {"BULLISH", "BEARISH"}:
+        return "ENTRY_DIRECTION_INVALID"
+    if plan.get("direction") != direction:
+        return "TRADE_PLAN_DIRECTION_MISMATCH"
+    required = (
+        ("structure_event", {"BOS", "CHOCH_MSS"}),
+        ("liquidity_sweep", {"BSL_SWEEP", "SSL_SWEEP"}),
+        ("displacement", {"DISPLACEMENT"}),
+        ("fvg", {"FVG"}),
+        ("order_block", {"ORDER_BLOCK"}),
+    )
+    for key, events in required:
+        item = detector.get(key)
+        if not isinstance(item, dict):
+            return f"{key.upper()}_MISSING"
+        if item.get("event") not in events:
+            return f"{key.upper()}_EVENT_INVALID"
+        if item.get("direction") != direction:
+            return f"{key.upper()}_DIRECTION_MISMATCH"
+    order_block = detector.get("order_block")
+    if isinstance(order_block, dict) and order_block.get("state") == "INVALIDATED":
+        return "ORDER_BLOCK_INVALIDATED"
+    raw_timestamp = detector.get("latest_closed_timestamp")
+    if not isinstance(raw_timestamp, str):
+        return "SOURCE_TIMESTAMP_MISSING"
+    try:
+        source_timestamp = datetime.fromisoformat(raw_timestamp)
+    except ValueError:
+        return "SOURCE_TIMESTAMP_INVALID"
+    if source_timestamp.tzinfo is None:
+        return "SOURCE_TIMESTAMP_NAIVE"
+    for key in ("entry_reference", "stop_loss", "take_profit", "risk_reward"):
+        try:
+            Decimal(str(plan[key]))
+        except (KeyError, ValueError, InvalidOperation):
+            return f"TRADE_PLAN_{key.upper()}_INVALID"
+    return "AUTO_ENTRY_REQUEST_BUILDABLE"
+
+
+def realtime_fill_rejection_reason(
+    request: VerifiedAutoPaperEntryRequest,
+    detector: Dict[str, object],
+    ticker: MarketDatum,
+) -> str:
+    """Explain why a real Coinbase ticker cannot be used as the paper fill."""
+    if ticker.status != DataQualityStatus.VALID:
+        return f"REALTIME_TICKER_{ticker.status.value}"
+    if ticker.value is None:
+        return "REALTIME_TICKER_PRICE_MISSING"
+    if ticker.timestamp is None:
+        return "REALTIME_TICKER_TIMESTAMP_MISSING"
+    if ticker.timestamp.tzinfo is None:
+        return "REALTIME_TICKER_TIMESTAMP_NAIVE"
+    plan = detector.get("trade_plan")
+    if not isinstance(plan, dict):
+        return "REALTIME_TRADE_PLAN_MISSING"
+    zone_low = plan.get("entry_zone_low")
+    zone_high = plan.get("entry_zone_high")
+    if not isinstance(zone_low, (int, float)) or not isinstance(zone_high, (int, float)):
+        return "REALTIME_ENTRY_ZONE_INVALID"
+    price = Decimal(str(ticker.value))
+    if not Decimal(str(zone_low)) <= price <= Decimal(str(zone_high)):
+        return "REALTIME_PRICE_OUTSIDE_ENTRY_ZONE"
+    if request.stop_loss is None or request.take_profit is None:
+        return "REALTIME_SL_TP_MISSING"
+    if request.direction == "BULLISH":
+        if not request.stop_loss < price < request.take_profit:
+            return "REALTIME_PRICE_INVALID_FOR_BULLISH_PLAN"
+    elif request.direction == "BEARISH":
+        if not request.take_profit < price < request.stop_loss:
+            return "REALTIME_PRICE_INVALID_FOR_BEARISH_PLAN"
+    else:
+        return "REALTIME_DIRECTION_INVALID"
+    risk = abs(price - request.stop_loss)
+    reward = abs(request.take_profit - price)
+    if risk <= 0:
+        return "REALTIME_RISK_NOT_POSITIVE"
+    if reward <= 0:
+        return "REALTIME_REWARD_NOT_POSITIVE"
+    return "REALTIME_FILL_ELIGIBLE"
+
+
+async def run_server_auto_paper_generation_once() -> Dict[str, int]:
+    """Scan crypto instruments and record every server decision observably."""
+    stats = {
+        "checked": 0,
+        "entry_now": 0,
+        "opened": 0,
+        "already_consumed": 0,
+        "blocked": 0,
+    }
+    if not persistence_state.ready:
+        return stats
+    for instrument in instrument_registry.all():
+        if instrument.asset_class != AssetClass.CRYPTO:
+            continue
+        symbol = instrument.canonical_symbol
+        stats["checked"] += 1
+        detector: Optional[Dict[str, object]] = None
+        try:
+            detector = await get_server_market_setup_detector(symbol)
+            request = build_verified_auto_entry_request_from_detector(symbol, detector)
+            if request is None:
+                setup_state = str(detector.get("setup_state", "WAIT"))
+                if setup_state == "ENTRY_NOW":
+                    reason = auto_entry_request_rejection_reason(detector)
+                    await record_and_persist_auto_decision_trace(
+                        symbol, "BLOCKED", reason, detector
+                    )
+                else:
+                    await record_and_persist_auto_decision_trace(
+                        symbol,
+                        setup_state,
+                        _decision_reason_from_detector(detector),
+                        detector,
+                    )
+                continue
+            provider_symbol = provider_symbol_map.to_provider("coinbase", symbol)
+            if provider_symbol is None:
+                stats["blocked"] += 1
+                await record_and_persist_auto_decision_trace(
+                    symbol, "BLOCKED", "PROVIDER_SYMBOL_UNAVAILABLE", detector
+                )
+                continue
+            ticker = await market_provider.get_ticker(provider_symbol)
+            fill_request = apply_realtime_market_fill_to_auto_request(
+                request, detector, ticker
+            )
+            if fill_request is None:
+                stats["blocked"] += 1
+                reason = realtime_fill_rejection_reason(request, detector, ticker)
+                await record_and_persist_auto_decision_trace(
+                    symbol, "BLOCKED", reason, detector
+                )
+                continue
+            request = fill_request
+            stats["entry_now"] += 1
+            result = await verified_auto_paper_entry(request)
+        except HTTPException as exc:
+            if exc.status_code == 409:
+                stats["already_consumed"] += 1
+                reason = "DUPLICATE_OR_PORTFOLIO_CONFLICT"
+            else:
+                stats["blocked"] += 1
+                reason = f"HTTP_{exc.status_code}"
+            await record_and_persist_auto_decision_trace(symbol, "BLOCKED", reason, detector)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            log.error("Server auto-paper generation failed: %s", exc)
+            stats["blocked"] += 1
+            await record_and_persist_auto_decision_trace(
+                symbol, "BLOCKED", f"RUNTIME_{type(exc).__name__}", detector
+            )
+            continue
+        if result.get("status") == "OPENED":
+            stats["opened"] += 1
+            await record_and_persist_auto_decision_trace(
+                symbol, "ENTRY_NOW", "PAPER_POSITION_OPENED", detector
+            )
+        else:
+            stats["blocked"] += 1
+            raw_reason = result.get("reason")
+            reason = str(raw_reason) if raw_reason else "VERIFIED_ENTRY_BLOCKED"
+            await record_and_persist_auto_decision_trace(symbol, "BLOCKED", reason, detector)
+    return stats
 
 
 async def run_auto_entry_orchestrator_once() -> Dict[str, int]:
@@ -2376,13 +3858,85 @@ async def run_auto_entry_orchestrator_once() -> Dict[str, int]:
 
 async def auto_entry_orchestrator_loop() -> None:
     while True:
+        auto_scan_runtime["last_started_at"] = utcnow().isoformat()
+        auto_scan_runtime["last_error"] = None
         try:
-            await run_auto_entry_orchestrator_once()
+            generation = await run_server_auto_paper_generation_once()
+            queue = await run_auto_entry_orchestrator_once()
+            auto_scan_runtime["last_generation"] = generation
+            auto_scan_runtime["last_queue"] = queue
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
+            auto_scan_runtime["last_error"] = type(exc).__name__
             log.error("Auto-entry orchestrator iteration failed: %s", exc)
+        finally:
+            iterations = auto_scan_runtime.get("iterations", 0)
+            if not isinstance(iterations, int):
+                iterations = 0
+            auto_scan_runtime["iterations"] = iterations + 1
+            auto_scan_runtime["last_completed_at"] = utcnow().isoformat()
         await asyncio.sleep(AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS)
+
+
+def auto_paper_e2e_readiness() -> Dict[str, object]:
+    """Expose the server-side wiring required for paper auto-trading E2E.
+
+    This is a readiness/contract audit, not proof that a market setup exists.
+    A real position still requires real VALID market data and ENTRY_NOW.
+    """
+    task = auto_entry_orchestrator_task
+    orchestrator_running = task is not None and not task.done()
+    ready = persistence_state.ready and orchestrator_running
+    return {
+        "status": "READY" if ready else "NOT_READY",
+        "validation": "SERVER_AUTO_PAPER_E2E_READINESS_V1",
+        "persistence_ready": persistence_state.ready,
+        "orchestrator_running": orchestrator_running,
+        "paper_monitor_interval_seconds": max(
+            settings.paper_monitor_interval_seconds, 1.0
+        ),
+        "pipeline": [
+            "REAL_MARKET_DATA",
+            "SERVER_SMC_SETUP",
+            "ENTRY_NOW_GATE",
+            "PORTFOLIO_RISK_GUARD",
+            "PAPER_POSITION_CREATE",
+            "REALTIME_MARK",
+            "SL_TP_CLOSE",
+            "PAPER_HISTORY",
+        ],
+        "paper_only": True,
+        "broker_execution": False,
+        "live_trading_enabled": False,
+    }
+
+
+@api_router.get("/paper/auto-entry/e2e-readiness")
+async def get_auto_paper_e2e_readiness() -> Dict[str, object]:
+    return auto_paper_e2e_readiness()
+
+
+@api_router.get("/paper/auto-entry/runtime-status")
+async def get_auto_scan_runtime_status() -> Dict[str, object]:
+    return auto_scan_runtime_status()
+
+
+@api_router.get("/paper/auto-entry/watchdog-status")
+async def get_auto_scan_watchdog_status() -> Dict[str, object]:
+    return auto_scan_watchdog_status()
+
+
+@api_router.get("/paper/auto-entry/decision-trace")
+async def get_auto_decision_trace(limit: int = 50) -> Dict[str, object]:
+    return auto_decision_trace_status(limit)
+
+
+@api_router.get("/paper/auto-entry/decision-history")
+async def get_signal_decision_history(
+    limit: int = 100, symbol: Optional[str] = None, state: Optional[str] = None
+) -> Dict[str, object]:
+    return await signal_decision_history(limit=limit, symbol=symbol, state=state)
 
 
 @api_router.post("/paper/auto-entry/candidates")
@@ -2402,7 +3956,15 @@ async def get_auto_entry_orchestrator_status() -> Dict[str, object]:
         "market_setup_detection": "STRUCTURE_BOS_CHOCH_V1",
         "liquidity_sweep_detection": "SERVER_LIQUIDITY_SWEEP_V1",
         "displacement_detection": "SERVER_DISPLACEMENT_V1",
-        "smc_auto_candidate_generation": "NOT_IMPLEMENTED",
+        "fvg_detection": "SERVER_FVG_V1",
+        "order_block_detection": "SERVER_ORDER_BLOCK_V1",
+        "retest_revalidation": "SERVER_RETEST_REVALIDATION_V1",
+        "trade_plan_builder": "SERVER_TRADE_PLAN_V1",
+        "entry_now_gate": "SERVER_ENTRY_NOW_GATE_V1",
+        "smc_auto_candidate_generation": "SERVER_AUTO_PAPER_POSITION_V1",
+        "auto_position_creation": "SERVER_AUTO_PAPER_POSITION_V1",
+        "decision_trace": "SERVER_DECISION_TRACE_V1",
+        "decision_history": "SERVER_SIGNAL_DECISION_HISTORY_V1",
         "paper_only": True,
         "execution": False,
     }
@@ -2504,6 +4066,29 @@ class PaperPositionMark(BaseModel):
     source_timestamp: datetime
 
 
+async def paper_mark_from_coinbase_rest(
+    canonical: str, provider_symbol: str
+) -> Optional[PaperPositionMark]:
+    """Fail-safe real REST mark for crypto when the WS store has no fresh price."""
+    try:
+        datum = await market_provider.get_ticker(provider_symbol)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - monitoring fallback must fail closed
+        log.warning("Coinbase REST paper mark unavailable for %s: %s", canonical, exc)
+        return None
+    if datum.status != DataQualityStatus.VALID:
+        return None
+    if datum.value is None or datum.value <= 0 or datum.timestamp is None:
+        return None
+    return PaperPositionMark(
+        current_price=Decimal(str(datum.value)),
+        observed_at=utcnow(),
+        source="coinbase_rest_fallback",
+        source_timestamp=datum.timestamp,
+    )
+
+
 async def paper_mark_from_realtime(symbol: str) -> Optional[PaperPositionMark]:
     canonical = symbol.upper().replace("/", "-")
     instrument = instrument_registry.get(canonical)
@@ -2520,10 +4105,14 @@ async def paper_mark_from_realtime(symbol: str) -> Optional[PaperPositionMark]:
         if provider_symbol is None:
             return None
         datum = await market_store.get_ticker(provider_symbol)
-        if datum is None or datum.status != DataQualityStatus.VALID:
-            return None
-        if datum.value is None or datum.value <= 0 or datum.source_timestamp is None:
-            return None
+        if (
+            datum is None
+            or datum.status != DataQualityStatus.VALID
+            or datum.value is None
+            or datum.value <= 0
+            or datum.source_timestamp is None
+        ):
+            return await paper_mark_from_coinbase_rest(canonical, provider_symbol)
         price = Decimal(str(datum.value))
         received_at = datum.received_at
         source_timestamp = datum.source_timestamp
@@ -2576,7 +4165,7 @@ async def paper_mark_from_realtime(symbol: str) -> Optional[PaperPositionMark]:
 
 async def monitor_open_paper_positions_once() -> Dict[str, int]:
     if not persistence_state.ready:
-        return {"checked": 0, "marked": 0, "unavailable": 0}
+        return {"checked": 0, "marked": 0, "unavailable": 0, "errors": 0}
     async with engine.connect() as conn:
         result = await conn.execute(
             text("SELECT position_id, symbol FROM paper_positions WHERE status='OPEN'")
@@ -2584,14 +4173,30 @@ async def monitor_open_paper_positions_once() -> Dict[str, int]:
         rows = result.fetchall()
     marked = 0
     unavailable = 0
+    errors = 0
     for row in rows:
-        mark = await paper_mark_from_realtime(row._mapping["symbol"])
-        if mark is None:
-            unavailable += 1
-            continue
-        await mark_paper_position(row._mapping["position_id"], mark)
-        marked += 1
-    return {"checked": len(rows), "marked": marked, "unavailable": unavailable}
+        try:
+            mark = await paper_mark_from_realtime(row._mapping["symbol"])
+            if mark is None:
+                unavailable += 1
+                continue
+            await mark_paper_position(row._mapping["position_id"], mark)
+            marked += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - isolate one position from the batch
+            errors += 1
+            log.error(
+                "Paper position monitor failed for %s: %s",
+                row._mapping["position_id"],
+                exc,
+            )
+    return {
+        "checked": len(rows),
+        "marked": marked,
+        "unavailable": unavailable,
+        "errors": errors,
+    }
 
 
 async def paper_monitor_loop(stop_event: asyncio.Event) -> None:
@@ -2607,6 +4212,19 @@ async def paper_monitor_loop(stop_event: asyncio.Event) -> None:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except asyncio.TimeoutError:
             pass
+
+
+def paper_mark_temporally_valid(
+    mark: PaperPositionMark, opened_at: datetime
+) -> bool:
+    timestamps = (mark.observed_at, mark.source_timestamp, opened_at)
+    if any(value.tzinfo is None or value.utcoffset() is None for value in timestamps):
+        return False
+    if mark.source_timestamp > mark.observed_at:
+        return False
+    if mark.source_timestamp < opened_at:
+        return False
+    return True
 
 
 def evaluate_paper_close(side: str, price: Decimal, stop_loss: Decimal,
@@ -2654,6 +4272,11 @@ async def mark_paper_position(position_id: str, req: PaperPositionMark) -> Dict[
             data = dict(row._mapping)
             if data["status"] != "OPEN":
                 return paper_position_to_dict(row)
+            if not paper_mark_temporally_valid(req, data["opened_at"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"status": "CONFLICT", "reason": "STALE_OR_INVALID_MARK"},
+                )
             outcome = evaluate_paper_close(
                 data["side"], req.current_price, data["stop_loss"], data["take_profit"]
             )
@@ -2867,6 +4490,284 @@ async def get_paper_account() -> Dict[str, object]:
     }
 
 
+def calculate_paper_performance_metrics(
+    closed_positions: List[Dict[str, object]], initial_capital: Decimal
+) -> Dict[str, object]:
+    """Calculate deterministic paper-only performance metrics from closed trades."""
+    if initial_capital <= 0:
+        raise ValueError("initial_capital must be positive")
+    wins = losses = breakeven = 0
+    gross_profit = Decimal("0")
+    gross_loss = Decimal("0")
+    net_pnl = Decimal("0")
+    rr_sum = Decimal("0")
+    rr_count = 0
+    equity = initial_capital
+    peak = initial_capital
+    max_drawdown = Decimal("0")
+    max_drawdown_percent = Decimal("0")
+
+    for position in closed_positions:
+        side = str(position["side"])
+        entry = Decimal(str(position["entry"]))
+        close_price = Decimal(str(position["close_price"]))
+        size = Decimal(str(position["size"]))
+        risk_money = Decimal(str(position["risk_money"]))
+        pnl = calculate_paper_pnl(side, entry, close_price, size)
+        net_pnl += pnl
+        if pnl > 0:
+            wins += 1
+            gross_profit += pnl
+        elif pnl < 0:
+            losses += 1
+            gross_loss += -pnl
+        else:
+            breakeven += 1
+        if risk_money > 0:
+            rr_sum += pnl / risk_money
+            rr_count += 1
+        equity += pnl
+        if equity > peak:
+            peak = equity
+        drawdown = peak - equity
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+        if peak > 0:
+            drawdown_percent = drawdown / peak * Decimal("100")
+            if drawdown_percent > max_drawdown_percent:
+                max_drawdown_percent = drawdown_percent
+
+    trades = len(closed_positions)
+    win_rate = Decimal(wins) / Decimal(trades) * Decimal("100") if trades else None
+    expectancy = net_pnl / Decimal(trades) if trades else None
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
+    average_realized_rr = rr_sum / Decimal(rr_count) if rr_count else None
+    return {
+        "closed_trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "win_rate_percent": str(win_rate) if win_rate is not None else None,
+        "gross_profit": str(gross_profit),
+        "gross_loss": str(gross_loss),
+        "net_pnl": str(net_pnl),
+        "profit_factor": str(profit_factor) if profit_factor is not None else None,
+        "expectancy": str(expectancy) if expectancy is not None else None,
+        "average_realized_rr": (
+            str(average_realized_rr) if average_realized_rr is not None else None
+        ),
+        "max_drawdown": str(max_drawdown),
+        "max_drawdown_percent": str(max_drawdown_percent),
+    }
+
+
+PAPER_PERFORMANCE_PERIODS = {"ALL", "DAY", "WEEK", "MONTH", "YEAR"}
+
+
+def paper_performance_period_start(
+    period: str, now: Optional[datetime] = None
+) -> Optional[datetime]:
+    """Return the UTC start boundary for an objective performance window."""
+    normalized = period.upper()
+    if normalized not in PAPER_PERFORMANCE_PERIODS:
+        raise ValueError("unsupported paper performance period")
+    if normalized == "ALL":
+        return None
+    current = now or utcnow()
+    if current.tzinfo is None:
+        raise ValueError("performance period now must be timezone-aware")
+    current = current.astimezone(timezone.utc)
+    if normalized == "DAY":
+        return current.replace(hour=0, minute=0, second=0, microsecond=0)
+    if normalized == "WEEK":
+        day_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        return day_start - timedelta(days=day_start.weekday())
+    if normalized == "MONTH":
+        return current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return current.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+@api_router.get("/paper/performance")
+async def get_paper_performance(
+    symbol: Optional[str] = None, period: str = "ALL"
+) -> Dict[str, object]:
+    """Return performance analytics derived only from persisted CLOSED paper trades."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503, detail={"status": "UNAVAILABLE", "reason": "persistence not ready"}
+        )
+    canonical = symbol.upper().replace("/", "-") if symbol else None
+    normalized_period = period.upper()
+    try:
+        period_start = paper_performance_period_start(normalized_period)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "unsupported performance period"},
+        ) from exc
+    try:
+        async with engine.connect() as conn:
+            account_result = await conn.execute(
+                text(
+                    "SELECT initial_capital FROM paper_account "
+                    "WHERE account_id=:account_id"
+                ),
+                {"account_id": PAPER_ACCOUNT_ID},
+            )
+            account = account_result.fetchone()
+            if account is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"status": "UNAVAILABLE", "reason": "paper account not initialized"},
+                )
+            sql = (
+                "SELECT position_id, symbol, side, entry, close_price, size, risk_money, "
+                "closed_at FROM paper_positions WHERE status='CLOSED' "
+                "AND close_price IS NOT NULL"
+            )
+            params: Dict[str, object] = {}
+            if canonical is not None:
+                sql += " AND symbol=:symbol"
+                params["symbol"] = canonical
+            if period_start is not None:
+                sql += " AND closed_at>=:period_start"
+                params["period_start"] = period_start
+            sql += " ORDER BY closed_at ASC, position_id ASC"
+            result = await conn.execute(text(sql), params)
+            rows = [dict(row._mapping) for row in result.fetchall()]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"},
+        ) from exc
+
+    initial_capital = Decimal(str(account._mapping["initial_capital"]))
+    metrics = calculate_paper_performance_metrics(rows, initial_capital)
+    return {
+        "status": "OK",
+        "validation": "SERVER_PAPER_PERFORMANCE_ANALYTICS_V1",
+        "period_validation": "SERVER_PAPER_PERFORMANCE_PERIODS_V1",
+        "symbol": canonical,
+        "period": normalized_period,
+        "period_start": period_start.isoformat() if period_start is not None else None,
+        "metrics": metrics,
+        "paper_only": True,
+        "execution": False,
+    }
+
+
+PAPER_PERFORMANCE_BREAKDOWN_GROUPS = {"SYMBOL", "SIDE"}
+
+
+def build_paper_performance_breakdown(
+    closed_positions: List[Dict[str, object]],
+    initial_capital: Decimal,
+    group_by: str,
+) -> List[Dict[str, object]]:
+    """Group persisted closed paper trades by an actually stored dimension."""
+    normalized = group_by.upper()
+    if normalized not in PAPER_PERFORMANCE_BREAKDOWN_GROUPS:
+        raise ValueError("unsupported paper performance breakdown")
+    grouped: Dict[str, List[Dict[str, object]]] = {}
+    field = "symbol" if normalized == "SYMBOL" else "side"
+    for position in closed_positions:
+        raw_value = position.get(field)
+        if raw_value is None or not str(raw_value).strip():
+            raise ValueError(f"closed paper trade missing {field}")
+        key = str(raw_value).upper()
+        grouped.setdefault(key, []).append(position)
+    return [
+        {
+            "group": key,
+            "metrics": calculate_paper_performance_metrics(grouped[key], initial_capital),
+        }
+        for key in sorted(grouped)
+    ]
+
+
+@api_router.get("/paper/performance/breakdown")
+async def get_paper_performance_breakdown(
+    group_by: str = "SYMBOL",
+    period: str = "ALL",
+) -> Dict[str, object]:
+    """Break down persisted CLOSED paper performance by stored symbol or side."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+    normalized_group = group_by.upper()
+    if normalized_group not in PAPER_PERFORMANCE_BREAKDOWN_GROUPS:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "unsupported performance breakdown"},
+        )
+    normalized_period = period.upper()
+    try:
+        period_start = paper_performance_period_start(normalized_period)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "unsupported performance period"},
+        ) from exc
+    try:
+        async with engine.connect() as conn:
+            account_result = await conn.execute(
+                text(
+                    "SELECT initial_capital FROM paper_account "
+                    "WHERE account_id=:account_id"
+                ),
+                {"account_id": PAPER_ACCOUNT_ID},
+            )
+            account = account_result.fetchone()
+            if account is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "status": "UNAVAILABLE",
+                        "reason": "paper account not initialized",
+                    },
+                )
+            sql = (
+                "SELECT position_id, symbol, side, entry, close_price, size, risk_money, "
+                "closed_at FROM paper_positions WHERE status='CLOSED' "
+                "AND close_price IS NOT NULL"
+            )
+            params: Dict[str, object] = {}
+            if period_start is not None:
+                sql += " AND closed_at>=:period_start"
+                params["period_start"] = period_start
+            sql += " ORDER BY closed_at ASC, position_id ASC"
+            result = await conn.execute(text(sql), params)
+            rows = [dict(row._mapping) for row in result.fetchall()]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"},
+        ) from exc
+
+    initial_capital = Decimal(str(account._mapping["initial_capital"]))
+    groups = build_paper_performance_breakdown(rows, initial_capital, normalized_group)
+    return {
+        "status": "OK",
+        "validation": "SERVER_PAPER_PERFORMANCE_BREAKDOWN_V1",
+        "group_by": normalized_group,
+        "period": normalized_period,
+        "period_start": period_start.isoformat() if period_start is not None else None,
+        "groups": groups,
+        "dimensions_available": ["SYMBOL", "SIDE"],
+        "dimensions_deferred": ["TIMEFRAME", "STRATEGY", "SESSION", "REGIME"],
+        "paper_only": True,
+        "execution": False,
+    }
+
+
 @api_router.get("/paper/positions")
 async def list_paper_positions(status_filter: Optional[str] = None) -> Dict[str, object]:
     if not persistence_state.ready:
@@ -2893,6 +4794,74 @@ async def list_paper_positions(status_filter: Optional[str] = None) -> Dict[str,
             status_code=503, detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"}
         ) from exc
     return {"status": "OK", "positions": rows, "count": len(rows), "paper_only": True}
+
+
+async def _paper_ui_section(call: Any) -> Dict[str, object]:
+    try:
+        data = await call()
+        return {"status": "OK", "data": data}
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"reason": str(exc.detail)}
+        return {
+            "status": "UNAVAILABLE",
+            "http_status": exc.status_code,
+            "reason": detail.get("reason", "HTTP_ERROR"),
+            "data": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.error("Paper UI snapshot section failed: %s", exc)
+        return {
+            "status": "UNAVAILABLE",
+            "http_status": 500,
+            "reason": type(exc).__name__,
+            "data": None,
+        }
+
+
+@api_router.get("/paper/ui-snapshot")
+async def get_paper_ui_snapshot(
+    symbol: Optional[str] = None, state: Optional[str] = None
+) -> Dict[str, object]:
+    """Return one server-stamped, fail-safe snapshot for the paper UI."""
+    snapshot_at = utcnow()
+    account = await _paper_ui_section(get_live_paper_account)
+    positions = await _paper_ui_section(list_paper_positions)
+    live_positions = await _paper_ui_section(get_live_paper_positions)
+    performance = await _paper_ui_section(get_paper_performance)
+
+    async def decisions() -> Dict[str, object]:
+        return await signal_decision_history(limit=50, symbol=symbol, state=state)
+
+    decision_history = await _paper_ui_section(decisions)
+    watchdog: Dict[str, object] = {
+        "status": "OK",
+        "data": auto_scan_watchdog_status(),
+    }
+    runtime: Dict[str, object] = {
+        "status": "OK",
+        "data": auto_scan_runtime_status(),
+    }
+    sections: Dict[str, Dict[str, object]] = {
+        "account": account,
+        "positions": positions,
+        "live_positions": live_positions,
+        "performance": performance,
+        "decision_history": decision_history,
+        "watchdog": watchdog,
+        "runtime": runtime,
+    }
+    available = 0
+    for section in sections.values():
+        if section.get("status") == "OK":
+            available += 1
+    return {
+        "status": "OK" if available == len(sections) else "PARTIAL",
+        "validation": "SERVER_PAPER_UI_SNAPSHOT_V1",
+        "snapshot_at": snapshot_at.isoformat(),
+        "sections": sections,
+        "paper_only": True,
+        "execution": False,
+    }
 
 
 async def init_candle_schema() -> None:
@@ -3562,6 +5531,10 @@ def _register_coinbase_instruments() -> None:
     for canon, base, quote, name in (
         ("BTC-USD", "BTC", "USD", "Bitcoin / US Dollar"),
         ("ETH-USD", "ETH", "USD", "Ethereum / US Dollar"),
+        ("SOL-USD", "SOL", "USD", "Solana / US Dollar"),
+        ("XRP-USD", "XRP", "USD", "XRP / US Dollar"),
+        ("LTC-USD", "LTC", "USD", "Litecoin / US Dollar"),
+        ("ADA-USD", "ADA", "USD", "Cardano / US Dollar"),
     ):
         instrument_registry.register(
             Instrument(
@@ -5633,6 +7606,33 @@ def _mount_frontend(app: FastAPI, cfg: Settings) -> None:
 
 
 # ============================ app factory ============================
+async def start_server_crypto_market_stream() -> bool:
+    """Start the Coinbase ticker stream server-side for autonomous paper monitoring."""
+    products = sorted(
+        provider_symbol
+        for instrument in instrument_registry.all()
+        if instrument.asset_class == AssetClass.CRYPTO
+        if (
+            provider_symbol := provider_symbol_map.to_provider(
+                "coinbase", instrument.canonical_symbol
+            )
+        ) is not None
+    )
+    if not products:
+        log.warning("No Coinbase products registered for server paper monitoring")
+        return False
+    try:
+        await market_ws.subscribe("ticker", products)
+        await market_ws.start()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - REST fallback keeps paper monitoring safe
+        log.warning("Server Coinbase WS auto-start failed; REST fallback remains active: %s", exc)
+        return False
+    log.info("Server Coinbase WS auto-started for paper monitoring: %s", products)
+    return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Starting %s (env=%s)", settings.app_name, settings.environment)
@@ -5646,6 +7646,7 @@ async def lifespan(app: FastAPI):
     await massive_indices_provider.connect()
     activation = await activate_massive_forex_mappings()
     log.info("Massive forex mapping activation: %s", activation)
+    await start_server_crypto_market_stream()
     try:
         await init_candle_schema()
         persistence_state.mark_ready()
@@ -5707,4 +7708,113 @@ def create_app() -> FastAPI:
     return app
 
 
+# V16-M5B4-FIX2 — fresh synchronized copy
+
+# V16-M5B17: paper performance analytics from persisted CLOSED trades
+
+# V16-M5B20: UTC DAY/WEEK/MONTH/YEAR paper performance windows
+
+
+# ============================ V16-M5B23 Market Sessions & Calendar ============
+def market_session_context(
+    canonical_symbol: str, now_utc: Optional[datetime] = None
+) -> Dict[str, object]:
+    """Unified, fail-safe session/calendar context for a registered instrument.
+
+    Calendar state never implies data quality or trade permission. Holiday knowledge
+    is not fabricated: policies without a verified holiday calendar expose UNKNOWN.
+    """
+    symbol = canonical_symbol.upper().replace("/", "-")
+    inst = instrument_registry.get(symbol)
+    if inst is None:
+        return {
+            "status": "NOT_SUPPORTED",
+            "symbol": symbol,
+            "market_state": "UNKNOWN",
+            "reason": "unknown instrument",
+            "paper_only": True,
+            "execution": False,
+        }
+    now = now_utc or utcnow()
+    if now.tzinfo is None:
+        return {
+            "status": "INVALID_TIME",
+            "symbol": symbol,
+            "market_state": "UNKNOWN",
+            "reason": "timezone-aware UTC timestamp required",
+            "paper_only": True,
+            "execution": False,
+        }
+    now = now.astimezone(timezone.utc)
+    calendar = calendar_for(inst.market_calendar)
+    open_state = calendar.is_market_expected_open(int(now.timestamp())).value
+    sessions: List[Dict[str, object]] = []
+    current_session: Optional[str] = None
+    next_open: Optional[str] = None
+    next_close: Optional[str] = None
+    holidays = "NOT_IMPLEMENTED"
+
+    if inst.market_calendar == MarketCalendarPolicy.ALWAYS_OPEN_24_7:
+        market_state = "OPEN"
+        current_session = "24_7"
+        reason = "registered 24/7 market calendar"
+        holidays = "NOT_APPLICABLE"
+    elif inst.market_calendar == MarketCalendarPolicy.FOREX_WEEK:
+        state = forex_market_state(now)
+        market_state = str(state["market_state"])
+        reason = str(state["reason"])
+        state_sessions = state.get("sessions")
+        if isinstance(state_sessions, list):
+            sessions = [item for item in state_sessions if isinstance(item, dict)]
+        value = state.get("current_session")
+        current_session = str(value) if value is not None else None
+        open_value = state.get("next_open")
+        close_value = state.get("next_close")
+        next_open = open_value if isinstance(open_value, str) else None
+        next_close = close_value if isinstance(close_value, str) else None
+    elif inst.market_calendar == MarketCalendarPolicy.US_EQUITY_RTH:
+        market_state = open_state
+        reason = "U.S. regular-hours baseline; holidays and early closes unknown"
+        if market_state == "OPEN":
+            current_session = "US_RTH"
+    else:
+        market_state = "UNKNOWN"
+        reason = "market calendar not configured"
+
+    return {
+        "status": "READY",
+        "symbol": symbol,
+        "asset_class": inst.asset_class.value,
+        "calendar_policy": inst.market_calendar.value,
+        "market_state": market_state,
+        "calendar_open_state": open_state,
+        "current_session": current_session,
+        "sessions": sessions,
+        "next_open": next_open,
+        "next_close": next_close,
+        "holidays": holidays,
+        "observed_at": now.isoformat(),
+        "timezone_internal": "UTC",
+        "reason": reason,
+        "data_quality_independent": True,
+        "trade_authorization": False,
+        "paper_only": True,
+        "execution": False,
+        "marker": "SERVER_MARKET_SESSIONS_CALENDAR_V1",
+    }
+
+
+@api_router.get("/market/session-context/{symbol}")
+async def market_session_context_endpoint(symbol: str) -> dict:
+    result = market_session_context(symbol)
+    if result["status"] == "NOT_SUPPORTED":
+        raise HTTPException(status_code=404, detail=result)
+    return result
+
+
+# App must be built only after every router decorator above has executed.
 app = create_app()
+
+# V16-M5B24A — autonomous crypto WS + fail-safe REST paper-mark fallback
+
+# V16-M5B24B — crypto registry alignment: BTC/ETH/SOL/XRP/LTC/ADA

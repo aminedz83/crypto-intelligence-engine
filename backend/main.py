@@ -5903,8 +5903,9 @@ async def get_adaptive_edge_impact_validation(period: str = "ALL") -> Dict[str, 
             status_code=503,
             detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
         )
+    normalized_period = period.upper()
     try:
-        normalized_period, period_start = paper_performance_period_start(period, utcnow())
+        period_start = paper_performance_period_start(normalized_period, utcnow())
     except ValueError as exc:
         raise HTTPException(
             status_code=400,

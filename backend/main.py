@@ -7957,6 +7957,173 @@ async def get_strategy_context(symbol: str) -> Dict[str, object]:
     }
 
 
+# V16-M5B27 — objective candidate detectors (observational, non-executing)
+CANDIDATE_DETECTOR_VERSION = "SERVER_CANDIDATE_DETECTORS_V1"
+TREND_PULLBACK_EMA_PERIOD = 20
+BREAKOUT_LOOKBACK = 20
+BREAKOUT_BODY_MULTIPLIER = 1.5
+BREAKOUT_MIN_BODY_RANGE_RATIO = 0.70
+
+
+def _ema(values: List[float], period: int) -> List[float]:
+    """Deterministic EMA series using only values available at each index."""
+    if not values or period <= 0:
+        return []
+    alpha = 2.0 / (period + 1.0)
+    result = [values[0]]
+    for value in values[1:]:
+        result.append(alpha * value + (1.0 - alpha) * result[-1])
+    return result
+
+
+def detect_trend_pullback_candidate(
+    candles: List[Candle], now: datetime, regime: Dict[str, object]
+) -> Dict[str, object]:
+    """Detect a closed-candle trend pullback confirmation without execution."""
+    base = {
+        "strategy_id": "TREND_PULLBACK",
+        "marker": CANDIDATE_DETECTOR_VERSION,
+        "candidate_only": True,
+        "auto_queue": False,
+        "execution": False,
+        "no_lookahead": True,
+    }
+    context = evaluate_candidate_strategy_context("TREND_PULLBACK", regime)
+    if context.get("status") != "CONTEXT_ELIGIBLE":
+        return {**base, "status": "WAIT", "reason": str(context.get("reason", "CONTEXT_NOT_ELIGIBLE"))}
+    closed = closed_valid_candles(candles, now)
+    if len(closed) < TREND_PULLBACK_EMA_PERIOD + 2:
+        return {**base, "status": "WAIT", "reason": "INSUFFICIENT_CLOSED_CANDLES"}
+    sample = closed[-(TREND_PULLBACK_EMA_PERIOD + 2):]
+    closes = [float(item.close) for item in sample if item.close is not None]
+    if len(closes) != len(sample) or any(value <= 0 for value in closes):
+        return {**base, "status": "WAIT", "reason": "INVALID_CLOSE_SERIES"}
+    ema = _ema(closes, TREND_PULLBACK_EMA_PERIOD)
+    previous, latest = sample[-2], sample[-1]
+    previous_ema, latest_ema = ema[-2], ema[-1]
+    if previous.low is None or previous.high is None or latest.close is None:
+        return {**base, "status": "WAIT", "reason": "INVALID_PULLBACK_CANDLE"}
+    direction = str(regime.get("direction") or "")
+    if direction == "BULLISH":
+        touched = previous.low <= previous_ema
+        confirmed = latest.close > latest_ema and latest.close > previous.high
+    elif direction == "BEARISH":
+        touched = previous.high >= previous_ema
+        confirmed = latest.close < latest_ema and latest.close < previous.low
+    else:
+        return {**base, "status": "WAIT", "reason": "TREND_DIRECTION_NOT_READY"}
+    if not touched:
+        return {**base, "status": "WAIT", "reason": "PULLBACK_NOT_TOUCHED"}
+    if not confirmed:
+        return {**base, "status": "WAIT", "reason": "PULLBACK_NOT_CONFIRMED"}
+    return {
+        **base,
+        "status": "SETUP",
+        "reason": "TREND_PULLBACK_CONFIRMED",
+        "direction": direction,
+        "ema_period": TREND_PULLBACK_EMA_PERIOD,
+        "ema": round(latest_ema, 8),
+        "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
+    }
+
+
+def detect_breakout_expansion_candidate(
+    candles: List[Candle], now: datetime, regime: Dict[str, object]
+) -> Dict[str, object]:
+    """Detect a closed-candle range breakout with objective displacement."""
+    base = {
+        "strategy_id": "BREAKOUT_EXPANSION",
+        "marker": CANDIDATE_DETECTOR_VERSION,
+        "candidate_only": True,
+        "auto_queue": False,
+        "execution": False,
+        "no_lookahead": True,
+    }
+    context = evaluate_candidate_strategy_context("BREAKOUT_EXPANSION", regime)
+    if context.get("status") != "CONTEXT_ELIGIBLE":
+        return {**base, "status": "WAIT", "reason": str(context.get("reason", "CONTEXT_NOT_ELIGIBLE"))}
+    closed = closed_valid_candles(candles, now)
+    if len(closed) < BREAKOUT_LOOKBACK + 1:
+        return {**base, "status": "WAIT", "reason": "INSUFFICIENT_CLOSED_CANDLES"}
+    prior = closed[-(BREAKOUT_LOOKBACK + 1):-1]
+    latest = closed[-1]
+    if any(item.high is None or item.low is None or item.open is None or item.close is None for item in prior):
+        return {**base, "status": "WAIT", "reason": "INVALID_BREAKOUT_HISTORY"}
+    if latest.high is None or latest.low is None or latest.open is None or latest.close is None:
+        return {**base, "status": "WAIT", "reason": "INVALID_BREAKOUT_CANDLE"}
+    range_high = max(float(item.high) for item in prior if item.high is not None)
+    range_low = min(float(item.low) for item in prior if item.low is not None)
+    bodies = [abs(float(item.close) - float(item.open)) for item in prior if item.close is not None and item.open is not None]
+    mean_body = sum(bodies) / len(bodies) if bodies else 0.0
+    body = abs(float(latest.close) - float(latest.open))
+    candle_range = float(latest.high) - float(latest.low)
+    body_ratio = body / candle_range if candle_range > 0 else 0.0
+    displaced = mean_body > 0 and body >= BREAKOUT_BODY_MULTIPLIER * mean_body and body_ratio >= BREAKOUT_MIN_BODY_RANGE_RATIO
+    bullish = float(latest.close) > range_high and float(latest.close) > float(latest.open)
+    bearish = float(latest.close) < range_low and float(latest.close) < float(latest.open)
+    if not bullish and not bearish:
+        return {**base, "status": "WAIT", "reason": "BREAKOUT_NOT_CONFIRMED"}
+    if not displaced:
+        return {**base, "status": "WAIT", "reason": "BREAKOUT_NO_DISPLACEMENT"}
+    direction = "BULLISH" if bullish else "BEARISH"
+    return {
+        **base,
+        "status": "SETUP",
+        "reason": "BREAKOUT_EXPANSION_CONFIRMED",
+        "direction": direction,
+        "range_high": range_high,
+        "range_low": range_low,
+        "body_ratio": round(body_ratio, 6),
+        "body_multiple": round(body / mean_body, 6),
+        "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
+    }
+
+
+@api_router.get("/strategies/detect/{symbol}")
+async def get_candidate_strategy_detections(symbol: str) -> Dict[str, object]:
+    """Run candidate detectors on one real Coinbase closed-candle snapshot."""
+    canonical = symbol.upper().replace("/", "-")
+    instrument = instrument_registry.get(canonical)
+    if instrument is None:
+        return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "INSTRUMENT_NOT_REGISTERED"}
+    if instrument.asset_class != AssetClass.CRYPTO:
+        return {"status": "NOT_SUPPORTED", "symbol": canonical, "reason": "CANDIDATE_DETECTORS_CRYPTO_ONLY_V1"}
+    provider_symbol = provider_symbol_map.to_provider("coinbase", canonical)
+    if provider_symbol is None:
+        return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "PROVIDER_SYMBOL_NOT_MAPPED"}
+    try:
+        candles, quality = await market_provider.get_candles(
+            provider_symbol, SERVER_SETUP_GRANULARITY, SERVER_SETUP_CANDLE_LIMIT
+        )
+    except (httpx.HTTPError, ValueError):
+        return {"status": "UNAVAILABLE", "symbol": canonical, "reason": "CANDLES_UNAVAILABLE"}
+    if quality != DataQualityStatus.VALID:
+        return {"status": "WAIT", "symbol": canonical, "reason": "CANDLES_NOT_VALID", "quality": quality.value}
+    latest_quality = _latest_quality(candles)
+    if latest_quality != DataQualityStatus.VALID.value:
+        return {"status": "WAIT", "symbol": canonical, "reason": "LATEST_CANDLE_NOT_FRESH", "quality": latest_quality}
+    now = utcnow()
+    regime = classify_server_market_regime(candles, now)
+    detections = [
+        detect_trend_pullback_candidate(candles, now, regime),
+        detect_breakout_expansion_candidate(candles, now, regime),
+    ]
+    return {
+        "status": "READY" if regime.get("status") == "READY" else "WAIT",
+        "symbol": canonical,
+        "source": "coinbase",
+        "granularity": SERVER_SETUP_GRANULARITY,
+        "quality": quality.value,
+        "regime": regime,
+        "detections": detections,
+        "candidate_only": True,
+        "auto_queue": False,
+        "execution": False,
+        "paper_only": True,
+        "marker": CANDIDATE_DETECTOR_VERSION,
+    }
+
+
 # App must be built only after every router decorator above has executed.
 app = create_app()
 

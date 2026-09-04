@@ -1350,6 +1350,71 @@ function renderTrading(){
   }
 }
 
+var strategyMatrixState={period:"ALL",symbol:"ALL",strategy:"ALL",timeframe:"ALL",session:"ALL",regime:"ALL"};
+function matrixNum(v,d){var n=Number(v);return Number.isFinite(n)?n:(d==null?0:d)}
+function matrixSelect(label,key,values){
+  var sel=h("select",{class:"subtab","aria-label":label},values.map(function(x){return h("option",{value:x},[x==="ALL"?label:x])}));
+  sel.value=strategyMatrixState[key]||"ALL";
+  sel.addEventListener("change",function(){strategyMatrixState[key]=sel.value;renderStrategies()});
+  return sel;
+}
+function matrixEvidenceClass(x){return x==="ROBUST"?"ok":x==="PROMISING"?"future":x==="WEAK"?"bad":"future"}
+function matrixCellCard(c){
+  var m=c.metrics||{},pf=m.profit_factor==null?"—":matrixNum(m.profit_factor).toFixed(2);
+  var wr=m.win_rate_percent==null?"—":matrixNum(m.win_rate_percent).toFixed(1)+"%";
+  var exp=m.expectancy==null?"—":paperMoney(m.expectancy);
+  var rr=m.average_realized_rr==null?"—":matrixNum(m.average_realized_rr).toFixed(2)+"R";
+  var dd=m.max_drawdown==null?"—":paperMoney(m.max_drawdown);
+  return h("div",{class:"card tool-card"},[
+    h("div",{},[
+      h("div",{class:"tool-name"},[c.symbol||"—"]),
+      h("div",{class:"tool-desc"},[(c.strategy_id||"—")+(c.strategy_version?" · "+c.strategy_version:"")]),
+      h("div",{class:"sub"},[(c.timeframe||"TF —")+" · "+(c.session||"Session —")+" · "+(c.regime||"Régime —")])
+    ]),
+    h("div",{class:"tool-foot"},[
+      h("span",{class:"status-pill "+matrixEvidenceClass(c.evidence)},[c.evidence||"—"]),
+      h("span",{class:"sub"},[String(m.closed_trades||0)+" trades"])
+    ]),
+    h("div",{class:"metric-strip"},[
+      h("div",{class:"metric-mini"},[h("span",{},["Win Rate"]),h("b",{},[wr])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Profit Factor"]),h("b",{},[pf])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Expectancy"]),h("b",{},[exp])]),
+      h("div",{class:"metric-mini"},[h("span",{},["RR moyen"]),h("b",{},[rr])])
+    ]),
+    h("div",{class:"kv"},[h("span",{class:"k"},["P&L net"]),h("b",{},[paperMoney(m.net_pnl)])]),
+    h("div",{class:"kv"},[h("span",{class:"k"},["Drawdown max"]),h("span",{},[dd])])
+  ]);
+}
+function strategyPerformanceMatrix(){
+  var host=h("div",{class:"card"},[loading("Chargement de la Performance Matrix…")]);
+  api("/api/v1/paper/performance/matrix?period="+encodeURIComponent(strategyMatrixState.period)).then(function(r){
+    clear(host);
+    if(!r.ok||!r.data){host.appendChild(emptyState("Performance Matrix indisponible",errorMessage(r)));return}
+    var d=r.data,cells=Array.isArray(d.cells)?d.cells:[];
+    function uniq(key){return ["ALL"].concat(Array.from(new Set(cells.map(function(c){return c[key]}).filter(Boolean))).sort())}
+    var filters=h("div",{class:"subtabs"},[
+      matrixSelect("Toutes périodes","period",["ALL","DAY","WEEK","MONTH","YEAR"]),
+      matrixSelect("Tous actifs","symbol",uniq("symbol")),matrixSelect("Toutes stratégies","strategy",uniq("strategy_id")),
+      matrixSelect("Tous TF","timeframe",uniq("timeframe")),matrixSelect("Toutes sessions","session",uniq("session")),
+      matrixSelect("Tous régimes","regime",uniq("regime"))
+    ]);
+    var f=cells.filter(function(c){return (strategyMatrixState.symbol==="ALL"||c.symbol===strategyMatrixState.symbol)&&(strategyMatrixState.strategy==="ALL"||c.strategy_id===strategyMatrixState.strategy)&&(strategyMatrixState.timeframe==="ALL"||c.timeframe===strategyMatrixState.timeframe)&&(strategyMatrixState.session==="ALL"||c.session===strategyMatrixState.session)&&(strategyMatrixState.regime==="ALL"||c.regime===strategyMatrixState.regime)});
+    f.sort(function(a,b){var rank={ROBUST:3,PROMISING:2,WEAK:1,INSUFFICIENT_SAMPLE:0};var x=(rank[b.evidence]||0)-(rank[a.evidence]||0);return x||matrixNum((b.metrics||{}).expectancy)-matrixNum((a.metrics||{}).expectancy)});
+    var cov=d.context_coverage||{};
+    host.appendChild(h("div",{class:"module-title"},[h("div",{},[h("h3",{},["Performance Matrix"]),h("p",{},["Actif × Stratégie × TF × Session × Régime · trades CLOSED persistés"])]),h("span",{class:"module-badge"},[d.validation||"V2"])]));
+    host.appendChild(filters);
+    host.appendChild(h("div",{class:"metric-strip"},[
+      h("div",{class:"metric-mini"},[h("span",{},["Cellules"]),h("b",{},[String(f.length)])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Trades clôturés"]),h("b",{},[String(cov.closed_positions||0)])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Contexte complet"]),h("b",{},[String(cov.context_complete||0)])]),
+      h("div",{class:"metric-mini"},[h("span",{},["Minimum preuve"]),h("b",{},[String(d.minimum_sample||20)+" trades"])])
+    ]));
+    if(!f.length){host.appendChild(placeholder("Aucune cellule pour ces filtres","Les nouveaux trades enrichiront automatiquement cette matrice."));return}
+    var grid=h("div",{class:"grid-2"},[]);f.forEach(function(c){grid.appendChild(matrixCellCard(c))});host.appendChild(grid);
+  });
+  return host;
+}
+
 function renderStrategies(){
   var v=byId("view-strategies");clear(v);
   v.appendChild(pageHead("Stratégies","3 familles objectives · validation et replay sur données réelles.","PAPER ONLY"));
@@ -1375,6 +1440,7 @@ function renderStrategies(){
       ]));
     });
     host.appendChild(g);
+    host.appendChild(strategyPerformanceMatrix());
     host.appendChild(modCard("Validation statistique","SERVER-AUTHORITATIVE",h("div",{class:"section-stack"},[
       h("div",{class:"journal-card"},[h("h4",{},["Règle"]),h("p",{},["Aucune stratégie n’est déclarée rentable sans échantillon OOS suffisant. INS UFFICIENT_SAMPLE bloque le ranking plutôt que d’inventer une performance."])]),
       h("div",{class:"journal-card"},[h("h4",{},["Replay"]),h("p",{},["Le backend expose un replay déterministe sur bougies Coinbase fermées avec coûts exprimés en R."])])

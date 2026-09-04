@@ -8327,3 +8327,129 @@ class ServerHtfLtfStrategyIntegrationTests(unittest.TestCase):
         self.assertIn("classify_server_htf_context(htf_candles, utcnow())", source)
         self.assertIn('ltf_result.get("setup_state") != "ENTRY_NOW"', source)
 
+
+# ---------------- V16-M5B27: objective candidate strategy detectors ----------------
+class CandidateStrategyDetectorsV16M5B27Tests(unittest.TestCase):
+    def _candles(self, count=24, start_price=100.0, step=1.0):
+        now = datetime.now(timezone.utc)
+        candles = []
+        for index in range(count):
+            close = start_price + index * step
+            candles.append(
+                main.Candle(
+                    start=now - timedelta(minutes=5 * (count - index + 1)),
+                    low=close - 0.5,
+                    high=close + 0.5,
+                    open=close - (0.2 if step >= 0 else -0.2),
+                    close=close,
+                    volume=1.0,
+                    status=main.DataQualityStatus.VALID,
+                )
+            )
+        return candles, now
+
+    def test_detector_constants_are_objective(self):
+        self.assertEqual(main.TREND_PULLBACK_EMA_PERIOD, 20)
+        self.assertEqual(main.BREAKOUT_LOOKBACK, 20)
+        self.assertEqual(main.BREAKOUT_BODY_MULTIPLIER, 1.5)
+        self.assertEqual(main.BREAKOUT_MIN_BODY_RANGE_RATIO, 0.70)
+
+    def test_trend_pullback_waits_without_trend_context(self):
+        candles, now = self._candles()
+        result = main.detect_trend_pullback_candidate(
+            candles, now, {"status": "READY", "regime": "RANGE", "volatility": "NORMAL"}
+        )
+        self.assertEqual((result["status"], result["reason"]), ("WAIT", "REGIME_NOT_ELIGIBLE"))
+
+    def test_trend_pullback_waits_on_small_sample(self):
+        candles, now = self._candles(count=10)
+        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "NORMAL"}
+        self.assertEqual(main.detect_trend_pullback_candidate(candles, now, regime)["reason"], "INSUFFICIENT_CLOSED_CANDLES")
+
+    def test_trend_pullback_bullish_setup(self):
+        candles, now = self._candles()
+        candles[-2].low = 100.0
+        candles[-1].close = candles[-2].high + 2.0
+        candles[-1].high = candles[-1].close + 0.5
+        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "NORMAL"}
+        result = main.detect_trend_pullback_candidate(candles, now, regime)
+        self.assertEqual((result["status"], result["direction"]), ("SETUP", "BULLISH"))
+
+    def test_trend_pullback_is_candidate_only(self):
+        candles, now = self._candles()
+        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "NORMAL"}
+        result = main.detect_trend_pullback_candidate(candles, now, regime)
+        self.assertTrue(result["candidate_only"])
+        self.assertFalse(result["auto_queue"])
+        self.assertFalse(result["execution"])
+
+    def test_trend_pullback_declares_no_lookahead(self):
+        candles, now = self._candles()
+        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "NORMAL"}
+        self.assertTrue(main.detect_trend_pullback_candidate(candles, now, regime)["no_lookahead"])
+
+    def test_breakout_requires_expansion_context(self):
+        candles, now = self._candles(count=21)
+        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "NORMAL"}
+        result = main.detect_breakout_expansion_candidate(candles, now, regime)
+        self.assertEqual((result["status"], result["reason"]), ("WAIT", "VOLATILITY_NOT_ELIGIBLE"))
+
+    def test_breakout_waits_on_small_sample(self):
+        candles, now = self._candles(count=10)
+        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "EXPANSION"}
+        self.assertEqual(main.detect_breakout_expansion_candidate(candles, now, regime)["reason"], "INSUFFICIENT_CLOSED_CANDLES")
+
+    def test_breakout_bullish_setup(self):
+        candles, now = self._candles(count=21, step=0.1)
+        prior_high = max(c.high for c in candles[:-1] if c.high is not None)
+        candles[-1].open = prior_high - 0.1
+        candles[-1].close = prior_high + 2.0
+        candles[-1].low = candles[-1].open - 0.1
+        candles[-1].high = candles[-1].close + 0.1
+        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "EXPANSION"}
+        result = main.detect_breakout_expansion_candidate(candles, now, regime)
+        self.assertEqual((result["status"], result["direction"]), ("SETUP", "BULLISH"))
+
+    def test_breakout_bearish_setup(self):
+        candles, now = self._candles(count=21, start_price=120.0, step=-0.1)
+        prior_low = min(c.low for c in candles[:-1] if c.low is not None)
+        candles[-1].open = prior_low + 0.1
+        candles[-1].close = prior_low - 2.0
+        candles[-1].high = candles[-1].open + 0.1
+        candles[-1].low = candles[-1].close - 0.1
+        regime = {"status": "READY", "regime": "TREND", "direction": "BEARISH", "volatility": "EXPANSION"}
+        result = main.detect_breakout_expansion_candidate(candles, now, regime)
+        self.assertEqual((result["status"], result["direction"]), ("SETUP", "BEARISH"))
+
+    def test_breakout_is_candidate_only(self):
+        candles, now = self._candles(count=21)
+        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "EXPANSION"}
+        result = main.detect_breakout_expansion_candidate(candles, now, regime)
+        self.assertTrue(result["candidate_only"])
+        self.assertFalse(result["auto_queue"])
+        self.assertFalse(result["execution"])
+
+    def test_breakout_declares_no_lookahead(self):
+        candles, now = self._candles(count=21)
+        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH", "volatility": "EXPANSION"}
+        self.assertTrue(main.detect_breakout_expansion_candidate(candles, now, regime)["no_lookahead"])
+
+    def test_endpoint_is_registered(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/strategies/detect/{symbol}", paths)
+
+    def test_endpoint_uses_real_coinbase_candles(self):
+        source = inspect.getsource(main.get_candidate_strategy_detections)
+        self.assertIn("market_provider.get_candles", source)
+        self.assertIn('to_provider("coinbase"', source)
+
+    def test_endpoint_has_latest_freshness_guard(self):
+        source = inspect.getsource(main.get_candidate_strategy_detections)
+        self.assertIn("_latest_quality(candles)", source)
+        self.assertIn("LATEST_CANDLE_NOT_FRESH", source)
+
+    def test_endpoint_cannot_execute_or_auto_queue(self):
+        source = inspect.getsource(main.get_candidate_strategy_detections)
+        self.assertIn('"auto_queue": False', source)
+        self.assertIn('"execution": False', source)
+        self.assertNotIn("create_paper_position", source)

@@ -6505,6 +6505,246 @@ async def rollback_adaptive_policy(
     }
 
 
+ADAPTIVE_POLICY_IMPACT_VERSION = "SERVER_ADAPTIVE_POLICY_IMPACT_COMPARISON_V1"
+
+
+def normalize_adaptive_policy_version(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "UNKNOWN_POLICY"
+    if raw == ADAPTIVE_EDGE_ACTIVE_VERSION:
+        return "LEGACY_PRE_POLICY_V1"
+    return raw
+
+
+def decimal_delta(current: object, baseline: object) -> Optional[str]:
+    if current is None or baseline is None:
+        return None
+    try:
+        return str(Decimal(str(current)) - Decimal(str(baseline)))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@api_router.get("/paper/adaptive-edge/policy-impact")
+async def get_adaptive_policy_impact(period: str = "ALL") -> Dict[str, object]:
+    """Compare observed paper outcomes by the exact policy version that gated them."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+    normalized_period = period.upper()
+    try:
+        period_start = paper_performance_period_start(normalized_period, utcnow())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "unsupported performance period"},
+        ) from exc
+
+    params: Dict[str, object] = {}
+    trade_filter = ""
+    decision_filter = ""
+    counterfactual_filter = ""
+    if period_start is not None:
+        params["period_start"] = period_start
+        trade_filter = " AND p.closed_at>=:period_start"
+        decision_filter = " WHERE a.created_at>=:period_start"
+        counterfactual_filter = " WHERE c.created_at>=:period_start"
+
+    try:
+        async with engine.connect() as conn:
+            account_result = await conn.execute(
+                text(
+                    "SELECT initial_capital FROM paper_account "
+                    "WHERE account_id=:account_id"
+                ),
+                {"account_id": PAPER_ACCOUNT_ID},
+            )
+            account = account_result.fetchone()
+            if account is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"status": "UNAVAILABLE", "reason": "paper account not initialized"},
+                )
+
+            trade_sql = (
+                "SELECT p.position_id, p.symbol, p.side, p.entry, p.close_price, "
+                "p.size, p.risk_money, p.closed_at, fx.quote_to_usd, "
+                "l.gate_action, e.policy_version "
+                "FROM paper_positions p "
+                "JOIN paper_adaptive_edge_trade_link l ON l.position_id=p.position_id "
+                "JOIN paper_adaptive_edge_explainability e "
+                "ON e.decision_id=l.decision_id "
+                "LEFT JOIN paper_fx_conversion_snapshots fx "
+                "ON fx.position_id=p.position_id AND fx.phase='CLOSE' "
+                "WHERE status='CLOSED' AND p.close_price IS NOT NULL"
+                + trade_filter
+                + " ORDER BY p.closed_at ASC, p.position_id ASC"
+            )
+            trade_result = await conn.execute(text(trade_sql), params)
+            trade_rows = [dict(row._mapping) for row in trade_result.fetchall()]
+
+            decision_sql = (
+                "SELECT a.action, e.policy_version "
+                "FROM paper_adaptive_edge_active a "
+                "LEFT JOIN paper_adaptive_edge_explainability e "
+                "ON e.decision_id=a.decision_id"
+                + decision_filter
+            )
+            decision_result = await conn.execute(text(decision_sql), params)
+            decision_rows = [dict(row._mapping) for row in decision_result.fetchall()]
+
+            cf_sql = (
+                "SELECT c.status, c.realized_rr, e.policy_version "
+                "FROM paper_adaptive_edge_counterfactual c "
+                "LEFT JOIN paper_adaptive_edge_explainability e "
+                "ON e.decision_id=c.decision_id"
+                + counterfactual_filter
+            )
+            cf_result = await conn.execute(text(cf_sql), params)
+            cf_rows = [dict(row._mapping) for row in cf_result.fetchall()]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "policy impact comparison failed"},
+        ) from exc
+
+    initial_capital = Decimal(str(account._mapping["initial_capital"]))
+    policies = {
+        normalize_adaptive_policy_version(row.get("policy_version"))
+        for row in trade_rows + decision_rows + cf_rows
+    }
+    policies.discard("UNKNOWN_POLICY")
+
+    comparisons: List[Dict[str, object]] = []
+    for policy_version in sorted(policies):
+        policy_trades = [
+            row
+            for row in trade_rows
+            if normalize_adaptive_policy_version(row.get("policy_version")) == policy_version
+        ]
+        policy_decisions = [
+            row
+            for row in decision_rows
+            if normalize_adaptive_policy_version(row.get("policy_version")) == policy_version
+        ]
+        policy_cf = [
+            row
+            for row in cf_rows
+            if normalize_adaptive_policy_version(row.get("policy_version")) == policy_version
+        ]
+        metrics = _impact_metrics_or_empty(policy_trades, initial_capital)
+        decision_counts = {
+            action: sum(
+                1
+                for row in policy_decisions
+                if str(row.get("action") or "").upper() == action
+            )
+            for action in ("ALLOWED", "FAVORED", "BLOCKED")
+        }
+        resolved_rr = [
+            Decimal(str(row.get("realized_rr") or "0"))
+            for row in policy_cf
+            if row.get("status") == "RESOLVED"
+        ]
+        blocked_wins = sum(1 for value in resolved_rr if value > 0)
+        blocked_losses = sum(1 for value in resolved_rr if value < 0)
+        blocked_avg_rr = (
+            sum(resolved_rr, Decimal("0")) / Decimal(len(resolved_rr))
+            if resolved_rr
+            else Decimal("0")
+        )
+        comparisons.append(
+            {
+                "policy_version": policy_version,
+                "executed": metrics,
+                "decisions": decision_counts,
+                "blocked_counterfactual": {
+                    "resolved": len(resolved_rr),
+                    "wins": blocked_wins,
+                    "losses": blocked_losses,
+                    "win_rate_percent": (
+                        str(
+                            Decimal(blocked_wins)
+                            * Decimal("100")
+                            / Decimal(len(resolved_rr))
+                        )
+                        if resolved_rr
+                        else "0"
+                    ),
+                    "average_realized_rr": str(blocked_avg_rr),
+                },
+            }
+        )
+
+    baseline = next(
+        (
+            item
+            for item in comparisons
+            if item.get("policy_version") == ADAPTIVE_POLICY_BASELINE
+        ),
+        None,
+    )
+    baseline_metrics_raw = baseline.get("executed") if isinstance(baseline, dict) else {}
+    baseline_metrics = (
+        baseline_metrics_raw if isinstance(baseline_metrics_raw, dict) else {}
+    )
+    for item in comparisons:
+        metrics_raw = item.get("executed")
+        metrics = metrics_raw if isinstance(metrics_raw, dict) else {}
+        item["delta_vs_baseline"] = {
+            "win_rate_percent": decimal_delta(
+                metrics.get("win_rate_percent"),
+                baseline_metrics.get("win_rate_percent"),
+            ),
+            "expectancy": decimal_delta(
+                metrics.get("expectancy"),
+                baseline_metrics.get("expectancy"),
+            ),
+            "average_realized_rr": decimal_delta(
+                metrics.get("average_realized_rr"),
+                baseline_metrics.get("average_realized_rr"),
+            ),
+            "net_pnl": decimal_delta(
+                metrics.get("net_pnl"),
+                baseline_metrics.get("net_pnl"),
+            ),
+            "max_drawdown_percent": decimal_delta(
+                metrics.get("max_drawdown_percent"),
+                baseline_metrics.get("max_drawdown_percent"),
+            ),
+        }
+
+    active_state = await get_adaptive_policy_state()
+    active_version = str(
+        active_state.get("policy_version") or ADAPTIVE_POLICY_BASELINE
+    )
+    return {
+        "status": "OK",
+        "validation": ADAPTIVE_POLICY_IMPACT_VERSION,
+        "period": normalized_period,
+        "period_start": period_start.isoformat() if period_start is not None else None,
+        "active_policy_version": active_version,
+        "baseline_policy_version": ADAPTIVE_POLICY_BASELINE,
+        "baseline_available": baseline is not None,
+        "comparisons": comparisons,
+        "methodology": {
+            "observed_executed_trades_only": True,
+            "blocked_outcomes_from_zero_capital_counterfactuals": True,
+            "randomized_control": False,
+            "automatic_policy_change": False,
+        },
+        "paper_only": True,
+        "live_trading": False,
+        "changes_execution": False,
+    }
+
+
 @api_router.get("/paper/adaptive-edge/impact-validation")
 async def get_adaptive_edge_impact_validation(period: str = "ALL") -> Dict[str, object]:
     """Observed paper impact only; blocked-trade counterfactual P&L is never invented."""

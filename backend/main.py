@@ -5572,6 +5572,131 @@ COINBASE_PROFILE = ProviderProfile(
 _register_coinbase_instruments()
 
 
+# V16-M5B28A — live-verified Coinbase crypto universe expansion.
+# The original six proven symbols stay registered. Additional symbols are
+# activated only after Coinbase's public product endpoint verifies that the
+# product exists, exposes usable sizing increments, and is not disabled/view-only.
+CRYPTO_UNIVERSE_VERSION = "SERVER_CRYPTO_UNIVERSE_V1"
+CRYPTO_UNIVERSE_CANDIDATES: Tuple[str, ...] = (
+    "DOGE-USD",
+    "AVAX-USD",
+    "LINK-USD",
+    "DOT-USD",
+    "BCH-USD",
+    "UNI-USD",
+    "AAVE-USD",
+    "NEAR-USD",
+    "SUI-USD",
+    "APT-USD",
+    "HBAR-USD",
+    "ICP-USD",
+    "ATOM-USD",
+    "FIL-USD",
+    "ALGO-USD",
+    "XLM-USD",
+    "SHIB-USD",
+    "ETC-USD",
+)
+crypto_universe_activation: Dict[str, Dict[str, object]] = {}
+
+
+def coinbase_product_is_eligible(symbol: str, payload: object) -> Tuple[bool, str]:
+    """Fail closed unless Coinbase proves a usable public USD spot product."""
+    if not isinstance(payload, dict):
+        return False, "PRODUCT_PAYLOAD_INVALID"
+    canonical = symbol.upper().replace("/", "-")
+    product_id = str(payload.get("product_id", "")).upper()
+    if product_id != canonical:
+        return False, "PRODUCT_ID_MISMATCH"
+    if not canonical.endswith("-USD"):
+        return False, "QUOTE_NOT_USD"
+    if payload.get("trading_disabled") is True:
+        return False, "TRADING_DISABLED"
+    if payload.get("view_only") is True:
+        return False, "VIEW_ONLY"
+    specs = parse_coinbase_spot_specs(canonical, payload)
+    if specs.get("status") != "VALID":
+        return False, "PRODUCT_SPECS_INVALID"
+    return True, "COINBASE_PRODUCT_VERIFIED"
+
+
+def register_verified_coinbase_crypto(symbol: str) -> bool:
+    """Register only a symbol already verified against Coinbase public metadata."""
+    canonical = symbol.upper().replace("/", "-")
+    if not canonical.endswith("-USD"):
+        return False
+    base = canonical.removesuffix("-USD")
+    instrument_registry.register(
+        Instrument(
+            canonical_symbol=canonical,
+            asset_class=AssetClass.CRYPTO,
+            base_asset=base,
+            quote_asset="USD",
+            display_name=f"{base} / US Dollar",
+            timezone="UTC",
+            market_calendar=MarketCalendarPolicy.ALWAYS_OPEN_24_7,
+            volume_semantics=VolumeSemantics.BASE_ASSET_VOLUME,
+            price_precision=None,
+            tick_size=None,
+        )
+    )
+    provider_symbol_map.add("coinbase", canonical, canonical)
+    return True
+
+
+async def activate_verified_crypto_universe() -> Dict[str, object]:
+    """Probe Coinbase live; unavailable/invalid candidates never enter the scanner."""
+    activated: List[str] = []
+    rejected: Dict[str, str] = {}
+    for symbol in CRYPTO_UNIVERSE_CANDIDATES:
+        try:
+            payload = await market_provider.get_product_specs(symbol)
+            eligible, reason = coinbase_product_is_eligible(symbol, payload)
+        except asyncio.CancelledError:
+            raise
+        except (httpx.HTTPError, ValueError, KeyError):
+            eligible, reason = False, "COINBASE_PRODUCT_UNAVAILABLE"
+        if eligible and register_verified_coinbase_crypto(symbol):
+            activated.append(symbol)
+        else:
+            rejected[symbol] = reason
+        crypto_universe_activation[symbol] = {
+            "active": bool(eligible),
+            "reason": reason,
+        }
+    return {
+        "status": "READY",
+        "activated": sorted(activated),
+        "rejected": rejected,
+        "candidate_count": len(CRYPTO_UNIVERSE_CANDIDATES),
+        "marker": CRYPTO_UNIVERSE_VERSION,
+        "paper_only": True,
+        "execution": False,
+    }
+
+
+@api_router.get("/market/crypto-universe")
+async def get_crypto_universe() -> Dict[str, object]:
+    active = sorted(
+        instrument.canonical_symbol
+        for instrument in instrument_registry.all()
+        if instrument.asset_class == AssetClass.CRYPTO
+        if provider_symbol_map.to_provider(
+            "coinbase", instrument.canonical_symbol
+        ) is not None
+    )
+    return {
+        "status": "READY",
+        "active_symbols": active,
+        "active_count": len(active),
+        "candidate_activation": dict(crypto_universe_activation),
+        "source": "coinbase_public_product",
+        "marker": CRYPTO_UNIVERSE_VERSION,
+        "paper_only": True,
+        "execution": False,
+    }
+
+
 # ============================ Massive Forex REST (increment 6B-1) =============
 # First real Multi-Asset connector: Massive (ex-Polygon) Forex REST aggregates.
 # Reuses the 6A canonical model + the existing Candle/persistence bricks (NO
@@ -7647,6 +7772,8 @@ async def lifespan(app: FastAPI):
     await massive_indices_provider.connect()
     activation = await activate_massive_forex_mappings()
     log.info("Massive forex mapping activation: %s", activation)
+    crypto_activation = await activate_verified_crypto_universe()
+    log.info("Coinbase crypto universe activation: %s", crypto_activation)
     await start_server_crypto_market_stream()
     try:
         await init_candle_schema()

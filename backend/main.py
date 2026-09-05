@@ -1,4 +1,5 @@
 # CI395 recovery marker: cumulative V16-M5B25B-FIX2 backend baseline.
+# V16-M5B30M — continuous paper runtime + feed watchdog + restart recovery.
 """Crypto Intelligence Engine — single-file backend (Phase 1 + frontend serving).
 
 Consolidated into one module for a minimal file layout. Behaviour is identical
@@ -4639,6 +4640,90 @@ async def paper_mark_from_realtime(symbol: str) -> Optional[PaperPositionMark]:
     )
 
 
+CONTINUOUS_RUNTIME_VERSION = "SERVER_PAPER_CONTINUOUS_RUNTIME_V1"
+CONTINUOUS_FEED_ENSURE_INTERVAL_SECONDS = 30.0
+
+
+@dataclass
+class ContinuousRuntimeState:
+    cycles: int = 0
+    feed_ensure_attempts: int = 0
+    last_cycle_at: Optional[datetime] = None
+    last_feed_ensure_at: Optional[datetime] = None
+    last_position_result: Dict[str, int] = field(default_factory=dict)
+    last_counterfactual_result: Dict[str, int] = field(default_factory=dict)
+    last_feed_status: Dict[str, str] = field(default_factory=dict)
+    last_error: Optional[str] = None
+
+
+continuous_runtime_state = ContinuousRuntimeState()
+
+
+async def ensure_continuous_market_streams_once() -> Dict[str, str]:
+    """Keep server-side paper-monitoring feeds running without browser intervention."""
+    status_map: Dict[str, str] = {}
+    continuous_runtime_state.feed_ensure_attempts += 1
+    continuous_runtime_state.last_feed_ensure_at = utcnow()
+
+    try:
+        if not market_ws.running:
+            started = await start_server_crypto_market_stream()
+            status_map["crypto"] = "STARTED" if started else "REST_FALLBACK"
+        else:
+            status_map["crypto"] = "RUNNING"
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Continuous crypto feed ensure failed: %s", type(exc).__name__)
+        status_map["crypto"] = "REST_FALLBACK"
+
+    if not settings.massive_api_key:
+        status_map["forex"] = "API_KEY_MISSING"
+        status_map["indices"] = "API_KEY_MISSING"
+    else:
+        try:
+            if not massive_forex_ws.running:
+                await massive_forex_ws.start()
+                status_map["forex"] = "STARTED"
+            else:
+                status_map["forex"] = "RUNNING"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Continuous forex feed ensure failed: %s", type(exc).__name__)
+            status_map["forex"] = "UNAVAILABLE"
+
+        try:
+            if not massive_indices_ws.running:
+                await massive_indices_ws.start()
+                status_map["indices"] = "STARTED"
+            else:
+                status_map["indices"] = "RUNNING"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Continuous index feed ensure failed: %s", type(exc).__name__)
+            status_map["indices"] = "UNAVAILABLE"
+
+    if not settings.twelvedata_api_key:
+        status_map["metal"] = "API_KEY_MISSING"
+    else:
+        try:
+            if not twelvedata_gold_ws.running:
+                await twelvedata_gold_ws.start()
+                status_map["metal"] = "STARTED"
+            else:
+                status_map["metal"] = "RUNNING"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Continuous metal feed ensure failed: %s", type(exc).__name__)
+            status_map["metal"] = "UNAVAILABLE"
+
+    continuous_runtime_state.last_feed_status = dict(status_map)
+    return status_map
+
+
 async def monitor_open_paper_positions_once() -> Dict[str, int]:
     if not persistence_state.ready:
         return {"checked": 0, "marked": 0, "unavailable": 0, "errors": 0}
@@ -4677,23 +4762,127 @@ async def monitor_open_paper_positions_once() -> Dict[str, int]:
 
 async def paper_monitor_loop(stop_event: asyncio.Event) -> None:
     interval = max(settings.paper_monitor_interval_seconds, 1.0)
+    next_feed_ensure = 0.0
     while not stop_event.is_set():
+        continuous_runtime_state.cycles += 1
+        continuous_runtime_state.last_cycle_at = utcnow()
+        continuous_runtime_state.last_error = None
+
+        now_mono = time.monotonic()
+        if now_mono >= next_feed_ensure:
+            try:
+                await ensure_continuous_market_streams_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                continuous_runtime_state.last_error = type(exc).__name__
+                log.error("Continuous feed ensure iteration failed: %s", exc)
+            next_feed_ensure = now_mono + CONTINUOUS_FEED_ENSURE_INTERVAL_SECONDS
+
         try:
-            await monitor_open_paper_positions_once()
+            result = await monitor_open_paper_positions_once()
+            continuous_runtime_state.last_position_result = dict(result)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - loop must fail safe and keep serving
+            continuous_runtime_state.last_error = type(exc).__name__
             log.error("Paper monitor iteration failed: %s", exc)
+
         try:
-            await monitor_adaptive_edge_counterfactuals_once()
+            cf_result = await monitor_adaptive_edge_counterfactuals_once()
+            continuous_runtime_state.last_counterfactual_result = dict(cf_result)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
+            continuous_runtime_state.last_error = type(exc).__name__
             log.error("Counterfactual monitor iteration failed: %s", exc)
+
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except asyncio.TimeoutError:
             pass
+
+
+@api_router.get("/paper/continuous-runtime")
+async def get_paper_continuous_runtime() -> Dict[str, object]:
+    """Operational status for uninterrupted server-side paper monitoring."""
+    open_positions = 0
+    open_counterfactuals = 0
+    if persistence_state.ready:
+        try:
+            async with engine.connect() as conn:
+                pos_result = await conn.execute(
+                    text("SELECT COUNT(*) AS count FROM paper_positions WHERE status='OPEN'")
+                )
+                pos_row = pos_result.fetchone()
+                open_positions = int(pos_row._mapping["count"]) if pos_row is not None else 0
+                cf_result = await conn.execute(
+                    text(
+                        "SELECT COUNT(*) AS count FROM "
+                        "paper_adaptive_edge_counterfactual WHERE status='OPEN'"
+                    )
+                )
+                cf_row = cf_result.fetchone()
+                open_counterfactuals = (
+                    int(cf_row._mapping["count"]) if cf_row is not None else 0
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Continuous runtime counts unavailable: %s", type(exc).__name__)
+
+    stream_status = {
+        "crypto": {
+            "running": market_ws.running,
+            "connected": market_ws.websocket is not None,
+            "rest_fallback": True,
+        },
+        "forex": {
+            "running": massive_forex_ws.running,
+            "connected": massive_forex_ws.websocket is not None,
+            "authenticated": massive_forex_ws.authenticated,
+        },
+        "metal": {
+            "running": twelvedata_gold_ws.running,
+            "connected": twelvedata_gold_ws.websocket is not None,
+            "subscribed": twelvedata_gold_ws.subscribed,
+        },
+        "indices": {
+            "running": massive_indices_ws.running,
+            "connected": massive_indices_ws.websocket is not None,
+            "authenticated": massive_indices_ws.authenticated,
+        },
+    }
+    return {
+        "status": "OK",
+        "validation": CONTINUOUS_RUNTIME_VERSION,
+        "paper_only": True,
+        "live_trading": False,
+        "browser_required": False,
+        "monitor_interval_seconds": max(
+            settings.paper_monitor_interval_seconds, 1.0
+        ),
+        "feed_ensure_interval_seconds": CONTINUOUS_FEED_ENSURE_INTERVAL_SECONDS,
+        "cycles": continuous_runtime_state.cycles,
+        "feed_ensure_attempts": continuous_runtime_state.feed_ensure_attempts,
+        "last_cycle_at": (
+            continuous_runtime_state.last_cycle_at.isoformat()
+            if continuous_runtime_state.last_cycle_at is not None
+            else None
+        ),
+        "last_feed_ensure_at": (
+            continuous_runtime_state.last_feed_ensure_at.isoformat()
+            if continuous_runtime_state.last_feed_ensure_at is not None
+            else None
+        ),
+        "last_feed_status": continuous_runtime_state.last_feed_status,
+        "last_position_result": continuous_runtime_state.last_position_result,
+        "last_counterfactual_result": (
+            continuous_runtime_state.last_counterfactual_result
+        ),
+        "last_error": continuous_runtime_state.last_error,
+        "open_positions": open_positions,
+        "open_counterfactuals": open_counterfactuals,
+        "streams": stream_status,
+    }
 
 
 def paper_mark_temporally_valid(
@@ -10160,6 +10349,25 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001 - explicit, never a silent false success
         persistence_state.mark_init_failed(str(exc))
         log.error("Candle schema init failed; persistence UNAVAILABLE: %s", exc)
+
+    try:
+        await ensure_continuous_market_streams_once()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Continuous feed startup ensure failed: %s", type(exc).__name__)
+
+    if persistence_state.ready:
+        try:
+            recovery = await monitor_open_paper_positions_once()
+            continuous_runtime_state.last_position_result = dict(recovery)
+            log.info("Paper startup recovery reconciliation: %s", recovery)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            continuous_runtime_state.last_error = type(exc).__name__
+            log.warning("Paper startup recovery failed: %s", type(exc).__name__)
+
     paper_monitor_stop = asyncio.Event()
     paper_monitor_task = asyncio.create_task(
         paper_monitor_loop(paper_monitor_stop), name="paper-monitor"

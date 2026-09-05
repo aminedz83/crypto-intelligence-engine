@@ -9379,21 +9379,21 @@ class V17CooldownTests(unittest.TestCase):
         main._recent_trade_results.clear()
 
     def test_no_cooldown_initially(self):
-        self.assertFalse(main.is_cooldown_active(utcnow()))
+        self.assertFalse(main.is_cooldown_active(main.utcnow()))
 
     def test_cooldown_after_consecutive_losses(self):
         main.record_trade_result("LOSS")
         main.record_trade_result("LOSS")
-        self.assertTrue(main.is_cooldown_active(utcnow()))
+        self.assertTrue(main.is_cooldown_active(main.utcnow()))
 
     def test_win_breaks_cooldown(self):
         main.record_trade_result("LOSS")
         main.record_trade_result("WIN")
-        self.assertFalse(main.is_cooldown_active(utcnow()))
+        self.assertFalse(main.is_cooldown_active(main.utcnow()))
 
     def test_single_loss_no_cooldown(self):
         main.record_trade_result("LOSS")
-        self.assertFalse(main.is_cooldown_active(utcnow()))
+        self.assertFalse(main.is_cooldown_active(main.utcnow()))
 
 
 class V17SmartExitConstantsTests(unittest.TestCase):

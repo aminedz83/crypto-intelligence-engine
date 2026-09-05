@@ -1,6 +1,7 @@
 # CI395 recovery marker: cumulative V16-M5B25B-FIX2 backend baseline.
 # V16-M5B30M — continuous paper runtime + feed watchdog + restart recovery.
 # V16-M5B30N — observability + recovery audit for continuous paper runtime.
+# V16-M5B30O — long-run soak evidence + resilience counters.
 """Crypto Intelligence Engine — single-file backend (Phase 1 + frontend serving).
 
 Consolidated into one module for a minimal file layout. Behaviour is identical
@@ -4648,7 +4649,13 @@ CONTINUOUS_FEED_ENSURE_INTERVAL_SECONDS = 30.0
 @dataclass
 class ContinuousRuntimeState:
     cycles: int = 0
+    successful_cycles: int = 0
+    degraded_cycles: int = 0
     feed_ensure_attempts: int = 0
+    feed_ensure_failures: int = 0
+    position_monitor_errors_total: int = 0
+    counterfactual_monitor_errors_total: int = 0
+    started_at: Optional[datetime] = None
     last_cycle_at: Optional[datetime] = None
     last_feed_ensure_at: Optional[datetime] = None
     last_position_result: Dict[str, int] = field(default_factory=dict)
@@ -4663,6 +4670,77 @@ continuous_runtime_state = ContinuousRuntimeState()
 CONTINUOUS_OBSERVABILITY_VERSION = "SERVER_CONTINUOUS_OBSERVABILITY_RECOVERY_AUDIT_V1"
 CONTINUOUS_MONITOR_STALE_MULTIPLIER = 3.0
 CONTINUOUS_FEED_STALE_AFTER_SECONDS = 90.0
+
+CONTINUOUS_SOAK_VERSION = "SERVER_CONTINUOUS_SOAK_RESILIENCE_V1"
+CONTINUOUS_SOAK_MIN_CYCLES = 60
+CONTINUOUS_SOAK_MIN_UPTIME_SECONDS = 300.0
+CONTINUOUS_SOAK_MAX_DEGRADED_RATIO = 0.05
+
+
+def continuous_soak_status() -> Dict[str, object]:
+    """Summarize long-run runtime evidence without inventing synthetic load."""
+    now = utcnow()
+    started_at = continuous_runtime_state.started_at
+    uptime_seconds = _aware_age_seconds(started_at, now) if started_at else 0.0
+    cycles = continuous_runtime_state.cycles
+    successful = continuous_runtime_state.successful_cycles
+    degraded = continuous_runtime_state.degraded_cycles
+    degraded_ratio = degraded / cycles if cycles else 0.0
+
+    enough_evidence = (
+        cycles >= CONTINUOUS_SOAK_MIN_CYCLES
+        and uptime_seconds >= CONTINUOUS_SOAK_MIN_UPTIME_SECONDS
+    )
+    hard_errors = (
+        continuous_runtime_state.feed_ensure_failures
+        + continuous_runtime_state.position_monitor_errors_total
+        + continuous_runtime_state.counterfactual_monitor_errors_total
+    )
+    if not enough_evidence:
+        status = "WARMING_UP"
+        reason = "INSUFFICIENT_LONG_RUN_EVIDENCE"
+    elif continuous_runtime_state.last_error:
+        status = "UNSTABLE"
+        reason = f'ACTIVE_RUNTIME_ERROR:{continuous_runtime_state.last_error}'
+    elif degraded_ratio > CONTINUOUS_SOAK_MAX_DEGRADED_RATIO:
+        status = "UNSTABLE"
+        reason = "DEGRADED_CYCLE_RATIO_TOO_HIGH"
+    elif hard_errors:
+        status = "DEGRADED"
+        reason = "RECOVERED_ERRORS_OBSERVED"
+    else:
+        status = "STABLE"
+        reason = "LONG_RUN_RUNTIME_WITHIN_GUARDS"
+
+    return {
+        "status": status,
+        "reason": reason,
+        "validation": CONTINUOUS_SOAK_VERSION,
+        "paper_only": True,
+        "live_trading": False,
+        "browser_required": False,
+        "started_at": started_at.isoformat() if started_at is not None else None,
+        "uptime_seconds": uptime_seconds,
+        "cycles": cycles,
+        "successful_cycles": successful,
+        "degraded_cycles": degraded,
+        "degraded_ratio": degraded_ratio,
+        "feed_ensure_attempts": continuous_runtime_state.feed_ensure_attempts,
+        "feed_ensure_failures": continuous_runtime_state.feed_ensure_failures,
+        "position_monitor_errors_total": (
+            continuous_runtime_state.position_monitor_errors_total
+        ),
+        "counterfactual_monitor_errors_total": (
+            continuous_runtime_state.counterfactual_monitor_errors_total
+        ),
+        "last_error": continuous_runtime_state.last_error,
+        "thresholds": {
+            "min_cycles": CONTINUOUS_SOAK_MIN_CYCLES,
+            "min_uptime_seconds": CONTINUOUS_SOAK_MIN_UPTIME_SECONDS,
+            "max_degraded_ratio": CONTINUOUS_SOAK_MAX_DEGRADED_RATIO,
+        },
+        "evidence_ready": enough_evidence,
+    }
 
 
 def _aware_age_seconds(value: Optional[datetime], now: datetime) -> Optional[float]:
@@ -4985,6 +5063,9 @@ async def ensure_continuous_market_streams_once() -> Dict[str, str]:
             status_map["metal"] = "UNAVAILABLE"
 
     continuous_runtime_state.last_feed_status = dict(status_map)
+    failure_states = {"UNAVAILABLE", "REST_FALLBACK"}
+    if any(state in failure_states for state in status_map.values()):
+        continuous_runtime_state.feed_ensure_failures += 1
     return status_map
 
 
@@ -5043,28 +5124,52 @@ async def paper_monitor_loop(stop_event: asyncio.Event) -> None:
                 log.error("Continuous feed ensure iteration failed: %s", exc)
             next_feed_ensure = now_mono + CONTINUOUS_FEED_ENSURE_INTERVAL_SECONDS
 
+        cycle_degraded = continuous_runtime_state.last_error is not None
         try:
             result = await monitor_open_paper_positions_once()
             continuous_runtime_state.last_position_result = dict(result)
+            position_errors = int(result.get("errors", 0))
+            continuous_runtime_state.position_monitor_errors_total += position_errors
+            cycle_degraded = cycle_degraded or position_errors > 0
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - loop must fail safe and keep serving
             continuous_runtime_state.last_error = type(exc).__name__
+            continuous_runtime_state.position_monitor_errors_total += 1
+            cycle_degraded = True
             log.error("Paper monitor iteration failed: %s", exc)
 
         try:
             cf_result = await monitor_adaptive_edge_counterfactuals_once()
             continuous_runtime_state.last_counterfactual_result = dict(cf_result)
+            cf_errors = int(cf_result.get("errors", 0))
+            continuous_runtime_state.counterfactual_monitor_errors_total += cf_errors
+            cycle_degraded = cycle_degraded or cf_errors > 0
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             continuous_runtime_state.last_error = type(exc).__name__
+            continuous_runtime_state.counterfactual_monitor_errors_total += 1
+            cycle_degraded = True
             log.error("Counterfactual monitor iteration failed: %s", exc)
+
+        if cycle_degraded:
+            continuous_runtime_state.degraded_cycles += 1
+        else:
+            continuous_runtime_state.successful_cycles += 1
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except asyncio.TimeoutError:
             pass
+
+
+@api_router.get("/paper/continuous-soak")
+async def get_paper_continuous_soak() -> Dict[str, object]:
+    """Long-run resilience evidence for the autonomous paper runtime."""
+    result = continuous_soak_status()
+    result["observability"] = await build_continuous_observability_audit()
+    return result
 
 
 @api_router.get("/paper/continuous-observability")
@@ -10619,6 +10724,7 @@ async def lifespan(app: FastAPI):
         persistence_state.mark_init_failed(str(exc))
         log.error("Candle schema init failed; persistence UNAVAILABLE: %s", exc)
 
+    continuous_runtime_state.started_at = utcnow()
     try:
         await ensure_continuous_market_streams_once()
     except asyncio.CancelledError:

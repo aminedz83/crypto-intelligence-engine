@@ -1185,7 +1185,25 @@ function renderIndex(){var v=byId("view-index");clear(v);v.appendChild(h("h2",{c
 function renderSystem(){var v=byId("view-system");clear(v);v.appendChild(h("h2",{class:"section"},["Santé backend & données"]));v.appendChild(loading("Lecture de /health…"));api("/health").then(function(r){clear(v);v.appendChild(h("h2",{class:"section"},["Santé backend & données"]));if(!r.ok||!r.data){v.appendChild(emptyState("Backend indisponible",errorMessage(r)));return}var c=h("div",{class:"card"},[]);c.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["État global"]),h("span",{},[r.data.overall||"UNKNOWN"])]));(r.data.components||[]).forEach(function(x){c.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},[x.name]),h("span",{},[x.state||"?"])]))});v.appendChild(c)})}
 
 function openDetail(kind,symbol){chartTradeOverlay=null;detailCtx={kind:kind,symbol:symbol,canonical:symbol};setView("detail")}
-function renderDetail(){var v=byId("view-detail");clear(v);if(!detailCtx){v.appendChild(emptyState("Aucun actif",""));return}var back=detailCtx.kind==="forex"?"forex":detailCtx.kind==="metal"?"metal":detailCtx.kind==="index"?"index":"markets";v.appendChild(h("button",{class:"back",onclick:function(){setView(back)}},["← Retour"]));v.appendChild(h("h2",{class:"section"},[detailCtx.symbol]));if(chartTradeOverlay&&chartTradeOverlay.symbol===detailCtx.symbol){var oi=paperResultInfo(chartTradeOverlay);v.appendChild(h("div",{class:"trade-overlay-banner"},[h("span",{class:"status-pill ready"},["TRADE OVERLAY"]),h("span",{class:"status-pill future"},[paperStrategyLabel(chartTradeOverlay)]),h("span",{class:"status-pill "+(chartTradeOverlay.status==="OPEN"?"ready":"future")},[chartTradeOverlay.status||"—"]),chartTradeOverlay.status==="CLOSED"?h("span",{class:oi.klass},[oi.label+" · "+oi.reason]):null]));}if(detailCtx.kind==="crypto"||detailCtx.kind==="metal")v.appendChild(h("div",{class:"card"},[h("div",{class:"kv"},[h("span",{class:"k"},["Prix"]),h("span",{id:"d-price"},[h("span",{class:"spin"})])]),h("div",{class:"kv"},[h("span",{class:"k"},["Marché (fournisseur)"]),h("span",{id:"d-market-provider"},["UNKNOWN"])])]));v.appendChild(h("div",{class:"card",id:"d-hist"},[loading("Historique réel…")]));refreshDetail()}
+function returnFromDetail(){
+  if(detailCtx&&detailCtx.returnView==="trading"){
+    var tab=detailCtx.returnPaperTab==="history"?"history":"positions";
+    paperActiveTab=tab;
+    var targetHash=tab==="history"?"#paper-history":"#paper-positions";
+    if(location.hash!==targetHash)history.replaceState(null,"",targetHash);
+    chartTradeOverlay=null;
+    detailCtx=null;
+    setView("trading");
+    return;
+  }
+  var back=detailCtx&&detailCtx.kind==="forex"?"forex":
+    detailCtx&&detailCtx.kind==="metal"?"metal":
+    detailCtx&&detailCtx.kind==="index"?"index":"markets";
+  chartTradeOverlay=null;
+  detailCtx=null;
+  setView(back);
+}
+function renderDetail(){var v=byId("view-detail");clear(v);if(!detailCtx){v.appendChild(emptyState("Aucun actif",""));return}v.appendChild(h("button",{class:"back",onclick:returnFromDetail},["← Retour"]));v.appendChild(h("h2",{class:"section"},[detailCtx.symbol]));if(chartTradeOverlay&&chartTradeOverlay.symbol===detailCtx.symbol){var oi=paperResultInfo(chartTradeOverlay);v.appendChild(h("div",{class:"trade-overlay-banner"},[h("span",{class:"status-pill ready"},["TRADE OVERLAY"]),h("span",{class:"status-pill future"},[paperStrategyLabel(chartTradeOverlay)]),h("span",{class:"status-pill "+(chartTradeOverlay.status==="OPEN"?"ready":"future")},[chartTradeOverlay.status||"—"]),chartTradeOverlay.status==="CLOSED"?h("span",{class:oi.klass},[oi.label+" · "+oi.reason]):null]));}if(detailCtx.kind==="crypto"||detailCtx.kind==="metal")v.appendChild(h("div",{class:"card"},[h("div",{class:"kv"},[h("span",{class:"k"},["Prix"]),h("span",{id:"d-price"},[h("span",{class:"spin"})])]),h("div",{class:"kv"},[h("span",{class:"k"},["Marché (fournisseur)"]),h("span",{id:"d-market-provider"},["UNKNOWN"])])]));v.appendChild(h("div",{class:"card",id:"d-hist"},[loading("Historique réel…")]));refreshDetail()}
 function refreshDetail(){if(!detailCtx)return;if(detailCtx.kind==="crypto"){api("/api/v1/market/ticker/"+encodeURIComponent(detailCtx.symbol)).then(function(r){var p=byId("d-price");if(!p)return;clear(p);if(!r.ok||!r.data){p.textContent="—";return}p.appendChild(priceCell(r.data.value));p.appendChild(document.createTextNode(" "));p.appendChild(qualityBadge(r.data.quality))});loadCandles("/api/v1/market/candles/"+encodeURIComponent(detailCtx.symbol)+"?granularity=1h")}else if(detailCtx.kind==="metal"){api("/api/v1/market/metal/"+encodeURIComponent(detailCtx.canonical)+"/quote").then(function(r){var p=byId("d-price");if(!p)return;clear(p);var d=r.data;if(!r.ok||!d||d.price == null){p.textContent="—";return}p.appendChild(priceCell(d.price));p.appendChild(document.createTextNode(" "));p.appendChild(qualityBadge(d.quality||"UNKNOWN"));var ms=byId("d-market-provider");if(ms){ms.textContent=d.is_market_open===true?"OUVERT":d.is_market_open===false?"FERMÉ":"UNKNOWN"}});var e=Math.floor(Date.now()/1000/3600)*3600;loadCandles("/api/v1/market/metal/"+encodeURIComponent(detailCtx.canonical)+"/history?granularity=1h&start="+(e-43200)+"&end="+e)}else if(detailCtx.kind==="index"){var e2=Math.floor(Date.now()/1000);loadCandles("/api/v1/market/index/"+encodeURIComponent(detailCtx.canonical)+"/history?granularity=1d&start="+(e2-2592000)+"&end="+e2)}else{var e3=Math.floor(Date.now()/1000/3600)*3600;loadCandles("/api/v1/market/forex/"+encodeURIComponent(detailCtx.canonical)+"/history?granularity=1h&start="+(e3-43200)+"&end="+e3)}}
 function loadCandles(path){api(path).then(function(r){var w=byId("d-hist");if(!w)return;clear(w);if(!r.ok){w.appendChild(emptyState("Historique indisponible",errorMessage(r)));return}var d=r.data||{},cs=(d.candles||[]).slice().sort(function(a,b){return(Date.parse(a.start)||0)-(Date.parse(b.start)||0)});w.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["Dernières bougies"]),qualityBadge(d.latest_quality||(cs.length?cs[cs.length-1].quality:"MISSING"))]));if(!cs.length){w.appendChild(emptyState("Pas de données",""));return}var rows=cs.slice(-10).reverse().map(function(c){return h("tr",{},[h("td",{},[formatMontrealTime(c.start)]),h("td",{},[priceCell(c.open)]),h("td",{},[priceCell(c.high)]),h("td",{},[priceCell(c.low)]),h("td",{},[priceCell(c.close)])])});w.appendChild(h("div",{class:"tbl-wrap"},[h("table",{class:"tbl"},[h("thead",{},[h("tr",{},[h("th",{},["Heure (Montréal)"]),h("th",{},["O"]),h("th",{},["H"]),h("th",{},["L"]),h("th",{},["C"])])]),h("tbody",{},rows)])]))})}
 
@@ -1910,7 +1928,14 @@ function paperAssetKind(symbol){return symbol==="XAU-USD"?"metal":symbol&&symbol
 function openPaperTradeChart(p){
   if(!p||!p.symbol)return;
   chartTradeOverlay=Object.assign({},p);
-  detailCtx={kind:paperAssetKind(p.symbol),symbol:p.symbol,canonical:p.symbol};
+  var returnPaperTab=p.status==="CLOSED"?"history":"positions";
+  detailCtx={
+    kind:paperAssetKind(p.symbol),
+    symbol:p.symbol,
+    canonical:p.symbol,
+    returnView:"trading",
+    returnPaperTab:returnPaperTab
+  };
   chartState.offset=0;chartState.visible=Math.max(chartState.visible,90);
   setView("detail");
 }
@@ -2756,6 +2781,7 @@ function renderHelpGlossary(){
 <!-- V16-M5B30K · CONTROLLED POLICY ACTIVATION · MANUAL / VERSIONED / ROLLBACK -->
 <!-- V16-M5B30L · POLICY VERSION IMPACT COMPARISON · OBSERVED / READ ONLY -->
 <!-- V16-M5B30L-UI1 · CRYPTO LOGOS + PREMIUM REAL-OHLC CHART POLISH -->
+<!-- V16-M5B30L-UI1-FIX1 · DETAIL BACK RETURNS TO PAPER ORIGIN TAB -->
 <!-- V16-M5B5 — server FVG detector -->
 
 <!-- SERVER DETECTOR · ORDER BLOCK V1 -->

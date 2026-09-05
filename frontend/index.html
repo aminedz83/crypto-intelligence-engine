@@ -138,6 +138,7 @@ body.workspace-mode main{padding-top:14px}
 .paper-history-kpi{padding:10px;border:1px solid #203149;border-radius:12px;background:#06101b;min-width:0}.paper-history-kpi span{display:block;color:#8997aa;font-size:8px}.paper-history-kpi b{display:block;margin-top:3px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .paper-history-filters{display:flex;gap:7px;overflow-x:auto;margin:0 0 10px;padding-bottom:2px}.paper-history-filter{min-height:38px;padding:0 14px;border:1px solid #203149;border-radius:999px;background:#06101b;color:#9aa8ba;font-weight:800}.paper-history-filter.active{border-color:rgba(81,231,255,.55);color:var(--cyan);background:rgba(81,231,255,.08)}
 .paper-history-list{display:grid;gap:9px}.paper-trade-compact{border:1px solid #203149;border-radius:13px;background:#06101b;overflow:hidden}.paper-trade-compact>summary{list-style:none;padding:12px;cursor:pointer;-webkit-tap-highlight-color:transparent}.paper-trade-compact>summary::-webkit-details-marker{display:none}.paper-trade-top{display:flex;align-items:flex-start;gap:7px;min-width:0}.paper-trade-symbol{font-size:14px;font-weight:900;line-height:1.2;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.paper-trade-result{margin-left:auto;text-align:right;white-space:nowrap}.paper-trade-result b{display:block;font-size:13px}.paper-trade-result span{display:block;font-size:8px;margin-top:2px}.paper-trade-meta{margin-top:6px;color:#8997aa;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.paper-trade-levels{display:grid;grid-template-columns:1fr 1fr;gap:5px 12px;margin-top:9px}.paper-trade-level{display:flex;justify-content:space-between;gap:8px;font-size:8px}.paper-trade-level span{color:#8997aa}.paper-trade-level b{font-size:9px}.paper-trade-outcome{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-top:9px;padding-top:8px;border-top:1px solid #18283c;font-size:8px}.paper-trade-more{color:var(--cyan);font-weight:800}.paper-trade-details{padding:0 12px 12px;border-top:1px solid #18283c}.paper-trade-details .section-stack{padding-top:8px}.paper-trade-compact[open] .paper-trade-more:after{content:" · ouvert"}
+.paper-history-detail-card{padding-top:10px}.paper-history-detail-hero{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.paper-history-detail-hero b{font-size:14px}.paper-history-detail-strategy{margin-top:7px}.paper-history-detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:10px}.paper-history-detail-cell{padding:9px 10px;border:1px solid #1c2d42;border-radius:10px;background:#07111d;min-width:0}.paper-history-detail-cell span{display:block;color:#7f8da1;font-size:7px}.paper-history-detail-cell b{display:block;margin-top:3px;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.paper-history-detail-result{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:9px;padding:9px 10px;border:1px solid #1c2d42;border-radius:10px;background:#07111d}.paper-history-detail-result strong{font-size:13px}.paper-history-detail-result span{font-size:8px;color:#8b99ad;text-align:right}.paper-history-detail-time{margin-top:8px;color:#8391a5;font-size:8px;text-align:center}.paper-history-detail-card .trade-chart-btn{margin-top:10px}
 @media(min-width:760px){.paper-history-summary{grid-template-columns:repeat(4,minmax(0,1fr))}.paper-history-list{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
 </style>
@@ -1020,10 +1021,40 @@ function paperTradeDuration(p){
   var m=Math.round((b-a)/60000),d=Math.floor(m/1440),h0=Math.floor((m%1440)/60),mm=m%60;
   return (d?d+"j ":"")+(h0?h0+"h ":"")+mm+"min";
 }
+var paperHistoryOpenState={};
+function paperHistoryCardKey(p){
+  return String(p.position_id||p.id||[(p.symbol||""),(p.opened_at||""),(p.closed_at||"")].join("|"));
+}
+function paperCompactHistoryDetails(p,result,rr,pnlText,strategyRaw){
+  var reason=result.reason||p.close_reason||"—";
+  return h("div",{class:"paper-history-detail-card"},[
+    h("div",{class:"paper-history-detail-hero"},[
+      h("b",{},[p.symbol||"—"]),
+      h("span",{class:"status-pill "+(p.side==="LONG"?"ready":"future")},[p.side||"—"]),
+      h("span",{class:"status-pill future"},["CLOSED"]),
+      h("b",{class:result.klass},[result.label])
+    ]),
+    h("div",{class:"paper-history-detail-strategy"},[strategyBadges(strategyRaw,"PAPER")]),
+    h("div",{class:"paper-history-detail-grid"},[
+      h("div",{class:"paper-history-detail-cell"},[h("span",{},["Entry"]),h("b",{},[fmtNum(p.entry)||"—"])]),
+      h("div",{class:"paper-history-detail-cell"},[h("span",{},["Exit"]),h("b",{},[fmtNum(p.close_price)||"—"])]),
+      h("div",{class:"paper-history-detail-cell"},[h("span",{},["SL"]),h("b",{},[fmtNum(p.stop_loss)||"—"])]),
+      h("div",{class:"paper-history-detail-cell"},[h("span",{},["TP"]),h("b",{},[fmtNum(p.take_profit)||"—"])])
+    ]),
+    h("div",{class:"paper-history-detail-result"},[
+      h("strong",{class:result.klass},[pnlText]),
+      h("span",{},[(rr===null?"—":(rr>=0?"+":"")+rr.toFixed(2)+"R")+" · "+paperTradeDuration(p)+" · "+reason.replaceAll("_"," ")])
+    ]),
+    h("div",{class:"paper-history-detail-time"},[formatMontrealTime(p.opened_at)+" → "+formatMontrealTime(p.closed_at)+" · Montréal"]),
+    h("button",{type:"button",class:"trade-chart-btn",onclick:function(){openPaperTradeChart(p)}},["Voir le graphique du trade"])
+  ]);
+}
 function paperCompactHistoryCard(p){
   var result=paperResultInfo(p),rr=paperRealizedRR(p),pnl=Number(p.realized_pnl),pnlText=Number.isFinite(pnl)?paperMoney(pnl):"—";
-  var strategyRaw=paperStrategyLabel(p);
-  var details=h("details",{class:"paper-trade-compact","data-paper-history-card":result.label},[
+  var strategyRaw=paperStrategyLabel(p),cardKey=paperHistoryCardKey(p);
+  var attrs={class:"paper-trade-compact","data-paper-history-card":result.label,"data-paper-history-key":cardKey};
+  if(paperHistoryOpenState[cardKey])attrs.open="";
+  var details=h("details",attrs,[
     h("summary",{},[
       h("div",{class:"paper-history-head"},[
         iconFor(p.symbol||""),
@@ -1045,8 +1076,9 @@ function paperCompactHistoryCard(p){
       ]),
       h("div",{class:"paper-trade-outcome"},[h("b",{class:result.klass},[(result.label==="WIN"?"✓ ":result.label==="LOSS"?"✕ ":"")+result.reason.replaceAll("_"," ")]),h("span",{},[paperTradeDuration(p)]),h("span",{class:"paper-trade-more"},["Détails ›"])])
     ]),
-    h("div",{class:"paper-trade-details"},[paperPositionCard(p)])
+    h("div",{class:"paper-trade-details"},[paperCompactHistoryDetails(p,result,rr,pnlText,strategyRaw)])
   ]);
+  details.addEventListener("toggle",function(){paperHistoryOpenState[cardKey]=details.open;if(!details.open)delete paperHistoryOpenState[cardKey]});
   return details;
 }
 function paperHistorySummary(closed,perf){
@@ -2799,4 +2831,5 @@ function renderHelpGlossary(){
 
 <!-- V16-M5B16-FIX2 · synchronized regression fix bundle -->
 <!-- V16-M5B30Q · FINAL IPHONE ACCEPTANCE CANDIDATE · BASELINE M5B30L-UI1-FIX1 -->
+<!-- V16-M5B30Q-HISTORY-FIX1 · PERSISTENT DETAILS STATE + COMPACT IPHONE TRADE DETAILS -->
 <!-- V16-M5B30R · PAPER TRADING V1 RELEASE CANDIDATE FREEZE · BASELINE M5B30Q -->

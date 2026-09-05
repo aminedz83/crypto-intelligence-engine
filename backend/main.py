@@ -3628,6 +3628,107 @@ async def get_server_market_setup_detector(symbol: str) -> Dict[str, object]:
 
 
 AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS = 5.0
+
+# ==================== V17-PRO — Smart exit, session filter, cooldown ============
+# Break-even: after +1R, effective SL moves to entry (zero risk).
+# Trailing: after +1.5R, effective SL trails at 0.75R behind peak.
+# Time stop: position open > 60 candles (5h on 5m) without hitting TP → close.
+SMART_EXIT_BREAKEVEN_R = Decimal("1")
+SMART_EXIT_TRAILING_ACTIVATION_R = Decimal("1.5")
+SMART_EXIT_TRAILING_DISTANCE_R = Decimal("0.75")
+SMART_EXIT_TIME_STOP_MINUTES = 300  # 5 hours (60 x 5m candles)
+
+# Session filter: only trade during London and NY sessions (UTC).
+# Outside these windows, setups are lower quality (less institutional flow).
+CRYPTO_SESSION_LONDON_START_UTC = 8   # 08:00 UTC
+CRYPTO_SESSION_NY_END_UTC = 21        # 21:00 UTC
+
+# Cooldown: after N consecutive losses, pause entries for M minutes.
+COOLDOWN_CONSECUTIVE_LOSSES = 2
+COOLDOWN_MINUTES = 30
+
+# Peak price tracking for trailing stop (in-memory, per position).
+_position_peaks: Dict[str, Decimal] = {}
+
+
+def is_crypto_session_active(now_utc: datetime) -> bool:
+    """Return True if now is within London open → NY close (08:00-21:00 UTC).
+    Outside this window, crypto setups are statistically weaker."""
+    hour = now_utc.hour
+    return CRYPTO_SESSION_LONDON_START_UTC <= hour < CRYPTO_SESSION_NY_END_UTC
+
+
+def compute_smart_sl(
+    side: str, entry: Decimal, original_sl: Decimal,
+    peak_price: Decimal, current_price: Decimal,
+) -> Decimal:
+    """Compute the effective stop-loss with break-even and trailing logic.
+    The effective SL is ALWAYS at least as good as the original SL (never worse)."""
+    risk = abs(entry - original_sl)
+    if risk <= 0:
+        return original_sl
+
+    if side == "LONG":
+        favorable = peak_price - entry
+        r_achieved = favorable / risk if risk > 0 else Decimal("0")
+        if r_achieved >= SMART_EXIT_TRAILING_ACTIVATION_R:
+            # Trail: SL = peak - trailing_distance * risk
+            trailing_sl = peak_price - SMART_EXIT_TRAILING_DISTANCE_R * risk
+            return max(trailing_sl, entry)  # never below entry
+        if r_achieved >= SMART_EXIT_BREAKEVEN_R:
+            return entry  # break-even
+        return original_sl
+    else:  # SHORT
+        favorable = entry - peak_price  # peak_price is the lowest for SHORT
+        r_achieved = favorable / risk if risk > 0 else Decimal("0")
+        if r_achieved >= SMART_EXIT_TRAILING_ACTIVATION_R:
+            trailing_sl = peak_price + SMART_EXIT_TRAILING_DISTANCE_R * risk
+            return min(trailing_sl, entry)  # never above entry
+        if r_achieved >= SMART_EXIT_BREAKEVEN_R:
+            return entry
+        return original_sl
+
+
+def update_peak_price(
+    position_id: str, side: str, current_price: Decimal
+) -> Decimal:
+    """Track the best price seen for a position (highest for LONG, lowest for SHORT)."""
+    existing = _position_peaks.get(position_id)
+    if existing is None:
+        _position_peaks[position_id] = current_price
+        return current_price
+    if side == "LONG":
+        best = max(existing, current_price)
+    else:
+        best = min(existing, current_price)
+    _position_peaks[position_id] = best
+    return best
+
+
+def should_time_stop(opened_at: datetime, now: datetime) -> bool:
+    """Return True if the position has been open longer than the time stop."""
+    if opened_at.tzinfo is None or now.tzinfo is None:
+        return False
+    elapsed = (now - opened_at).total_seconds() / 60.0
+    return elapsed > SMART_EXIT_TIME_STOP_MINUTES
+
+
+_recent_trade_results: List[str] = []  # WIN / LOSS / BREAKEVEN
+
+
+def record_trade_result(result: str) -> None:
+    """Record a trade result for cooldown tracking."""
+    _recent_trade_results.append(result)
+    if len(_recent_trade_results) > 20:
+        _recent_trade_results.pop(0)
+
+
+def is_cooldown_active(now_utc: datetime) -> bool:
+    """Return True if the last N trades were consecutive losses."""
+    if len(_recent_trade_results) < COOLDOWN_CONSECUTIVE_LOSSES:
+        return False
+    recent = _recent_trade_results[-COOLDOWN_CONSECUTIVE_LOSSES:]
+    return all(r == "LOSS" for r in recent)
 auto_entry_candidates: Dict[str, AutoEntryCandidateState] = {}
 auto_entry_orchestrator_task: Optional[asyncio.Task] = None
 AUTO_DECISION_TRACE_MAX = 200
@@ -4170,6 +4271,13 @@ async def run_server_auto_paper_generation_once() -> Dict[str, int]:
         "blocked": 0,
     }
     if not persistence_state.ready:
+        return stats
+    # V17-PRO: session filter — only trade during London/NY (08-21 UTC)
+    now = utcnow()
+    if not is_crypto_session_active(now):
+        return stats
+    # V17-PRO: cooldown — pause after consecutive losses
+    if is_cooldown_active(now):
         return stats
     for instrument in instrument_registry.all():
         if instrument.asset_class != AssetClass.CRYPTO:
@@ -5611,9 +5719,20 @@ async def mark_paper_position(position_id: str, req: PaperPositionMark) -> Dict[
                     status_code=409,
                     detail={"status": "CONFLICT", "reason": "STALE_OR_INVALID_MARK"},
                 )
-            outcome = evaluate_paper_close(
-                data["side"], req.current_price, data["stop_loss"], data["take_profit"]
+            # V17-PRO: smart exit — break-even, trailing stop, time stop
+            side_str = str(data["side"])
+            pos_id = str(data["position_id"])
+            peak = update_peak_price(pos_id, side_str, req.current_price)
+            effective_sl = compute_smart_sl(
+                side_str, data["entry"], data["stop_loss"], peak, req.current_price
             )
+            # Time stop: close at market if position open too long
+            if should_time_stop(data["opened_at"], req.observed_at):
+                outcome = ("TIME_STOP", req.current_price)
+            else:
+                outcome = evaluate_paper_close(
+                    side_str, req.current_price, effective_sl, data["take_profit"]
+                )
             if outcome is None:
                 payload = paper_position_to_dict(row)
                 payload["mark_price"] = str(req.current_price)
@@ -5666,6 +5785,15 @@ async def mark_paper_position(position_id: str, req: PaperPositionMark) -> Dict[
                 )
             payload["close_source"] = req.source
             payload["close_source_timestamp"] = req.source_timestamp.isoformat()
+            # V17-PRO: track result for cooldown + cleanup peak tracker
+            if reason == "TAKE_PROFIT":
+                record_trade_result("WIN")
+            elif reason in ("STOP_LOSS", "TIME_STOP"):
+                raw_result_pnl = calculate_paper_pnl(
+                    data["side"], data["entry"], close_price, Decimal("1")
+                )
+                record_trade_result("LOSS" if raw_result_pnl < 0 else "BREAKEVEN")
+            _position_peaks.pop(pos_id, None)
             return payload
     except HTTPException:
         raise

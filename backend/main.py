@@ -1,5 +1,6 @@
 # CI395 recovery marker: cumulative V16-M5B25B-FIX2 backend baseline.
 # V16-M5B30M — continuous paper runtime + feed watchdog + restart recovery.
+# V16-M5B30N — observability + recovery audit for continuous paper runtime.
 """Crypto Intelligence Engine — single-file backend (Phase 1 + frontend serving).
 
 Consolidated into one module for a minimal file layout. Behaviour is identical
@@ -4659,6 +4660,269 @@ class ContinuousRuntimeState:
 continuous_runtime_state = ContinuousRuntimeState()
 
 
+CONTINUOUS_OBSERVABILITY_VERSION = "SERVER_CONTINUOUS_OBSERVABILITY_RECOVERY_AUDIT_V1"
+CONTINUOUS_MONITOR_STALE_MULTIPLIER = 3.0
+CONTINUOUS_FEED_STALE_AFTER_SECONDS = 90.0
+
+
+def _aware_age_seconds(value: Optional[datetime], now: datetime) -> Optional[float]:
+    if value is None or value.tzinfo is None:
+        return None
+    return max(0.0, (now - value).total_seconds())
+
+
+def _iso_age_seconds(value: object, now: datetime) -> Optional[float]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return _aware_age_seconds(parsed, now)
+
+
+def _stream_observability(
+    *,
+    configured: bool,
+    running: bool,
+    connected: bool,
+    last_message_at: Optional[datetime],
+    last_error: Optional[str],
+    now: datetime,
+    fallback: Optional[str] = None,
+) -> Dict[str, object]:
+    age = _aware_age_seconds(last_message_at, now)
+    if not configured:
+        status = "UNAVAILABLE"
+        reason = "PROVIDER_NOT_CONFIGURED"
+    elif last_error and not connected:
+        status = "RECOVERING" if running else "DEGRADED"
+        reason = f"STREAM_ERROR:{last_error}"
+    elif not running:
+        status = "DEGRADED"
+        reason = "STREAM_NOT_RUNNING"
+    elif not connected:
+        status = "RECOVERING"
+        reason = "STREAM_RECONNECTING"
+    elif age is None:
+        status = "RECOVERING"
+        reason = "WAITING_FOR_FIRST_MESSAGE"
+    elif age > CONTINUOUS_FEED_STALE_AFTER_SECONDS:
+        status = "STALE"
+        reason = "STREAM_MESSAGE_STALE"
+    else:
+        status = "HEALTHY"
+        reason = "STREAM_MESSAGE_FRESH"
+    result: Dict[str, object] = {
+        "status": status,
+        "reason": reason,
+        "configured": configured,
+        "running": running,
+        "connected": connected,
+        "last_message_at": (
+            last_message_at.isoformat() if last_message_at is not None else None
+        ),
+        "last_message_age_seconds": age,
+        "stale_after_seconds": CONTINUOUS_FEED_STALE_AFTER_SECONDS,
+        "last_error": last_error,
+    }
+    if fallback is not None:
+        result["fallback"] = fallback
+    return result
+
+
+async def build_continuous_observability_audit() -> Dict[str, object]:
+    """Audit real runtime liveness, feed freshness and paper-monitor recovery."""
+    now = utcnow()
+    monitor_interval = max(settings.paper_monitor_interval_seconds, 1.0)
+    monitor_stale_after = max(
+        5.0, monitor_interval * CONTINUOUS_MONITOR_STALE_MULTIPLIER
+    )
+    monitor_age = _aware_age_seconds(continuous_runtime_state.last_cycle_at, now)
+    if continuous_runtime_state.last_error:
+        monitor_status = "DEGRADED"
+        monitor_reason = f'LAST_MONITOR_ERROR:{continuous_runtime_state.last_error}'
+    elif monitor_age is None:
+        monitor_status = "RECOVERING"
+        monitor_reason = "WAITING_FOR_FIRST_MONITOR_CYCLE"
+    elif monitor_age > monitor_stale_after:
+        monitor_status = "STALE"
+        monitor_reason = "PAPER_MONITOR_HEARTBEAT_STALE"
+    else:
+        monitor_status = "HEALTHY"
+        monitor_reason = "PAPER_MONITOR_HEARTBEAT_FRESH"
+
+    scan = auto_scan_watchdog_status()
+    scan_status = str(scan.get("status") or "UNKNOWN")
+    scan_reason = str(scan.get("reason") or "UNKNOWN")
+
+    market_health = await market_store.health()
+    heartbeat_age = _iso_age_seconds(market_health.get("last_heartbeat_at"), now)
+
+    feeds: Dict[str, Dict[str, object]] = {
+        "crypto": _stream_observability(
+            configured=True,
+            running=market_ws.running,
+            connected=market_ws.websocket is not None,
+            last_message_at=market_ws.last_message_at,
+            last_error=None,
+            now=now,
+            fallback="COINBASE_REST_TICKER",
+        ),
+        "forex": _stream_observability(
+            configured=bool(settings.massive_api_key),
+            running=massive_forex_ws.running,
+            connected=massive_forex_ws.websocket is not None
+            and massive_forex_ws.authenticated,
+            last_message_at=massive_forex_ws.last_message_at,
+            last_error=massive_forex_ws.last_error,
+            now=now,
+        ),
+        "metal": _stream_observability(
+            configured=bool(settings.twelvedata_api_key),
+            running=twelvedata_gold_ws.running,
+            connected=twelvedata_gold_ws.websocket is not None
+            and twelvedata_gold_ws.subscribed,
+            last_message_at=twelvedata_gold_ws.last_message_at,
+            last_error=twelvedata_gold_ws.last_error,
+            now=now,
+        ),
+        "indices": _stream_observability(
+            configured=bool(settings.massive_api_key),
+            running=massive_indices_ws.running,
+            connected=massive_indices_ws.websocket is not None
+            and massive_indices_ws.authenticated,
+            last_message_at=massive_indices_ws.last_message_at,
+            last_error=massive_indices_ws.last_error,
+            now=now,
+        ),
+    }
+
+    open_positions = 0
+    open_counterfactuals = 0
+    counts_error: Optional[str] = None
+    if persistence_state.ready:
+        try:
+            async with engine.connect() as conn:
+                pos_result = await conn.execute(
+                    text("SELECT COUNT(*) AS count FROM paper_positions WHERE status='OPEN'")
+                )
+                pos_row = pos_result.fetchone()
+                open_positions = int(pos_row._mapping["count"]) if pos_row else 0
+                cf_result = await conn.execute(
+                    text(
+                        "SELECT COUNT(*) AS count FROM "
+                        "paper_adaptive_edge_counterfactual WHERE status='OPEN'"
+                    )
+                )
+                cf_row = cf_result.fetchone()
+                open_counterfactuals = int(cf_row._mapping["count"]) if cf_row else 0
+        except Exception as exc:  # noqa: BLE001
+            counts_error = type(exc).__name__
+
+    last_result = continuous_runtime_state.last_position_result
+    checked = int(last_result.get("checked", 0))
+    marked = int(last_result.get("marked", 0))
+    unavailable = int(last_result.get("unavailable", 0))
+    errors = int(last_result.get("errors", 0))
+    coverage_ok = checked == open_positions and errors == 0
+    if open_positions == 0:
+        coverage_status = "HEALTHY"
+        coverage_reason = "NO_OPEN_POSITIONS"
+    elif errors:
+        coverage_status = "DEGRADED"
+        coverage_reason = "POSITION_MONITOR_ERRORS"
+    elif checked != open_positions:
+        coverage_status = "RECOVERING"
+        coverage_reason = "OPEN_POSITION_RECONCILIATION_PENDING"
+    elif unavailable:
+        coverage_status = "DEGRADED"
+        coverage_reason = "SOME_REAL_MARKS_UNAVAILABLE"
+    else:
+        coverage_status = "HEALTHY"
+        coverage_reason = "ALL_OPEN_POSITIONS_MONITORED"
+
+    required_feed_states = [
+        item["status"] for item in feeds.values() if item["configured"]
+    ]
+    components = [monitor_status, scan_status, coverage_status] + [
+        str(state) for state in required_feed_states
+    ]
+    if "STALE" in components:
+        overall = "STALE"
+    elif "DEGRADED" in components or "ERROR" in components or counts_error:
+        overall = "DEGRADED"
+    elif "RECOVERING" in components or "STARTING" in components:
+        overall = "RECOVERING"
+    elif all(state == "HEALTHY" for state in components):
+        overall = "HEALTHY"
+    else:
+        overall = "DEGRADED"
+
+    reasons = [monitor_reason, f"AUTO_SCAN:{scan_reason}", coverage_reason]
+    for name, item in feeds.items():
+        if item["configured"] and item["status"] != "HEALTHY":
+            reasons.append(f'{name.upper()}:{item["reason"]}')
+    if counts_error:
+        reasons.append(f"PERSISTENCE_COUNTS_ERROR:{counts_error}")
+
+    return {
+        "status": overall,
+        "validation": CONTINUOUS_OBSERVABILITY_VERSION,
+        "observed_at": now.isoformat(),
+        "paper_only": True,
+        "live_trading": False,
+        "browser_required": False,
+        "reasons": reasons,
+        "monitor": {
+            "status": monitor_status,
+            "reason": monitor_reason,
+            "cycles": continuous_runtime_state.cycles,
+            "last_cycle_at": (
+                continuous_runtime_state.last_cycle_at.isoformat()
+                if continuous_runtime_state.last_cycle_at is not None
+                else None
+            ),
+            "heartbeat_age_seconds": monitor_age,
+            "stale_after_seconds": monitor_stale_after,
+            "last_error": continuous_runtime_state.last_error,
+        },
+        "scanner": scan,
+        "feeds": feeds,
+        "coinbase_transport": {
+            "heartbeat_age_seconds": heartbeat_age,
+            "messages": market_health.get("messages"),
+            "gaps_detected": market_health.get("gaps_detected"),
+            "duplicates_detected": market_health.get("duplicates_detected"),
+            "out_of_order_detected": market_health.get("out_of_order_detected"),
+        },
+        "paper_position_coverage": {
+            "status": coverage_status,
+            "reason": coverage_reason,
+            "open_positions": open_positions,
+            "last_checked": checked,
+            "last_marked": marked,
+            "last_unavailable": unavailable,
+            "last_errors": errors,
+            "coverage_ok": coverage_ok,
+        },
+        "recovery": {
+            "feed_ensure_attempts": continuous_runtime_state.feed_ensure_attempts,
+            "last_feed_ensure_at": (
+                continuous_runtime_state.last_feed_ensure_at.isoformat()
+                if continuous_runtime_state.last_feed_ensure_at is not None
+                else None
+            ),
+            "last_feed_status": continuous_runtime_state.last_feed_status,
+            "open_counterfactuals": open_counterfactuals,
+        },
+        "persistence": {
+            "ready": persistence_state.ready,
+            "counts_error": counts_error,
+        },
+    }
+
+
 async def ensure_continuous_market_streams_once() -> Dict[str, str]:
     """Keep server-side paper-monitoring feeds running without browser intervention."""
     status_map: Dict[str, str] = {}
@@ -4801,6 +5065,11 @@ async def paper_monitor_loop(stop_event: asyncio.Event) -> None:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except asyncio.TimeoutError:
             pass
+
+
+@api_router.get("/paper/continuous-observability")
+async def get_paper_continuous_observability() -> Dict[str, object]:
+    return await build_continuous_observability_audit()
 
 
 @api_router.get("/paper/continuous-runtime")

@@ -13433,3 +13433,5 @@ app = create_app()
 # V16-M5B24A — autonomous crypto WS + fail-safe REST paper-mark fallback
 
 # V16-M5B24B — crypto registry alignment: BTC/ETH/SOL/XRP/LTC/ADA
+
+# V16-M5B30R · PAPER TRADING V1 RELEASE CANDIDATE FREEZE · BASELINE M5B30P

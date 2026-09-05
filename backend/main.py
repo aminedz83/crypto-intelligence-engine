@@ -4681,7 +4681,8 @@ def continuous_soak_status() -> Dict[str, object]:
     """Summarize long-run runtime evidence without inventing synthetic load."""
     now = utcnow()
     started_at = continuous_runtime_state.started_at
-    uptime_seconds = _aware_age_seconds(started_at, now) if started_at else 0.0
+    uptime_seconds_raw = _aware_age_seconds(started_at, now) if started_at else None
+    uptime_seconds = uptime_seconds_raw if uptime_seconds_raw is not None else 0.0
     cycles = continuous_runtime_state.cycles
     successful = continuous_runtime_state.successful_cycles
     degraded = continuous_runtime_state.degraded_cycles

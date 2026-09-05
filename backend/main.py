@@ -2,6 +2,7 @@
 # V16-M5B30M — continuous paper runtime + feed watchdog + restart recovery.
 # V16-M5B30N — observability + recovery audit for continuous paper runtime.
 # V16-M5B30O — long-run soak evidence + resilience counters.
+# V16-M5B30P — Paper V1 final readiness / release-candidate audit.
 """Crypto Intelligence Engine — single-file backend (Phase 1 + frontend serving).
 
 Consolidated into one module for a minimal file layout. Behaviour is identical
@@ -5163,6 +5164,204 @@ async def paper_monitor_loop(stop_event: asyncio.Event) -> None:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except asyncio.TimeoutError:
             pass
+
+
+PAPER_V1_FINAL_READINESS_VERSION = "SERVER_PAPER_V1_FINAL_READINESS_V1"
+
+
+def _final_readiness_item(
+    name: str,
+    status: str,
+    reason: str,
+    evidence: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    return {
+        "name": name,
+        "status": status,
+        "reason": reason,
+        "evidence": evidence or {},
+    }
+
+
+@api_router.get("/paper/final-readiness")
+async def get_paper_v1_final_readiness() -> Dict[str, object]:
+    """Aggregate the validated paper stack into one release-candidate checklist."""
+    checks: List[Dict[str, object]] = []
+
+    safety_ok = not settings.live_trading_enabled
+    checks.append(
+        _final_readiness_item(
+            "SAFETY_PAPER_ONLY",
+            "PASS" if safety_ok else "FAIL",
+            (
+                "LIVE_TRADING_DISABLED"
+                if safety_ok
+                else "LIVE_TRADING_FLAG_MUST_REMAIN_DISABLED"
+            ),
+            {
+                "live_trading_enabled": settings.live_trading_enabled,
+                "broker_execution": False,
+            },
+        )
+    )
+
+    persistence_ok = persistence_state.ready
+    checks.append(
+        _final_readiness_item(
+            "PERSISTENCE",
+            "PASS" if persistence_ok else "FAIL",
+            "POSTGRES_READY" if persistence_ok else "POSTGRES_NOT_READY",
+            {"ready": persistence_state.ready},
+        )
+    )
+
+    e2e = auto_paper_e2e_readiness()
+    e2e_ok = e2e.get("status") == "READY"
+    checks.append(
+        _final_readiness_item(
+            "AUTO_PAPER_E2E",
+            "PASS" if e2e_ok else "FAIL",
+            "PIPELINE_WIRED" if e2e_ok else "PIPELINE_NOT_READY",
+            e2e,
+        )
+    )
+
+    scanner = auto_scan_watchdog_status()
+    scanner_status = str(scanner.get("status") or "UNKNOWN")
+    scanner_ok = scanner_status == "HEALTHY"
+    checks.append(
+        _final_readiness_item(
+            "AUTO_SCAN_WATCHDOG",
+            "PASS" if scanner_ok else "FAIL",
+            str(scanner.get("reason") or scanner_status),
+            scanner,
+        )
+    )
+
+    observability = await build_continuous_observability_audit()
+    observed_status = str(observability.get("status") or "UNKNOWN")
+    observed_ok = observed_status == "HEALTHY"
+    checks.append(
+        _final_readiness_item(
+            "CONTINUOUS_OBSERVABILITY",
+            "PASS" if observed_ok else "FAIL",
+            observed_status,
+            {
+                "status": observed_status,
+                "reasons": observability.get("reasons"),
+                "paper_position_coverage": observability.get(
+                    "paper_position_coverage"
+                ),
+            },
+        )
+    )
+
+    soak = continuous_soak_status()
+    soak_status = str(soak.get("status") or "UNKNOWN")
+    if soak_status == "STABLE":
+        soak_check = "PASS"
+    elif soak_status == "WARMING_UP":
+        soak_check = "WARN"
+    else:
+        soak_check = "FAIL"
+    checks.append(
+        _final_readiness_item(
+            "LONG_RUN_SOAK",
+            soak_check,
+            str(soak.get("reason") or soak_status),
+            soak,
+        )
+    )
+
+    multi_asset = await get_multi_asset_paper_execution_status()
+    multi_asset_ok = (
+        multi_asset.get("paper_only") is True
+        and multi_asset.get("live_trading") is False
+    )
+    checks.append(
+        _final_readiness_item(
+            "MULTI_ASSET_PAPER_EXECUTION",
+            "PASS" if multi_asset_ok else "FAIL",
+            (
+                "PAPER_EXECUTION_GUARDS_ACTIVE"
+                if multi_asset_ok
+                else "MULTI_ASSET_EXECUTION_GUARD_INVALID"
+            ),
+            {
+                "status": multi_asset.get("status"),
+                "authorized_scope": multi_asset.get("authorized_scope"),
+                "strategies": multi_asset.get("strategies"),
+            },
+        )
+    )
+
+    policy = await get_adaptive_policy()
+    policy_ok = (
+        policy.get("paper_only") is True
+        and policy.get("live_trading") is False
+        and policy.get("automatic_activation") is False
+    )
+    checks.append(
+        _final_readiness_item(
+            "ADAPTIVE_EDGE_POLICY",
+            "PASS" if policy_ok else "FAIL",
+            (
+                "CONTROLLED_MANUAL_POLICY"
+                if policy_ok
+                else "ADAPTIVE_POLICY_GUARD_INVALID"
+            ),
+            {
+                "mode": policy.get("mode"),
+                "state": policy.get("state"),
+                "automatic_activation": policy.get("automatic_activation"),
+            },
+        )
+    )
+
+    failed = [item for item in checks if item.get("status") == "FAIL"]
+    warnings = [item for item in checks if item.get("status") == "WARN"]
+    if failed:
+        overall = "NOT_READY"
+    elif warnings:
+        overall = "WARMING_UP"
+    else:
+        overall = "READY"
+
+    next_actions: List[str] = []
+    if failed:
+        next_actions.append("RESOLVE_FAILED_CHECKS")
+    if warnings:
+        next_actions.append("COMPLETE_SOAK_EVIDENCE")
+    if overall == "READY":
+        next_actions.extend(
+            [
+                "RUN_IPHONE_FINAL_ACCEPTANCE",
+                "FREEZE_PAPER_V1_RELEASE_CANDIDATE",
+            ]
+        )
+
+    return {
+        "status": overall,
+        "validation": PAPER_V1_FINAL_READINESS_VERSION,
+        "release_scope": "PAPER_TRADING_V1",
+        "paper_only": True,
+        "live_trading": False,
+        "broker_execution": False,
+        "checked_at": utcnow().isoformat(),
+        "summary": {
+            "total": len(checks),
+            "passed": sum(1 for item in checks if item.get("status") == "PASS"),
+            "warnings": len(warnings),
+            "failed": len(failed),
+        },
+        "checks": checks,
+        "next_actions": next_actions,
+        "definition_of_ready": {
+            "all_required_checks_pass": True,
+            "long_run_soak_stable": True,
+            "iphone_acceptance_pending_after_backend_ready": True,
+        },
+    }
 
 
 @api_router.get("/paper/continuous-soak")

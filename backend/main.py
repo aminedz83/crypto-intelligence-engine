@@ -3063,6 +3063,9 @@ def build_server_trade_plan(
     reward = abs(target - entry)
     if risk <= 0.0 or reward <= 0.0:
         return waiting
+    rr = reward / risk
+    if rr < 1.5:
+        return waiting  # V17: RR < 1.5 not worth the risk, wait for better setup
 
     return {
         "event": "TRADE_PLAN",
@@ -3073,7 +3076,7 @@ def build_server_trade_plan(
         "entry_reference": entry,
         "stop_loss": stop,
         "take_profit": target,
-        "risk_reward": reward / risk,
+        "risk_reward": rr,
         "auto_queue": False,
     }
 
@@ -3272,6 +3275,14 @@ def detect_server_market_structure(candles: List[Candle], now: datetime) -> Dict
     structure_event["prior_structure"] = prior_structure
     liquidity_sweep = latest_confirmed_liquidity_sweep(closed, highs, lows)
     displacement = latest_confirmed_displacement(closed)
+
+    # V17: chronological sequence — displacement must come AFTER sweep.
+    # A displacement that precedes the sweep is a stale signal, not a fresh reversal.
+    if liquidity_sweep and displacement:
+        sweep_idx = liquidity_sweep.get("sweep_index", -1)
+        disp_idx = displacement.get("candle_index", -1)
+        if isinstance(sweep_idx, int) and isinstance(disp_idx, int) and disp_idx <= sweep_idx:
+            displacement = None  # stale displacement before sweep -> ignore
     fvg = latest_confirmed_fvg(closed)
     order_block = latest_confirmed_order_block(closed, displacement)
     revalidation = latest_confirmed_revalidation(closed, order_block, fvg)
@@ -11119,7 +11130,7 @@ def server_strategy_registry() -> List[Dict[str, object]]:
             "version": "1.0",
             "status": "ACTIVE_VALIDATED_PIPELINE",
             "family": "REVERSAL",
-            "preferred_regimes": ["TREND", "RANGE", "TRANSITION"],
+            "preferred_regimes": ["RANGE", "TRANSITION"],
             "execution_eligible": True,
             "paper_only": True,
         },
@@ -11248,9 +11259,11 @@ async def get_strategy_context(symbol: str) -> Dict[str, object]:
 # V16-M5B27 — objective candidate detectors (observational, non-executing)
 CANDIDATE_DETECTOR_VERSION = "SERVER_CANDIDATE_DETECTORS_V1"
 TREND_PULLBACK_EMA_PERIOD = 20
+TREND_PULLBACK_MIN_EMA_SLOPE = 0.0005  # V17: minimum EMA slope (relative to price)
 BREAKOUT_LOOKBACK = 20
 BREAKOUT_BODY_MULTIPLIER = 1.5
 BREAKOUT_MIN_BODY_RANGE_RATIO = 0.70
+BREAKOUT_REINTEGRATION_CHECK = True  # V17: reject if close reintegrates the range
 
 
 def _ema(values: List[float], period: int) -> List[float]:
@@ -11290,6 +11303,11 @@ def detect_trend_pullback_candidate(
     ema = _ema(closes, TREND_PULLBACK_EMA_PERIOD)
     previous, latest = sample[-2], sample[-1]
     previous_ema, latest_ema = ema[-2], ema[-1]
+
+    # V17: require meaningful EMA slope (trend strength)
+    ema_slope = abs(latest_ema - previous_ema) / latest_ema if latest_ema > 0 else 0.0
+    if ema_slope < TREND_PULLBACK_MIN_EMA_SLOPE:
+        return {**base, "status": "WAIT", "reason": "TREND_TOO_WEAK"}
     if previous.low is None or previous.high is None or latest.close is None:
         return {**base, "status": "WAIT", "reason": "INVALID_PULLBACK_CANDLE"}
     direction = str(regime.get("direction") or "")
@@ -11369,6 +11387,15 @@ def detect_breakout_expansion_candidate(
         return {**base, "status": "WAIT", "reason": "BREAKOUT_NOT_CONFIRMED"}
     if not displaced:
         return {**base, "status": "WAIT", "reason": "BREAKOUT_NO_DISPLACEMENT"}
+
+    # V17: require meaningful breakout margin (close beyond range by >= 30% of body)
+    # A close barely beyond the level is often a sweep disguised as a breakout.
+    if bullish:
+        margin = float(latest.close) - range_high
+    else:
+        margin = range_low - float(latest.close)
+    if body > 0 and margin / body < 0.30:
+        return {**base, "status": "WAIT", "reason": "BREAKOUT_MARGIN_INSUFFICIENT"}
     direction = "BULLISH" if bullish else "BEARISH"
     return {
         **base,

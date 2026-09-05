@@ -9259,3 +9259,162 @@ class V17NoLiveTrading(unittest.TestCase):
         source = open("main.py").read()
         for term in ("mt5", "metatrader", "broker_connect", "place_order"):
             self.assertNotIn(term, source.lower())
+
+
+# ==================== V17-PRO — Smart Exit + Session + Cooldown Tests ==========
+
+
+class V17SmartExitBreakevenTests(unittest.TestCase):
+    """Break-even: after +1R, effective SL moves to entry."""
+
+    def test_long_breakeven_at_1r(self):
+        entry = Decimal("100")
+        sl = Decimal("98")  # risk = 2
+        # Peak reached +1R (102) → SL should be at entry (100)
+        result = main.compute_smart_sl("LONG", entry, sl, Decimal("102"), Decimal("101"))
+        self.assertEqual(result, entry)
+
+    def test_long_below_1r_keeps_original_sl(self):
+        entry = Decimal("100")
+        sl = Decimal("98")
+        # Peak only reached +0.5R → SL stays at 98
+        result = main.compute_smart_sl("LONG", entry, sl, Decimal("101"), Decimal("100.5"))
+        self.assertEqual(result, sl)
+
+    def test_short_breakeven_at_1r(self):
+        entry = Decimal("100")
+        sl = Decimal("102")  # risk = 2
+        # Peak reached +1R (98) → SL should be at entry (100)
+        result = main.compute_smart_sl("SHORT", entry, sl, Decimal("98"), Decimal("99"))
+        self.assertEqual(result, entry)
+
+    def test_short_below_1r_keeps_original_sl(self):
+        entry = Decimal("100")
+        sl = Decimal("102")
+        result = main.compute_smart_sl("SHORT", entry, sl, Decimal("99.5"), Decimal("100"))
+        self.assertEqual(result, sl)
+
+
+class V17SmartExitTrailingTests(unittest.TestCase):
+    """Trailing: after +1.5R, SL trails at 0.75R behind peak."""
+
+    def test_long_trailing_at_1_5r(self):
+        entry = Decimal("100")
+        sl = Decimal("98")  # risk = 2
+        # Peak at +2R (104) → trail SL = 104 - 0.75*2 = 102.5
+        result = main.compute_smart_sl("LONG", entry, sl, Decimal("104"), Decimal("103"))
+        self.assertEqual(result, Decimal("102.5"))
+
+    def test_short_trailing_at_1_5r(self):
+        entry = Decimal("100")
+        sl = Decimal("102")  # risk = 2
+        # Peak at +2R (96) → trail SL = 96 + 0.75*2 = 97.5
+        result = main.compute_smart_sl("SHORT", entry, sl, Decimal("96"), Decimal("97"))
+        self.assertEqual(result, Decimal("97.5"))
+
+    def test_trailing_never_worse_than_entry(self):
+        entry = Decimal("100")
+        sl = Decimal("98")
+        # Edge case: peak barely at 1.5R → trailing SL must not go below entry
+        result = main.compute_smart_sl("LONG", entry, sl, Decimal("103"), Decimal("102"))
+        self.assertGreaterEqual(result, entry)
+
+
+class V17TimeStopTests(unittest.TestCase):
+    """Time stop: close after 5 hours of no TP hit."""
+
+    def test_within_time_limit(self):
+        opened = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc)  # 4h < 5h
+        self.assertFalse(main.should_time_stop(opened, now))
+
+    def test_beyond_time_limit(self):
+        opened = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 1, 1, 15, 1, tzinfo=timezone.utc)  # 5h01 > 5h
+        self.assertTrue(main.should_time_stop(opened, now))
+
+
+class V17PeakTrackingTests(unittest.TestCase):
+    """Peak price tracking for trailing stop."""
+
+    def test_long_peak_is_highest(self):
+        main._position_peaks.clear()
+        main.update_peak_price("TEST1", "LONG", Decimal("100"))
+        main.update_peak_price("TEST1", "LONG", Decimal("105"))
+        main.update_peak_price("TEST1", "LONG", Decimal("103"))
+        self.assertEqual(main._position_peaks["TEST1"], Decimal("105"))
+
+    def test_short_peak_is_lowest(self):
+        main._position_peaks.clear()
+        main.update_peak_price("TEST2", "SHORT", Decimal("100"))
+        main.update_peak_price("TEST2", "SHORT", Decimal("95"))
+        main.update_peak_price("TEST2", "SHORT", Decimal("97"))
+        self.assertEqual(main._position_peaks["TEST2"], Decimal("95"))
+
+
+class V17SessionFilterTests(unittest.TestCase):
+    """Session filter: only trade during London/NY (08-21 UTC)."""
+
+    def test_london_open_active(self):
+        self.assertTrue(main.is_crypto_session_active(
+            datetime(2026, 1, 1, 8, 0, tzinfo=timezone.utc)))
+
+    def test_ny_close_active(self):
+        self.assertTrue(main.is_crypto_session_active(
+            datetime(2026, 1, 1, 20, 59, tzinfo=timezone.utc)))
+
+    def test_asian_session_inactive(self):
+        self.assertFalse(main.is_crypto_session_active(
+            datetime(2026, 1, 1, 3, 0, tzinfo=timezone.utc)))
+
+    def test_after_ny_close_inactive(self):
+        self.assertFalse(main.is_crypto_session_active(
+            datetime(2026, 1, 1, 21, 0, tzinfo=timezone.utc)))
+
+
+class V17CooldownTests(unittest.TestCase):
+    """Cooldown: pause after consecutive losses."""
+
+    def setUp(self):
+        main._recent_trade_results.clear()
+
+    def test_no_cooldown_initially(self):
+        self.assertFalse(main.is_cooldown_active(utcnow()))
+
+    def test_cooldown_after_consecutive_losses(self):
+        main.record_trade_result("LOSS")
+        main.record_trade_result("LOSS")
+        self.assertTrue(main.is_cooldown_active(utcnow()))
+
+    def test_win_breaks_cooldown(self):
+        main.record_trade_result("LOSS")
+        main.record_trade_result("WIN")
+        self.assertFalse(main.is_cooldown_active(utcnow()))
+
+    def test_single_loss_no_cooldown(self):
+        main.record_trade_result("LOSS")
+        self.assertFalse(main.is_cooldown_active(utcnow()))
+
+
+class V17SmartExitConstantsTests(unittest.TestCase):
+    """Verify smart exit constants exist and are reasonable."""
+
+    def test_breakeven_threshold(self):
+        self.assertEqual(main.SMART_EXIT_BREAKEVEN_R, Decimal("1"))
+
+    def test_trailing_activation(self):
+        self.assertEqual(main.SMART_EXIT_TRAILING_ACTIVATION_R, Decimal("1.5"))
+
+    def test_trailing_distance(self):
+        self.assertEqual(main.SMART_EXIT_TRAILING_DISTANCE_R, Decimal("0.75"))
+
+    def test_time_stop_minutes(self):
+        self.assertEqual(main.SMART_EXIT_TIME_STOP_MINUTES, 300)
+
+    def test_session_hours(self):
+        self.assertEqual(main.CRYPTO_SESSION_LONDON_START_UTC, 8)
+        self.assertEqual(main.CRYPTO_SESSION_NY_END_UTC, 21)
+
+    def test_cooldown_params(self):
+        self.assertEqual(main.COOLDOWN_CONSECUTIVE_LOSSES, 2)
+        self.assertEqual(main.COOLDOWN_MINUTES, 30)

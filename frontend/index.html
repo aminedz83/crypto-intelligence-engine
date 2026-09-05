@@ -1767,7 +1767,7 @@ function renderStrategies(){
   v.appendChild(pageHead("Stratégies","3 familles objectives · validation et replay sur données réelles.","PAPER ONLY"));
   var host=h("div",{id:"strategy-live"},[loading("Chargement du registre de stratégies…")]);
   v.appendChild(host);
-  api("/api/v1/strategies/overview").then(function(r){
+  api("/api/v1/strategies").then(function(r){
     clear(host);
     if(!r.ok||!r.data){host.appendChild(emptyState("Registre indisponible",errorMessage(r)));return}
     var d=r.data, strategies=Array.isArray(d.strategies)?d.strategies:[];

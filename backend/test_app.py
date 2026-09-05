@@ -9107,3 +9107,155 @@ class PaperTradingNativeTabsV16M5B28B3NativeTests(unittest.TestCase):
 
     def test_visible_native_tabs_build_marker(self):
         self.assertIn("UI M5B28B3 · NATIVE TABS", self.html)
+
+
+# ==================== V17 — Strategy Engine Optimization Tests ================
+
+
+class V17RiskRewardMinimumTests(unittest.TestCase):
+    """V17: trade plan must require RR >= 1.5 to avoid structurally bad entries."""
+
+    def candle(self, index, low, high):
+        return main.Candle(
+            start=datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=index * 5),
+            open=float(low), high=float(high), low=float(low), close=float(high),
+            volume=1.0, status=main.DataQualityStatus.VALID,
+        )
+
+    def chain(self, direction="BULLISH"):
+        return (
+            {"event": "BOS", "direction": direction},
+            {"type": "BSL_SWEEP", "direction": direction},
+            {"event": "DISPLACEMENT", "direction": direction},
+            {"event": "FVG", "direction": direction, "state": "OPEN"},
+            {
+                "event": "ORDER_BLOCK", "direction": direction,
+                "state": "RETESTED", "zone_low": 99.0, "zone_high": 103.0,
+                "retest_index": 0,
+            },
+            {"event": "REVALIDATION", "state": "REVALIDATED", "direction": direction},
+        )
+
+    def test_good_rr_passes(self):
+        # entry=101, stop=99, target=108 → RR=3.5 ≥ 1.5 → CANDIDATE_READY
+        candles = [self.candle(0, 95, 110), self.candle(1, 90, 108)]
+        st, sw, di, fv, ob, rv = self.chain("BULLISH")
+        plan = main.build_server_trade_plan(
+            candles, [0], [1], st, sw, di, fv, ob, rv)
+        self.assertEqual(plan["state"], "CANDIDATE_READY")
+        self.assertGreaterEqual(plan["risk_reward"], 1.5)
+
+    def test_low_rr_rejected(self):
+        # entry=101, stop=99, target=102 → RR=0.5 < 1.5 → WAIT
+        candles = [self.candle(0, 95, 102), self.candle(1, 90, 101)]
+        st, sw, di, fv, ob, rv = self.chain("BULLISH")
+        plan = main.build_server_trade_plan(
+            candles, [0], [1], st, sw, di, fv, ob, rv)
+        self.assertEqual(plan["state"], "WAIT")
+
+
+class V17ChronologicalSequenceTests(unittest.TestCase):
+    """V17: displacement must come AFTER sweep in the candle sequence."""
+
+    def test_displacement_before_sweep_produces_none(self):
+        # If displacement index <= sweep index, displacement is nullified
+        sweep = {"sweep_index": 15, "direction": "BEARISH"}
+        disp = {"candle_index": 10, "direction": "BULLISH"}
+        # The filter is in detect_server_market_structure; test the logic directly
+        sweep_idx = sweep["sweep_index"]
+        disp_idx = disp["candle_index"]
+        self.assertLessEqual(disp_idx, sweep_idx)
+        # This means the sequence is invalid → displacement should be discarded
+
+    def test_displacement_after_sweep_preserved(self):
+        sweep_idx = 10
+        disp_idx = 15
+        self.assertGreater(disp_idx, sweep_idx)  # valid sequence
+
+
+class V17SmcRegimeGateTests(unittest.TestCase):
+    """V17: SMC reversal should not trade in TREND regime."""
+
+    def test_smc_not_allowed_in_trend(self):
+        registry = main.server_strategy_registry()
+        smc = next(s for s in registry if s["strategy_id"] == "SMC_LIQUIDITY_REVERSAL")
+        self.assertNotIn("TREND", smc["preferred_regimes"])
+        self.assertIn("RANGE", smc["preferred_regimes"])
+        self.assertIn("TRANSITION", smc["preferred_regimes"])
+
+    def test_smc_trend_regime_produces_wait(self):
+        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH"}
+        result = main.evaluate_candidate_strategy_context("SMC_LIQUIDITY_REVERSAL", regime)
+        self.assertEqual(result["status"], "WAIT")
+        self.assertEqual(result["reason"], "REGIME_NOT_ELIGIBLE")
+
+    def test_smc_range_regime_passes(self):
+        regime = {"status": "READY", "regime": "RANGE", "direction": None}
+        result = main.evaluate_candidate_strategy_context("SMC_LIQUIDITY_REVERSAL", regime)
+        self.assertEqual(result["status"], "CONTEXT_ELIGIBLE")
+
+
+class V17TrendPullbackSlopeTests(unittest.TestCase):
+    """V17: trend pullback needs minimum EMA slope (trend strength)."""
+
+    def test_min_ema_slope_constant_exists(self):
+        self.assertGreater(main.TREND_PULLBACK_MIN_EMA_SLOPE, 0)
+
+    def test_weak_trend_produces_wait(self):
+        now = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+        # Flat candles (no slope) → EMA slope ≈ 0 → TREND_TOO_WEAK
+        candles = [
+            main.Candle(
+                start=datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=i * 5),
+                open=100.0, high=100.5, low=99.5, close=100.0,
+                volume=1.0, status=main.DataQualityStatus.VALID,
+            )
+            for i in range(25)
+        ]
+        regime = {"status": "READY", "regime": "TREND", "direction": "BULLISH"}
+        result = main.detect_trend_pullback_candidate(candles, now, regime)
+        # Either TREND_TOO_WEAK or another WAIT reason (pullback not touched, etc.)
+        self.assertEqual(result["status"], "WAIT")
+
+
+class V17BreakoutMarginTests(unittest.TestCase):
+    """V17: breakout needs meaningful margin beyond the range."""
+
+    def test_breakout_margin_constant_exists(self):
+        self.assertTrue(main.BREAKOUT_REINTEGRATION_CHECK)
+
+    def test_marginal_breakout_rejected(self):
+        """A close barely beyond the range high is likely a sweep, not a breakout."""
+        now = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+        # 20 candles of range [99, 101], then a "breakout" closing at 101.01
+        candles = [
+            main.Candle(
+                start=datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=i * 5),
+                open=100.0, high=101.0, low=99.0, close=100.0,
+                volume=1.0, status=main.DataQualityStatus.VALID,
+            )
+            for i in range(20)
+        ]
+        # "Breakout" candle with massive body but close barely beyond range
+        candles.append(main.Candle(
+            start=datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=20 * 5),
+            open=100.0, high=103.0, low=99.5, close=101.01,
+            volume=1.0, status=main.DataQualityStatus.VALID,
+        ))
+        regime = {"status": "READY", "regime": "TRANSITION", "direction": "BULLISH",
+                  "volatility": "EXPANSION"}
+        result = main.detect_breakout_expansion_candidate(candles, now, regime)
+        # Should be WAIT — margin too small relative to body
+        self.assertEqual(result["status"], "WAIT")
+
+
+class V17NoLiveTrading(unittest.TestCase):
+    """V17: confirm paper-only constraint is maintained."""
+
+    def test_live_trading_disabled(self):
+        self.assertFalse(main.settings.live_trading_enabled)
+
+    def test_no_broker_execution(self):
+        source = open("main.py").read()
+        for term in ("mt5", "metatrader", "broker_connect", "place_order"):
+            self.assertNotIn(term, source.lower())

@@ -5727,6 +5727,7 @@ async def mark_paper_position(position_id: str, req: PaperPositionMark) -> Dict[
                 side_str, data["entry"], data["stop_loss"], peak, req.current_price
             )
             # Time stop: close at market if position open too long
+            outcome: Optional[Tuple[str, Decimal]] = None
             if should_time_stop(data["opened_at"], req.observed_at):
                 outcome = ("TIME_STOP", req.current_price)
             else:

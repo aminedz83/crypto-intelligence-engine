@@ -9464,3 +9464,107 @@ class V17AttributionTests(unittest.TestCase):
         block = src[idx:idx + 1200]
         self.assertIn('"strategy_id": req.performance_strategy_id', block)
         self.assertIn('"strategy_version": req.performance_strategy_version', block)
+
+# ==================== V17-ENERGY — WTI + Brent backend/frontend contract ======
+
+
+class V17EnergyRegistryTests(unittest.TestCase):
+    def test_energy_asset_class_exists(self):
+        self.assertEqual(main.AssetClass.ENERGY.value, "ENERGY")
+
+    def test_wti_registered_as_energy(self):
+        inst = main.instrument_registry.get("WTI-USD")
+        self.assertIsNotNone(inst)
+        self.assertEqual(inst.asset_class, main.AssetClass.ENERGY)
+        self.assertEqual(inst.quote_asset, "USD")
+
+    def test_brent_registered_as_energy(self):
+        inst = main.instrument_registry.get("BRENT-USD")
+        self.assertIsNotNone(inst)
+        self.assertEqual(inst.asset_class, main.AssetClass.ENERGY)
+        self.assertEqual(inst.quote_asset, "USD")
+
+    def test_wti_twelvedata_mapping(self):
+        self.assertEqual(
+            main.provider_symbol_map.to_provider("twelvedata", "WTI-USD"), "WTI/USD"
+        )
+
+    def test_brent_twelvedata_mapping(self):
+        self.assertEqual(
+            main.provider_symbol_map.to_provider("twelvedata", "BRENT-USD"), "XBR/USD"
+        )
+
+    def test_energy_specs_are_not_invented(self):
+        for symbol in ("WTI-USD", "BRENT-USD"):
+            inst = main.instrument_registry.get(symbol)
+            self.assertIsNotNone(inst)
+            self.assertIsNone(inst.tick_size)
+            self.assertIsNone(inst.price_precision)
+            self.assertEqual(inst.market_calendar, main.MarketCalendarPolicy.NOT_CONFIGURED)
+
+
+class V17EnergyPaperSafetyTests(unittest.TestCase):
+    def test_wti_sizing_fail_closed(self):
+        result = main.multi_asset_extended_sizing_readiness("WTI-USD")
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["reason"], "ENERGY_INSTRUMENT_SPECS_NOT_VERIFIED")
+
+    def test_brent_sizing_fail_closed(self):
+        result = main.multi_asset_extended_sizing_readiness("BRENT-USD")
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["reason"], "ENERGY_INSTRUMENT_SPECS_NOT_VERIFIED")
+
+    def test_wti_execution_fail_closed(self):
+        result = main.multi_asset_paper_execution_readiness("WTI-USD")
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertFalse(result["auto_entry_authorized"])
+
+    def test_brent_execution_fail_closed(self):
+        result = main.multi_asset_paper_execution_readiness("BRENT-USD")
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertFalse(result["auto_entry_authorized"])
+
+
+class V17EnergyApiContractTests(unittest.TestCase):
+    def test_energy_routes_are_registered(self):
+        paths = {getattr(route, "path", None) for route in main.create_app().routes}
+        self.assertIn("/api/v1/market/energy/{symbol}/quote", paths)
+        self.assertIn("/api/v1/market/energy/{symbol}/history", paths)
+
+    def test_energy_session_context_is_registered_but_unknown(self):
+        result = main.market_session_context("WTI-USD", NOW)
+        self.assertEqual(result["asset_class"], "ENERGY")
+        self.assertEqual(result["market_state"], "UNKNOWN")
+        self.assertFalse(result["trade_authorization"])
+
+    def test_energy_analysis_span_is_session_aware(self):
+        span = main._analysis_history_span_seconds(main.AssetClass.ENERGY, "1h", 30)
+        self.assertGreaterEqual(span, 10 * 86400)
+
+    def test_unknown_energy_history_rejected(self):
+        async def run():
+            with self.assertRaises(ValueError):
+                await main.fetch_energy_history("UNKNOWN-USD", "1h", 1, 2)
+        asyncio.run(run())
+
+
+class V17EnergyFrontendContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_frontend_has_energy_tab(self):
+        self.assertIn('data-market-tab="energy"', self.html)
+        self.assertIn("Pétrole", self.html)
+
+    def test_frontend_has_wti_and_brent_symbols(self):
+        self.assertIn('"WTI-USD"', self.html)
+        self.assertIn('"BRENT-USD"', self.html)
+
+    def test_frontend_consumes_energy_quote_route(self):
+        self.assertIn('/api/v1/market/energy/', self.html)
+        self.assertIn('/quote', self.html)
+
+    def test_frontend_consumes_energy_history_route(self):
+        self.assertIn('/history?granularity=', self.html)
+        self.assertIn('kind==="energy"', self.html)

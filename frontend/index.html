@@ -149,6 +149,12 @@ body.workspace-mode main{padding-top:14px}
 .coin.spx-mark{font-size:9px}
 .coin.ndx-mark{font-size:17px}
 .coin.dow-mark{font-size:10px}
+
+/* V17-ENERGY-UI4 — Forex pair flags (no external assets) */
+.fx-pair-icon{position:relative;display:inline-flex;width:54px;height:38px;flex:0 0 54px;align-items:center}
+.fx-flag{position:absolute;width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:22px;line-height:1;background:#0d1726;border:2px solid #1d3148;box-shadow:0 4px 12px rgba(0,0,0,.28);overflow:hidden}
+.fx-flag-a{left:0;z-index:2}
+.fx-flag-b{left:20px;z-index:1}
 </style>
 
 <style id="v4-reference-tuning">
@@ -1123,6 +1129,19 @@ function emptyState(t,s){return h("div",{class:"state"},[h("strong",{},[t]),s||"
 
 function refreshHealth(){return api("/health").then(function(r){var dot=byId("health-dot"),lab=byId("health-label");dot.className="dot";if(!r.ok||!r.data){dot.className="dot down";lab.textContent="backend indisponible";return}var o=r.data.overall||"UNKNOWN";dot.className="dot "+(o==="UP"?"up":o==="DEGRADED"?"deg":o==="DOWN"?"down":"");lab.textContent="backend "+o.toLowerCase()})}
 
+function forexFlag(code){
+  var flags={EUR:"🇪🇺",USD:"🇺🇸",GBP:"🇬🇧",JPY:"🇯🇵",CHF:"🇨🇭",AUD:"🇦🇺",CAD:"🇨🇦",NZD:"🇳🇿"};
+  return flags[String(code||"").toUpperCase()]||"";
+}
+function forexPairIcon(sym){
+  var p=String(sym||"").toUpperCase().split("-");
+  var a=forexFlag(p[0]),b=forexFlag(p[1]);
+  return h("span",{class:"fx-pair-icon",title:String(sym||"")+" · devises"},[
+    h("span",{class:"fx-flag fx-flag-a"},[a||p[0]||""]),
+    h("span",{class:"fx-flag fx-flag-b"},[b||p[1]||""])
+  ]);
+}
+
 function iconFor(sym){
   var base=String(sym||"").split("-")[0].toUpperCase();
   if(sym==="XAU-USD")return h("span",{class:"coin gold",title:"Gold Spot"},["Au"]);
@@ -1245,7 +1264,7 @@ function refreshDashboard(){
 function renderMarkets(){var v=byId("view-markets");clear(v);v.appendChild(h("h2",{class:"section"},["Crypto · Coinbase · univers dynamique réel"]));v.appendChild(h("div",{class:"sub"},["Actifs actifs: "+String(CRYPTO_SYMBOLS.length)+" / cible "+String(CRYPTO_UNIVERSE_STATE.target_count||100)+" · source Coinbase"]));if(!CRYPTO_SYMBOLS.length){v.appendChild(emptyState("Univers crypto indisponible","Aucun symbole Coinbase vérifié n’est actif."));return}var c=h("div",{class:"card listcard"},[]);CRYPTO_SYMBOLS.forEach(function(sym){c.appendChild(h("div",{class:"row tap",onclick:function(){openDetail("crypto",sym)}},[h("div",{class:"asset"},[iconFor(sym),h("div",{},[h("div",{class:"sym"},[sym]),h("div",{class:"aname"},["Coinbase"])])]),h("div",{class:"right"},[h("span",{class:"price","data-price":sym},["…"]),h("span",{"data-badge":sym},[])])]))});v.appendChild(c);refreshMarkets()}
 function refreshMarkets(){CRYPTO_SYMBOLS.forEach(function(sym){api("/api/v1/market/ticker/"+encodeURIComponent(sym)).then(function(r){var p=document.querySelector('[data-price="'+sym+'"]'),b=document.querySelector('[data-badge="'+sym+'"]');if(!p||!b)return;clear(p);clear(b);if(!r.ok||!r.data){p.textContent="—";b.appendChild(qualityBadge("UNKNOWN"));return}p.appendChild(priceCell(r.data.value));b.appendChild(qualityBadge(r.data.quality))})})}
 
-function renderForex(){var v=byId("view-forex");clear(v);v.appendChild(h("h2",{class:"section"},["Forex · Massive · données réelles"]));v.appendChild(h("div",{class:"sub",title:"Horaires du marché Forex"},["ⓘ Horaires du marché Forex · état réel fourni par le backend, sessions indicatives."]));v.appendChild(h("div",{class:"card",id:"fx-state"},[loading("État du marché…")]));v.appendChild(h("div",{id:"fx-map"},[loading("Mappings…")]));refreshForexMarket();api("/api/v1/market/forex/mappings").then(function(r){var w=byId("fx-map");clear(w);if(!r.ok||!r.data){w.appendChild(emptyState("Forex indisponible",errorMessage(r)));return}var c=h("div",{class:"card listcard"},[]);(r.data.mappings||[]).forEach(function(m){var mapped=m.status === "MAPPED";c.appendChild(h("div",{class:"row "+(mapped?"tap":""),onclick:mapped?function(){openDetail("forex",m.canonical)}:null},[h("div",{},[h("div",{class:"sym"},[m.canonical]),h("div",{class:"sub"},[mapped?"Massive · "+(m.provider_symbol||""):"Non disponible"])]),qualityBadge(mapped ? "MAPPED" : "NOT_MAPPED")]))});w.appendChild(c)})}
+function renderForex(){var v=byId("view-forex");clear(v);v.appendChild(h("h2",{class:"section"},["Forex · Massive · données réelles"]));v.appendChild(h("div",{class:"sub",title:"Horaires du marché Forex"},["ⓘ Horaires du marché Forex · état réel fourni par le backend, sessions indicatives."]));v.appendChild(h("div",{class:"card",id:"fx-state"},[loading("État du marché…")]));v.appendChild(h("div",{id:"fx-map"},[loading("Mappings…")]));refreshForexMarket();api("/api/v1/market/forex/mappings").then(function(r){var w=byId("fx-map");clear(w);if(!r.ok||!r.data){w.appendChild(emptyState("Forex indisponible",errorMessage(r)));return}var c=h("div",{class:"card listcard"},[]);(r.data.mappings||[]).forEach(function(m){var mapped=m.status === "MAPPED";c.appendChild(h("div",{class:"row "+(mapped?"tap":""),onclick:mapped?function(){openDetail("forex",m.canonical)}:null},[h("div",{class:"asset"},[forexPairIcon(m.canonical),h("div",{},[h("div",{class:"sym"},[m.canonical]),h("div",{class:"sub"},[mapped?"Massive · "+(m.provider_symbol||""):"Non disponible"])])]),qualityBadge(mapped ? "MAPPED" : "NOT_MAPPED")]))});w.appendChild(c)})}
 function refreshForexMarket(){api("/api/v1/market/forex/market-state").then(function(r){var w=byId("fx-state");if(!w)return;clear(w);var d=(r.ok&&r.data)?r.data:{market_state:"UNKNOWN"},st=d.market_state||"UNKNOWN";w.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["État du marché"]),h("span",{},[st])]));if(d.current_session)w.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["Session indicative"]),h("span",{},[d.current_session])]))})}
 
 function renderMetal(){var v=byId("view-metal");clear(v);v.appendChild(h("h2",{class:"section"},["Métaux · Twelve Data · données réelles"]));var c=h("div",{class:"card listcard"},[]);c.appendChild(h("div",{class:"row tap",onclick:function(){openDetail("metal","XAU-USD")}},[h("div",{class:"asset"},[iconFor("XAU-USD"),h("div",{},[h("div",{class:"sym"},["XAU-USD"]),h("div",{class:"aname"},["Gold Spot · Twelve Data"])])]),qualityBadge("MAPPED")]));v.appendChild(c)}

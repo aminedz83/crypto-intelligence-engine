@@ -668,6 +668,7 @@ body.market-menu-open .market-tabs-wrap{display:block!important}
  <button class="mtab crypto" data-mtab="markets" onclick="setView('markets')"><span class="ico">₿</span>Crypto</button>
  <button class="mtab forex" data-mtab="forex" onclick="setView('forex')"><span class="ico">$</span>Forex</button>
  <button class="mtab metals" data-mtab="metal" onclick="setView('metal')"><span class="ico">▰</span>Métaux</button>
+ <button class="mtab energy" data-mtab="energy" onclick="setView('energy')"><span class="ico">◈</span>Pétrole</button>
  <button class="mtab indices" data-mtab="index" onclick="setView('index')"><span class="ico">▥</span>Indices</button>
 </div></div></div>
 <main>
@@ -675,6 +676,7 @@ body.market-menu-open .market-tabs-wrap{display:block!important}
  <section class="view" id="view-markets" data-view="markets"></section>
  <section class="view" id="view-forex" data-view="forex"></section>
  <section class="view" id="view-metal" data-view="metal"></section>
+ <section class="view" id="view-energy" data-view="energy"></section>
  <section class="view" id="view-index" data-view="index"></section>
  <section class="view" id="view-system" data-view="system"></section>
  <section class="view" id="view-detail" data-view="detail"></section>
@@ -690,7 +692,8 @@ body.market-menu-open .market-tabs-wrap{display:block!important}
 <script>
 "use strict";
 var POLL_MS=5000;
-const REAL_ASSET_VIEWS=[{id:"markets"},{id:"forex"},{id:"metal"},{id:"index"},{id:"system"},{id:"detail"}];
+const REAL_ASSET_VIEWS=[{id:"markets"},{id:"forex"},{id:"metal"},{id:"energy"},{id:"index"},{id:"system"},{id:"detail"}];
+const ENERGY_SYMBOLS=[["WTI-USD","WTI · West Texas Intermediate"],["BRENT-USD","Brent Crude Oil"]];
 var CRYPTO_SYMBOLS=[];
 var CRYPTO_UNIVERSE_STATE={status:"LOADING",source:"coinbase_public_products",active_count:0};
 var current="dashboard",detailCtx=null;
@@ -1213,6 +1216,40 @@ function renderForex(){var v=byId("view-forex");clear(v);v.appendChild(h("h2",{c
 function refreshForexMarket(){api("/api/v1/market/forex/market-state").then(function(r){var w=byId("fx-state");if(!w)return;clear(w);var d=(r.ok&&r.data)?r.data:{market_state:"UNKNOWN"},st=d.market_state||"UNKNOWN";w.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["État du marché"]),h("span",{},[st])]));if(d.current_session)w.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["Session indicative"]),h("span",{},[d.current_session])]))})}
 
 function renderMetal(){var v=byId("view-metal");clear(v);v.appendChild(h("h2",{class:"section"},["Métaux · Twelve Data · données réelles"]));var c=h("div",{class:"card listcard"},[]);c.appendChild(h("div",{class:"row tap",onclick:function(){openDetail("metal","XAU-USD")}},[h("div",{class:"asset"},[iconFor("XAU-USD"),h("div",{},[h("div",{class:"sym"},["XAU-USD"]),h("div",{class:"aname"},["Gold Spot · Twelve Data"])])]),qualityBadge("MAPPED")]));v.appendChild(c)}
+function renderEnergy(){
+  var v=byId("view-energy");clear(v);
+  v.appendChild(h("h2",{class:"section"},["Energy · Pétrole · données backend réelles"]));
+  v.appendChild(h("div",{class:"sub"},["WTI + Brent · aucune donnée financière hardcodée · UNAVAILABLE si le backend/provider ne répond pas."]));
+  var c=h("div",{class:"card listcard"},[]);
+  ENERGY_SYMBOLS.forEach(function(it){
+    var sym=it[0],name=it[1];
+    c.appendChild(h("div",{class:"row tap",onclick:function(){openDetail("energy",sym)}},[
+      h("div",{class:"asset"},[
+        iconFor(sym),
+        h("div",{},[h("div",{class:"sym"},[sym]),h("div",{class:"aname"},[name])])
+      ]),
+      h("div",{class:"right"},[
+        h("span",{class:"price","data-energy-price":sym},["—"]),
+        h("span",{"data-energy-badge":sym},[qualityBadge("UNKNOWN")])
+      ])
+    ]))
+  });
+  v.appendChild(c);
+  refreshEnergyMarket();
+}
+function refreshEnergyMarket(){
+  ENERGY_SYMBOLS.forEach(function(it){
+    var sym=it[0];
+    api("/api/v1/market/energy/"+encodeURIComponent(sym)+"/quote").then(function(r){
+      var p=document.querySelector('[data-energy-price="'+sym+'"]'),b=document.querySelector('[data-energy-badge="'+sym+'"]');
+      if(!p||!b)return;clear(p);clear(b);
+      var d=r&&r.ok?r.data:null;
+      if(!d||d.price==null){p.textContent="—";b.appendChild(qualityBadge(d&&d.quality?d.quality:"UNAVAILABLE"));return}
+      p.appendChild(priceCell(d.price));
+      b.appendChild(qualityBadge(d.quality||"UNKNOWN"));
+    })
+  })
+}
 function renderIndex(){var v=byId("view-index");clear(v);v.appendChild(h("h2",{class:"section"},["Indices US cash · Massive · données réelles"]));var c=h("div",{class:"card listcard"},[]);[["SPX","S&P 500"],["NDX","Nasdaq-100"],["US30","Dow Jones 30"]].forEach(function(it){c.appendChild(h("div",{class:"row tap",onclick:function(){openDetail("index",it[0])}},[h("div",{class:"asset"},[iconFor("US30"),h("div",{},[h("div",{class:"sym"},[it[0]]),h("div",{class:"aname"},[it[1]+" · indice cash"])])]),qualityBadge("MAPPED")]))});v.appendChild(c)}
 function renderSystem(){var v=byId("view-system");clear(v);v.appendChild(h("h2",{class:"section"},["Santé backend & données"]));v.appendChild(loading("Lecture de /health…"));api("/health").then(function(r){clear(v);v.appendChild(h("h2",{class:"section"},["Santé backend & données"]));if(!r.ok||!r.data){v.appendChild(emptyState("Backend indisponible",errorMessage(r)));return}var c=h("div",{class:"card"},[]);c.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["État global"]),h("span",{},[r.data.overall||"UNKNOWN"])]));(r.data.components||[]).forEach(function(x){c.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},[x.name]),h("span",{},[x.state||"?"])]))});v.appendChild(c)})}
 
@@ -1230,13 +1267,14 @@ function returnFromDetail(){
   }
   var back=detailCtx&&detailCtx.kind==="forex"?"forex":
     detailCtx&&detailCtx.kind==="metal"?"metal":
+    detailCtx&&detailCtx.kind==="energy"?"energy":
     detailCtx&&detailCtx.kind==="index"?"index":"markets";
   chartTradeOverlay=null;
   detailCtx=null;
   setView(back);
 }
-function renderDetail(){var v=byId("view-detail");clear(v);if(!detailCtx){v.appendChild(emptyState("Aucun actif",""));return}v.appendChild(h("button",{class:"back",onclick:returnFromDetail},["← Retour"]));v.appendChild(h("h2",{class:"section"},[detailCtx.symbol]));if(chartTradeOverlay&&chartTradeOverlay.symbol===detailCtx.symbol){var oi=paperResultInfo(chartTradeOverlay);v.appendChild(h("div",{class:"trade-overlay-banner"},[h("span",{class:"status-pill ready"},["TRADE OVERLAY"]),h("span",{class:"status-pill future"},[paperStrategyLabel(chartTradeOverlay)]),h("span",{class:"status-pill "+(chartTradeOverlay.status==="OPEN"?"ready":"future")},[chartTradeOverlay.status||"—"]),chartTradeOverlay.status==="CLOSED"?h("span",{class:oi.klass},[oi.label+" · "+oi.reason]):null]));}if(detailCtx.kind==="crypto"||detailCtx.kind==="metal")v.appendChild(h("div",{class:"card"},[h("div",{class:"kv"},[h("span",{class:"k"},["Prix"]),h("span",{id:"d-price"},[h("span",{class:"spin"})])]),h("div",{class:"kv"},[h("span",{class:"k"},["Marché (fournisseur)"]),h("span",{id:"d-market-provider"},["UNKNOWN"])])]));v.appendChild(h("div",{class:"card",id:"d-hist"},[loading("Historique réel…")]));refreshDetail()}
-function refreshDetail(){if(!detailCtx)return;if(detailCtx.kind==="crypto"){api("/api/v1/market/ticker/"+encodeURIComponent(detailCtx.symbol)).then(function(r){var p=byId("d-price");if(!p)return;clear(p);if(!r.ok||!r.data){p.textContent="—";return}p.appendChild(priceCell(r.data.value));p.appendChild(document.createTextNode(" "));p.appendChild(qualityBadge(r.data.quality))});loadCandles("/api/v1/market/candles/"+encodeURIComponent(detailCtx.symbol)+"?granularity=1h")}else if(detailCtx.kind==="metal"){api("/api/v1/market/metal/"+encodeURIComponent(detailCtx.canonical)+"/quote").then(function(r){var p=byId("d-price");if(!p)return;clear(p);var d=r.data;if(!r.ok||!d||d.price == null){p.textContent="—";return}p.appendChild(priceCell(d.price));p.appendChild(document.createTextNode(" "));p.appendChild(qualityBadge(d.quality||"UNKNOWN"));var ms=byId("d-market-provider");if(ms){ms.textContent=d.is_market_open===true?"OUVERT":d.is_market_open===false?"FERMÉ":"UNKNOWN"}});var e=Math.floor(Date.now()/1000/3600)*3600;loadCandles("/api/v1/market/metal/"+encodeURIComponent(detailCtx.canonical)+"/history?granularity=1h&start="+(e-43200)+"&end="+e)}else if(detailCtx.kind==="index"){var e2=Math.floor(Date.now()/1000);loadCandles("/api/v1/market/index/"+encodeURIComponent(detailCtx.canonical)+"/history?granularity=1d&start="+(e2-2592000)+"&end="+e2)}else{var e3=Math.floor(Date.now()/1000/3600)*3600;loadCandles("/api/v1/market/forex/"+encodeURIComponent(detailCtx.canonical)+"/history?granularity=1h&start="+(e3-43200)+"&end="+e3)}}
+function renderDetail(){var v=byId("view-detail");clear(v);if(!detailCtx){v.appendChild(emptyState("Aucun actif",""));return}v.appendChild(h("button",{class:"back",onclick:returnFromDetail},["← Retour"]));v.appendChild(h("h2",{class:"section"},[detailCtx.symbol]));if(chartTradeOverlay&&chartTradeOverlay.symbol===detailCtx.symbol){var oi=paperResultInfo(chartTradeOverlay);v.appendChild(h("div",{class:"trade-overlay-banner"},[h("span",{class:"status-pill ready"},["TRADE OVERLAY"]),h("span",{class:"status-pill future"},[paperStrategyLabel(chartTradeOverlay)]),h("span",{class:"status-pill "+(chartTradeOverlay.status==="OPEN"?"ready":"future")},[chartTradeOverlay.status||"—"]),chartTradeOverlay.status==="CLOSED"?h("span",{class:oi.klass},[oi.label+" · "+oi.reason]):null]));}if(detailCtx.kind==="crypto"||detailCtx.kind==="metal"||detailCtx.kind==="energy")v.appendChild(h("div",{class:"card"},[h("div",{class:"kv"},[h("span",{class:"k"},["Prix"]),h("span",{id:"d-price"},[h("span",{class:"spin"})])]),h("div",{class:"kv"},[h("span",{class:"k"},["Marché (fournisseur)"]),h("span",{id:"d-market-provider"},["UNKNOWN"])])]));v.appendChild(h("div",{class:"card",id:"d-hist"},[loading("Historique réel…")]));refreshDetail()}
+function refreshDetail(){if(!detailCtx)return;if(detailCtx.kind==="crypto"){api("/api/v1/market/ticker/"+encodeURIComponent(detailCtx.symbol)).then(function(r){var p=byId("d-price");if(!p)return;clear(p);if(!r.ok||!r.data){p.textContent="—";return}p.appendChild(priceCell(r.data.value));p.appendChild(document.createTextNode(" "));p.appendChild(qualityBadge(r.data.quality))});loadCandles("/api/v1/market/candles/"+encodeURIComponent(detailCtx.symbol)+"?granularity=1h")}else if(detailCtx.kind==="metal"){api("/api/v1/market/metal/"+encodeURIComponent(detailCtx.canonical)+"/quote").then(function(r){var p=byId("d-price");if(!p)return;clear(p);var d=r.data;if(!r.ok||!d||d.price == null){p.textContent="—";return}p.appendChild(priceCell(d.price));p.appendChild(document.createTextNode(" "));p.appendChild(qualityBadge(d.quality||"UNKNOWN"));var ms=byId("d-market-provider");if(ms){ms.textContent=d.is_market_open===true?"OUVERT":d.is_market_open===false?"FERMÉ":"UNKNOWN"}});var e=Math.floor(Date.now()/1000/3600)*3600;loadCandles("/api/v1/market/metal/"+encodeURIComponent(detailCtx.canonical)+"/history?granularity=1h&start="+(e-43200)+"&end="+e)}else if(detailCtx.kind==="energy"){api("/api/v1/market/energy/"+encodeURIComponent(detailCtx.canonical)+"/quote").then(function(r){var p=byId("d-price");if(!p)return;clear(p);var d=r&&r.ok?r.data:null;if(!d||d.price==null){p.textContent="—";p.appendChild(document.createTextNode(" "));p.appendChild(qualityBadge(d&&d.quality?d.quality:"UNAVAILABLE"));return}p.appendChild(priceCell(d.price));p.appendChild(document.createTextNode(" "));p.appendChild(qualityBadge(d.quality||"UNKNOWN"));var ms=byId("d-market-provider");if(ms){var state=d.is_market_open===true?"OUVERT":d.is_market_open===false?"FERMÉ":"UNKNOWN";ms.textContent=state+(d.provider?" · "+d.provider:"")}});var ee=Math.floor(Date.now()/1000/3600)*3600;loadCandles("/api/v1/market/energy/"+encodeURIComponent(detailCtx.canonical)+"/history?granularity=1h&start="+(ee-43200)+"&end="+ee)}else if(detailCtx.kind==="index"){var e2=Math.floor(Date.now()/1000);loadCandles("/api/v1/market/index/"+encodeURIComponent(detailCtx.canonical)+"/history?granularity=1d&start="+(e2-2592000)+"&end="+e2)}else{var e3=Math.floor(Date.now()/1000/3600)*3600;loadCandles("/api/v1/market/forex/"+encodeURIComponent(detailCtx.canonical)+"/history?granularity=1h&start="+(e3-43200)+"&end="+e3)}}
 function loadCandles(path){api(path).then(function(r){var w=byId("d-hist");if(!w)return;clear(w);if(!r.ok){w.appendChild(emptyState("Historique indisponible",errorMessage(r)));return}var d=r.data||{},cs=(d.candles||[]).slice().sort(function(a,b){return(Date.parse(a.start)||0)-(Date.parse(b.start)||0)});w.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["Dernières bougies"]),qualityBadge(d.latest_quality||(cs.length?cs[cs.length-1].quality:"MISSING"))]));if(!cs.length){w.appendChild(emptyState("Pas de données",""));return}var rows=cs.slice(-10).reverse().map(function(c){return h("tr",{},[h("td",{},[formatMontrealTime(c.start)]),h("td",{},[priceCell(c.open)]),h("td",{},[priceCell(c.high)]),h("td",{},[priceCell(c.low)]),h("td",{},[priceCell(c.close)])])});w.appendChild(h("div",{class:"tbl-wrap"},[h("table",{class:"tbl"},[h("thead",{},[h("tr",{},[h("th",{},["Heure (Montréal)"]),h("th",{},["O"]),h("th",{},["H"]),h("th",{},["L"]),h("th",{},["C"])])]),h("tbody",{},rows)])]))})}
 
 
@@ -1260,7 +1298,7 @@ function placeholder(title,sub){
 }
 
 function multiAssetIcon(assetClass){
-  var key=assetClass==="FOREX"?"forex":assetClass==="METAL"?"metal":"indices";
+  var key=assetClass==="FOREX"?"forex":assetClass==="METAL"?"metal":assetClass==="ENERGY"?"metal":"indices";
   return h("div",{class:"multi-monitor-icon",html:iconSvg(key)},[]);
 }
 function monitorStatusClass(v){v=String(v||"").toUpperCase();return v==="READY"||v==="VALID"||v==="ENTRY_NOW"||v==="SETUP"?"good":v==="WAIT"||v==="NOT_SCANNED"||v==="UNKNOWN"?"wait":"bad";}
@@ -2099,11 +2137,12 @@ function refreshGoldRealtime(){
   })
 }
 const CHART_BUCKETS={"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600,"2h":7200,"4h":14400,"6h":21600,"1d":86400};
-function chartTimeframes(kind){return kind==="metal"?["1m","5m","15m","30m","1h","2h","4h"]:["1m","5m","15m","30m","1h","2h","4h","6h","1d"]}
+function chartTimeframes(kind){return (kind==="metal"||kind==="energy")?["1m","5m","15m","30m","1h","2h","4h"]:["1m","5m","15m","30m","1h","2h","4h","6h","1d"]}
 function chartPath(kind,symbol,tf){
   if(kind==="crypto")return "/api/v1/market/candles/"+encodeURIComponent(symbol)+"?granularity="+encodeURIComponent(tf)+"&limit=300";
   var bucket=CHART_BUCKETS[tf]||3600, end=Math.floor(Date.now()/1000/bucket)*bucket, start=end-bucket*300;
   if(kind==="metal")return "/api/v1/market/metal/"+encodeURIComponent(symbol)+"/history?granularity="+tf+"&start="+start+"&end="+end;
+  if(kind==="energy")return "/api/v1/market/energy/"+encodeURIComponent(symbol)+"/history?granularity="+tf+"&start="+start+"&end="+end;
   if(kind==="index")return "/api/v1/market/index/"+encodeURIComponent(symbol)+"/history?granularity="+tf+"&start="+start+"&end="+end;
   return "/api/v1/market/forex/"+encodeURIComponent(symbol)+"/history?granularity="+tf+"&start="+start+"&end="+end;
 }
@@ -2747,8 +2786,8 @@ var BOTTOM=[
  {id:"settings",label:"Réglages",icon:"⚙"}
 ];
 function buildNav(){var n=byId("nav");clear(n);BOTTOM.forEach(function(x){n.appendChild(h("button",{"data-view":x.id,onclick:function(){setView(x.id)}},[h("span",{class:"ic"},[x.icon]),x.label]))})}
-function setView(id){closeMarketMenu();current=id;var workspace=["signals","trading","strategies","intelligence","settings"].includes(id);document.body.classList.toggle("workspace-mode",workspace);document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading")renderTrading();else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
-function poll(){refreshHealth();if(current==="dashboard")refreshDashboard();else if(current==="markets")refreshMarkets();else if(current==="forex")refreshForexMarket();else if(current==="system")renderSystem();else if(current==="trading")refreshPaperTrading();else if(current==="detail")refreshDetail()}
+function setView(id){closeMarketMenu();current=id;var workspace=["signals","trading","strategies","intelligence","settings"].includes(id);document.body.classList.toggle("workspace-mode",workspace);document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="energy")renderEnergy();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading")renderTrading();else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
+function poll(){refreshHealth();if(current==="dashboard")refreshDashboard();else if(current==="markets")refreshMarkets();else if(current==="forex")refreshForexMarket();else if(current==="energy")refreshEnergyMarket();else if(current==="system")renderSystem();else if(current==="trading")refreshPaperTrading();else if(current==="detail")refreshDetail()}
 function loadCryptoUniverse(){
   return api("/api/v1/market/crypto-universe").then(function(r){
     var d=r&&r.ok&&r.data?r.data:null;
@@ -2833,3 +2872,5 @@ function renderHelpGlossary(){
 <!-- V16-M5B30Q · FINAL IPHONE ACCEPTANCE CANDIDATE · BASELINE M5B30L-UI1-FIX1 -->
 <!-- V16-M5B30Q-HISTORY-FIX1 · PERSISTENT DETAILS STATE + COMPACT IPHONE TRADE DETAILS -->
 <!-- V16-M5B30R · PAPER TRADING V1 RELEASE CANDIDATE FREEZE · BASELINE M5B30Q -->
+
+<!-- V16-M5B30Q-ENERGY-UI1 · WTI + BRENT FRONTEND CONTRACT · REAL BACKEND DATA ONLY -->

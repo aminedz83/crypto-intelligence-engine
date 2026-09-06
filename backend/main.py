@@ -4601,8 +4601,6 @@ async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
         "source_timestamp": req.source_timestamp, "opened_at": req.opened_at,
         "close_reason": None, "close_price": None, "closed_at": None,
         "created_at": now, "updated_at": now,
-        "strategy_id": req.performance_strategy_id,
-        "strategy_version": req.performance_strategy_version,
     }
     try:
         async with engine.begin() as conn:
@@ -5831,8 +5829,14 @@ async def get_live_paper_positions() -> Dict[str, object]:
         async with engine.connect() as conn:
             result = await conn.execute(
                 text(
-                    "SELECT * FROM paper_positions WHERE status='OPEN' "
-                    "ORDER BY opened_at DESC, position_id DESC"
+                    "SELECT p.*, c.strategy_id, c.strategy_version, "
+                    "c.timeframe, c.session AS session_at_entry, "
+                    "c.market_regime AS regime_at_entry "
+                    "FROM paper_positions p "
+                    "LEFT JOIN paper_position_context c "
+                    "ON p.position_id = c.position_id "
+                    "WHERE p.status='OPEN' "
+                    "ORDER BY p.opened_at DESC, p.position_id DESC"
                 )
             )
             rows = result.fetchall()
@@ -7993,9 +7997,14 @@ async def list_paper_positions(status_filter: Optional[str] = None) -> Dict[str,
         "fx.conversion_price AS fx_conversion_price_close, "
         "fx.inverse AS fx_conversion_inverse_close, "
         "fx.source AS fx_conversion_source_close, "
-        "fx.source_timestamp AS fx_conversion_source_timestamp_close "
+        "fx.source_timestamp AS fx_conversion_source_timestamp_close, "
+        "ctx.strategy_id, ctx.strategy_version, ctx.timeframe, "
+        "ctx.session AS session_at_entry, "
+        "ctx.market_regime AS regime_at_entry "
         "FROM paper_positions p LEFT JOIN paper_fx_conversion_snapshots fx "
-        "ON fx.position_id=p.position_id AND fx.phase='CLOSE'"
+        "ON fx.position_id=p.position_id AND fx.phase='CLOSE' "
+        "LEFT JOIN paper_position_context ctx "
+        "ON ctx.position_id=p.position_id"
     )
     params: Dict[str, object] = {}
     if status_filter is not None:
@@ -11300,6 +11309,21 @@ async def lifespan(app: FastAPI):
         raise
     except Exception as exc:  # noqa: BLE001
         log.warning("Continuous feed startup ensure failed: %s", type(exc).__name__)
+
+    # V17-PRO: auto-start WS for all asset classes so monitoring has prices
+    # even without a browser. Errors are non-fatal (fail-open for WS).
+    for ws_starter_name, ws_starter in (
+        ("forex", market_forex_ws_start),
+        ("metal", market_metal_ws_start),
+        ("index", market_index_ws_start),
+    ):
+        try:
+            await ws_starter()
+            log.info("WS auto-start %s: OK", ws_starter_name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("WS auto-start %s failed: %s", ws_starter_name, type(exc).__name__)
 
     if persistence_state.ready:
         try:

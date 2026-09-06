@@ -4600,6 +4600,8 @@ async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
         "source_timestamp": req.source_timestamp, "opened_at": req.opened_at,
         "close_reason": None, "close_price": None, "closed_at": None,
         "created_at": now, "updated_at": now,
+        "strategy_id": req.performance_strategy_id,
+        "strategy_version": req.performance_strategy_version,
     }
     try:
         async with engine.begin() as conn:
@@ -13112,6 +13114,12 @@ async def run_trend_pullback_paper_generation_once() -> Dict[str, int]:
     stats = {"checked": 0, "setups": 0, "opened": 0, "blocked": 0}
     if not persistence_state.ready:
         return stats
+    # V17-PRO: session filter + cooldown (same as SMC orchestrator)
+    now = utcnow()
+    if not is_crypto_session_active(now):
+        return stats
+    if is_cooldown_active(now):
+        return stats
     for instrument in instrument_registry.all():
         if instrument.asset_class != AssetClass.CRYPTO:
             continue
@@ -13357,6 +13365,12 @@ async def run_breakout_expansion_paper_generation_once() -> Dict[str, int]:
     """Scan the real crypto registry for Breakout Expansion paper entries."""
     stats = {"checked": 0, "setups": 0, "opened": 0, "blocked": 0}
     if not persistence_state.ready:
+        return stats
+    # V17-PRO: session filter + cooldown (same as SMC orchestrator)
+    now = utcnow()
+    if not is_crypto_session_active(now):
+        return stats
+    if is_cooldown_active(now):
         return stats
     for instrument in instrument_registry.all():
         if instrument.asset_class != AssetClass.CRYPTO:

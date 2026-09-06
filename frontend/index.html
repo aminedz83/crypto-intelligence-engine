@@ -155,6 +155,62 @@ body.workspace-mode main{padding-top:14px}
 .fx-flag{position:absolute;width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:22px;line-height:1;background:#0d1726;border:2px solid #1d3148;box-shadow:0 4px 12px rgba(0,0,0,.28);overflow:hidden}
 .fx-flag-a{left:0;z-index:2}
 .fx-flag-b{left:20px;z-index:1}
+
+/* V17-UI5 — Strategy/Adaptive Edge mobile polish; real backend data only */
+#view-strategies .module-title.matrix-title{
+  display:flex;align-items:flex-start;justify-content:space-between;gap:10px;min-width:0;
+}
+#view-strategies .module-title.matrix-title>div{min-width:0;flex:1 1 auto}
+#view-strategies .module-title.matrix-title h3{margin:0 0 4px;font-size:22px;line-height:1.08}
+#view-strategies .module-title.matrix-title p{margin:0;max-width:100%;overflow-wrap:anywhere}
+#view-strategies .matrix-validation{
+  flex:0 1 auto;max-width:42%;white-space:normal;text-align:right;
+  overflow-wrap:anywhere;word-break:break-word;font-size:10px;line-height:1.2;
+}
+#view-strategies .subtabs{
+  overflow-x:auto;overscroll-behavior-inline:contain;scrollbar-width:none;
+  -webkit-overflow-scrolling:touch;padding-bottom:2px;
+}
+#view-strategies .subtabs::-webkit-scrollbar{display:none}
+#view-strategies .subtabs .subtab{flex:0 0 auto;min-width:138px;max-width:190px}
+#view-strategies .matrix-cell-card{min-width:0}
+#view-strategies .matrix-context{white-space:normal;overflow-wrap:anywhere}
+#view-strategies .matrix-cell-card .metric-strip{grid-template-columns:repeat(2,minmax(0,1fr))}
+#view-strategies .matrix-cell-card .metric-mini{min-width:0}
+#view-strategies .matrix-cell-card .metric-mini b{overflow-wrap:anywhere}
+
+.edge-replay-card-v2{padding:16px!important}
+.edge-replay-head-v2{display:flex!important;align-items:flex-start!important;justify-content:space-between;gap:10px;min-width:0}
+.edge-replay-identity{display:flex;align-items:center;gap:10px;min-width:0;flex:1 1 auto}
+.edge-replay-identity .coin{flex:0 0 auto}
+.edge-replay-identity>div{min-width:0}
+.edge-replay-head-v2 .edge-replay-symbol{font-size:18px;line-height:1.1}
+.edge-replay-head-v2 .edge-replay-context{margin-top:4px;font-size:12px}
+.edge-replay-badges{display:flex;align-items:flex-end;gap:6px;flex-wrap:wrap;justify-content:flex-end;max-width:54%}
+.edge-replay-badges .strategy-badge,.edge-replay-badges .status-pill{max-width:100%;white-space:normal;text-align:center}
+.edge-replay-proof-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:12px 0 0}
+.edge-replay-date{margin-left:auto;font-size:11px;color:var(--muted)}
+.edge-no-evidence{
+  margin-top:12px;padding:12px 13px;border:1px solid var(--line);border-radius:14px;
+  background:rgba(255,255,255,.018);display:flex;flex-direction:column;gap:4px;
+}
+.edge-no-evidence b{font-size:13px;color:var(--text)}
+.edge-no-evidence span{font-size:12px;line-height:1.45;color:var(--muted)}
+.edge-replay-metrics-v2{margin-top:12px!important;grid-template-columns:repeat(2,minmax(0,1fr))!important}
+.edge-replay-reason-v2{margin-top:10px!important;font-size:12px!important;line-height:1.4}
+#view-trading .edge-replay-list{gap:12px!important}
+
+@media(max-width:700px){
+  #view-strategies .grid-2{grid-template-columns:1fr}
+  #view-strategies .card{min-width:0}
+  #view-strategies .module-title.matrix-title{align-items:flex-start}
+  #view-strategies .module-title.matrix-title h3{font-size:20px}
+  #view-strategies .matrix-validation{max-width:36%;font-size:9px}
+  #view-strategies .metric-strip{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .edge-replay-head-v2{flex-direction:column}
+  .edge-replay-badges{max-width:100%;justify-content:flex-start}
+  .edge-replay-date{margin-left:0}
+}
 </style>
 
 <style id="v4-reference-tuning">
@@ -851,45 +907,50 @@ function edgeReplayActionClass(action){
 }
 function edgeReplayCard(d){
   var action=String(d.action||"ALLOWED").toUpperCase(),m=d.metrics||{},c=d.components||{};
-  var score=d.score==null?"—":paperMetric(d.score," / 100");
-  var rank=d.rank==null?"—":"#"+String(d.rank);
-  var evidence=d.evidence||"NO EVIDENCE";
+  var evidence=String(d.evidence||"NO EVIDENCE").toUpperCase();
   var snapshot=d.snapshot_available?"SNAPSHOT":"LEGACY";
-  return h("div",{class:"edge-replay-card"},[
-    h("div",{class:"edge-replay-head"},[
-      h("img",{class:"coin",src:iconFor(d.symbol||""),alt:"","aria-hidden":"true"}),
-      h("span",{class:"edge-replay-symbol"},[d.symbol||"—"]),
-      h("span",{class:"strategy-badge"},[String(d.strategy_id||"STRATEGY").replaceAll("_"," ")]),
-      h("span",{class:"status-pill "+edgeReplayActionClass(action)},[action]),
-      h("span",{class:"status-pill other"},[evidence]),
-      h("span",{class:"status-pill other"},[snapshot])
-    ]),
-    h("div",{class:"edge-replay-context"},[
-      [d.timeframe,d.session,d.market_regime].filter(Boolean).join(" · ")||
-      "Contexte historique non persisté"
-    ]),
-    h("div",{class:"edge-replay-reason"},[humanDecisionReason(d.reason)]),
-    h("div",{class:"edge-replay-metrics"},[
-      h("div",{class:"edge-replay-metric"},[h("span",{},["Edge"]),h("b",{},[score])]),
-      h("div",{class:"edge-replay-metric"},[h("span",{},["Rang"]),h("b",{},[rank])]),
-      h("div",{class:"edge-replay-metric"},[
-        h("span",{},["Profit Factor"]),h("b",{},[paperMetric(m.profit_factor,"")])
+  var hasMetric=function(v){return v!==null&&v!==undefined&&v!==""&&Number.isFinite(Number(v))};
+  var metrics=[];
+  if(hasMetric(d.score))metrics.push(["Edge",paperMetric(d.score," / 100")]);
+  if(hasMetric(d.rank))metrics.push(["Rang","#"+String(d.rank)]);
+  if(hasMetric(m.profit_factor))metrics.push(["Profit Factor",paperMetric(m.profit_factor,"")]);
+  if(hasMetric(m.win_rate_percent))metrics.push(["Win Rate",paperMetric(m.win_rate_percent," %")]);
+  if(hasMetric(m.average_realized_rr))metrics.push(["RR moyen",paperMetric(m.average_realized_rr," R")]);
+  if(hasMetric(m.max_drawdown_percent))metrics.push(["Drawdown",paperMetric(m.max_drawdown_percent," %")]);
+  if(hasMetric(c.sample))metrics.push(["Échantillon",paperMetric(c.sample," / 20")]);
+
+  return h("div",{class:"edge-replay-card edge-replay-card-v2"},[
+    h("div",{class:"edge-replay-head edge-replay-head-v2"},[
+      h("div",{class:"edge-replay-identity"},[
+        iconFor(d.symbol||""),
+        h("div",{},[
+          h("div",{class:"edge-replay-symbol"},[d.symbol||"—"]),
+          h("div",{class:"edge-replay-context"},[
+            [d.timeframe,d.session,d.market_regime].filter(Boolean).join(" · ")||
+            "Contexte historique non persisté"
+          ])
+        ])
       ]),
-      h("div",{class:"edge-replay-metric"},[
-        h("span",{},["Win Rate"]),h("b",{},[paperMetric(m.win_rate_percent," %")])
-      ]),
-      h("div",{class:"edge-replay-metric"},[
-        h("span",{},["RR moyen"]),h("b",{},[paperMetric(m.average_realized_rr," R")])
-      ]),
-      h("div",{class:"edge-replay-metric"},[
-        h("span",{},["Drawdown"]),h("b",{},[paperMetric(m.max_drawdown_percent," %")])
-      ]),
-      h("div",{class:"edge-replay-metric"},[
-        h("span",{},["Sample pts"]),h("b",{},[paperMetric(c.sample," / 20")])
-      ]),
-      h("div",{class:"edge-replay-metric"},[
-        h("span",{},["Date"]),h("b",{},[formatMontrealTime(d.created_at)])
+      h("div",{class:"edge-replay-badges"},[
+        h("span",{class:"strategy-badge"},[String(d.strategy_id||"STRATEGY").replaceAll("_"," ")]),
+        h("span",{class:"status-pill "+edgeReplayActionClass(action)},[action])
       ])
+    ]),
+    h("div",{class:"edge-replay-proof-row"},[
+      h("span",{class:"status-pill other"},[evidence]),
+      h("span",{class:"status-pill other"},[snapshot]),
+      h("span",{class:"edge-replay-date"},[d.created_at?formatMontrealTime(d.created_at):"—"])
+    ]),
+    evidence==="NO EVIDENCE"&&!metrics.length
+      ? h("div",{class:"edge-no-evidence"},[
+          h("b",{},["Aucune preuve statistique persistée"]),
+          h("span",{},["Le gate reste affiché, mais aucune performance n’est inventée tant qu’un contexte correspondant n’a pas assez de trades CLOSED."])
+        ])
+      : h("div",{class:"edge-replay-metrics edge-replay-metrics-v2"},metrics.map(function(x){
+          return h("div",{class:"edge-replay-metric"},[h("span",{},[x[0]]),h("b",{},[x[1]])]);
+        })),
+    h("div",{class:"edge-replay-reason edge-replay-reason-v2"},[
+      humanDecisionReason(d.reason||"NO_MATCHING_PERSISTED_CONTEXT")
     ])
   ]);
 }
@@ -1631,11 +1692,11 @@ function matrixCellCard(c){
   var exp=m.expectancy==null?"—":paperMoney(m.expectancy);
   var rr=m.average_realized_rr==null?"—":matrixNum(m.average_realized_rr).toFixed(2)+"R";
   var dd=m.max_drawdown==null?"—":paperMoney(m.max_drawdown);
-  return h("div",{class:"card tool-card"},[
+  return h("div",{class:"card tool-card matrix-cell-card"},[
     h("div",{},[
       h("div",{class:"tool-name"},[c.symbol||"—"]),
       h("div",{class:"tool-desc"},[(c.strategy_id||"—")+(c.strategy_version?" · "+c.strategy_version:"")]),
-      h("div",{class:"sub"},[(c.timeframe||"TF —")+" · "+(c.session||"Session —")+" · "+(c.regime||"Régime —")])
+      h("div",{class:"sub matrix-context"},[(c.timeframe||"TF —")+" · "+(c.session||"Session —")+" · "+(c.regime||"Régime —")])
     ]),
     h("div",{class:"tool-foot"},[
       h("span",{class:"status-pill "+matrixEvidenceClass(c.evidence)},[c.evidence||"—"]),
@@ -1667,7 +1728,7 @@ function strategyPerformanceMatrix(){
     var f=cells.filter(function(c){return (strategyMatrixState.symbol==="ALL"||c.symbol===strategyMatrixState.symbol)&&(strategyMatrixState.strategy==="ALL"||c.strategy_id===strategyMatrixState.strategy)&&(strategyMatrixState.timeframe==="ALL"||c.timeframe===strategyMatrixState.timeframe)&&(strategyMatrixState.session==="ALL"||c.session===strategyMatrixState.session)&&(strategyMatrixState.regime==="ALL"||c.regime===strategyMatrixState.regime)});
     f.sort(function(a,b){var rank={ROBUST:3,PROMISING:2,WEAK:1,INSUFFICIENT_SAMPLE:0};var x=(rank[b.evidence]||0)-(rank[a.evidence]||0);return x||matrixNum((b.metrics||{}).expectancy)-matrixNum((a.metrics||{}).expectancy)});
     var cov=d.context_coverage||{};
-    host.appendChild(h("div",{class:"module-title"},[h("div",{},[h("h3",{},["Performance Matrix"]),h("p",{},["Actif × Stratégie × TF × Session × Régime · trades CLOSED persistés"])]),h("span",{class:"module-badge"},[d.validation||"V2"])]));
+    host.appendChild(h("div",{class:"module-title matrix-title"},[h("div",{},[h("h3",{},["Performance Matrix"]),h("p",{},["Performances paper réelles · trades CLOSED persistés"])]),h("span",{class:"module-badge matrix-validation"},[d.validation||"V2"])]));
     host.appendChild(filters);
     host.appendChild(h("div",{class:"metric-strip"},[
       h("div",{class:"metric-mini"},[h("span",{},["Cellules"]),h("b",{},[String(f.length)])]),
@@ -2894,6 +2955,7 @@ function renderHelpGlossary(){
 <!-- V16-M5B28B6 · MOBILE UI POLISH · COMPACT OPEN POSITIONS · SIGNAL SUMMARY · DASHBOARD PAPER PULSE -->
 <!-- V16-M5B28B7 · DYNAMIC CRYPTO LOGOS · COINCAP CDN + TICKER FALLBACK -->
 <!-- V16-M5B28B7-FIX3 · SAME-ORIGIN DYNAMIC CRYPTO LOGO PROXY -->
+<!-- V17-UI5 · STRATEGY MATRIX + ADAPTIVE EDGE MOBILE REAL-DATA FIX -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

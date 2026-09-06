@@ -1,3 +1,4 @@
+# V17-ENERGY-UI2 — WTI + Brent real Twelve Data market-data integration; paper sizing fail-closed.
 # CI395 recovery marker: cumulative V16-M5B25B-FIX2 backend baseline.
 # V16-M5B30M — continuous paper runtime + feed watchdog + restart recovery.
 # V16-M5B30N — observability + recovery audit for continuous paper runtime.
@@ -4743,6 +4744,19 @@ async def paper_mark_from_realtime(symbol: str) -> Optional[PaperPositionMark]:
         source_timestamp = gold.source_timestamp
         source = "twelvedata"
 
+    elif instrument.asset_class == AssetClass.ENERGY:
+        q = await twelvedata_provider.get_quote(canonical)
+        if q.status != "OK" or q.price is None or q.price <= 0 or q.timestamp_utc is None:
+            return None
+        if classify_freshness(
+            q.timestamp_utc, settings.ticker_max_age_seconds, now=utcnow()
+        ) != DataQualityStatus.VALID:
+            return None
+        price = q.price
+        received_at = utcnow()
+        source_timestamp = q.timestamp_utc
+        source = "twelvedata"
+
     elif instrument.asset_class == AssetClass.INDEX:
         value = massive_indices_ws.values.get(canonical)
         if value is None or value.quality != DataQualityStatus.VALID:
@@ -8385,6 +8399,7 @@ class AssetClass(str, Enum):
     CRYPTO = "CRYPTO"
     FOREX = "FOREX"
     METAL = "METAL"
+    ENERGY = "ENERGY"
     INDEX = "INDEX"
 
 
@@ -9845,6 +9860,10 @@ class TwelveDataProvider:
 # Officially-catalogued Twelve Data symbol for gold spot -> verified provider
 # mapping (a mapping is not an entitlement: MAPPED can coexist with NOT_ENTITLED).
 provider_symbol_map.add("twelvedata", "XAU-USD", "XAU/USD")
+# Official Twelve Data commodity catalogue mappings. Canonical app symbols remain
+# provider-agnostic; provider symbols are explicit and never inferred at runtime.
+provider_symbol_map.add("twelvedata", "WTI-USD", "WTI/USD")
+provider_symbol_map.add("twelvedata", "BRENT-USD", "XBR/USD")
 
 twelvedata_provider = TwelveDataProvider()
 
@@ -10107,6 +10126,37 @@ def _register_metal_instruments() -> None:
 _register_metal_instruments()
 
 
+def _register_energy_instruments() -> None:
+    """Register real Twelve Data spot-oil instruments without inventing contract specs.
+
+    WTI/USD and XBR/USD are provider catalogue symbols. The canonical app identity
+    for Brent is BRENT-USD while its provider symbol remains XBR/USD. Calendar,
+    tick size and broker contract metadata stay unconfigured until independently
+    verified; this keeps paper execution fail-closed while market data/analysis work.
+    """
+    for canonical, base, name in (
+        ("WTI-USD", "WTI", "Crude Oil WTI Spot / US Dollar"),
+        ("BRENT-USD", "BRENT", "Brent Spot / US Dollar"),
+    ):
+        instrument_registry.register(
+            Instrument(
+                canonical_symbol=canonical,
+                asset_class=AssetClass.ENERGY,
+                base_asset=base,
+                quote_asset="USD",
+                display_name=name,
+                timezone="UTC",
+                market_calendar=MarketCalendarPolicy.NOT_CONFIGURED,
+                volume_semantics=VolumeSemantics.UNKNOWN,
+                price_precision=None,
+                tick_size=None,
+            )
+        )
+
+
+_register_energy_instruments()
+
+
 @dataclass(frozen=True)
 class MetalHistory:
     """Assembled metal history: the JSON-serialisable `result` for the API, and the
@@ -10306,6 +10356,183 @@ async def market_metal_quote(symbol: str) -> dict:
     if http is not None:
         raise HTTPException(
             status_code=http, detail={"status": status, "reason": result.get("reason")}
+        )
+    return result
+
+
+# ==================== Twelve Data REST — Energy / Oil ========================
+# Real commodity data only. Twelve Data catalogue symbols are explicitly mapped:
+# WTI-USD -> WTI/USD and BRENT-USD -> XBR/USD. No futures/CFD contract metadata
+# is inferred. Market data and strategy analysis are enabled; paper execution
+# remains fail-closed until instrument sizing/contract rules are independently
+# verified.
+
+
+@dataclass(frozen=True)
+class EnergyHistory:
+    result: Dict[str, object]
+    rows: List[CandleRow]
+
+
+async def fetch_energy_history(
+    canonical_symbol: str, granularity: str, start: int, end: int
+) -> EnergyHistory:
+    inst = instrument_registry.get(canonical_symbol)
+    if inst is None or inst.asset_class != AssetClass.ENERGY:
+        raise ValueError(f"unknown energy instrument: {canonical_symbol}")
+    if start >= end:
+        raise ValueError("start must be strictly before end")
+    provider_symbol = provider_symbol_map.to_provider("twelvedata", canonical_symbol)
+    if provider_symbol is None:
+        return EnergyHistory(
+            {
+                "source": "twelvedata",
+                "canonical_symbol": canonical_symbol,
+                "provider_symbol": None,
+                "granularity": granularity,
+                "status": "NOT_MAPPED",
+                "reason": "no verified Twelve Data energy mapping",
+                "count": 0,
+                "candles": [],
+            },
+            [],
+        )
+    start_s = datetime.fromtimestamp(int(start), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    end_s = datetime.fromtimestamp(int(end), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    tdr = await twelvedata_provider.get_time_series(
+        canonical_symbol, granularity, outputsize=5000, start=start_s, end=end_s
+    )
+    base: Dict[str, object] = {
+        "source": "twelvedata",
+        "canonical_symbol": canonical_symbol,
+        "provider_symbol": provider_symbol,
+        "asset_class": AssetClass.ENERGY.value,
+        "granularity": granularity,
+        "requested_range": {"start": start, "end": end},
+        "timezone_internal": "UTC",
+        "display_timezone": "America/Toronto",
+        "market_timezone": inst.timezone,
+        "market_calendar": inst.market_calendar.value,
+        "volume_semantics": inst.volume_semantics.value,
+    }
+    if tdr.status != "OK":
+        base.update({"status": tdr.status, "reason": tdr.reason, "count": 0, "candles": []})
+        return EnergyHistory(base, [])
+    collected: Dict[int, TwelveDataBar] = {}
+    invalid = 0
+    for bar in tdr.bars:
+        if bar.datetime_utc is None or bar.status == DataQualityStatus.INVALID:
+            invalid += 1
+            continue
+        key = int(bar.datetime_utc.timestamp())
+        if key < start or key >= end:
+            continue
+        collected[key] = bar
+    kept = [collected[k] for k in sorted(collected)]
+    rows = _metal_bars_to_rows("twelvedata", provider_symbol, granularity, kept, utcnow())
+    base.update({
+        "status": "EMPTY" if not kept else "OK",
+        "count": len(kept),
+        "invalid_candles_count": invalid,
+        "latest_quality": _metal_latest_quality(kept, granularity),
+        "gaps_status": "UNKNOWN",
+        "candles": [_td_bar_dict(b) for b in kept],
+    })
+    return EnergyHistory(base, rows)
+
+
+_ENERGY_HTTP_STATUS = {
+    "NOT_MAPPED": 409, "NOT_SUPPORTED": 409, "NO_KEY": 503, "ACCESS_DENIED": 403,
+    "RATE_LIMITED": 429, "UNAVAILABLE": 503,
+}
+
+
+@api_router.get("/market/energy/{symbol}/history")
+async def market_energy_history(
+    symbol: str, start: int, end: int, granularity: str = "1h"
+) -> dict:
+    canonical = symbol.upper().replace("/", "-")
+    try:
+        hist = await fetch_energy_history(canonical, granularity, start, end)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": str(exc)}
+        ) from exc
+    status_value = str(hist.result.get("status"))
+    if status_value == "OK" and persistence_state.ready and hist.rows:
+        try:
+            await persist_candles(hist.rows)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Energy persistence error: %s", exc)
+    http = _ENERGY_HTTP_STATUS.get(status_value)
+    if http is not None:
+        raise HTTPException(
+            status_code=http,
+            detail={"status": status_value, "reason": hist.result.get("reason")},
+        )
+    return hist.result
+
+
+async def fetch_energy_quote(canonical_symbol: str) -> Dict[str, object]:
+    inst = instrument_registry.get(canonical_symbol)
+    if inst is None or inst.asset_class != AssetClass.ENERGY:
+        raise ValueError(f"unknown energy instrument: {canonical_symbol}")
+    q = await twelvedata_provider.get_quote(canonical_symbol)
+    provider_symbol = provider_symbol_map.to_provider("twelvedata", canonical_symbol)
+    base: Dict[str, object] = {
+        "source": "twelvedata",
+        "provider": "twelvedata",
+        "symbol": canonical_symbol,
+        "canonical_symbol": canonical_symbol,
+        "provider_symbol": provider_symbol,
+        "asset_class": AssetClass.ENERGY.value,
+        "timezone_internal": "UTC",
+        "display_timezone": "America/Toronto",
+    }
+    if q.status != "OK":
+        base.update({
+            "status": q.status,
+            "reason": q.reason,
+            "price": None,
+            "is_market_open": None,
+            "timestamp": None,
+            "quality": DataQualityStatus.MISSING.value,
+        })
+        return base
+    age = compute_age_seconds(q.timestamp_utc) if q.timestamp_utc is not None else None
+    quality = (
+        classify_freshness(q.timestamp_utc, settings.ticker_max_age_seconds).value
+        if q.timestamp_utc is not None
+        else DataQualityStatus.UNKNOWN.value
+    )
+    timestamp = q.timestamp_utc.isoformat() if q.timestamp_utc else None
+    base.update({
+        "status": "OK",
+        "price": str(q.price) if q.price is not None else None,
+        "is_market_open": q.is_market_open,
+        "timestamp": timestamp,
+        "quote_time": timestamp,
+        "quote_age_seconds": age,
+        "quality": quality,
+        "volume_semantics": inst.volume_semantics.value,
+    })
+    return base
+
+
+@api_router.get("/market/energy/{symbol}/quote")
+async def market_energy_quote(symbol: str) -> dict:
+    canonical = symbol.upper().replace("/", "-")
+    try:
+        result = await fetch_energy_quote(canonical)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail={"status": "INVALID", "reason": str(exc)}
+        ) from exc
+    status_value = str(result.get("status"))
+    http = _ENERGY_HTTP_STATUS.get(status_value)
+    if http is not None:
+        raise HTTPException(
+            status_code=http, detail={"status": status_value, "reason": result.get("reason")}
         )
     return result
 
@@ -11691,7 +11918,7 @@ def _analysis_history_span_seconds(
     # These are retrieval windows only, never fabricated candles.
     if asset_class == AssetClass.INDEX:
         return max(bare * 6, 21 * 86400)
-    if asset_class in {AssetClass.FOREX, AssetClass.METAL}:
+    if asset_class in {AssetClass.FOREX, AssetClass.METAL, AssetClass.ENERGY}:
         return max(bare * 3, 10 * 86400)
     return bare * 2
 
@@ -11772,6 +11999,17 @@ async def _fetch_multi_asset_analysis_candles(
                 else None
             )
             rows = metal_history.result.get("candles")
+            raw_rows = rows if isinstance(rows, list) else []
+        elif instrument.asset_class == AssetClass.ENERGY:
+            source = "twelvedata"
+            energy_history = await fetch_energy_history(canonical, granularity, start, end)
+            provider_status = str(energy_history.result.get("status") or "UNAVAILABLE")
+            provider_reason = (
+                str(energy_history.result.get("reason"))
+                if energy_history.result.get("reason") is not None
+                else None
+            )
+            rows = energy_history.result.get("candles")
             raw_rows = rows if isinstance(rows, list) else []
         elif instrument.asset_class == AssetClass.INDEX:
             source = "massive"
@@ -12127,7 +12365,9 @@ async def get_multi_asset_strategy_analysis_universe() -> Dict[str, object]:
         for instrument in sorted(
             instrument_registry.all(), key=lambda item: item.canonical_symbol
         )
-        if instrument.asset_class in {AssetClass.FOREX, AssetClass.METAL, AssetClass.INDEX}
+        if instrument.asset_class in {
+            AssetClass.FOREX, AssetClass.METAL, AssetClass.ENERGY, AssetClass.INDEX
+        }
     ]
     return {
         "status": "READY",
@@ -12188,6 +12428,14 @@ def multi_asset_extended_sizing_readiness(symbol: str) -> Dict[str, object]:
             "reason": "XAU_USD_NATIVE_UNIT_PNL",
             "sizing_mode": "XAU_UNITS", "pnl_currency": "USD",
             "session_model": "WEEKDAY_SPOT_BASELINE_PLUS_FRESH_PROVIDER_MARK",
+        }
+    if instrument.asset_class == AssetClass.ENERGY:
+        return {
+            **base,
+            "status": "BLOCKED",
+            "reason": "ENERGY_INSTRUMENT_SPECS_NOT_VERIFIED",
+            "sizing_mode": None,
+            "pnl_currency": "USD",
         }
     if instrument.asset_class == AssetClass.INDEX and instrument.quote_asset == "USD":
         return {
@@ -12402,6 +12650,16 @@ def multi_asset_paper_execution_readiness(symbol: str) -> Dict[str, object]:
             "session_model": "WEEKDAY_SPOT_BASELINE_PLUS_FRESH_PROVIDER_MARK",
             "risk_percent": str(MULTI_ASSET_PAPER_RISK_PERCENT),
             "auto_entry_authorized": True,
+        }
+    if instrument.asset_class == AssetClass.ENERGY:
+        if provider_symbol_map.to_provider("twelvedata", canonical) is None:
+            return {**base, "status": "BLOCKED", "reason": "ENERGY_PROVIDER_NOT_MAPPED"}
+        return {
+            **base,
+            "status": "BLOCKED",
+            "reason": "ENERGY_INSTRUMENT_SPECS_NOT_VERIFIED",
+            "provider": "twelvedata",
+            "auto_entry_authorized": False,
         }
     if instrument.asset_class == AssetClass.INDEX:
         if provider_symbol_map.to_provider("massive", canonical) is None:

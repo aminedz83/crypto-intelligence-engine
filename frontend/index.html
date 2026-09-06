@@ -141,6 +141,14 @@ body.workspace-mode main{padding-top:14px}
 .paper-history-detail-card{padding-top:10px}.paper-history-detail-hero{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.paper-history-detail-hero b{font-size:14px}.paper-history-detail-strategy{margin-top:7px}.paper-history-detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:10px}.paper-history-detail-cell{padding:9px 10px;border:1px solid #1c2d42;border-radius:10px;background:#07111d;min-width:0}.paper-history-detail-cell span{display:block;color:#7f8da1;font-size:7px}.paper-history-detail-cell b{display:block;margin-top:3px;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.paper-history-detail-result{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:9px;padding:9px 10px;border:1px solid #1c2d42;border-radius:10px;background:#07111d}.paper-history-detail-result strong{font-size:13px}.paper-history-detail-result span{font-size:8px;color:#8b99ad;text-align:right}.paper-history-detail-time{margin-top:8px;color:#8391a5;font-size:8px;text-align:center}.paper-history-detail-card .trade-chart-btn{margin-top:10px}
 @media(min-width:760px){.paper-history-summary{grid-template-columns:repeat(4,minmax(0,1fr))}.paper-history-list{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
+
+/* V17-ENERGY-UI3 — instrument/index marks, same-origin/no external assets */
+.coin.energy-mark,.coin.index-mark{display:inline-flex;align-items:center;justify-content:center;overflow:hidden;font-weight:900;letter-spacing:-.04em}
+.coin.energy-mark svg{width:100%;height:100%;display:block}
+.coin.index-mark{font-size:11px;border:1px solid rgba(255,255,255,.16);background:#0e1a2a;color:#f5f7fb}
+.coin.spx-mark{font-size:9px}
+.coin.ndx-mark{font-size:17px}
+.coin.dow-mark{font-size:10px}
 </style>
 
 <style id="v4-reference-tuning">
@@ -1117,8 +1125,33 @@ function refreshHealth(){return api("/health").then(function(r){var dot=byId("he
 
 function iconFor(sym){
   var base=String(sym||"").split("-")[0].toUpperCase();
-  if(sym==="XAU-USD")return h("span",{class:"coin gold"},["Au"]);
-  if(sym==="US30"||sym==="SPX500"||sym==="NAS100")return h("span",{class:"coin idx"},["I"]);
+  if(sym==="XAU-USD")return h("span",{class:"coin gold",title:"Gold Spot"},["Au"]);
+
+  // V17-ENERGY-UI3 — recognizable instrument/index marks.
+  // WTI and Brent are commodity benchmarks, not companies: there is no single
+  // universal "official logo" for the commodity itself. Use an oil pictogram +
+  // exact benchmark label rather than impersonating a provider/exchange logo.
+  if(sym==="WTI-USD")return h("span",{class:"coin energy-mark",title:"WTI · West Texas Intermediate"},[
+    h("svg",{viewBox:"0 0 48 48","aria-hidden":"true"},[
+      h("circle",{cx:"24",cy:"24",r:"23",fill:"#111827"}),
+      h("path",{d:"M24 7C19 15 13 21 13 29a11 11 0 0 0 22 0c0-8-6-14-11-22Z",fill:"#F59E0B"}),
+      h("text",{x:"24",y:"33","text-anchor":"middle","font-size":"10","font-weight":"900",fill:"#08111f"},["WTI"])
+    ])
+  ]);
+  if(sym==="BRENT-USD")return h("span",{class:"coin energy-mark",title:"Brent Crude Oil"},[
+    h("svg",{viewBox:"0 0 48 48","aria-hidden":"true"},[
+      h("circle",{cx:"24",cy:"24",r:"23",fill:"#111827"}),
+      h("path",{d:"M24 7C19 15 13 21 13 29a11 11 0 0 0 22 0c0-8-6-14-11-22Z",fill:"#38BDF8"}),
+      h("text",{x:"24",y:"33","text-anchor":"middle","font-size":"8","font-weight":"900",fill:"#08111f"},["BR"])
+    ])
+  ]);
+
+  // Index names are registered marks of their respective index providers.
+  // Render the exact benchmark names as compact marks without fetching or
+  // redistributing proprietary logo artwork.
+  if(sym==="SPX")return h("span",{class:"coin index-mark spx-mark",title:"S&P 500®"},["S&P"]);
+  if(sym==="NDX")return h("span",{class:"coin index-mark ndx-mark",title:"Nasdaq-100®"},["N"]);
+  if(sym==="US30")return h("span",{class:"coin index-mark dow-mark",title:"Dow Jones Industrial Average®"},["DJ"]);
 
   // V16-M5B28B7-FIX3: same-origin dynamic logo resolver. The browser only
   // requests our backend. The backend resolves/caches the real image and 404s
@@ -1250,7 +1283,7 @@ function refreshEnergyMarket(){
     })
   })
 }
-function renderIndex(){var v=byId("view-index");clear(v);v.appendChild(h("h2",{class:"section"},["Indices US cash · Massive · données réelles"]));var c=h("div",{class:"card listcard"},[]);[["SPX","S&P 500"],["NDX","Nasdaq-100"],["US30","Dow Jones 30"]].forEach(function(it){c.appendChild(h("div",{class:"row tap",onclick:function(){openDetail("index",it[0])}},[h("div",{class:"asset"},[iconFor("US30"),h("div",{},[h("div",{class:"sym"},[it[0]]),h("div",{class:"aname"},[it[1]+" · indice cash"])])]),qualityBadge("MAPPED")]))});v.appendChild(c)}
+function renderIndex(){var v=byId("view-index");clear(v);v.appendChild(h("h2",{class:"section"},["Indices US cash · Massive · données réelles"]));var c=h("div",{class:"card listcard"},[]);[["SPX","S&P 500®"],["NDX","Nasdaq-100®"],["US30","Dow Jones Industrial Average®"]].forEach(function(it){c.appendChild(h("div",{class:"row tap",onclick:function(){openDetail("index",it[0])}},[h("div",{class:"asset"},[iconFor(it[0]),h("div",{},[h("div",{class:"sym"},[it[0]]),h("div",{class:"aname"},[it[1]+" · indice cash"])])]),qualityBadge("MAPPED")]))});v.appendChild(c)}
 function renderSystem(){var v=byId("view-system");clear(v);v.appendChild(h("h2",{class:"section"},["Santé backend & données"]));v.appendChild(loading("Lecture de /health…"));api("/health").then(function(r){clear(v);v.appendChild(h("h2",{class:"section"},["Santé backend & données"]));if(!r.ok||!r.data){v.appendChild(emptyState("Backend indisponible",errorMessage(r)));return}var c=h("div",{class:"card"},[]);c.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["État global"]),h("span",{},[r.data.overall||"UNKNOWN"])]));(r.data.components||[]).forEach(function(x){c.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},[x.name]),h("span",{},[x.state||"?"])]))});v.appendChild(c)})}
 
 function openDetail(kind,symbol){chartTradeOverlay=null;detailCtx={kind:kind,symbol:symbol,canonical:symbol};setView("detail")}

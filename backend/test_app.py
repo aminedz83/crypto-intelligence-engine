@@ -9584,3 +9584,63 @@ class V17EnergyFrontendContractTests(unittest.TestCase):
     def test_frontend_consumes_energy_history_route(self):
         self.assertIn('/history?granularity=', self.html)
         self.assertIn('kind==="energy"', self.html)
+
+
+# ==================== V17 AUDIT FIXES — Attribution JOIN + WS auto-start =======
+
+
+class V17AuditAttributionJoinTests(unittest.TestCase):
+    """Attribution must be visible in position endpoints via LEFT JOIN context."""
+
+    def test_live_positions_joins_context(self):
+        src = open("main.py").read()
+        idx = src.index("async def get_live_paper_positions")
+        block = src[idx:idx + 800]
+        self.assertIn("paper_position_context", block)
+        self.assertIn("LEFT JOIN", block)
+        self.assertIn("strategy_id", block)
+        self.assertIn("regime_at_entry", block)
+
+    def test_list_positions_joins_context(self):
+        src = open("main.py").read()
+        idx = src.index("async def list_paper_positions")
+        block = src[idx:idx + 1200]
+        self.assertIn("paper_position_context", block)
+        self.assertIn("strategy_id", block)
+        self.assertIn("regime_at_entry", block)
+
+    def test_context_written_separately_not_in_positions_insert(self):
+        """strategy_id must NOT be in the paper_positions INSERT values dict
+        (it doesn't exist in that table — it goes in paper_position_context)."""
+        src = open("main.py").read()
+        idx = src.index("async def create_paper_position")
+        values_block = src[idx:idx + 600]
+        # The values dict should NOT contain strategy_id (wrong table)
+        self.assertNotIn('"strategy_id": req.performance_strategy_id', values_block)
+
+
+class V17AuditWsAutoStartTests(unittest.TestCase):
+    """WS must auto-start in lifespan so monitoring works without a browser."""
+
+    def test_ws_autostart_in_lifespan(self):
+        src = open("main.py").read()
+        idx = src.index("async def lifespan")
+        block = src[idx:idx + 3000]
+        self.assertIn("market_forex_ws_start", block)
+        self.assertIn("market_metal_ws_start", block)
+        self.assertIn("market_index_ws_start", block)
+        self.assertIn("WS auto-start", block)
+
+
+class V17AuditAllStrategiesInLoop(unittest.TestCase):
+    """All strategies must run in the orchestrator loop."""
+
+    def test_all_strategies_in_orchestrator(self):
+        src = open("main.py").read()
+        idx = src.index("async def auto_entry_orchestrator_loop")
+        block = src[idx:idx + 1200]
+        for func in ("run_server_auto_paper_generation_once",
+                     "run_trend_pullback_paper_generation_once",
+                     "run_breakout_expansion_paper_generation_once",
+                     "run_multi_asset_paper_generation_once"):
+            self.assertIn(func, block, f"{func} missing from orchestrator loop")

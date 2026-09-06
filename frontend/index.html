@@ -450,6 +450,79 @@ body.workspace-mode main{padding-top:14px}
   .paper-account-tile-label{font-size:8px}
   .paper-account-tile-sub{font-size:7px}
 }
+
+/* V17-UI11 — uniform instrument-logo sizing across every frontend placement */
+:root{--asset-logo-size:42px;--asset-logo-radius:13px}
+.coin.instrument-logo,
+.asset>.coin.instrument-logo,
+.paper-open-symbol-wrap>.coin.instrument-logo,
+.paper-history-head>.coin.instrument-logo,
+.dashboard-trade-card>.coin.instrument-logo,
+.decision-premium-card>.coin.instrument-logo,
+.edge-replay-identity>.coin.instrument-logo,
+.chart-asset-chip>.coin.instrument-logo{
+  width:var(--asset-logo-size)!important;
+  height:var(--asset-logo-size)!important;
+  min-width:var(--asset-logo-size)!important;
+  min-height:var(--asset-logo-size)!important;
+  max-width:var(--asset-logo-size)!important;
+  max-height:var(--asset-logo-size)!important;
+  flex:0 0 var(--asset-logo-size)!important;
+  border-radius:var(--asset-logo-radius)!important;
+  box-sizing:border-box!important;
+}
+.multi-monitor-icon.asset-real-icon{
+  width:var(--asset-logo-size)!important;
+  height:var(--asset-logo-size)!important;
+  min-width:var(--asset-logo-size)!important;
+  min-height:var(--asset-logo-size)!important;
+  flex:0 0 var(--asset-logo-size)!important;
+  padding:0!important;
+  border-radius:var(--asset-logo-radius)!important;
+}
+.multi-monitor-icon.asset-real-icon>.coin.instrument-logo{
+  width:100%!important;height:100%!important;min-width:100%!important;min-height:100%!important;
+  max-width:100%!important;max-height:100%!important;flex:0 0 100%!important;
+}
+.coin.xau-logo .gold-bars{transform:scale(.82)}
+.coin.oil-logo svg{width:27px!important;height:27px!important}
+.coin.spx-official-style{font-size:13px!important}
+.coin.ndx-official-style .ndx-mark-shape{transform:skew(-14deg) scale(.82)}
+.coin.dow-official-style{font-size:11px!important}
+@media(max-width:430px){
+  :root{--asset-logo-size:40px;--asset-logo-radius:12px}
+}
+
+/* V17-UI12 — non-crypto asset logos match the exact crypto logo footprint */
+.coin.instrument-logo{
+  width:36px!important;height:36px!important;
+  min-width:36px!important;min-height:36px!important;
+  max-width:36px!important;max-height:36px!important;
+  flex:0 0 36px!important;border-radius:50%!important;
+}
+.asset>.coin.instrument-logo,
+.paper-open-symbol-wrap>.coin.instrument-logo,
+.paper-history-head>.coin.instrument-logo,
+.dashboard-trade-card>.coin.instrument-logo,
+.decision-premium-card>.coin.instrument-logo,
+.edge-replay-identity>.coin.instrument-logo,
+.chart-asset-chip>.coin.instrument-logo{
+  width:36px!important;height:36px!important;
+  min-width:36px!important;min-height:36px!important;
+  max-width:36px!important;max-height:36px!important;
+  flex:0 0 36px!important;border-radius:50%!important;
+}
+.multi-monitor-icon.asset-real-icon{
+  width:36px!important;height:36px!important;
+  min-width:36px!important;min-height:36px!important;
+  max-width:36px!important;max-height:36px!important;
+  flex:0 0 36px!important;border-radius:50%!important;
+}
+.coin.xau-logo .gold-bars{transform:scale(.68)!important}
+.coin.oil-logo svg{width:23px!important;height:23px!important}
+.coin.spx-official-style{font-size:11px!important}
+.coin.ndx-official-style .ndx-mark-shape{transform:skew(-14deg) scale(.68)!important}
+.coin.dow-official-style{font-size:10px!important}
 </style>
 
 <style id="v4-reference-tuning">
@@ -3402,6 +3475,8 @@ function renderHelpGlossary(){
 <!-- V17-UI8 · SIGNALS RUNTIME REAL ICONS + MOBILE COMPACT -->
 <!-- V17-UI9 · GLOBAL ASSET ICONS ACROSS ALL VIEWS -->
 <!-- V17-UI10 · PREMIUM PAPER ACCOUNT REAL DATA ONLY -->
+<!-- V17-UI11 · UNIFORM GLOBAL ASSET LOGO SIZE -->
+<!-- V17-UI12 · ASSET LOGOS EXACT CRYPTO FOOTPRINT -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

@@ -211,6 +211,65 @@ body.workspace-mode main{padding-top:14px}
   .edge-replay-badges{max-width:100%;justify-content:flex-start}
   .edge-replay-date{margin-left:0}
 }
+
+/* V17-UI7 — dashboard KPI cards, real backend state only */
+.dash-kpi-grid{
+  display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px;
+}
+.dash-kpi-card{
+  appearance:none;-webkit-appearance:none;width:100%;min-width:0;min-height:150px;
+  padding:16px;text-align:left;color:var(--text);cursor:pointer;position:relative;overflow:hidden;
+  display:flex;flex-direction:column;gap:8px;border-radius:20px;
+  background:linear-gradient(145deg,#081422,#06101b);
+  transition:transform .14s ease,border-color .14s ease,box-shadow .14s ease;
+}
+.dash-kpi-card:active{transform:scale(.985)}
+.dash-kpi-card:hover{border-color:#315073}
+.dash-kpi-top{display:flex;align-items:center;gap:8px;min-width:0}
+.dash-kpi-icon{
+  width:27px;height:27px;display:flex;align-items:center;justify-content:center;flex:0 0 27px;
+  color:#8fb7ff;
+}
+.dash-kpi-icon svg{width:22px;height:22px}
+.dash-kpi-label{
+  min-width:0;flex:1 1 auto;font-size:10px;font-weight:850;letter-spacing:.12em;
+  text-transform:uppercase;color:#aeb9ca;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.dash-kpi-badge{
+  flex:0 0 auto;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid #3b4b60;
+  display:inline-flex;align-items:center;justify-content:center;font-size:7px;font-weight:900;
+  letter-spacing:.1em;color:#a9b5c8;background:#0a1523;
+}
+.dash-kpi-badge.ok{color:#52f18a;border-color:#198c4c;background:rgba(18,180,84,.10)}
+.dash-kpi-badge.warn{color:#ffd064;border-color:#8a6211;background:rgba(255,190,40,.09)}
+.dash-kpi-badge.paper{color:#c99aff;border-color:#6a3c97;background:rgba(145,70,210,.10)}
+.dash-kpi-value{
+  margin-top:4px;font-size:28px;line-height:1;font-weight:950;letter-spacing:-.035em;
+  color:#f5f7fb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.dash-kpi-secondary{
+  min-height:34px;font-size:10px;line-height:1.45;color:#94a3b8;
+  overflow-wrap:anywhere;
+}
+.dash-kpi-foot{
+  margin-top:auto;padding-top:9px;border-top:1px solid #15263b;
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  font-size:8px;color:#7f8da3;min-width:0;
+}
+.dash-kpi-foot>span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dash-kpi-arrow{font-size:18px;color:#8ea1ba;line-height:1}
+@media(max-width:900px){
+  .dash-kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:430px){
+  .dash-kpi-grid{gap:8px}
+  .dash-kpi-card{min-height:134px;padding:12px;border-radius:17px;gap:6px}
+  .dash-kpi-label{font-size:8px;letter-spacing:.09em}
+  .dash-kpi-badge{font-size:6px;padding:0 6px;min-height:20px}
+  .dash-kpi-value{font-size:23px}
+  .dash-kpi-secondary{font-size:8px;min-height:29px}
+  .dash-kpi-foot{font-size:7px;padding-top:7px}
+}
 </style>
 
 <style id="v4-reference-tuning">
@@ -1280,15 +1339,66 @@ function favRow(sym,name,kind){
 }
 function kpi(label,value,foot,cls){return h("div",{class:"card kpi"},[h("div",{class:"klabel"},[label]),h("div",{class:"kvalue "+(cls||"")},[value]),h("div",{class:"kfooter"},[foot])])}
 
+function dashboardKpiCard(opts){
+  var card=h("button",{class:"card dash-kpi-card "+(opts.klass||""),type:"button",onclick:opts.onclick||null},[
+    h("div",{class:"dash-kpi-top"},[
+      h("span",{class:"dash-kpi-icon",html:opts.icon||""}),
+      h("span",{class:"dash-kpi-label"},[opts.label||"—"]),
+      opts.badge?h("span",{class:"dash-kpi-badge "+(opts.badgeClass||"")},[opts.badge]):null
+    ]),
+    h("div",{class:"dash-kpi-value "+(opts.valueClass||"")},[opts.value===undefined?"—":String(opts.value)]),
+    opts.secondary?h("div",{class:"dash-kpi-secondary"},[opts.secondary]):null,
+    h("div",{class:"dash-kpi-foot"},[
+      h("span",{},[opts.foot||""]),
+      h("span",{class:"dash-kpi-arrow"},["›"])
+    ])
+  ]);
+  return card;
+}
+function dashboardExposureSummary(){
+  var open=(paperUiState.positions||[]).filter(function(p){return String(p.status||"").toUpperCase()==="OPEN"});
+  var valid=open.filter(function(p){return p.mark_status==="VALID"&&p.unrealized_pnl!==null&&p.unrealized_pnl!==undefined&&Number.isFinite(Number(p.unrealized_pnl))});
+  var pnl=valid.reduce(function(sum,p){return sum+Number(p.unrealized_pnl)},0);
+  return {
+    count:open.length,
+    validCount:valid.length,
+    pnl:valid.length?pnl:null,
+    complete:open.length===valid.length
+  };
+}
+
 function renderDashboard(){
  var v=byId("view-dashboard");clear(v);
  var dashAccount=paperUiState.account;
- var activeSignals=paperUiState.decisions.filter(function(d){return d.state==="ENTRY_NOW"}).length;
- v.appendChild(h("div",{class:"kpis"},[
-  kpi("Marché","…","Crypto · Forex · Métaux · Indices","green"),
-  kpi("Signaux ENTRY_NOW",String(activeSignals),"Historique serveur · 50 dernières"),
-  kpi("Capital virtuel",dashAccount?paperMoney(dashAccount.current_capital):"—","PostgreSQL paper"),
-  kpi("Exposition",dashAccount?String(dashAccount.open_positions):"—","Positions OPEN")
+ var activeSignals=paperUiState.decisions.filter(function(d){return String(d.state||"").toUpperCase()==="ENTRY_NOW"}).length;
+ var exposure=dashboardExposureSummary();
+ var capital=dashAccount&&dashAccount.current_capital!==undefined?paperMoney(dashAccount.current_capital):"—";
+ var signalFoot=activeSignals===0?"Aucune entrée prête maintenant":"Ouvrir les signaux serveur";
+ var exposureSecondary=exposure.pnl===null
+   ?(exposure.count?"P&L latent indisponible":"Aucune position ouverte")
+   :("P&L latent "+paperMoney(exposure.pnl)+(exposure.complete?"":" · partiel"));
+ v.appendChild(h("div",{class:"dash-kpi-grid"},[
+  dashboardKpiCard({
+    label:"Marchés",value:"5 classes",badge:"RÉEL",badgeClass:"ok",
+    secondary:"Crypto · Forex · Métaux · Pétrole · Indices",
+    foot:"Voir les marchés",icon:iconSvg("scanner"),onclick:function(){setView("markets")}
+  }),
+  dashboardKpiCard({
+    label:"ENTRY NOW",value:String(activeSignals),badge:activeSignals>0?"ACTIF":"AUCUN",badgeClass:activeSignals>0?"ok":"",
+    secondary:signalFoot,foot:"Décisions serveur · dernières 50",
+    icon:iconSvg("signals"),valueClass:activeSignals>0?"green":"",onclick:function(){setView("signals")}
+  }),
+  dashboardKpiCard({
+    label:"Capital paper",value:capital,badge:"PAPER",badgeClass:"paper",
+    secondary:dashAccount?"Capital réalisé persistant":"Compte indisponible",
+    foot:paperUiState.updatedAt?("Mis à jour "+formatMontrealTime(paperUiState.updatedAt)):"Snapshot en attente",
+    icon:iconSvg("paper"),onclick:function(){setPaperTab("account");setView("trading")}
+  }),
+  dashboardKpiCard({
+    label:"Exposition",value:String(exposure.count),badge:exposure.count?"OPEN":"FLAT",badgeClass:exposure.count?"warn":"ok",
+    secondary:exposureSecondary,foot:exposure.count?"Voir les positions":"Aucun capital exposé",
+    icon:iconSvg("charts"),onclick:function(){setPaperTab("positions");setView("trading")}
+  })
  ]));
  v.appendChild(h("div",{class:"card hours",id:"dash-hours"},[loading("État du marché…")]));
  var fav=h("div",{class:"card fav"},[
@@ -2971,6 +3081,7 @@ function renderHelpGlossary(){
 <!-- V16-M5B28B7-FIX3 · SAME-ORIGIN DYNAMIC CRYPTO LOGO PROXY -->
 <!-- V17-UI5 · STRATEGY MATRIX + ADAPTIVE EDGE MOBILE REAL-DATA FIX -->
 <!-- V17-UI6 · OPEN POSITION DETAILS STATE PERSISTS ACROSS AUTO-REFRESH -->
+<!-- V17-UI7 · DASHBOARD KPI REAL STATE + ACTIONABLE NAVIGATION -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

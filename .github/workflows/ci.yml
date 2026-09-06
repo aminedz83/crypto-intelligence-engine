@@ -6,7 +6,6 @@ on:
   pull_request:
 
 jobs:
-  # ── DEPENDENCIES → POSTGRES → REDIS → FASTAPI → COLLECT(==EXPECTED_TESTS) → TESTS → HTTP ─
   test:
     name: integration-tests
     runs-on: ubuntu-latest
@@ -38,21 +37,16 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "1514"
+      EXPECTED_TESTS: "1532"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install full dependencies from PyPI
         run: pip install -r requirements.txt
-
-      # Hard gate: a missing web/test dependency must FAIL the job, never skip.
       - name: Fail if FastAPI / httpx / pytest missing
         run: python -c "import fastapi, httpx, pytest; print('web+test deps present')"
-
-      # Real reachability: not just 'container running' — SELECT 1 and PING.
       - name: Verify PostgreSQL (SELECT 1) and Redis (PING)
         run: |
           python - <<'PY'
@@ -67,9 +61,6 @@ jobs:
               print("postgres SELECT 1 OK / redis PING OK")
           asyncio.run(main())
           PY
-
-      # Collection proof: pytest must collect exactly EXPECTED_TESTS. No auto-correction —
-      # on mismatch, print the full collection and FAIL for analysis.
       - name: Collect tests and assert exactly EXPECTED_TESTS
         run: |
           pytest --collect-only -q | tee /tmp/collect.log
@@ -83,9 +74,6 @@ jobs:
               print(f"::error::pytest collected {count} tests, expected {expected}. Difference above — analyse, do not auto-correct.")
               sys.exit(1)
           PY
-
-      # Execute. pytest exit code fails on any failure/error. Then a guard
-      # enforces skipped == 0 and passed == EXPECTED_TESTS.
       - name: Run pytest and enforce EXPECTED_TESTS passed / 0 skipped
         run: |
           pytest -v -ra | tee /tmp/pytest.log
@@ -104,8 +92,6 @@ jobs:
               sys.exit(1)
           print(f"{passed} passed, 0 skipped OK")
           PY
-
-      # Real HTTP checks against a live FastAPI process talking to real PG+Redis.
       - name: Start FastAPI and probe /health, /health/live, /health/ready over HTTP
         run: |
           uvicorn main:app --host 127.0.0.1 --port 8000 &
@@ -122,7 +108,6 @@ jobs:
           python - <<'PY'
           import json, sys
           d = json.loads(open("/tmp/ready.json").read())
-          # /health/ready must be UP (deps are healthy in CI)
           if d.get("overall") != "UP":
               print(f"::error::/health/ready overall != UP: {d}")
               sys.exit(1)
@@ -134,7 +119,6 @@ jobs:
           fi
           kill $APP_PID
 
-  # ── LINT + MYPY ────────────────────────────────────────────────────────────
   quality:
     name: ruff-and-mypy
     runs-on: ubuntu-latest
@@ -153,7 +137,6 @@ jobs:
       - name: Mypy (type check)
         run: mypy main.py
 
-  # ── DOCKER BUILD (reel) ────────────────────────────────────────────────────
   docker-build:
     name: docker-build
     runs-on: ubuntu-latest
@@ -162,7 +145,6 @@ jobs:
       - name: Build backend image (real build; job fails if build fails)
         run: docker build -f backend/Dockerfile -t crypto-intelligence-engine-backend:ci .
 
-  # ── SECURITY (echoue si un outil manque ou trouve quelque chose) ───────────
   security:
     name: security
     runs-on: ubuntu-latest
@@ -185,36 +167,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-# V16-M5B4-FIX2 — fresh synchronized copy
-
-# V16-M5B17: EXPECTED_TESTS=1157 (16 performance analytics tests)
-
-# V16-M5B18: EXPECTED_TESTS=1173 (16 Trading operational audit UI tests)
-
-# V16-M5B19: EXPECTED_TESTS=1189 (16 continuous scanner watchdog tests)
-
-# V16-M5B20: EXPECTED_TESTS=1205 (16 UTC performance-period tests)
-
-# V16-M5B21: EXPECTED_TESTS=1221 (16 persisted-dimension breakdown tests)
-
-# V16-M5B22: EXPECTED_TESTS=1237 (16 objective market-regime tests)
-
-# V16-M5B23-FIX4: EXPECTED_TESTS=1269 (8 runtime route/synchronization audit tests)
-# V16-M5B23-FIX5: EXPECTED_TESTS=1285 (16 frontend runtime synchronization audit tests)
-
-# V16-M5B24A: EXPECTED_TESTS=1301 (16 autonomous paper-monitoring hardening tests)
-
-# V16-M5B24B: EXPECTED_TESTS=1317 (16 crypto registry/scanner alignment tests)
-
-# V16-M5B25A: EXPECTED_TESTS=1333 (16 HTF context foundation tests)
-
-# V16-M5B25A-FIX2: EXPECTED_TESTS=1349 (16 ENTRY_NOW execution diagnostics tests)
-
-# V16-M5B25B: EXPECTED_TESTS=1365 (16 HTF->LTF integration tests)
-
-# V16-M5B27: EXPECTED_TESTS=1381 (16 candidate strategy detector tests)
-
-# V16-M5B28A: EXPECTED_TESTS=1397 (16 live-verified crypto universe tests)
-# V16-M5B28A-UI: EXPECTED_TESTS=1413 (16 dynamic crypto frontend synchronization tests)
-
-# V16-M5B28B1: EXPECTED_TESTS=1429 (16 Trend Pullback paper-execution tests)
+# V17-ENERGY: EXPECTED_TESTS=1532 (18 Energy WTI/Brent integration tests)

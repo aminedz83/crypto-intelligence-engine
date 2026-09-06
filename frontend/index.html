@@ -972,10 +972,15 @@ function paperSyncRow(){
     h("button",{type:"button",class:"ui-refresh-btn",onclick:function(){paperUiState.updatedAt=null;refreshPaperTrading()}},[paperUiState.loading?"Actualisation…":"↻ Actualiser"])
   ]);
 }
+var paperOpenPositionDetailsState={};
+function paperOpenPositionKey(p){
+  return String(p.position_id||p.id||[(p.symbol||""),(p.opened_at||""),(p.side||"")].join("|"));
+}
 function paperCompactOpenCard(p){
   var pnl=p.mark_status==="VALID"&&p.unrealized_pnl!==null&&p.unrealized_pnl!==undefined?Number(p.unrealized_pnl):null;
   var pnlClass=pnl===null?"":pnl>0?"trade-win":pnl<0?"trade-loss":"";
-  return h("div",{class:"paper-open-compact","data-paper-open-card":p.symbol||""},[
+  var positionKey=paperOpenPositionKey(p);
+  return h("div",{class:"paper-open-compact","data-paper-open-card":p.symbol||"","data-paper-open-key":positionKey},[
     h("div",{class:"paper-open-main"},[
       h("div",{class:"paper-open-top"},[
         h("div",{class:"paper-open-symbol-wrap"},[
@@ -999,10 +1004,19 @@ function paperCompactOpenCard(p){
         h("button",{type:"button",class:"trade-primary-btn",onclick:function(){openPaperTradeChart(p)}},["📈 Voir le graphique"])
       ])
     ]),
-    h("details",{},[
-      h("summary",{},["Détails de la position"]),
-      h("div",{class:"paper-open-details"},[paperPositionCard(p)])
-    ])
+    (function(){
+      var attrs={"data-paper-position-details":positionKey};
+      if(paperOpenPositionDetailsState[positionKey])attrs.open="";
+      var details=h("details",attrs,[
+        h("summary",{},["Détails de la position"]),
+        h("div",{class:"paper-open-details"},[paperPositionCard(p)])
+      ]);
+      details.addEventListener("toggle",function(){
+        paperOpenPositionDetailsState[positionKey]=details.open;
+        if(!details.open)delete paperOpenPositionDetailsState[positionKey];
+      });
+      return details;
+    })()
   ]);
 }
 function signalSummary(rows){
@@ -2956,6 +2970,7 @@ function renderHelpGlossary(){
 <!-- V16-M5B28B7 · DYNAMIC CRYPTO LOGOS · COINCAP CDN + TICKER FALLBACK -->
 <!-- V16-M5B28B7-FIX3 · SAME-ORIGIN DYNAMIC CRYPTO LOGO PROXY -->
 <!-- V17-UI5 · STRATEGY MATRIX + ADAPTIVE EDGE MOBILE REAL-DATA FIX -->
+<!-- V17-UI6 · OPEN POSITION DETAILS STATE PERSISTS ACROSS AUTO-REFRESH -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

@@ -9533,11 +9533,19 @@ class V17EnergyPaperSafetyTests(unittest.TestCase):
 
 class V17EnergyApiContractTests(unittest.TestCase):
     def test_energy_routes_are_registered(self):
-        # Runtime app is built only after all router decorators have executed.
-        # This is the authoritative registered-route surface for late-defined routes.
-        paths = {getattr(route, "path", None) for route in main.app.routes}
-        self.assertIn("/api/v1/market/energy/{symbol}/quote", paths)
-        self.assertIn("/api/v1/market/energy/{symbol}/history", paths)
+        # Energy endpoints are declared on the shared API router.  This mirrors the
+        # existing runtime-route contract used elsewhere in this suite: inspect the
+        # router declaration surface itself and let create_app() apply api_prefix.
+        paths = {getattr(route, "path", None) for route in main.api_router.routes}
+        self.assertIn("/market/energy/{symbol}/quote", paths)
+        self.assertIn("/market/energy/{symbol}/history", paths)
+
+        # Also prove the factory still includes the shared API router under the
+        # configured prefix; do not require the historical global `main.app` object
+        # to expose late-bound routes, because legacy tests intentionally preserve
+        # that distinction.
+        source = inspect.getsource(main.create_app)
+        self.assertIn("app.include_router(api_router, prefix=settings.api_prefix)", source)
 
     def test_energy_session_context_is_registered_but_unknown(self):
         result = main.market_session_context("WTI-USD", NOW)

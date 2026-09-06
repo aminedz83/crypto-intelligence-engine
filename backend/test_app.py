@@ -9418,3 +9418,50 @@ class V17SmartExitConstantsTests(unittest.TestCase):
     def test_cooldown_params(self):
         self.assertEqual(main.COOLDOWN_CONSECUTIVE_LOSSES, 2)
         self.assertEqual(main.COOLDOWN_MINUTES, 30)
+
+
+# ==================== V17-PRO FIX — Session on ALL paths + Attribution =========
+
+
+class V17SessionAllPathsTests(unittest.TestCase):
+    """Session filter must block entries on ALL orchestrators, not just SMC."""
+
+    def test_session_filter_in_smc_orchestrator(self):
+        src = open("main.py").read()
+        # find run_server_auto_paper_generation_once and check session filter
+        idx = src.index("async def run_server_auto_paper_generation_once")
+        block = src[idx:idx + 500]
+        self.assertIn("is_crypto_session_active", block)
+
+    def test_session_filter_in_trend_pullback_orchestrator(self):
+        src = open("main.py").read()
+        idx = src.index("async def run_trend_pullback_paper_generation_once")
+        block = src[idx:idx + 500]
+        self.assertIn("is_crypto_session_active", block)
+
+    def test_session_filter_in_breakout_orchestrator(self):
+        src = open("main.py").read()
+        idx = src.index("async def run_breakout_expansion_paper_generation_once")
+        block = src[idx:idx + 500]
+        self.assertIn("is_crypto_session_active", block)
+
+    def test_cooldown_in_all_orchestrators(self):
+        src = open("main.py").read()
+        for func in ("run_server_auto_paper_generation_once",
+                     "run_trend_pullback_paper_generation_once",
+                     "run_breakout_expansion_paper_generation_once"):
+            idx = src.index(f"async def {func}")
+            block = src[idx:idx + 500]
+            self.assertIn("is_cooldown_active", block, f"cooldown missing in {func}")
+
+
+class V17AttributionTests(unittest.TestCase):
+    """strategy_id must be written into paper_positions INSERT."""
+
+    def test_strategy_id_in_insert_values(self):
+        src = open("main.py").read()
+        # find create_paper_position and check values dict includes strategy_id
+        idx = src.index("async def create_paper_position")
+        block = src[idx:idx + 800]
+        self.assertIn('"strategy_id": req.performance_strategy_id', block)
+        self.assertIn('"strategy_version": req.performance_strategy_version', block)

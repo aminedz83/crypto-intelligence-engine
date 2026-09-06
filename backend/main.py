@@ -13858,6 +13858,32 @@ async def crypto_logo(symbol: str) -> Response:
 # App must be built only after every router decorator above has executed.
 app = create_app()
 
+# V17-ENERGY-FIX3 — runtime route binding hardening.
+# FastAPI copies APIRouter routes into the application at include time.  Keep the
+# exported uvicorn application authoritative even if a test/import path leaves the
+# global app without the already-declared health/API routes.  This is fail-safe and
+# idempotent: routers are added only when their representative runtime routes are
+# absent, so a normally-built app is not duplicated.
+def _ensure_runtime_routes_bound(runtime_app: FastAPI) -> None:
+    runtime_paths = {
+        getattr(route, "path", None)
+        for route in runtime_app.routes
+    }
+
+    if "/health/live" not in runtime_paths:
+        runtime_app.include_router(health_router)
+        runtime_paths = {
+            getattr(route, "path", None)
+            for route in runtime_app.routes
+        }
+
+    api_root_path = f"{settings.api_prefix}/"
+    if api_root_path not in runtime_paths:
+        runtime_app.include_router(api_router, prefix=settings.api_prefix)
+
+
+_ensure_runtime_routes_bound(app)
+
 # V16-M5B24A — autonomous crypto WS + fail-safe REST paper-mark fallback
 
 # V16-M5B24B — crypto registry alignment: BTC/ETH/SOL/XRP/LTC/ADA

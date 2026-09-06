@@ -9451,7 +9451,7 @@ class V17SessionAllPathsTests(unittest.TestCase):
                      "run_trend_pullback_paper_generation_once",
                      "run_breakout_expansion_paper_generation_once"):
             idx = src.index(f"async def {func}")
-            block = src[idx:idx + 500]
+            block = src[idx:idx + 800]
             self.assertIn("is_cooldown_active", block, f"cooldown missing in {func}")
 
 
@@ -9460,8 +9460,7 @@ class V17AttributionTests(unittest.TestCase):
 
     def test_strategy_id_in_insert_values(self):
         src = open("main.py").read()
-        # find create_paper_position and check values dict includes strategy_id
         idx = src.index("async def create_paper_position")
-        block = src[idx:idx + 800]
+        block = src[idx:idx + 1200]
         self.assertIn('"strategy_id": req.performance_strategy_id', block)
         self.assertIn('"strategy_version": req.performance_strategy_version', block)

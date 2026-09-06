@@ -4681,7 +4681,7 @@ class TestPaperLivePnlV16J(unittest.TestCase):
 
     def test_live_positions_reads_only_open_positions(self):
         source = inspect.getsource(main.get_live_paper_positions)
-        self.assertIn("WHERE status='OPEN'", source)
+        self.assertIn("WHERE p.status='OPEN'", source)
 
     def test_live_positions_reuses_multi_asset_mark_builder(self):
         source = inspect.getsource(main.get_live_paper_positions)
@@ -9462,14 +9462,21 @@ class V17SessionAllPathsTests(unittest.TestCase):
 
 
 class V17AttributionTests(unittest.TestCase):
-    """strategy_id must be written into paper_positions INSERT."""
+    """strategy_id is written into paper_position_context, NOT paper_positions INSERT."""
 
     def test_strategy_id_in_insert_values(self):
+        """strategy_id must NOT be in the paper_positions INSERT values dict
+        (the column doesn't exist in that table — context table handles it)."""
         src = open("main.py").read()
         idx = src.index("async def create_paper_position")
-        block = src[idx:idx + 1200]
-        self.assertIn('"strategy_id": req.performance_strategy_id', block)
-        self.assertIn('"strategy_version": req.performance_strategy_version', block)
+        # The values dict ends at the first '}' — strategy_id must not be there
+        values_end = src.index("    }", idx) + 5
+        values_block = src[idx:values_end]
+        self.assertNotIn('"strategy_id": req.performance_strategy_id', values_block)
+        # But it IS written into paper_position_context (further in the function)
+        full_block = src[idx:idx + 2500]
+        self.assertIn("paper_position_context_table", full_block)
+        self.assertIn("strategy_id=req.performance_strategy_id", full_block)
 
 # ==================== V17-ENERGY — WTI + Brent backend/frontend contract ======
 

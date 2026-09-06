@@ -357,6 +357,99 @@ body.workspace-mode main{padding-top:14px}
 .edge-replay-identity>.coin.instrument-logo,
 .chart-asset-chip>.coin.instrument-logo{flex:0 0 46px}
 .multi-monitor-icon.asset-real-icon>.coin.instrument-logo{width:44px!important;height:44px!important;flex-basis:44px!important;border-radius:14px}
+
+/* V17-UI10 — Premium Paper Account, real backend data only */
+#view-trading[data-paper-rendered="true"] .subtabs{margin-bottom:14px}
+.paper-account-hero{
+  display:flex;align-items:center;justify-content:space-between;gap:14px;
+  padding:17px;border:1px solid #233a55;border-radius:22px;
+  background:linear-gradient(145deg,#081624,#07111d);margin-bottom:12px;
+}
+.paper-account-hero-left{display:flex;align-items:center;gap:12px;min-width:0}
+.paper-account-hero-icon{
+  width:48px;height:48px;flex:0 0 48px;border-radius:15px;
+  display:flex;align-items:center;justify-content:center;color:#c58bff;
+  background:linear-gradient(145deg,#2b1952,#171334);border:1px solid #563b83
+}
+.paper-account-hero-icon svg{width:26px;height:26px}
+.paper-account-hero-title-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.paper-account-hero h3{margin:0;font-size:18px}
+.paper-account-hero p{margin:3px 0 5px;font-size:10px;color:#91a0b7}
+.paper-account-sync{font-size:9px;color:#788ba6}
+.paper-account-refresh{
+  flex:0 0 auto;border:1px solid #365778;background:#0b1a2b;color:#f3f6fb;
+  border-radius:16px;padding:12px 15px;font-weight:800;font-size:11px
+}
+.paper-account-section,.paper-performance-card,.paper-security-card{
+  border:1px solid #233a55;border-radius:22px;background:#07131f;
+  padding:15px;margin-bottom:12px
+}
+.paper-account-section-head,.paper-performance-head,.paper-security-head{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px
+}
+.paper-account-section-head h3,.paper-performance-head h3,.paper-security-head h3{
+  margin:0;font-size:18px
+}
+.paper-account-section-note{font-size:9px;color:#9c7cff}
+.paper-account-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}
+.paper-performance-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}
+.paper-account-tile{
+  min-width:0;min-height:104px;padding:12px;border:1px solid #203a55;
+  border-radius:17px;background:#081624;display:flex;gap:10px;align-items:flex-start
+}
+.paper-account-tile-icon{
+  width:34px;height:34px;flex:0 0 34px;border-radius:10px;display:flex;
+  align-items:center;justify-content:center;background:#10233a;color:#55a9ff
+}
+.paper-account-tile-icon svg{width:19px;height:19px}
+.paper-account-tile.green .paper-account-tile-icon{background:#0d3024;color:#50f18c}
+.paper-account-tile.red .paper-account-tile-icon{background:#311522;color:#ff6d82}
+.paper-account-tile.purple .paper-account-tile-icon{background:#25153e;color:#bf83ff}
+.paper-account-tile-main{min-width:0;display:flex;flex-direction:column;gap:4px}
+.paper-account-tile-label{font-size:9px;color:#8fa0b7}
+.paper-account-tile-value{font-size:17px;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.paper-account-tile-sub{font-size:8px;line-height:1.35;color:#71859f;overflow-wrap:anywhere}
+.paper-security-head{justify-content:flex-start}
+.paper-security-head .module-badge{margin-left:auto}
+.paper-security-lock{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center;background:#241640;color:#c68cff}
+.paper-security-lock svg{width:19px;height:19px}
+.paper-security-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0}
+.paper-security-tile{display:flex;gap:10px;padding:10px 12px;border-right:1px solid #17304a;min-width:0}
+.paper-security-tile:last-child{border-right:0}
+.paper-security-icon{width:32px;height:32px;flex:0 0 32px;border-radius:9px;display:flex;align-items:center;justify-content:center;background:#10223a;color:#62b0ff}
+.paper-security-icon svg{width:18px;height:18px}
+.paper-security-tile>div:last-child{min-width:0;display:flex;flex-direction:column;gap:4px}
+.paper-security-title{font-size:8px;color:#899bb3}
+.paper-security-value{font-size:10px}
+.paper-security-value.good{color:#4ff18a}
+.paper-security-value.bad{color:#ff6f84}
+.paper-security-sub{font-size:7px;color:#6f8199}
+.paper-security-meta{
+  display:grid;grid-template-columns:auto 1fr auto 1fr;gap:7px 10px;
+  border-top:1px solid #17304a;margin-top:10px;padding-top:10px;font-size:8px
+}
+.paper-security-meta span{color:#71859f}.paper-security-meta b{color:#aebdd0;overflow-wrap:anywhere}
+@media(max-width:700px){
+  .paper-account-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .paper-performance-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .paper-security-grid{grid-template-columns:1fr}
+  .paper-security-tile{border-right:0;border-bottom:1px solid #17304a}
+  .paper-security-tile:last-child{border-bottom:0}
+  .paper-security-meta{grid-template-columns:1fr 1fr}
+}
+@media(max-width:430px){
+  .paper-account-hero{padding:13px;border-radius:19px}
+  .paper-account-hero-icon{width:42px;height:42px;flex-basis:42px}
+  .paper-account-hero h3{font-size:15px}
+  .paper-account-refresh{padding:10px 12px;font-size:9px}
+  .paper-account-section,.paper-performance-card,.paper-security-card{padding:12px;border-radius:19px}
+  .paper-account-grid,.paper-performance-grid{gap:7px}
+  .paper-account-tile{min-height:92px;padding:10px;gap:8px;border-radius:15px}
+  .paper-account-tile-icon{width:30px;height:30px;flex-basis:30px}
+  .paper-account-tile-value{font-size:15px}
+  .paper-account-tile-label{font-size:8px}
+  .paper-account-tile-sub{font-size:7px}
+}
 </style>
 
 <style id="v4-reference-tuning">
@@ -1800,6 +1893,48 @@ function paperStrategyLabel(p){
   return src||"—";
 }
 
+
+function paperAccountDelta(a){
+  if(!a)return null;
+  var initial=Number(a.initial_capital),current=Number(a.current_capital);
+  if(!Number.isFinite(initial)||!Number.isFinite(current))return null;
+  return current-initial;
+}
+function paperOpenSideCounts(open){
+  var out={LONG:0,SHORT:0};
+  (open||[]).forEach(function(p){
+    var s=String(p.side||"").toUpperCase();
+    if(out[s]!==undefined)out[s]++;
+  });
+  return out;
+}
+function paperRiskExposure(open,a){
+  var cap=a?Number(a.current_capital):NaN,vals=(open||[]).map(function(p){return Number(p.risk_money)});
+  if(!Number.isFinite(cap)||cap<=0||!vals.length||vals.some(function(v){return !Number.isFinite(v)||v<0}))return null;
+  var total=vals.reduce(function(s,v){return s+v},0);
+  return {money:total,percent:(total/cap)*100};
+}
+function paperAccountTile(label,value,icon,accent,sub){
+  return h("div",{class:"paper-account-tile "+(accent||"")},[
+    h("div",{class:"paper-account-tile-icon",html:iconSvg(icon||"paper")},[]),
+    h("div",{class:"paper-account-tile-main"},[
+      h("span",{class:"paper-account-tile-label"},[label]),
+      h("b",{class:"paper-account-tile-value"},[value]),
+      sub?h("span",{class:"paper-account-tile-sub"},[sub]):null
+    ])
+  ]);
+}
+function paperSecurityTile(icon,title,value,klass,sub){
+  return h("div",{class:"paper-security-tile"},[
+    h("div",{class:"paper-security-icon",html:iconSvg(icon)},[]),
+    h("div",{},[
+      h("span",{class:"paper-security-title"},[title]),
+      h("b",{class:"paper-security-value "+klass},[value]),
+      h("span",{class:"paper-security-sub"},[sub])
+    ])
+  ]);
+}
+
 function renderTradingContent(){
   var v=byId("view-trading");
   clear(v);
@@ -1832,37 +1967,111 @@ function renderTradingContent(){
 
   if(paperActiveTab==="account"){
     v.appendChild(h("div",{id:"paper-account","data-paper-panel":"account"},[]));
-    v.appendChild(h("div",{class:"metric-strip"},[
-      h("div",{class:"metric-mini"},[h("span",{},["Capital initial"]),h("b",{},[a?paperMoney(a.initial_capital):"—"])]),
-      h("div",{class:"metric-mini"},[h("span",{},["Capital réalisé"]),h("b",{},[a?paperMoney(a.current_capital):"—"])]),
-      h("div",{class:"metric-mini"},[h("span",{},["Équité live"]),h("b",{},[a&&a.live_equity_status==="VALID"?paperMoney(a.live_equity):"—"])]),
-      h("div",{class:"metric-mini"},[h("span",{},["P&L latent"]),h("b",{},[a&&a.live_equity_status==="VALID"?paperMoney(a.unrealized_pnl):"—"])])
+
+    var delta=paperAccountDelta(a);
+    var deltaPct=a&&Number(a.initial_capital)>0&&delta!==null?(delta/Number(a.initial_capital))*100:null;
+    var sideCounts=paperOpenSideCounts(open);
+    var exposure=paperRiskExposure(open,a);
+    var liveEq=a&&a.live_equity_status==="VALID"?paperMoney(a.live_equity):"—";
+    var latent=a&&a.live_equity_status==="VALID"?paperMoney(a.unrealized_pnl):"—";
+    var realized=a?paperMoney(a.realized_pnl):"—";
+    var current=a?paperMoney(a.current_capital):"—";
+    var initial=a?paperMoney(a.initial_capital):"—";
+
+    v.appendChild(h("div",{class:"paper-account-hero"},[
+      h("div",{class:"paper-account-hero-left"},[
+        h("div",{class:"paper-account-hero-icon",html:iconSvg("paper")},[]),
+        h("div",{},[
+          h("div",{class:"paper-account-hero-title-row"},[
+            h("h3",{},["Compte Paper Trading"]),
+            h("span",{class:"status-pill ready"},["ACTIF"])
+          ]),
+          h("p",{},["Compte virtuel persistant · PAPER ONLY"]),
+          h("span",{class:"paper-account-sync"},[
+            "Dernière synchronisation · ",
+            paperUiState.updatedAt?formatMontrealTime(paperUiState.updatedAt):"—"
+          ])
+        ])
+      ]),
+      h("button",{class:"paper-account-refresh",type:"button",onclick:function(){refreshPaperTrading()}},["↻ Actualiser"])
     ]));
-    v.appendChild(h("div",{class:"metric-strip"},[
-      h("div",{class:"metric-mini"},[h("span",{},["P&L réalisé"]),h("b",{},[a?paperMoney(a.realized_pnl):"—"])]),
-      h("div",{class:"metric-mini"},[h("span",{},["Positions OPEN"]),h("b",{},[a?String(a.open_positions):"—"])]),
-      h("div",{class:"metric-mini"},[h("span",{},["Marks VALID"]),h("b",{},[a?String(a.marked_open_positions):"—"])]),
-      h("div",{class:"metric-mini"},[h("span",{},["Marks indisponibles"]),h("b",{},[a?String(a.unavailable_open_positions):"—"])])
+
+    v.appendChild(h("div",{class:"paper-account-section"},[
+      h("div",{class:"paper-account-section-head"},[
+        h("h3",{},["Vue d’ensemble"]),
+        h("span",{class:"paper-account-section-note"},[
+          a&&a.live_equity_status==="VALID"?"Marks temps réel valides":"Qualité des marks surveillée"
+        ])
+      ]),
+      h("div",{class:"paper-account-grid"},[
+        paperAccountTile("Capital initial",initial,"paper","blue","Base du compte"),
+        paperAccountTile(
+          "Capital réalisé",current,"charts",delta!==null&&delta>=0?"green":"red",
+          delta===null?"—":((delta>=0?"+":"")+paperMoney(delta)+" · "+(deltaPct>=0?"+":"")+deltaPct.toFixed(2)+" %")
+        ),
+        paperAccountTile(
+          "Équité live",liveEq,"trading",
+          a&&Number(a.unrealized_pnl)>=0?"purple":"red",
+          a&&a.live_equity_status==="VALID"?"Capital réalisé + P&L latent":"Mark incomplet"
+        ),
+        paperAccountTile("P&L réalisé",realized,"strategies",a&&Number(a.realized_pnl)>=0?"green":"red","Trades CLOSED"),
+        paperAccountTile("P&L latent",latent,"charts",a&&Number(a.unrealized_pnl)>=0?"green":"red","Positions OPEN"),
+        paperAccountTile(
+          "Positions OPEN",a?String(a.open_positions):"—","signals","blue",
+          sideCounts.LONG+" Long · "+sideCounts.SHORT+" Short"
+        ),
+        paperAccountTile(
+          "Marks VALID",a?String(a.marked_open_positions)+" / "+String(a.open_positions):"—","scanner","green",
+          a&&a.open_positions?((Number(a.marked_open_positions)/Number(a.open_positions))*100).toFixed(0)+" %":"Aucune position"
+        ),
+        paperAccountTile(
+          "Marks indisponibles",a?String(a.unavailable_open_positions):"—","settings",
+          a&&Number(a.unavailable_open_positions)>0?"red":"green",
+          a&&Number(a.unavailable_open_positions)>0?"Attention requise":"Aucun mark manquant"
+        ),
+        paperAccountTile(
+          "Exposition risque",
+          exposure?exposure.percent.toFixed(2)+" %":"—","overview",exposure&&exposure.percent>5?"red":"purple",
+          exposure?paperMoney(exposure.money)+" risque OPEN":"Risque non calculable"
+        )
+      ])
     ]));
-    v.appendChild(modCard("Performance paper","PERSISTÉE",perf?h("div",{class:"metric-strip"},[
-      h("div",{class:"metric-mini"},[h("span",{},["Trades clôturés"]),h("b",{},[String(perf.closed_trades)])]),
-      h("div",{class:"metric-mini"},[h("span",{},["Win Rate"]),h("b",{},[paperMetric(perf.win_rate_percent," %")])]),
-      h("div",{class:"metric-mini"},[h("span",{},["Profit Factor"]),h("b",{},[paperMetric(perf.profit_factor,"")])]),
-      h("div",{class:"metric-mini"},[h("span",{},["Expectancy"]),h("b",{},[paperMoney(perf.expectancy)])]),
-      h("div",{class:"metric-mini"},[h("span",{},["P&L net"]),h("b",{},[paperMoney(perf.net_pnl)])]),
-      h("div",{class:"metric-mini"},[h("span",{},["RR réalisé moyen"]),h("b",{},[paperMetric(perf.average_realized_rr," R")])]),
-      h("div",{class:"metric-mini"},[h("span",{},["Max Drawdown"]),h("b",{},[paperMoney(perf.max_drawdown)])]),
-      h("div",{class:"metric-mini"},[h("span",{},["Max DD %"]),h("b",{},[paperMetric(perf.max_drawdown_percent," %")])])
-    ]):placeholder("Performance indisponible","Aucune métrique n’est inventée sans historique CLOSED persisté.")));
-    v.appendChild(modCard("Sécurité","PAPER ONLY",h("div",{class:"section-stack"},[
-      h("div",{class:"kv"},[h("span",{},["Exécution broker / MT5"]),h("b",{},["DÉSACTIVÉE"])]),
-      h("div",{class:"kv"},[h("span",{},["Données inventées"]),h("b",{},["AUCUNE"])]),
-      h("div",{class:"kv"},[h("span",{},["Snapshot serveur"]),h("b",{},[paperUiState.serverSnapshotAt||"—"])]),
-      h("div",{class:"kv"},[h("span",{},["Dernière lecture UI"]),
-        h("b",{},[paperUiState.updatedAt?formatMontrealTime(paperUiState.updatedAt):"—"])]),
-      h("div",{class:"kv"},[h("span",{},["Sections indisponibles"]),
-        h("b",{},[Object.keys(paperUiState.sectionErrors).join(", ")||"AUCUNE"])])
-    ])));
+
+    v.appendChild(h("div",{class:"paper-performance-card"},[
+      h("div",{class:"paper-performance-head"},[
+        h("h3",{},["Performance paper"]),
+        h("span",{class:"module-badge"},["PERSISTÉE"])
+      ]),
+      perf?h("div",{class:"paper-performance-grid"},[
+        paperAccountTile("Trades clôturés",String(perf.closed_trades),"paper","blue","Historique réel"),
+        paperAccountTile("Win Rate",paperMetric(perf.win_rate_percent," %"),"scanner","purple","Trades CLOSED"),
+        paperAccountTile("Profit Factor",paperMetric(perf.profit_factor,""),"charts",Number(perf.profit_factor)>=1?"green":"red","Gains / pertes"),
+        paperAccountTile("Expectancy",paperMoney(perf.expectancy),"signals",Number(perf.expectancy)>=0?"green":"red","Par trade"),
+        paperAccountTile("P&L net",paperMoney(perf.net_pnl),"charts",Number(perf.net_pnl)>=0?"green":"red","Persisté"),
+        paperAccountTile("RR réalisé moyen",paperMetric(perf.average_realized_rr," R"),"trading","purple","Résultat moyen"),
+        paperAccountTile("Max Drawdown",paperMoney(perf.max_drawdown),"strategies","red","Capital"),
+        paperAccountTile("Max DD %",paperMetric(perf.max_drawdown_percent," %"),"overview","red","Pic → creux")
+      ]):placeholder("Performance indisponible","Aucune métrique n’est inventée sans historique CLOSED persisté.")
+    ]));
+
+    v.appendChild(h("div",{class:"paper-security-card"},[
+      h("div",{class:"paper-security-head"},[
+        h("div",{class:"paper-security-lock",html:iconSvg("settings")},[]),
+        h("h3",{},["Sécurité"]),
+        h("span",{class:"module-badge"},["PAPER ONLY"])
+      ]),
+      h("div",{class:"paper-security-grid"},[
+        paperSecurityTile("trading","Exécution broker / MT5","DÉSACTIVÉE","bad","Aucun ordre réel"),
+        paperSecurityTile("scanner","Données inventées","AUCUNE","good","Données backend uniquement"),
+        paperSecurityTile("paper","Trading réel","DÉSACTIVÉ","bad","Mode paper uniquement")
+      ]),
+      h("div",{class:"paper-security-meta"},[
+        h("span",{},["Snapshot serveur"]),
+        h("b",{},[paperUiState.serverSnapshotAt||"—"]),
+        h("span",{},["Sections indisponibles"]),
+        h("b",{},[Object.keys(paperUiState.sectionErrors).join(", ")||"AUCUNE"])
+      ])
+    ]));
   }else if(paperActiveTab==="positions"){
     v.appendChild(modCard("Positions ouvertes",open.length+" OPEN",
       open.length?h("div",{class:"paper-open-list"},open.map(paperCompactOpenCard)):
@@ -3192,6 +3401,7 @@ function renderHelpGlossary(){
 <!-- V17-UI7 · DASHBOARD KPI REAL STATE + ACTIONABLE NAVIGATION -->
 <!-- V17-UI8 · SIGNALS RUNTIME REAL ICONS + MOBILE COMPACT -->
 <!-- V17-UI9 · GLOBAL ASSET ICONS ACROSS ALL VIEWS -->
+<!-- V17-UI10 · PREMIUM PAPER ACCOUNT REAL DATA ONLY -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

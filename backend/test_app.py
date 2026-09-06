@@ -1456,7 +1456,13 @@ class RegistryMappingTests(unittest.TestCase):
 class AssetMetadataTests(unittest.TestCase):
     def test_distinct_asset_classes(self):
         self.assertEqual(
-            {AssetClass.CRYPTO, AssetClass.FOREX, AssetClass.METAL, AssetClass.INDEX},
+            {
+                AssetClass.CRYPTO,
+                AssetClass.FOREX,
+                AssetClass.METAL,
+                AssetClass.INDEX,
+                AssetClass.ENERGY,
+            },
             set(AssetClass),
         )
 
@@ -9527,7 +9533,9 @@ class V17EnergyPaperSafetyTests(unittest.TestCase):
 
 class V17EnergyApiContractTests(unittest.TestCase):
     def test_energy_routes_are_registered(self):
-        paths = {getattr(route, "path", None) for route in main.create_app().routes}
+        # Runtime app is built only after all router decorators have executed.
+        # This is the authoritative registered-route surface for late-defined routes.
+        paths = {getattr(route, "path", None) for route in main.app.routes}
         self.assertIn("/api/v1/market/energy/{symbol}/quote", paths)
         self.assertIn("/api/v1/market/energy/{symbol}/history", paths)
 

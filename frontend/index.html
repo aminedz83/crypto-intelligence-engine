@@ -270,6 +270,48 @@ body.workspace-mode main{padding-top:14px}
   .dash-kpi-secondary{font-size:8px;min-height:29px}
   .dash-kpi-foot{font-size:7px;padding-top:7px}
 }
+
+/* V17-UI8 — Signals + Multi-Asset Runtime mobile redesign; backend values only */
+#view-signals .metric-strip{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+#view-signals .metric-mini{min-height:92px;padding:14px;border-radius:18px}
+#view-signals .metric-mini span{font-size:10px}
+#view-signals .metric-mini b{font-size:25px}
+#view-signals .module{border-radius:22px}
+.runtime-summary{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:2px 0 4px}
+.runtime-summary>div:first-child{display:flex;flex-direction:column;gap:3px;min-width:0}
+.runtime-summary>div:first-child b{font-size:13px}
+.runtime-summary>div:first-child span,.runtime-last span{font-size:9px;color:var(--muted)}
+.runtime-last{display:flex;flex-direction:column;text-align:right;gap:3px;flex:0 0 auto}
+.runtime-last b{font-size:10px}
+.runtime-class-pills{display:flex;gap:7px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding:3px 0}
+.runtime-class-pills::-webkit-scrollbar{display:none}
+.runtime-class-pill{display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;border:1px solid #29415d;background:#081522;border-radius:999px;padding:8px 11px;font-size:9px;color:#aebbd0}
+.runtime-class-pill>span{width:15px;height:15px;display:inline-flex}
+.runtime-class-pill svg{width:15px;height:15px}
+.runtime-cycle-line{display:flex;align-items:center;justify-content:space-between;border-top:1px solid #15283d;border-bottom:1px solid #15283d;padding:10px 0;font-size:10px;color:var(--muted)}
+.runtime-cycle-line b{color:var(--text)}
+.multi-monitor-grid{gap:10px!important}
+.multi-monitor-card{padding:14px!important;border-radius:19px!important}
+.multi-monitor-head{gap:10px!important}
+.multi-monitor-icon.asset-real-icon{width:48px!important;height:48px!important;padding:0!important;background:#0a1726!important;overflow:visible}
+.multi-monitor-icon.asset-real-icon>.coin{width:44px!important;height:44px!important;margin:0}
+.multi-monitor-icon.asset-real-icon>.fx-pair-icon{transform:scale(.82);transform-origin:center}
+.multi-monitor-symbol{font-size:17px!important}
+.multi-monitor-sub{font-size:9px!important}
+.multi-monitor-pills{gap:6px!important;margin-top:10px!important}
+.multi-monitor-pill{font-size:8px!important;padding:6px 9px!important}
+.multi-monitor-empty{font-size:10px!important;line-height:1.4!important}
+.multi-monitor-foot{font-size:8px!important}
+@media(max-width:430px){
+ #view-signals .page-head h1{font-size:24px}
+ #view-signals .page-head p{font-size:12px;line-height:1.45}
+ .runtime-summary{flex-direction:column}
+ .runtime-last{text-align:left}
+ .multi-monitor-card{padding:12px!important}
+ .multi-monitor-head{align-items:center!important}
+ .multi-monitor-main{min-width:0}
+ .multi-monitor-head>.multi-monitor-pill{margin-left:auto;flex:0 0 auto}
+}
 </style>
 
 <style id="v4-reference-tuning">
@@ -1534,9 +1576,14 @@ function placeholder(title,sub){
   return h("div",{class:"placeholder"},[h("strong",{},[title]),sub||""])
 }
 
-function multiAssetIcon(assetClass){
-  var key=assetClass==="FOREX"?"forex":assetClass==="METAL"?"metal":assetClass==="ENERGY"?"metal":"indices";
-  return h("div",{class:"multi-monitor-icon",html:iconSvg(key)},[]);
+function multiAssetIcon(assetClass,symbol){
+  var cls=String(assetClass||"").toUpperCase(),sym=String(symbol||"").toUpperCase();
+  if(cls==="CRYPTO")return h("div",{class:"multi-monitor-icon asset-real-icon"},[iconFor(sym)]);
+  if(cls==="FOREX")return h("div",{class:"multi-monitor-icon asset-real-icon"},[forexPairIcon(sym)]);
+  if(cls==="METAL")return h("div",{class:"multi-monitor-icon asset-real-icon"},[iconFor(sym)]);
+  if(cls==="ENERGY")return h("div",{class:"multi-monitor-icon asset-real-icon"},[iconFor(sym)]);
+  if(cls==="INDEX")return h("div",{class:"multi-monitor-icon asset-real-icon"},[iconFor(sym)]);
+  return h("div",{class:"multi-monitor-icon",html:iconSvg("scanner")},[]);
 }
 function monitorStatusClass(v){v=String(v||"").toUpperCase();return v==="READY"||v==="VALID"||v==="ENTRY_NOW"||v==="SETUP"?"good":v==="WAIT"||v==="NOT_SCANNED"||v==="UNKNOWN"?"wait":"bad";}
 function multiAssetMonitorCard(item){
@@ -1552,7 +1599,7 @@ function multiAssetMonitorCard(item){
   });
   return h("div",{class:"multi-monitor-card","data-multi-asset-symbol":item.symbol||""},[
     h("div",{class:"multi-monitor-head"},[
-      multiAssetIcon(item.asset_class),
+      multiAssetIcon(item.asset_class,item.symbol),
       h("div",{class:"multi-monitor-main"},[h("div",{class:"multi-monitor-symbol"},[item.symbol||"—"]),h("div",{class:"multi-monitor-sub"},[(item.asset_class||"—")+" · "+(item.provider||"provider en attente")+(item.granularity?" · "+item.granularity:"")])]),
       h("span",{class:"multi-monitor-pill "+monitorStatusClass(item.analysis_status)},[item.analysis_status||"UNKNOWN"])
     ]),
@@ -1571,9 +1618,22 @@ function multiAssetMonitorCard(item){
 }
 function multiAssetMonitoringBlock(){
   var m=paperUiState.multiAsset,items=m&&m.instruments||[];
+  var counts={CRYPTO:0,FOREX:0,METAL:0,ENERGY:0,INDEX:0};
+  items.forEach(function(x){var k=String(x.asset_class||"").toUpperCase();if(counts[k]!==undefined)counts[k]++});
+  var head=h("div",{class:"runtime-summary"},[
+    h("div",{},[h("b",{},["Analyse automatique multi-marchés"]),h("span",{},["Snapshots réels persistés par le backend"])]),
+    h("div",{class:"runtime-last"},[h("span",{},["Dernière analyse"]),h("b",{},[m&&m.analysis_last_completed_at?formatMontrealTime(m.analysis_last_completed_at):"—"])])
+  ]);
+  var filters=h("div",{class:"runtime-class-pills"},[
+    ["Tous",items.length,"scanner"],["Crypto",counts.CRYPTO,"crypto"],["Forex",counts.FOREX,"forex"],
+    ["Métaux",counts.METAL,"metal"],["Pétrole",counts.ENERGY,"energy"],["Indices",counts.INDEX,"indices"]
+  ].map(function(x){return h("span",{class:"runtime-class-pill"},[h("span",{html:iconSvg(x[2])},[]),x[0]+" ("+x[1]+")"])}));
   return modCard("Multi-Asset Runtime",m&&m.status||"UNKNOWN",h("div",{class:"section-stack"},[
-    h("div",{class:"kv"},[h("span",{},["Dernière analyse"]),h("b",{},[m&&m.analysis_last_completed_at?formatMontrealTime(m.analysis_last_completed_at):"—"])]),
-    h("div",{class:"kv"},[h("span",{},["Cycles multi-actifs"]),h("b",{},[m?String(m.analysis_runs||0):"—"])]),
+    head,filters,
+    h("div",{class:"runtime-cycle-line"},[
+      h("span",{},["Cycles multi-actifs"]),
+      h("b",{},[m?String(m.analysis_runs||0):"—"])
+    ]),
     items.length?h("div",{class:"multi-monitor-grid"},items.map(multiAssetMonitorCard)):placeholder("Monitoring en attente","Le backend n'a pas encore produit de snapshot multi-actifs.")
   ]));
 }
@@ -1585,7 +1645,7 @@ function renderSignals(){
     return (!paperUiState.decisionSymbol||d.symbol===paperUiState.decisionSymbol)&&
       (!paperUiState.decisionState||d.state===paperUiState.decisionState);
   });
-  v.appendChild(pageHead("Signaux","Décisions serveur + monitoring Crypto, Forex, Gold et Indices.","SERVER AUTHORITATIVE"));
+  v.appendChild(pageHead("Signaux","Décisions serveur + monitoring Crypto, Forex, Gold, Pétrole et Indices.","SERVER AUTHORITATIVE"));
   v.appendChild(signalSummary(rows));
   v.appendChild(paperSyncRow());
   v.appendChild(multiAssetMonitoringBlock());
@@ -3082,6 +3142,7 @@ function renderHelpGlossary(){
 <!-- V17-UI5 · STRATEGY MATRIX + ADAPTIVE EDGE MOBILE REAL-DATA FIX -->
 <!-- V17-UI6 · OPEN POSITION DETAILS STATE PERSISTS ACROSS AUTO-REFRESH -->
 <!-- V17-UI7 · DASHBOARD KPI REAL STATE + ACTIONABLE NAVIGATION -->
+<!-- V17-UI8 · SIGNALS RUNTIME REAL ICONS + MOBILE COMPACT -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

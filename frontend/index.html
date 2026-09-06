@@ -312,6 +312,51 @@ body.workspace-mode main{padding-top:14px}
  .multi-monitor-main{min-width:0}
  .multi-monitor-head>.multi-monitor-pill{margin-left:auto;flex:0 0 auto}
 }
+
+/* V17-UI9 — GLOBAL XAU / OIL / INDEX ICON SYSTEM */
+.coin.instrument-logo{
+  position:relative;display:inline-flex;align-items:center;justify-content:center;
+  width:46px;height:46px;flex:0 0 46px;border-radius:15px;overflow:hidden;
+  border:1px solid rgba(255,255,255,.08);box-shadow:inset 0 0 18px rgba(255,255,255,.025);
+}
+.coin.xau-logo{background:radial-gradient(circle at 50% 42%,#243048 0,#111a2a 62%,#09111d 100%)}
+.gold-bars{position:relative;width:34px;height:27px;display:block}
+.gold-bar{position:absolute;display:block;height:11px;border-radius:3px 3px 2px 2px;
+  background:linear-gradient(180deg,#ffe477 0,#f6bd2c 35%,#c98200 100%);
+  border:1px solid #ffd35a;box-shadow:0 2px 5px rgba(249,190,36,.35)}
+.gold-bar.g1{left:11px;top:0;width:14px}
+.gold-bar.g2{left:2px;top:13px;width:14px}
+.gold-bar.g3{right:2px;top:13px;width:14px}
+
+.coin.oil-logo{background:linear-gradient(145deg,#1a2535,#0c1522)}
+.coin.oil-logo svg{width:31px;height:31px;filter:drop-shadow(0 2px 4px rgba(255,255,255,.08))}
+
+.coin.spx-official-style{
+  background:linear-gradient(145deg,#db143c,#8e0926);color:white;font-weight:900;
+  font-size:15px;letter-spacing:-.06em;border-color:#ed3554;
+  box-shadow:inset 0 0 20px rgba(255,255,255,.08),0 4px 12px rgba(137,0,28,.22)
+}
+.coin.ndx-official-style{
+  background:linear-gradient(145deg,#073c6d,#0b85bb);border-color:#126ea7;
+  box-shadow:inset 0 0 18px rgba(0,221,255,.09),0 4px 12px rgba(0,112,170,.18)
+}
+.ndx-mark-shape{position:relative;width:28px;height:25px;display:block;transform:skew(-14deg)}
+.ndx-mark-shape i{position:absolute;display:block;width:9px;height:23px;background:linear-gradient(180deg,#24e8ff,#27aef2);border-radius:1px}
+.ndx-left{left:5px;top:2px;transform:rotate(35deg)}
+.ndx-right{right:5px;top:0;transform:rotate(35deg)}
+.coin.dow-official-style{
+  background:linear-gradient(145deg,#173454,#0c1c30);color:#eef5ff;font-size:13px;font-weight:950
+}
+
+/* Normalize global use in asset rows, paper cards, replay and chart headers */
+.asset>.coin.instrument-logo,
+.paper-open-symbol-wrap>.coin.instrument-logo,
+.paper-history-head>.coin.instrument-logo,
+.dashboard-trade-card>.coin.instrument-logo,
+.decision-premium-card>.coin.instrument-logo,
+.edge-replay-identity>.coin.instrument-logo,
+.chart-asset-chip>.coin.instrument-logo{flex:0 0 46px}
+.multi-monitor-icon.asset-real-icon>.coin.instrument-logo{width:44px!important;height:44px!important;flex-basis:44px!important;border-radius:14px}
 </style>
 
 <style id="v4-reference-tuning">
@@ -1319,38 +1364,41 @@ function forexPairIcon(sym){
 }
 
 function iconFor(sym){
-  var base=String(sym||"").split("-")[0].toUpperCase();
-  if(sym==="XAU-USD")return h("span",{class:"coin gold",title:"Gold Spot"},["Au"]);
+  sym=String(sym||"").toUpperCase();
+  var base=sym.split("-")[0];
 
-  // V17-ENERGY-UI3 — recognizable instrument/index marks.
-  // WTI and Brent are commodity benchmarks, not companies: there is no single
-  // universal "official logo" for the commodity itself. Use an oil pictogram +
-  // exact benchmark label rather than impersonating a provider/exchange logo.
-  if(sym==="WTI-USD")return h("span",{class:"coin energy-mark",title:"WTI · West Texas Intermediate"},[
-    h("svg",{viewBox:"0 0 48 48","aria-hidden":"true"},[
-      h("circle",{cx:"24",cy:"24",r:"23",fill:"#111827"}),
-      h("path",{d:"M24 7C19 15 13 21 13 29a11 11 0 0 0 22 0c0-8-6-14-11-22Z",fill:"#F59E0B"}),
-      h("text",{x:"24",y:"33","text-anchor":"middle","font-size":"10","font-weight":"900",fill:"#08111f"},["WTI"])
-    ])
-  ]);
-  if(sym==="BRENT-USD")return h("span",{class:"coin energy-mark",title:"Brent Crude Oil"},[
-    h("svg",{viewBox:"0 0 48 48","aria-hidden":"true"},[
-      h("circle",{cx:"24",cy:"24",r:"23",fill:"#111827"}),
-      h("path",{d:"M24 7C19 15 13 21 13 29a11 11 0 0 0 22 0c0-8-6-14-11-22Z",fill:"#38BDF8"}),
-      h("text",{x:"24",y:"33","text-anchor":"middle","font-size":"8","font-weight":"900",fill:"#08111f"},["BR"])
+  // V17-UI9 — global instrument icons.
+  // These marks are used EVERYWHERE iconFor() is called: Markets, Signals,
+  // Paper positions/history, Adaptive Edge, dashboard cards and chart headers.
+  if(sym==="XAU-USD")return h("span",{class:"coin instrument-logo xau-logo",title:"Gold · XAU/USD","aria-label":"Gold"},[
+    h("span",{class:"gold-bars","aria-hidden":"true"},[
+      h("i",{class:"gold-bar g1"},[]),h("i",{class:"gold-bar g2"},[]),h("i",{class:"gold-bar g3"},[])
     ])
   ]);
 
-  // Index names are registered marks of their respective index providers.
-  // Render the exact benchmark names as compact marks without fetching or
-  // redistributing proprietary logo artwork.
-  if(sym==="SPX")return h("span",{class:"coin index-mark spx-mark",title:"S&P 500®"},["S&P"]);
-  if(sym==="NDX")return h("span",{class:"coin index-mark ndx-mark",title:"Nasdaq-100®"},["N"]);
-  if(sym==="US30")return h("span",{class:"coin index-mark dow-mark",title:"Dow Jones Industrial Average®"},["DJ"]);
+  if(sym==="WTI-USD"||sym==="BRENT-USD")return h("span",{
+    class:"coin instrument-logo oil-logo",
+    title:sym==="WTI-USD"?"WTI · West Texas Intermediate":"Brent Crude Oil",
+    "aria-label":sym==="WTI-USD"?"WTI":"Brent"
+  },[
+    h("svg",{viewBox:"0 0 48 48","aria-hidden":"true"},[
+      h("path",{d:"M24 5.5C20.7 12.1 12.2 21.3 12.2 29.4c0 7.2 5.3 12.6 11.8 12.6s11.8-5.4 11.8-12.6C35.8 21.3 27.3 12.1 24 5.5Z",fill:"#f6f8fb"}),
+      h("path",{d:"M29.7 35.7c-2.1 2.4-6 3.6-9.2 1.8",fill:"none",stroke:"#c8d0dc","stroke-width":"1.5","stroke-linecap":"round"})
+    ])
+  ]);
 
-  // V16-M5B28B7-FIX3: same-origin dynamic logo resolver. The browser only
-  // requests our backend. The backend resolves/caches the real image and 404s
-  // cleanly when no exact ticker logo can be proven; initials remain as fallback.
+  if(sym==="SPX")return h("span",{class:"coin instrument-logo spx-official-style",title:"S&P 500®","aria-label":"S&P 500"},["S&P"]);
+
+  if(sym==="NDX")return h("span",{class:"coin instrument-logo ndx-official-style",title:"Nasdaq-100®","aria-label":"Nasdaq-100"},[
+    h("span",{class:"ndx-mark-shape","aria-hidden":"true"},[
+      h("i",{class:"ndx-left"},[]),h("i",{class:"ndx-right"},[])
+    ])
+  ]);
+
+  if(sym==="US30")return h("span",{class:"coin instrument-logo dow-official-style",title:"Dow Jones Industrial Average®","aria-label":"Dow Jones 30"},["DJ"]);
+
+  // V16-M5B28B7-FIX3: same-origin dynamic crypto logo resolver.
+  // Browser requests only our backend; initials remain fallback on 404.
   var wrap=h("span",{class:"coin crypto-logo",title:base},[]);
   var fallback=h("span",{class:"crypto-logo-fallback"},[base.slice(0,2)||"?"]);
   var img=h("img",{
@@ -3143,6 +3191,7 @@ function renderHelpGlossary(){
 <!-- V17-UI6 · OPEN POSITION DETAILS STATE PERSISTS ACROSS AUTO-REFRESH -->
 <!-- V17-UI7 · DASHBOARD KPI REAL STATE + ACTIONABLE NAVIGATION -->
 <!-- V17-UI8 · SIGNALS RUNTIME REAL ICONS + MOBILE COMPACT -->
+<!-- V17-UI9 · GLOBAL ASSET ICONS ACROSS ALL VIEWS -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

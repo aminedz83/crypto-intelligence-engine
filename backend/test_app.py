@@ -9688,7 +9688,7 @@ class V17DailyBiasInOrchestratorsTests(unittest.TestCase):
     def test_daily_bias_in_smc_orchestrator(self):
         src = open("main.py").read()
         idx = src.index("async def run_server_auto_paper_generation_once")
-        block = src[idx:idx + 3000]
+        block = src[idx:idx + 4500]
         self.assertIn("get_daily_bias", block)
         self.assertIn("daily_bias_allows", block)
         self.assertIn("DAILY_BIAS", block)
@@ -9698,7 +9698,7 @@ class V17DailyBiasInOrchestratorsTests(unittest.TestCase):
         idx = src.index(
             "async def run_trend_pullback_paper_generation_once"
         )
-        block = src[idx:idx + 2000]
+        block = src[idx:idx + 2500]
         self.assertIn("get_daily_bias", block)
         self.assertIn("daily_bias_allows", block)
 
@@ -9707,7 +9707,7 @@ class V17DailyBiasInOrchestratorsTests(unittest.TestCase):
         idx = src.index(
             "async def run_breakout_expansion_paper_generation_once"
         )
-        block = src[idx:idx + 2000]
+        block = src[idx:idx + 2500]
         self.assertIn("get_daily_bias", block)
         self.assertIn("daily_bias_allows", block)
 

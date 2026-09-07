@@ -658,6 +658,12 @@ body.workspace-mode main{padding-top:14px}
   border:1px solid #1e6e49;border-radius:999px;background:rgba(28,177,96,.08);
   color:#58e991;font-size:7px;font-weight:900;letter-spacing:.08em;
 }
+
+/* V17-UI16 — no-flicker refresh */
+.crypto-logo{position:relative}
+.crypto-logo-img{transition:opacity .12s linear}
+.crypto-logo-fallback{opacity:1}
+.crypto-logo.logo-loaded .crypto-logo-fallback{opacity:0}
 </style>
 
 <style id="v4-reference-tuning">
@@ -1238,6 +1244,39 @@ function snapshotSection(snapshot,name){
   var section=snapshot&&snapshot.sections&&snapshot.sections[name];
   return section&&section.status==="OK"?section.data:null;
 }
+
+var paperRenderFingerprints={dashboard:"",signals:"",trading:""};
+function stableUiFingerprint(value){
+  try{
+    return JSON.stringify(value,function(k,v){
+      if(k==="snapshot_at"||k==="created_at"||k==="updated_at"||k==="last_seen_at")return undefined;
+      return v;
+    });
+  }catch(_){return String(Date.now())}
+}
+function paperViewFingerprint(view){
+  if(view==="signals")return stableUiFingerprint({
+    decisions:paperUiState.decisions,
+    watchdog:paperUiState.watchdog,
+    runtime:paperUiState.runtime,
+    multiAsset:paperUiState.multiAsset,
+    errors:paperUiState.sectionErrors
+  });
+  if(view==="dashboard")return stableUiFingerprint({
+    account:paperUiState.account,
+    positions:paperUiState.positions,
+    decisions:paperUiState.decisions
+  });
+  if(view==="trading")return stableUiFingerprint({
+    account:paperUiState.account,
+    positions:paperUiState.positions,
+    performance:paperUiState.performance,
+    edgeReplay:paperUiState.edgeReplay,
+    errors:paperUiState.sectionErrors
+  });
+  return "";
+}
+
 function refreshPaperTrading(){
   if(paperUiState.loading)return Promise.resolve();
   paperUiState.loading=true;
@@ -1295,9 +1334,27 @@ function refreshPaperTrading(){
     paperUiState.updatedAt=new Date().toISOString();
   }).finally(function(){
     paperUiState.loading=false;
-    if(current==="trading")renderTrading();
-    if(current==="signals")renderSignals();
-    if(current==="dashboard")renderDashboard();
+    if(current==="trading"){
+      var fTrading=paperViewFingerprint("trading");
+      if(fTrading!==paperRenderFingerprints.trading){
+        paperRenderFingerprints.trading=fTrading;
+        renderTrading();
+      }
+    }
+    if(current==="signals"){
+      var fSignals=paperViewFingerprint("signals");
+      if(fSignals!==paperRenderFingerprints.signals){
+        paperRenderFingerprints.signals=fSignals;
+        renderSignals();
+      }
+    }
+    if(current==="dashboard"){
+      var fDashboard=paperViewFingerprint("dashboard");
+      if(fDashboard!==paperRenderFingerprints.dashboard){
+        paperRenderFingerprints.dashboard=fDashboard;
+        renderDashboard();
+      }
+    }
   });
 }
 
@@ -1709,7 +1766,8 @@ function iconFor(sym){
     loading:"lazy",
     decoding:"async"
   },[]);
-  img.addEventListener("load",function(){wrap.classList.add("logo-loaded")});
+  img.style.opacity="0";
+  img.addEventListener("load",function(){img.style.opacity="1";wrap.classList.add("logo-loaded")});
   img.addEventListener("error",function(){
     img.style.display="none";
     wrap.classList.remove("logo-loaded");
@@ -2652,15 +2710,26 @@ function strategyPremiumCard(st){
 }
 var strategyAutoRefreshLast=0;
 var strategyAutoRefreshBusy=false;
+var strategyRegistryFingerprint="";
 function renderStrategies(preserveViewport){
   var savedY=preserveViewport?window.scrollY:null;
-  var v=byId("view-strategies");clear(v);
+  var v=byId("view-strategies");
+  if(!preserveViewport)clear(v);
   v.appendChild(pageHead("Stratégies","3 familles objectives · validation et replay sur données réelles.","PAPER ONLY"));
-  var host=h("div",{id:"strategy-live"},[loading("Chargement du registre de stratégies…")]);
-  v.appendChild(host);
+  var host=preserveViewport?byId("strategy-live"):null;
+  if(!host){
+    host=h("div",{id:"strategy-live"},[loading("Chargement du registre de stratégies…")]);
+    v.appendChild(host);
+  }
   api("/api/v1/strategies").then(function(r){
+    if(!r.ok||!r.data){
+      if(!preserveViewport){clear(host);host.appendChild(emptyState("Registre indisponible",errorMessage(r)))}
+      return;
+    }
+    var nextFingerprint=stableUiFingerprint(r.data);
+    if(preserveViewport&&nextFingerprint===strategyRegistryFingerprint)return;
+    strategyRegistryFingerprint=nextFingerprint;
     clear(host);
-    if(!r.ok||!r.data){host.appendChild(emptyState("Registre indisponible",errorMessage(r)));return}
     var d=r.data, strategies=Array.isArray(d.strategies)?d.strategies:[];
     var active=strategies.filter(function(st){
       var s=String(st.validation_state||"").toUpperCase();
@@ -2724,7 +2793,7 @@ function renderStrategies(preserveViewport){
 }
 function refreshStrategiesAuto(){
   var now=Date.now();
-  if(strategyAutoRefreshBusy||now-strategyAutoRefreshLast<10000)return;
+  if(strategyAutoRefreshBusy||now-strategyAutoRefreshLast<30000)return;
   strategyAutoRefreshLast=now;
   strategyAutoRefreshBusy=true;
   renderStrategies(true);
@@ -3728,6 +3797,7 @@ function renderHelpGlossary(){
 <!-- V17-UI13 · PREMIUM STRATEGIES MOBILE + MATRIX FIX -->
 <!-- V17-UI14 · PERFORMANCE MATRIX ASSET LOGOS -->
 <!-- V17-UI15 · GLOBAL AUTO REFRESH SIGNALS + STRATEGIES -->
+<!-- V17-UI16 · CHANGE-AWARE NO-FLICKER AUTO REFRESH -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

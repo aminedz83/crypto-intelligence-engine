@@ -1556,6 +1556,11 @@ function paperCompactOpenCard(p){
         h("div",{class:"paper-open-level"},[h("span",{},["Prix actuel"]),h("b",{},[p.mark_status==="VALID"?(fmtNum(p.mark_price)||"—"):"—"])]),
         h("div",{class:"paper-open-level"},[h("span",{},["TP / SL"]),h("b",{},[(fmtNum(p.take_profit)||"—")+" / "+(fmtNum(p.stop_loss)||"—")])])
       ]),
+      h("div",{class:"paper-open-levels paper-position-money-row"},[
+        h("div",{class:"paper-open-level"},[h("span",{},["Taille"]),h("b",{},[paperPositionSizeText(p)])]),
+        h("div",{class:"paper-open-level"},[h("span",{},["Valeur entrée"]),h("b",{},[paperEntryExposureText(p)])]),
+        h("div",{class:"paper-open-level"},[h("span",{},["Risque initial"]),h("b",{},[paperInitialRiskText(p)])])
+      ]),
       h("div",{class:"paper-open-actions"},[
         h("button",{type:"button",class:"trade-primary-btn",onclick:function(){openPaperTradeChart(p)}},["📈 Voir le graphique"])
       ])
@@ -1636,6 +1641,31 @@ function dashboardPaperOverview(){
   return card;
 }
 
+
+function paperPositionSizeText(p){
+  var size=fmtNum(p&&p.size);
+  if(size===null)return "—";
+  return size+(p&&p.size_unit?" "+String(p.size_unit):"");
+}
+function paperInitialRiskText(p){
+  var risk=Number(p&&p.risk_money);
+  return Number.isFinite(risk)&&risk>=0?paperMoney(risk):"—";
+}
+function paperEntryExposureText(p){
+  if(!p)return "—";
+  var assetClass=String(p.asset_class||"").toUpperCase();
+  if(assetClass==="INDEX")return "—";
+  var size=Number(p.size),entry=Number(p.entry);
+  if(!Number.isFinite(size)||size<=0||!Number.isFinite(entry)||entry<=0)return "—";
+  var symbol=String(p.symbol||"").toUpperCase();
+  var parts=symbol.split("-");
+  var quote=parts.length>1?parts[parts.length-1]:"";
+  var value=size*entry;
+  if(!Number.isFinite(value))return "—";
+  if(quote==="USD")return paperMoney(value);
+  return fmtNum(value)+(quote?" "+quote:"");
+}
+
 function paperPositionCard(p){
   var closed=p.status==="CLOSED",pnl=p.realized_pnl,result=paperResultInfo(p),rr=paperRealizedRR(p);
   return h("div",{class:"journal-card"},[
@@ -1649,7 +1679,9 @@ function paperPositionCard(p){
       h("div",{class:"kv"},[h("span",{},["Entry"]),h("b",{},[fmtNum(p.entry)||"—"])]),
       h("div",{class:"kv"},[h("span",{},["SL"]),h("b",{},[fmtNum(p.stop_loss)||"—"])]),
       h("div",{class:"kv"},[h("span",{},["TP"]),h("b",{},[fmtNum(p.take_profit)||"—"])]),
-      h("div",{class:"kv"},[h("span",{},["Taille"]),h("b",{},[(fmtNum(p.size)||"—")+" "+(p.size_unit||"")])]),
+      h("div",{class:"kv"},[h("span",{},["Taille de position"]),h("b",{},[paperPositionSizeText(p)])]),
+      h("div",{class:"kv"},[h("span",{},["Valeur à l’entrée"]),h("b",{},[paperEntryExposureText(p)])]),
+      h("div",{class:"kv"},[h("span",{},["Risque initial"]),h("b",{},[paperInitialRiskText(p)])]),
       h("div",{class:"kv"},[h("span",{},closed?["Prix de sortie"]:["Prix actuel"]),h("b",{},[closed?(fmtNum(p.close_price)||"—"):(p.mark_status==="VALID"?fmtNum(p.mark_price)||"—":"—")])]),
       h("div",{class:"kv"},[h("span",{},[closed?"P&L réalisé":"P&L latent"]),h("b",{},[closed&&pnl!==null&&pnl!==undefined?paperMoney(pnl):(!closed&&p.mark_status==="VALID"?paperMoney(p.unrealized_pnl):"—")])]),
       closed?h("div",{class:"kv"},[h("span",{},["Résultat"]),h("b",{class:result.klass},[result.label+" · "+result.reason])]):null,
@@ -1687,7 +1719,10 @@ function paperCompactHistoryDetails(p,result,rr,pnlText,strategyRaw){
       h("div",{class:"paper-history-detail-cell"},[h("span",{},["Entry"]),h("b",{},[fmtNum(p.entry)||"—"])]),
       h("div",{class:"paper-history-detail-cell"},[h("span",{},["Exit"]),h("b",{},[fmtNum(p.close_price)||"—"])]),
       h("div",{class:"paper-history-detail-cell"},[h("span",{},["SL"]),h("b",{},[fmtNum(p.stop_loss)||"—"])]),
-      h("div",{class:"paper-history-detail-cell"},[h("span",{},["TP"]),h("b",{},[fmtNum(p.take_profit)||"—"])])
+      h("div",{class:"paper-history-detail-cell"},[h("span",{},["TP"]),h("b",{},[fmtNum(p.take_profit)||"—"])]),
+      h("div",{class:"paper-history-detail-cell"},[h("span",{},["Taille de position"]),h("b",{},[paperPositionSizeText(p)])]),
+      h("div",{class:"paper-history-detail-cell"},[h("span",{},["Valeur à l’entrée"]),h("b",{},[paperEntryExposureText(p)])]),
+      h("div",{class:"paper-history-detail-cell"},[h("span",{},["Risque initial"]),h("b",{},[paperInitialRiskText(p)])])
     ]),
     h("div",{class:"paper-history-detail-result"},[
       h("strong",{class:result.klass},[pnlText]),
@@ -3891,3 +3926,5 @@ function renderHelpGlossary(){
 <!-- V17-UI18 · STABLE OPEN MARK/P&L · 1S OPEN DISCOVERY NEVER DOWNGRADES LIVE SNAPSHOT -->
 
 <!-- V17-UI19 · CI1555 LEGACY DASHBOARD CONTRACT + UI18 STABLE OPEN PRICE/P&L -->
+
+<!-- V17-UI20 · POSITION SIZE + ENTRY EXPOSURE + INITIAL RISK · BACKEND VALUES ONLY -->

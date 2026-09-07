@@ -3700,6 +3700,51 @@ def daily_bias_allows(bias: str, side: str) -> bool:
         return True
     return False
 
+
+# V17-PRO Symbol Performance Filter: focus on winning symbols.
+# Symbols with >= MIN_TRADES closed and a losing record are blocked.
+# New symbols (< MIN_TRADES) are allowed (discovery mode).
+SYMBOL_PERF_MIN_TRADES = 3
+SYMBOL_PERF_MIN_WIN_RATE = Decimal("30")  # block below 30% win rate
+SYMBOL_PERF_CACHE_SECONDS = 600  # 10 minutes
+_symbol_perf_cache: Dict[str, tuple] = {}  # symbol → (allowed, expiry)
+
+
+async def is_symbol_performance_allowed(symbol: str) -> bool:
+    """Return True if symbol has no losing track record, or not enough data."""
+    canonical = symbol.upper()
+    now_ts = utcnow().timestamp()
+    cached = _symbol_perf_cache.get(canonical)
+    if cached and now_ts < cached[1]:
+        return cached[0]
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT "
+                    "COUNT(*) AS total, "
+                    "SUM(CASE WHEN close_reason='TAKE_PROFIT' THEN 1 ELSE 0 END) AS wins "
+                    "FROM paper_positions "
+                    "WHERE symbol=:symbol AND status='CLOSED'"
+                ),
+                {"symbol": canonical},
+            )
+            row = result.fetchone()
+        total = int(row.total) if row and row.total else 0
+        wins = int(row.wins) if row and row.wins else 0
+        if total < SYMBOL_PERF_MIN_TRADES:
+            allowed = True  # not enough data — allow discovery
+        else:
+            win_rate = Decimal(str(wins * 100)) / Decimal(str(total))
+            allowed = win_rate >= SYMBOL_PERF_MIN_WIN_RATE
+        _symbol_perf_cache[canonical] = (
+            allowed,
+            now_ts + SYMBOL_PERF_CACHE_SECONDS,
+        )
+        return allowed
+    except Exception:  # noqa: BLE001
+        return True  # fail-open
+
 # Peak price tracking for trailing stop (in-memory, per position).
 _position_peaks: Dict[str, Decimal] = {}
 
@@ -4432,6 +4477,13 @@ async def run_server_auto_paper_generation_once() -> Dict[str, int]:
                 stats["blocked"] += 1
                 await record_and_persist_auto_decision_trace(
                     symbol, "BLOCKED", f"DAILY_BIAS_{daily_bias}_VS_{_smc_side}", detector
+                )
+                continue
+            # V17-PRO: Symbol Performance — block losing symbols
+            if not await is_symbol_performance_allowed(symbol):
+                stats["blocked"] += 1
+                await record_and_persist_auto_decision_trace(
+                    symbol, "BLOCKED", "SYMBOL_LOSING_RECORD", detector
                 )
                 continue
             stats["entry_now"] += 1
@@ -13612,6 +13664,10 @@ async def run_trend_pullback_paper_generation_once() -> Dict[str, int]:
             if not daily_bias_allows(tp_bias, tp_side):
                 stats["blocked"] += 1
                 continue
+            # V17-PRO: Symbol Performance — block losing symbols
+            if not await is_symbol_performance_allowed(symbol):
+                stats["blocked"] += 1
+                continue
             result = await execute_trend_pullback_paper_plan(symbol, plan)
             if result.get("status") == "OPENED":
                 stats["opened"] += 1
@@ -13868,6 +13924,10 @@ async def run_breakout_expansion_paper_generation_once() -> Dict[str, int]:
             bo_side = str(plan.get("side", ""))
             bo_bias = await get_daily_bias(symbol)
             if not daily_bias_allows(bo_bias, bo_side):
+                stats["blocked"] += 1
+                continue
+            # V17-PRO: Symbol Performance — block losing symbols
+            if not await is_symbol_performance_allowed(symbol):
                 stats["blocked"] += 1
                 continue
             result = await execute_breakout_expansion_paper_plan(symbol, plan)

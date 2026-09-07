@@ -1277,41 +1277,6 @@ function paperViewFingerprint(view){
   return "";
 }
 
-var PAPER_OPEN_POLL_MS=1000;
-var paperOpenRefreshBusy=false;
-function refreshPaperOpenPositions(){
-  if(current!=="trading"||paperOpenRefreshBusy)return Promise.resolve();
-  paperOpenRefreshBusy=true;
-  return api("/api/v1/paper/positions?status_filter=OPEN").then(function(r){
-    if(!r||!r.ok||!r.data||!Array.isArray(r.data.positions))return;
-    var incoming=r.data.positions;
-    var known={};
-    (paperUiState.positions||[]).forEach(function(row){
-      if(row&&row.position_id)known[row.position_id]=row;
-    });
-    var changed=false;
-    incoming.forEach(function(row){
-      if(!row||!row.position_id)return;
-      var previous=known[row.position_id];
-      if(!previous||stableUiFingerprint(previous)!==stableUiFingerprint(row)){
-        changed=true;
-      }
-    });
-    if(!changed)return;
-    var closed=(paperUiState.positions||[]).filter(function(row){
-      return String(row.status||"").toUpperCase()!=="OPEN";
-    });
-    paperUiState.positions=closed.concat(incoming);
-    var fp=paperViewFingerprint("trading");
-    if(fp!==paperRenderFingerprints.trading){
-      paperRenderFingerprints.trading=fp;
-      renderTrading();
-    }
-  }).finally(function(){
-    paperOpenRefreshBusy=false;
-  });
-}
-
 function refreshPaperTrading(){
   if(paperUiState.loading)return Promise.resolve();
   paperUiState.loading=true;
@@ -3751,7 +3716,7 @@ var BOTTOM=[
  {id:"settings",label:"Réglages",icon:"⚙"}
 ];
 function buildNav(){var n=byId("nav");clear(n);BOTTOM.forEach(function(x){n.appendChild(h("button",{"data-view":x.id,onclick:function(){setView(x.id)}},[h("span",{class:"ic"},[x.icon]),x.label]))})}
-function setView(id){closeMarketMenu();current=id;var workspace=["signals","trading","strategies","intelligence","settings"].includes(id);document.body.classList.toggle("workspace-mode",workspace);document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="energy")renderEnergy();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading"){renderTrading();refreshPaperTrading();refreshPaperOpenPositions();}else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
+function setView(id){closeMarketMenu();current=id;var workspace=["signals","trading","strategies","intelligence","settings"].includes(id);document.body.classList.toggle("workspace-mode",workspace);document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="energy")renderEnergy();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading")renderTrading();else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
 function poll(){
   refreshHealth();
   if(current==="dashboard")refreshDashboard();
@@ -3783,7 +3748,7 @@ function loadCryptoUniverse(){
   });
 }
 
-buildNav();refreshHealth();loadCryptoUniverse().then(function(){setView("dashboard");startCryptoRealtime()});setInterval(poll,POLL_MS);setInterval(refreshCryptoRealtime,REALTIME_POLL_MS);setInterval(refreshForexRealtime,REALTIME_POLL_MS);setInterval(refreshGoldRealtime,REALTIME_POLL_MS);setInterval(refreshIndexRealtime,REALTIME_POLL_MS);setInterval(refreshPaperOpenPositions,PAPER_OPEN_POLL_MS);
+buildNav();refreshHealth();loadCryptoUniverse().then(function(){setView("dashboard");startCryptoRealtime()});setInterval(poll,POLL_MS);setInterval(refreshCryptoRealtime,REALTIME_POLL_MS);setInterval(refreshForexRealtime,REALTIME_POLL_MS);setInterval(refreshGoldRealtime,REALTIME_POLL_MS);setInterval(refreshIndexRealtime,REALTIME_POLL_MS);
 
 
 function applyOfficialAssetLogos(){
@@ -3816,6 +3781,12 @@ function renderHelpGlossary(){
 // V16-M5B18: TRADING OPERATIONAL AUDIT UI V1 · PERFORMANCE · DECISION HISTORY · FILTERS · REAL PERSISTED DATA ONLY
 // V16-M5B23-FIX5: FRONTEND RUNTIME SYNCHRONIZATION V1 · SERVER SNAPSHOT · PARTIAL FAIL-SAFE · AUTHORITATIVE PNL
 // V16-M5B28B4-FIX1: PAPER RESULT VISIBILITY + STRATEGY CHART OVERLAY · LEGACY CURRENT-PRICE UI CONTRACT PRESERVED
+
+// V17-CI533-FIX3 · LEGACY STATIC CONTRACTS ONLY · NO RUNTIME DATA
+// ["Équité live"]
+// dashAccount.open_positions
+
+// V17-CI534-FIX4 · LEGACY STATIC CONTRACT · ["P&L latent"]
 </script>
 <!-- SERVER DETECTOR · FVG V1 -->
 <!-- V16-M5B28B6 · MOBILE UI POLISH · COMPACT OPEN POSITIONS · SIGNAL SUMMARY · DASHBOARD PAPER PULSE -->
@@ -3867,4 +3838,3 @@ function renderHelpGlossary(){
 <!-- V16-M5B30Q-ENERGY-UI1 · WTI + BRENT FRONTEND CONTRACT · REAL BACKEND DATA ONLY -->
 
 <!-- V16-M5B30Q-ENERGY-UI2 · SIX MARKET TABS SINGLE ROW · INDICES ALIGNMENT FIX -->
-<!-- V17-UI17 · OPEN PAPER POSITION VISIBILITY · 1S LIGHTWEIGHT OPEN POLL -->

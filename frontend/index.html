@@ -1290,10 +1290,27 @@ function refreshPaperOpenPositions(){
       if(row&&row.position_id)known[row.position_id]=row;
     });
     var changed=false;
+    var mergedOpen=[];
     incoming.forEach(function(row){
       if(!row||!row.position_id)return;
       var previous=known[row.position_id];
-      if(!previous||stableUiFingerprint(previous)!==stableUiFingerprint(row)){
+      if(!previous){
+        mergedOpen.push(row);
+        changed=true;
+        return;
+      }
+      /*
+       * UI18: the 1s OPEN endpoint is persistence-oriented and can omit the
+       * enriched live mark/P&L supplied by /paper/ui-snapshot. Never replace
+       * an already enriched OPEN row with the lighter persisted row, otherwise
+       * "Prix actuel" and latent P&L flicker between a value and "—".
+       *
+       * Keep the richer existing row while refreshing persisted metadata.
+       * The authoritative 5s snapshot continues to update live mark/P&L.
+       */
+      var merged=Object.assign({},row,previous);
+      mergedOpen.push(merged);
+      if(stableUiFingerprint(previous)!==stableUiFingerprint(merged)){
         changed=true;
       }
     });
@@ -1301,7 +1318,7 @@ function refreshPaperOpenPositions(){
     var closed=(paperUiState.positions||[]).filter(function(row){
       return String(row.status||"").toUpperCase()!=="OPEN";
     });
-    paperUiState.positions=closed.concat(incoming);
+    paperUiState.positions=closed.concat(mergedOpen);
     var fp=paperViewFingerprint("trading");
     if(fp!==paperRenderFingerprints.trading){
       paperRenderFingerprints.trading=fp;
@@ -3868,3 +3885,5 @@ function renderHelpGlossary(){
 
 <!-- V16-M5B30Q-ENERGY-UI2 · SIX MARKET TABS SINGLE ROW · INDICES ALIGNMENT FIX -->
 <!-- V17-UI17 · OPEN PAPER POSITION VISIBILITY · 1S LIGHTWEIGHT OPEN POLL -->
+
+<!-- V17-UI18 · STABLE OPEN MARK/P&L · 1S OPEN DISCOVERY NEVER DOWNGRADES LIVE SNAPSHOT -->

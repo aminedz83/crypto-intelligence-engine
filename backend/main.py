@@ -12979,6 +12979,70 @@ async def execute_multi_asset_paper_plan(
     }
 
 
+
+_BREAKOUT_HISTORY_PRIORITY_TTL_SECONDS = 60
+_breakout_history_priority_cache: tuple[datetime, dict[str, float]] | None = None
+
+
+async def get_breakout_historical_priority() -> dict[str, float]:
+    """Return persisted Breakout 0.2-paper evidence as scan priority only.
+
+    Historical performance never authorizes a paper entry. On any DB/query
+    problem the runtime falls back to its normal full-universe scan order.
+    """
+    global _breakout_history_priority_cache
+    now = utcnow()
+    cached = _breakout_history_priority_cache
+    if cached is not None:
+        cached_at, scores = cached
+        if (
+            now - cached_at
+        ).total_seconds() < _BREAKOUT_HISTORY_PRIORITY_TTL_SECONDS:
+            return dict(scores)
+
+    if not persistence_state.ready or _engine is None:
+        return {}
+
+    try:
+        async with _engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    select(
+                        paper_positions_table.c.symbol,
+                        paper_positions_table.c.realized_pnl,
+                    ).where(
+                        paper_positions_table.c.status == "CLOSED",
+                        paper_positions_table.c.strategy_id == "BREAKOUT_EXPANSION",
+                        paper_positions_table.c.strategy_version == "0.2-paper",
+                        paper_positions_table.c.realized_pnl.is_not(None),
+                    )
+                )
+            ).mappings().all()
+    except Exception:
+        logger.exception("breakout historical priority query failed")
+        return {}
+
+    aggregates: dict[str, list[float]] = {}
+    for row in rows:
+        symbol = str(row["symbol"])
+        aggregates.setdefault(symbol, []).append(float(row["realized_pnl"] or 0.0))
+
+    scores: dict[str, float] = {}
+    for symbol, pnl_values in aggregates.items():
+        sample_size = len(pnl_values)
+        if sample_size < ADAPTIVE_EDGE_MIN_SAMPLE_SIZE:
+            continue
+        wins = sum(1 for value in pnl_values if value > 0)
+        realized_pnl = sum(pnl_values)
+        win_rate = wins / sample_size
+        # Priority only. No entry/risk decision is made from this score.
+        pnl_component = max(-1.0, min(1.0, realized_pnl / 1000.0))
+        scores[symbol] = win_rate + pnl_component
+
+    _breakout_history_priority_cache = (now, scores)
+    return dict(scores)
+
+
 async def run_multi_asset_paper_generation_once() -> Dict[str, int]:
     """Auto-open verified paper setups from real Forex, Gold and index data."""
     stats = {
@@ -12996,7 +13060,13 @@ async def run_multi_asset_paper_generation_once() -> Dict[str, int]:
     now = utcnow()
     if is_cooldown_active(now):
         return stats
-    for instrument in instrument_registry.all():
+    breakout_priority = await get_breakout_historical_priority()
+    instruments = list(instrument_registry.all())
+    instruments.sort(
+        key=lambda item: breakout_priority.get(item.canonical_symbol, 0.0),
+        reverse=True,
+    )
+    for instrument in instruments:
         if instrument.asset_class == AssetClass.CRYPTO:
             continue
         canonical = instrument.canonical_symbol

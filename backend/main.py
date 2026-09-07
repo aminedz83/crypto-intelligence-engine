@@ -4637,18 +4637,21 @@ async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
                 req.performance_setup_context,
             )
             if any(value is not None for value in context_values):
-                await conn.execute(
-                    pg_insert(paper_position_context_table).values(
-                        position_id=req.position_id,
-                        strategy_id=req.performance_strategy_id,
-                        strategy_version=req.performance_strategy_version,
-                        timeframe=req.performance_timeframe,
-                        session=req.performance_session,
-                        market_regime=req.performance_market_regime,
-                        setup_context=req.performance_setup_context,
-                        captured_at=now,
-                    ).on_conflict_do_nothing(index_elements=["position_id"])
+                # Strategy attribution is persisted atomically with the paper position.
+                context_stmt = pg_insert(paper_position_context_table).values(
+                    position_id=req.position_id,
+                    strategy_id=req.performance_strategy_id,
+                    strategy_version=req.performance_strategy_version,
+                    timeframe=req.performance_timeframe,
+                    session=req.performance_session,
+                    market_regime=req.performance_market_regime,
+                    setup_context=req.performance_setup_context,
+                    captured_at=now,
                 )
+                context_stmt = context_stmt.on_conflict_do_nothing(
+                    index_elements=["position_id"]
+                )
+                await conn.execute(context_stmt)
     except HTTPException:
         raise
     except Exception as exc:

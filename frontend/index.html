@@ -523,6 +523,116 @@ body.workspace-mode main{padding-top:14px}
 .coin.spx-official-style{font-size:11px!important}
 .coin.ndx-official-style .ndx-mark-shape{transform:skew(-14deg) scale(.68)!important}
 .coin.dow-official-style{font-size:10px!important}
+
+/* V17-UI13 — Strategies premium mobile layout, server data only */
+#view-strategies .page-head{margin-bottom:14px}
+.strategy-overview-strip{
+  display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;
+  border:1px solid #223a55;border-radius:20px;background:#07131f;
+  padding:12px;margin-bottom:12px
+}
+.strategy-overview-item{
+  min-width:0;display:flex;align-items:center;gap:9px;padding:4px 10px;
+  border-right:1px solid #18304a
+}
+.strategy-overview-item:last-child{border-right:0}
+.strategy-overview-icon{
+  width:33px;height:33px;flex:0 0 33px;border-radius:10px;
+  display:flex;align-items:center;justify-content:center;
+  background:#10233a;color:#8d6cff
+}
+.strategy-overview-icon svg{width:19px;height:19px}
+.strategy-overview-item>div{display:flex;flex-direction:column;min-width:0}
+.strategy-overview-item b{font-size:21px;line-height:1}
+.strategy-overview-item span{font-size:9px;color:#dce5f1;margin-top:3px}
+.strategy-overview-item small{font-size:7px;color:#71849e;margin-top:2px}
+
+.strategy-policy-card{
+  border:1px solid #223a55;border-radius:18px;background:#081522;
+  padding:13px;margin-bottom:12px
+}
+.strategy-policy-title{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}
+.strategy-policy-title b{font-size:13px}
+.strategy-policy-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.strategy-policy-grid>div{
+  min-width:0;border:1px solid #17314b;border-radius:12px;padding:9px;background:#07111c;
+  display:flex;flex-direction:column;gap:4px
+}
+.strategy-policy-grid span{font-size:7px;color:#71859f;text-transform:uppercase;letter-spacing:.05em}
+.strategy-policy-grid b{font-size:9px;overflow-wrap:anywhere}
+
+.strategy-premium-list{display:grid;gap:11px;margin-bottom:13px}
+.strategy-premium-card{
+  border:1px solid #233d59;border-radius:20px;background:linear-gradient(145deg,#081522,#07111d);
+  padding:14px;min-width:0
+}
+.strategy-premium-card.smc{box-shadow:inset 3px 0 0 #8751d8}
+.strategy-premium-card.trend{box-shadow:inset 3px 0 0 #15a9e5}
+.strategy-premium-card.breakout{box-shadow:inset 3px 0 0 #f3a11f}
+.strategy-premium-main{display:flex;gap:11px;align-items:flex-start}
+.strategy-premium-icon{
+  width:44px;height:44px;flex:0 0 44px;border-radius:13px;display:flex;
+  align-items:center;justify-content:center;background:#151b38;color:#a96eff
+}
+.strategy-premium-card.trend .strategy-premium-icon{background:#082e48;color:#25c4ff}
+.strategy-premium-card.breakout .strategy-premium-icon{background:#322416;color:#ffae32}
+.strategy-premium-icon svg{width:25px;height:25px}
+.strategy-premium-copy{min-width:0;flex:1}
+.strategy-premium-title-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.strategy-premium-title{font-size:16px;font-weight:900;letter-spacing:.01em;overflow-wrap:anywhere}
+.strategy-premium-family{font-size:9px;color:#899bb4;margin-top:3px}
+.strategy-premium-desc{font-size:9px;line-height:1.4;color:#a4b2c5;margin-top:5px}
+.strategy-tag-row{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px}
+.strategy-tag{
+  padding:4px 7px;border-radius:999px;border:1px solid #274662;background:#0a1b2b;
+  font-size:7px;color:#b8c8dc
+}
+.strategy-premium-evidence{
+  display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-top:11px
+}
+.strategy-premium-evidence>div{
+  min-width:0;border-top:1px solid #16304a;padding-top:8px;display:flex;flex-direction:column;gap:3px
+}
+.strategy-premium-evidence span{font-size:7px;color:#7387a2}
+.strategy-premium-evidence b{font-size:9px;color:#d7e0eb;overflow-wrap:anywhere}
+.strategy-premium-foot{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:11px
+}
+.strategy-ranking{
+  padding:5px 9px;border-radius:999px;border:1px solid #563b83;background:#24143c;
+  color:#c99aff;font-size:7px;font-weight:900;letter-spacing:.08em
+}
+.strategy-ranking.eligible{border-color:#167d48;background:#0d2b20;color:#57ef8f}
+.strategy-paper-note{font-size:7px;color:#6f829b}
+
+#view-strategies .module-title.matrix-title{
+  padding:0!important;align-items:center!important
+}
+#view-strategies .module-title.matrix-title h3{font-size:20px!important}
+#view-strategies .matrix-validation{
+  max-width:34%!important;font-size:8px!important;line-height:1.15!important;
+  word-break:break-word;overflow-wrap:anywhere
+}
+
+@media(max-width:700px){
+  .strategy-overview-strip{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .strategy-overview-item{border-right:0;border:1px solid #17304a;border-radius:12px;padding:9px}
+  .strategy-policy-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .strategy-premium-evidence{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:430px){
+  .strategy-overview-strip{padding:9px;gap:7px}
+  .strategy-overview-item b{font-size:18px}
+  .strategy-premium-card{padding:12px;border-radius:18px}
+  .strategy-premium-title{font-size:14px}
+  .strategy-premium-desc{font-size:8px}
+  .strategy-premium-foot{align-items:flex-start;flex-direction:column}
+  #view-strategies .module-title.matrix-title{
+    display:grid!important;grid-template-columns:1fr auto!important;gap:8px!important
+  }
+  #view-strategies .module-title.matrix-title p{grid-column:1/-1;font-size:9px!important}
+  #view-strategies .matrix-validation{max-width:110px!important;text-align:right!important}
+}
 </style>
 
 <style id="v4-reference-tuning">
@@ -2459,6 +2569,59 @@ function adaptivePolicyImpactComparison(){
     ])
   ]));
 }
+function strategyVisualMeta(id){
+  var key=String(id||"").toUpperCase();
+  if(key==="SMC_LIQUIDITY_REVERSAL")return {
+    icon:"strategies",klass:"smc",desc:"Prise de liquidité + retournement structurel avec confirmations strictes.",
+    tags:["SMC","Liquidity","Structure","OB","FVG"]
+  };
+  if(key==="TREND_PULLBACK")return {
+    icon:"charts",klass:"trend",desc:"Continuation de tendance après pullback confirmé et structure valide.",
+    tags:["Trend","Pullback","Structure","EMA","FVG"]
+  };
+  if(key==="BREAKOUT_EXPANSION")return {
+    icon:"scanner",klass:"breakout",desc:"Cassure de range + expansion de volatilité avec confirmation et retest.",
+    tags:["Breakout","Expansion","Volume","Retest"]
+  };
+  return {icon:"strategies",klass:"generic",desc:"Stratégie serveur objective.",tags:[]};
+}
+function strategyStateClass(state){
+  var s=String(state||"").toUpperCase();
+  return s==="ACTIVE"||s==="PROMOTED"?"ready":s==="CANDIDATE"?"future":"other";
+}
+function strategyPremiumCard(st){
+  var meta=strategyVisualMeta(st.strategy_id);
+  var regimes=Array.isArray(st.allowed_regimes)&&st.allowed_regimes.length?st.allowed_regimes.join(" · "):"—";
+  var tfs=Array.isArray(st.timeframes)&&st.timeframes.length?st.timeframes.join(" · "):"—";
+  var oos=st.minimum_oos_trades==null?"—":String(st.minimum_oos_trades);
+  var pf=st.minimum_paper_forward_trades==null?"—":String(st.minimum_paper_forward_trades);
+  return h("div",{class:"strategy-premium-card "+meta.klass,"data-strategy-id":st.strategy_id||""},[
+    h("div",{class:"strategy-premium-main"},[
+      h("div",{class:"strategy-premium-icon",html:iconSvg(meta.icon)},[]),
+      h("div",{class:"strategy-premium-copy"},[
+        h("div",{class:"strategy-premium-title-row"},[
+          h("div",{class:"strategy-premium-title"},[st.strategy_id||"—"]),
+          h("span",{class:"status-pill "+strategyStateClass(st.validation_state)},[st.validation_state||"CANDIDATE"])
+        ]),
+        h("div",{class:"strategy-premium-family"},[(st.family||"—")+" · v"+(st.version||"—")]),
+        h("div",{class:"strategy-premium-desc"},[meta.desc]),
+        meta.tags.length?h("div",{class:"strategy-tag-row"},meta.tags.map(function(tag){return h("span",{class:"strategy-tag"},[tag])})):null
+      ])
+    ]),
+    h("div",{class:"strategy-premium-evidence"},[
+      h("div",{},[h("span",{},["TF"]),h("b",{},[tfs])]),
+      h("div",{},[h("span",{},["Régimes"]),h("b",{},[regimes])]),
+      h("div",{},[h("span",{},["Minimum OOS"]),h("b",{},[oos+" trades"])]),
+      h("div",{},[h("span",{},["Paper forward"]),h("b",{},[pf+" trades"])])
+    ]),
+    h("div",{class:"strategy-premium-foot"},[
+      h("span",{class:"strategy-ranking "+(st.ranking_eligible?"eligible":"locked")},[
+        st.ranking_eligible?"RANKING ELIGIBLE":"RANKING LOCKED"
+      ]),
+      h("span",{class:"strategy-paper-note"},["Données serveur · PAPER ONLY"])
+    ])
+  ]);
+}
 function renderStrategies(){
   var v=byId("view-strategies");clear(v);
   v.appendChild(pageHead("Stratégies","3 familles objectives · validation et replay sur données réelles.","PAPER ONLY"));
@@ -2468,30 +2631,57 @@ function renderStrategies(){
     clear(host);
     if(!r.ok||!r.data){host.appendChild(emptyState("Registre indisponible",errorMessage(r)));return}
     var d=r.data, strategies=Array.isArray(d.strategies)?d.strategies:[];
-    host.appendChild(h("div",{class:"card"},[
-      h("div",{class:"kv"},[h("span",{class:"k"},["Politique"]),h("b",{},[(d.portfolio&&d.portfolio.policy)||"—"])]),
-      h("div",{class:"kv"},[h("span",{class:"k"},["Ranking"]),h("span",{},[(d.portfolio&&d.portfolio.ranker)||"—"])]),
-      h("div",{class:"kv"},[h("span",{class:"k"},["Minimum OOS"]),h("span",{},[String(d.minimum_oos_trades==null?"—":d.minimum_oos_trades)+" trades"])]),
-      h("div",{class:"kv"},[h("span",{class:"k"},["Paper forward"]),h("span",{},[String(d.minimum_paper_forward_trades==null?"—":d.minimum_paper_forward_trades)+" trades"])] )
+    var active=strategies.filter(function(st){
+      var s=String(st.validation_state||"").toUpperCase();
+      return s==="ACTIVE"||s==="PROMOTED";
+    }).length;
+    var candidates=strategies.filter(function(st){return String(st.validation_state||"").toUpperCase()==="CANDIDATE"}).length;
+    var eligible=strategies.filter(function(st){return !!st.ranking_eligible}).length;
+
+    host.appendChild(h("div",{class:"strategy-overview-strip"},[
+      h("div",{class:"strategy-overview-item"},[
+        h("span",{class:"strategy-overview-icon",html:iconSvg("strategies")},[]),
+        h("div",{},[h("b",{},[String(strategies.length)]),h("span",{},["Stratégies"]),h("small",{},["Registre serveur"])])
+      ]),
+      h("div",{class:"strategy-overview-item"},[
+        h("span",{class:"strategy-overview-icon",html:iconSvg("scanner")},[]),
+        h("div",{},[h("b",{},[String(active)]),h("span",{},["Actives"]),h("small",{},["Production paper"])])
+      ]),
+      h("div",{class:"strategy-overview-item"},[
+        h("span",{class:"strategy-overview-icon",html:iconSvg("signals")},[]),
+        h("div",{},[h("b",{},[String(candidates)]),h("span",{},["Candidates"]),h("small",{},["En validation"])])
+      ]),
+      h("div",{class:"strategy-overview-item"},[
+        h("span",{class:"strategy-overview-icon",html:iconSvg("charts")},[]),
+        h("div",{},[h("b",{},[String(eligible)]),h("span",{},["Ranking"]),h("small",{},["Éligibles"])])
+      ])
     ]));
-    var g=h("div",{class:"grid-2"},[]);
-    strategies.forEach(function(st){
-      var regimes=Array.isArray(st.allowed_regimes)?st.allowed_regimes.join(" · "):"—";
-      var tfs=Array.isArray(st.timeframes)?st.timeframes.join(" · "):"—";
-      g.appendChild(h("div",{class:"card tool-card"},[
-        h("div",{},[h("div",{class:"tool-name"},[st.strategy_id||"—"]),h("div",{class:"tool-desc"},[(st.family||"—")+" · v"+(st.version||"—")]),h("div",{class:"sub"},["TF: "+tfs+" · Régimes: "+regimes])]),
-        h("div",{class:"tool-foot"},[h("span",{class:"status-pill future"},[st.validation_state||"CANDIDATE"]),h("span",{class:"sub"},[st.ranking_eligible?"RANKING ELIGIBLE":"RANKING LOCKED"])])
-      ]));
-    });
+
+    host.appendChild(h("div",{class:"strategy-policy-card"},[
+      h("div",{class:"strategy-policy-title"},[
+        h("b",{},["Validation serveur"]),
+        h("span",{class:"module-badge"},["SERVER AUTHORITATIVE"])
+      ]),
+      h("div",{class:"strategy-policy-grid"},[
+        h("div",{},[h("span",{},["Politique"]),h("b",{},[(d.portfolio&&d.portfolio.policy)||"—"])]),
+        h("div",{},[h("span",{},["Ranking"]),h("b",{},[(d.portfolio&&d.portfolio.ranker)||"—"])]),
+        h("div",{},[h("span",{},["Minimum OOS"]),h("b",{},[String(d.minimum_oos_trades==null?"—":d.minimum_oos_trades)+" trades"])]),
+        h("div",{},[h("span",{},["Paper forward"]),h("b",{},[String(d.minimum_paper_forward_trades==null?"—":d.minimum_paper_forward_trades)+" trades"])])
+      ])
+    ]));
+
+    var g=h("div",{class:"strategy-premium-list"},[]);
+    strategies.forEach(function(st){g.appendChild(strategyPremiumCard(st))});
     host.appendChild(g);
+
     host.appendChild(strategyPerformanceMatrix());
     host.appendChild(adaptiveEdgeImpactValidation());
     host.appendChild(adaptivePolicyCalibration());
     host.appendChild(adaptivePolicyActivationStatus());
     host.appendChild(adaptivePolicyImpactComparison());
     host.appendChild(modCard("Validation statistique","SERVER-AUTHORITATIVE",h("div",{class:"section-stack"},[
-      h("div",{class:"journal-card"},[h("h4",{},["Règle"]),h("p",{},["Aucune stratégie n’est déclarée rentable sans échantillon OOS suffisant. INS UFFICIENT_SAMPLE bloque le ranking plutôt que d’inventer une performance."])]),
-      h("div",{class:"journal-card"},[h("h4",{},["Replay"]),h("p",{},["Le backend expose un replay déterministe sur bougies Coinbase fermées avec coûts exprimés en R."])])
+      h("div",{class:"journal-card"},[h("h4",{},["Règle"]),h("p",{},["Aucune stratégie n’est déclarée rentable sans échantillon OOS suffisant. INSUFFICIENT_SAMPLE bloque le ranking plutôt que d’inventer une performance."])]),
+      h("div",{class:"journal-card"},[h("h4",{},["Replay"]),h("p",{},["Le backend expose un replay déterministe sur bougies fermées avec coûts exprimés en R."])])
     ])));
   });
 }
@@ -3477,6 +3667,7 @@ function renderHelpGlossary(){
 <!-- V17-UI10 · PREMIUM PAPER ACCOUNT REAL DATA ONLY -->
 <!-- V17-UI11 · UNIFORM GLOBAL ASSET LOGO SIZE -->
 <!-- V17-UI12 · ASSET LOGOS EXACT CRYPTO FOOTPRINT -->
+<!-- V17-UI13 · PREMIUM STRATEGIES MOBILE + MATRIX FIX -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

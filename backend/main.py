@@ -3715,21 +3715,42 @@ def should_time_stop(opened_at: datetime, now: datetime) -> bool:
 
 
 _recent_trade_results: List[str] = []  # WIN / LOSS / BREAKEVEN
+_cooldown_started_at: Optional[datetime] = None
 
 
-def record_trade_result(result: str) -> None:
-    """Record a trade result for cooldown tracking."""
-    _recent_trade_results.append(result)
+def record_trade_result(result: str, observed_at: Optional[datetime] = None) -> None:
+    """Record a paper result and start a finite cooldown after the loss threshold."""
+    global _cooldown_started_at
+    normalized = result.upper()
+    if normalized not in {"WIN", "LOSS", "BREAKEVEN"}:
+        return
+    _recent_trade_results.append(normalized)
     if len(_recent_trade_results) > 20:
         _recent_trade_results.pop(0)
+    recent = _recent_trade_results[-COOLDOWN_CONSECUTIVE_LOSSES:]
+    if (
+        len(recent) == COOLDOWN_CONSECUTIVE_LOSSES
+        and all(item == "LOSS" for item in recent)
+    ):
+        stamp = observed_at or utcnow()
+        _cooldown_started_at = stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
+    elif normalized in {"WIN", "BREAKEVEN"}:
+        _cooldown_started_at = None
 
 
 def is_cooldown_active(now_utc: datetime) -> bool:
-    """Return True if the last N trades were consecutive losses."""
-    if len(_recent_trade_results) < COOLDOWN_CONSECUTIVE_LOSSES:
+    """Pause entries for COOLDOWN_MINUTES after the configured consecutive losses."""
+    global _cooldown_started_at
+    if _cooldown_started_at is None:
         return False
-    recent = _recent_trade_results[-COOLDOWN_CONSECUTIVE_LOSSES:]
-    return all(r == "LOSS" for r in recent)
+    now = now_utc if now_utc.tzinfo is not None else now_utc.replace(tzinfo=timezone.utc)
+    elapsed = now - _cooldown_started_at
+    if elapsed.total_seconds() < 0:
+        return True
+    if elapsed < timedelta(minutes=COOLDOWN_MINUTES):
+        return True
+    _cooldown_started_at = None
+    return False
 auto_entry_candidates: Dict[str, AutoEntryCandidateState] = {}
 auto_entry_orchestrator_task: Optional[asyncio.Task] = None
 AUTO_DECISION_TRACE_MAX = 200
@@ -12961,6 +12982,11 @@ async def run_multi_asset_paper_generation_once() -> Dict[str, int]:
     }
     if not persistence_state.ready:
         return stats
+    # V17 GOLD continuous re-entry: cooldown is finite and applies to every
+    # auto-entry asset class. Once expired, XAU-USD is eligible for fresh setups again.
+    now = utcnow()
+    if is_cooldown_active(now):
+        return stats
     for instrument in instrument_registry.all():
         if instrument.asset_class == AssetClass.CRYPTO:
             continue
@@ -12995,6 +13021,11 @@ async def run_multi_asset_paper_generation_once() -> Dict[str, int]:
                 if not isinstance(detector_obj, dict):
                     continue
                 strategy_id = str(detector_obj.get("strategy_id") or "")
+                # V17 GOLD policy: XAU-USD auto-paper execution is intentionally
+                # restricted to BREAKOUT_EXPANSION@0.2-paper. SMC and Trend
+                # remain observable in analysis but cannot open Gold positions.
+                if canonical == "XAU-USD" and strategy_id != "BREAKOUT_EXPANSION":
+                    continue
                 plan: Optional[Dict[str, object]] = None
                 if strategy_id == "SMC_LIQUIDITY_REVERSAL":
                     if detector_obj.get("setup_state") != "ENTRY_NOW":

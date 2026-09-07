@@ -12994,11 +12994,11 @@ async def get_breakout_historical_priority() -> dict[str, float]:
     now = utcnow()
     cached = _breakout_history_priority_cache
     if cached is not None:
-        cached_at, scores = cached
+        cached_at, cached_scores = cached
         if (
             now - cached_at
         ).total_seconds() < _BREAKOUT_HISTORY_PRIORITY_TTL_SECONDS:
-            return dict(scores)
+            return dict(cached_scores)
 
     if not persistence_state.ready:
         return {}

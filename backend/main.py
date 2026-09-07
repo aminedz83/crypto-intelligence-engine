@@ -3733,7 +3733,9 @@ def record_trade_result(result: str, observed_at: Optional[datetime] = None) -> 
         and all(item == "LOSS" for item in recent)
     ):
         stamp = observed_at or utcnow()
-        _cooldown_started_at = stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
+        _cooldown_started_at = (
+            stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
+        )
     elif normalized in {"WIN", "BREAKEVEN"}:
         _cooldown_started_at = None
 
@@ -3741,9 +3743,16 @@ def record_trade_result(result: str, observed_at: Optional[datetime] = None) -> 
 def is_cooldown_active(now_utc: datetime) -> bool:
     """Pause entries for COOLDOWN_MINUTES after the configured consecutive losses."""
     global _cooldown_started_at
+    if len(_recent_trade_results) < COOLDOWN_CONSECUTIVE_LOSSES:
+        _cooldown_started_at = None
+        return False
     if _cooldown_started_at is None:
         return False
-    now = now_utc if now_utc.tzinfo is not None else now_utc.replace(tzinfo=timezone.utc)
+    now = (
+        now_utc
+        if now_utc.tzinfo is not None
+        else now_utc.replace(tzinfo=timezone.utc)
+    )
     elapsed = now - _cooldown_started_at
     if elapsed.total_seconds() < 0:
         return True

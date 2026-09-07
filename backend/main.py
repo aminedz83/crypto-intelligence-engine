@@ -13000,14 +13000,14 @@ async def get_breakout_historical_priority() -> dict[str, float]:
         ).total_seconds() < _BREAKOUT_HISTORY_PRIORITY_TTL_SECONDS:
             return dict(scores)
 
-    if not persistence_state.ready or _engine is None:
+    if not persistence_state.ready:
         return {}
 
     try:
-        async with _engine.connect() as conn:
+        async with engine.connect() as conn:
             rows = (
                 await conn.execute(
-                    select(
+                    paper_positions_table.select().with_only_columns(
                         paper_positions_table.c.symbol,
                         paper_positions_table.c.realized_pnl,
                     ).where(
@@ -13019,7 +13019,7 @@ async def get_breakout_historical_priority() -> dict[str, float]:
                 )
             ).mappings().all()
     except Exception:
-        logger.exception("breakout historical priority query failed")
+        log.exception("breakout historical priority query failed")
         return {}
 
     aggregates: dict[str, list[float]] = {}
@@ -13030,7 +13030,7 @@ async def get_breakout_historical_priority() -> dict[str, float]:
     scores: dict[str, float] = {}
     for symbol, pnl_values in aggregates.items():
         sample_size = len(pnl_values)
-        if sample_size < ADAPTIVE_EDGE_MIN_SAMPLE_SIZE:
+        if sample_size < ADAPTIVE_EDGE_MIN_SAMPLE:
             continue
         wins = sum(1 for value in pnl_values if value > 0)
         realized_pnl = sum(pnl_values)

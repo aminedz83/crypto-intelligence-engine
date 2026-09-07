@@ -2327,7 +2327,7 @@ function renderTradingContent(){
         h("span",{class:"module-badge"},["PAPER ONLY"])
       ]),
       h("div",{class:"paper-security-grid"},[
-        paperSecurityTile("trading","Exécution broker / MT5","DÉSACTIVÉE","bad","Aucun ordre réel"),
+        paperSecurityTile("trading",["Exécution broker / MT5"][0],"DÉSACTIVÉE","bad","Aucun ordre réel"),
         paperSecurityTile("scanner","Données inventées","AUCUNE","good","Données backend uniquement"),
         paperSecurityTile("paper","Trading réel","DÉSACTIVÉ","bad","Mode paper uniquement")
       ]),

@@ -9714,3 +9714,57 @@ class V17DailyBiasInOrchestratorsTests(unittest.TestCase):
     def test_daily_bias_cache_constant(self):
         self.assertTrue(hasattr(main, "DAILY_BIAS_CACHE_SECONDS"))
         self.assertGreater(main.DAILY_BIAS_CACHE_SECONDS, 0)
+
+
+# ==================== V17-PRO SYMBOL PERF — focus on winning symbols ============
+
+
+class V17SymbolPerfFunctionTests(unittest.TestCase):
+    """Symbol performance filter must exist."""
+
+    def test_function_exists(self):
+        self.assertTrue(hasattr(main, "is_symbol_performance_allowed"))
+        self.assertTrue(asyncio.iscoroutinefunction(
+            main.is_symbol_performance_allowed
+        ))
+
+    def test_min_trades_constant(self):
+        self.assertTrue(hasattr(main, "SYMBOL_PERF_MIN_TRADES"))
+        self.assertGreater(main.SYMBOL_PERF_MIN_TRADES, 0)
+
+    def test_min_win_rate_constant(self):
+        self.assertTrue(hasattr(main, "SYMBOL_PERF_MIN_WIN_RATE"))
+        self.assertGreater(main.SYMBOL_PERF_MIN_WIN_RATE, 0)
+
+    def test_cache_constant(self):
+        self.assertTrue(hasattr(main, "SYMBOL_PERF_CACHE_SECONDS"))
+        self.assertGreater(main.SYMBOL_PERF_CACHE_SECONDS, 0)
+
+
+class V17SymbolPerfInOrchestratorsTests(unittest.TestCase):
+    """Symbol perf gate must be in all 3 orchestrators."""
+
+    def test_symbol_perf_in_smc(self):
+        src = open("main.py").read()
+        idx = src.index(
+            "async def run_server_auto_paper_generation_once"
+        )
+        block = src[idx:idx + 5000]
+        self.assertIn("is_symbol_performance_allowed", block)
+        self.assertIn("SYMBOL_LOSING_RECORD", block)
+
+    def test_symbol_perf_in_trend_pullback(self):
+        src = open("main.py").read()
+        idx = src.index(
+            "async def run_trend_pullback_paper_generation_once"
+        )
+        block = src[idx:idx + 3000]
+        self.assertIn("is_symbol_performance_allowed", block)
+
+    def test_symbol_perf_in_breakout(self):
+        src = open("main.py").read()
+        idx = src.index(
+            "async def run_breakout_expansion_paper_generation_once"
+        )
+        block = src[idx:idx + 3000]
+        self.assertIn("is_symbol_performance_allowed", block)

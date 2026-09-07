@@ -10842,20 +10842,28 @@ async def resolve_twelvedata_index_symbol(canonical: str) -> Dict[str, object]:
 
     query = _TD_INDEX_SEARCH_TERMS.get(canonical)
     if query is None:
-        result = {"status": "NOT_MAPPED", "symbol": None,
-                  "reason": f"no Twelve Data discovery rule for {canonical}"}
+        result: Dict[str, object] = {
+            "status": "NOT_MAPPED",
+            "symbol": None,
+            "reason": f"no Twelve Data discovery rule for {canonical}",
+        }
         _twelvedata_index_resolution[canonical] = result
         return dict(result)
 
     search = await twelvedata_provider.search_symbols(query, outputsize=30)
     if search.get("status") != "OK":
-        result = {"status": str(search.get("status") or "UNAVAILABLE"), "symbol": None,
-                  "reason": search.get("reason")}
+        result = {
+            "status": str(search.get("status") or "UNAVAILABLE"),
+            "symbol": None,
+            "reason": search.get("reason"),
+        }
         _twelvedata_index_resolution[canonical] = result
         return dict(result)
 
+    raw_search_rows = search.get("data")
+    search_rows = raw_search_rows if isinstance(raw_search_rows, list) else []
     matches = [
-        row for row in (search.get("data") or [])
+        row for row in search_rows
         if _is_verified_twelvedata_index_match(canonical, row)
     ]
     if not matches:
@@ -10996,7 +11004,12 @@ async def fetch_index_history(
             )
             selected_status = "OK"
             selected_reason = None
-            selected_bars = list(td.get("bars") or [])
+            raw_td_bars = td.get("bars")
+            selected_bars = (
+                [bar for bar in raw_td_bars if isinstance(bar, IndexBar)]
+                if isinstance(raw_td_bars, list)
+                else []
+            )
             fallback_from = "massive"
             fallback_reason = massive_res.reason or massive_res.status
         else:

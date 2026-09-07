@@ -9651,3 +9651,66 @@ class V17AuditAllStrategiesInLoop(unittest.TestCase):
                      "run_breakout_expansion_paper_generation_once",
                      "run_multi_asset_paper_generation_once"):
             self.assertIn(func, block, f"{func} missing from orchestrator loop")
+
+# ==================== V17-PRO DAILY BIAS — trade in daily direction only ========
+
+
+class V17DailyBiasFunctionTests(unittest.TestCase):
+    """Daily bias functions must exist and work correctly."""
+
+    def test_get_daily_bias_function_exists(self):
+        self.assertTrue(hasattr(main, "get_daily_bias"))
+        self.assertTrue(asyncio.iscoroutinefunction(main.get_daily_bias))
+
+    def test_daily_bias_allows_function_exists(self):
+        self.assertTrue(callable(main.daily_bias_allows))
+
+    def test_daily_bias_allows_bullish_long(self):
+        self.assertTrue(main.daily_bias_allows("BULLISH", "LONG"))
+
+    def test_daily_bias_allows_bearish_short(self):
+        self.assertTrue(main.daily_bias_allows("BEARISH", "SHORT"))
+
+    def test_daily_bias_blocks_bullish_short(self):
+        self.assertFalse(main.daily_bias_allows("BULLISH", "SHORT"))
+
+    def test_daily_bias_blocks_bearish_long(self):
+        self.assertFalse(main.daily_bias_allows("BEARISH", "LONG"))
+
+    def test_daily_bias_neutral_allows_both(self):
+        self.assertTrue(main.daily_bias_allows("NEUTRAL", "LONG"))
+        self.assertTrue(main.daily_bias_allows("NEUTRAL", "SHORT"))
+
+
+class V17DailyBiasInOrchestratorsTests(unittest.TestCase):
+    """Daily bias gate must be present in all 3 orchestrators."""
+
+    def test_daily_bias_in_smc_orchestrator(self):
+        src = open("main.py").read()
+        idx = src.index("async def run_server_auto_paper_generation_once")
+        block = src[idx:idx + 3000]
+        self.assertIn("get_daily_bias", block)
+        self.assertIn("daily_bias_allows", block)
+        self.assertIn("DAILY_BIAS", block)
+
+    def test_daily_bias_in_trend_pullback_orchestrator(self):
+        src = open("main.py").read()
+        idx = src.index(
+            "async def run_trend_pullback_paper_generation_once"
+        )
+        block = src[idx:idx + 2000]
+        self.assertIn("get_daily_bias", block)
+        self.assertIn("daily_bias_allows", block)
+
+    def test_daily_bias_in_breakout_orchestrator(self):
+        src = open("main.py").read()
+        idx = src.index(
+            "async def run_breakout_expansion_paper_generation_once"
+        )
+        block = src[idx:idx + 2000]
+        self.assertIn("get_daily_bias", block)
+        self.assertIn("daily_bias_allows", block)
+
+    def test_daily_bias_cache_constant(self):
+        self.assertTrue(hasattr(main, "DAILY_BIAS_CACHE_SECONDS"))
+        self.assertGreater(main.DAILY_BIAS_CACHE_SECONDS, 0)

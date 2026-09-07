@@ -3648,6 +3648,58 @@ CRYPTO_SESSION_NY_END_UTC = 21        # 21:00 UTC
 COOLDOWN_CONSECUTIVE_LOSSES = 2
 COOLDOWN_MINUTES = 30
 
+# V17-PRO Daily Bias: only trade in the direction of the current daily candle.
+# Fetches the last 1d candle from Coinbase and compares open vs close.
+# BULLISH (close > open) → only LONG allowed.
+# BEARISH (close < open) → only SHORT allowed.
+# NEUTRAL or UNAVAILABLE → both sides allowed (fail-open).
+_daily_bias_cache: Dict[str, tuple] = {}  # symbol → (bias, expiry_ts)
+DAILY_BIAS_CACHE_SECONDS = 900  # 15 minutes
+
+
+async def get_daily_bias(symbol: str) -> str:
+    """Return BULLISH, BEARISH, or NEUTRAL for the current daily candle."""
+    now_ts = utcnow().timestamp()
+    cached = _daily_bias_cache.get(symbol)
+    if cached and now_ts < cached[1]:
+        return cached[0]
+    provider_symbol = provider_symbol_map.to_provider("coinbase", symbol)
+    if provider_symbol is None:
+        return "NEUTRAL"
+    try:
+        candles, _quality = await market_provider.get_candles(
+            provider_symbol, "1d", 2
+        )
+        if not candles:
+            return "NEUTRAL"
+        latest = candles[-1]
+        o = Decimal(str(latest.get("open", 0)))
+        c = Decimal(str(latest.get("close", 0)))
+        if c > o:
+            bias = "BULLISH"
+        elif c < o:
+            bias = "BEARISH"
+        else:
+            bias = "NEUTRAL"
+        _daily_bias_cache[symbol] = (
+            bias,
+            now_ts + DAILY_BIAS_CACHE_SECONDS,
+        )
+        return bias
+    except Exception:  # noqa: BLE001
+        return "NEUTRAL"
+
+
+def daily_bias_allows(bias: str, side: str) -> bool:
+    """Return True if the daily bias allows the given trade side."""
+    if bias == "NEUTRAL":
+        return True
+    if bias == "BULLISH" and side == "LONG":
+        return True
+    if bias == "BEARISH" and side == "SHORT":
+        return True
+    return False
+
 # Peak price tracking for trailing stop (in-memory, per position).
 _position_peaks: Dict[str, Decimal] = {}
 
@@ -4373,6 +4425,14 @@ async def run_server_auto_paper_generation_once() -> Dict[str, int]:
                 default=str,
                 sort_keys=True,
             )
+            # V17-PRO: Daily Bias — only trade in the daily candle direction
+            daily_bias = await get_daily_bias(symbol)
+            if not daily_bias_allows(daily_bias, request.side):
+                stats["blocked"] += 1
+                await record_and_persist_auto_decision_trace(
+                    symbol, "BLOCKED", f"DAILY_BIAS_{daily_bias}_VS_{request.side}", detector
+                )
+                continue
             stats["entry_now"] += 1
             result = await verified_auto_paper_entry(request)
         except HTTPException as exc:
@@ -13545,6 +13605,12 @@ async def run_trend_pullback_paper_generation_once() -> Dict[str, int]:
             if plan.get("status") != "ENTRY_NOW":
                 stats["blocked"] += 1
                 continue
+            # V17-PRO: Daily Bias gate
+            tp_side = str(plan.get("side", ""))
+            tp_bias = await get_daily_bias(symbol)
+            if not daily_bias_allows(tp_bias, tp_side):
+                stats["blocked"] += 1
+                continue
             result = await execute_trend_pullback_paper_plan(symbol, plan)
             if result.get("status") == "OPENED":
                 stats["opened"] += 1
@@ -13795,6 +13861,12 @@ async def run_breakout_expansion_paper_generation_once() -> Dict[str, int]:
                 {"detector": detection}, default=str, sort_keys=True
             )
             if plan.get("status") != "ENTRY_NOW":
+                stats["blocked"] += 1
+                continue
+            # V17-PRO: Daily Bias gate
+            bo_side = str(plan.get("side", ""))
+            bo_bias = await get_daily_bias(symbol)
+            if not daily_bias_allows(bo_bias, bo_side):
                 stats["blocked"] += 1
                 continue
             result = await execute_breakout_expansion_paper_plan(symbol, plan)

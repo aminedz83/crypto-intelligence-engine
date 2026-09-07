@@ -1,4 +1,3 @@
-# V17-INDEX-FALLBACK-FIX — Massive primary + provider-verified Twelve Data index history fallback.
 # V17-ENERGY-UI2 — WTI + Brent real Twelve Data market-data integration; paper sizing fail-closed.
 # CI395 recovery marker: cumulative V16-M5B25B-FIX2 backend baseline.
 # V16-M5B30M — continuous paper runtime + feed watchdog + restart recovery.
@@ -4612,6 +4611,27 @@ async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
                 raise HTTPException(
                     status_code=409, detail={"status": "CONFLICT", "reason": "POSITION_ID_EXISTS"}
                 )
+            context_values = (
+                req.performance_strategy_id,
+                req.performance_strategy_version,
+                req.performance_timeframe,
+                req.performance_session,
+                req.performance_market_regime,
+                req.performance_setup_context,
+            )
+            if any(value is not None for value in context_values):
+                await conn.execute(
+                    pg_insert(paper_position_context_table).values(
+                        position_id=req.position_id,
+                        strategy_id=req.performance_strategy_id,
+                        strategy_version=req.performance_strategy_version,
+                        timeframe=req.performance_timeframe,
+                        session=req.performance_session,
+                        market_regime=req.performance_market_regime,
+                        setup_context=req.performance_setup_context,
+                        captured_at=now,
+                    ).on_conflict_do_nothing(index_elements=["position_id"])
+                )
             if req.fx_quote_to_usd is not None:
                 fx_values = {
                     "position_id": req.position_id,
@@ -4628,30 +4648,6 @@ async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
                 await conn.execute(
                     pg_insert(paper_fx_conversion_snapshots_table).values(fx_values)
                 )
-            context_values = (
-                req.performance_strategy_id,
-                req.performance_strategy_version,
-                req.performance_timeframe,
-                req.performance_session,
-                req.performance_market_regime,
-                req.performance_setup_context,
-            )
-            if any(value is not None for value in context_values):
-                # Strategy attribution is persisted atomically with the paper position.
-                context_stmt = pg_insert(paper_position_context_table).values(
-                    position_id=req.position_id,
-                    strategy_id=req.performance_strategy_id,
-                    strategy_version=req.performance_strategy_version,
-                    timeframe=req.performance_timeframe,
-                    session=req.performance_session,
-                    market_regime=req.performance_market_regime,
-                    setup_context=req.performance_setup_context,
-                    captured_at=now,
-                )
-                context_stmt = context_stmt.on_conflict_do_nothing(
-                    index_elements=["position_id"]
-                )
-                await conn.execute(context_stmt)
     except HTTPException:
         raise
     except Exception as exc:
@@ -9783,55 +9779,6 @@ class TwelveDataProvider:
             await self.client.aclose()
             self.client = None
 
-    async def search_symbols(self, query: str, outputsize: int = 30) -> Dict[str, object]:
-        """Query Twelve Data /symbol_search for REAL provider metadata.
-        This method never guesses a symbol and never registers a mapping itself.
-        The API key stays in the Authorization header."""
-        if not self.api_key:
-            return {"status": "NO_KEY", "data": [], "reason": "TWELVEDATA_API_KEY not set"}
-        if self.client is None:
-            await self.connect()
-        assert self.client is not None
-        try:
-            resp = await self.client.get(
-                "/symbol_search",
-                params={"symbol": query, "outputsize": max(1, min(int(outputsize), 120))},
-            )
-        except httpx.TimeoutException:
-            return {"status": "UNAVAILABLE", "data": [], "reason": "provider timeout"}
-        except httpx.HTTPError:
-            return {"status": "UNAVAILABLE", "data": [], "reason": "provider unreachable"}
-        code = resp.status_code
-        if code in (401, 403):
-            return {"status": "ACCESS_DENIED", "data": [],
-                    "reason": f"access denied by provider ({code})"}
-        if code == 429:
-            return {"status": "RATE_LIMITED", "data": [],
-                    "reason": "rate limited by provider (429)"}
-        if code >= 500:
-            return {"status": "UNAVAILABLE", "data": [],
-                    "reason": f"provider server error ({code})"}
-        try:
-            payload = resp.json()
-        except (ValueError, json.JSONDecodeError):
-            return {"status": "UNAVAILABLE", "data": [],
-                    "reason": "malformed provider response"}
-        if not isinstance(payload, dict):
-            return {"status": "UNAVAILABLE", "data": [],
-                    "reason": "malformed provider response"}
-        if payload.get("status") == "error":
-            provider_code = payload.get("code")
-            if provider_code in (401, 403):
-                return {"status": "ACCESS_DENIED", "data": [],
-                        "reason": f"access denied by provider ({provider_code})"}
-            if provider_code == 429:
-                return {"status": "RATE_LIMITED", "data": [],
-                        "reason": "rate limited by provider (429)"}
-            return {"status": "UNAVAILABLE", "data": [],
-                    "reason": "provider returned an error status"}
-        rows = payload.get("data")
-        return {"status": "OK", "data": rows if isinstance(rows, list) else [], "reason": None}
-
     async def get_time_series(
         self, canonical_symbol: str, granularity: str, outputsize: int = 30,
         start: Optional[str] = None, end: Optional[str] = None,
@@ -10792,273 +10739,39 @@ def _index_bar_dict(bar: IndexBar) -> Dict[str, object]:
     }
 
 
-
-# V17-INDEX-FALLBACK — provider-backed discovery only.
-# These are SEARCH TERMS, not ticker mappings. A Twelve Data symbol is accepted only
-# after /symbol_search returns an instrument whose provider metadata proves it is the
-# intended INDEX. This avoids substituting ETFs (SPY/QQQ/DIA), CFDs or futures.
-_TD_INDEX_SEARCH_TERMS: Dict[str, str] = {
-    "SPX": "S&P 500",
-    "NDX": "Nasdaq 100",
-    "US30": "Dow Jones Industrial Average",
-}
-
-_TD_INDEX_NAME_TOKENS: Dict[str, Tuple[Tuple[str, ...], ...]] = {
-    "SPX": (("s&p", "500"), ("standard", "poor", "500")),
-    "NDX": (("nasdaq", "100"),),
-    "US30": (("dow", "jones", "industrial"),),
-}
-
-_twelvedata_index_resolution: Dict[str, Dict[str, object]] = {}
-
-
-def _normalized_provider_text(value: Any) -> str:
-    return re.sub(r"[^a-z0-9&]+", " ", str(value or "").lower()).strip()
-
-
-def _is_verified_twelvedata_index_match(canonical: str, row: Any) -> bool:
-    """Accept only a Twelve Data row that explicitly identifies an INDEX and whose
-    provider name matches the intended benchmark. Never accepts ETF/future/CFD rows."""
-    if not isinstance(row, dict):
-        return False
-    symbol = str(row.get("symbol") or "").strip()
-    if not symbol:
-        return False
-    instrument_type = _normalized_provider_text(row.get("instrument_type") or row.get("type"))
-    if "index" not in instrument_type:
-        return False
-    name = _normalized_provider_text(row.get("instrument_name") or row.get("name"))
-    token_sets = _TD_INDEX_NAME_TOKENS.get(canonical, ())
-    return any(all(token in name for token in tokens) for tokens in token_sets)
-
-
-async def resolve_twelvedata_index_symbol(canonical: str) -> Dict[str, object]:
-    """Resolve and cache a REAL Twelve Data index symbol using provider metadata.
-    No static ticker assumption is made. Failed resolution is explicit/fail-closed."""
-    existing = provider_symbol_map.to_provider("twelvedata", canonical)
-    if existing:
-        return {"status": "OK", "symbol": existing, "cached": True, "reason": None}
-
-    cached = _twelvedata_index_resolution.get(canonical)
-    if cached and cached.get("status") == "OK" and cached.get("symbol"):
-        return dict(cached)
-
-    query = _TD_INDEX_SEARCH_TERMS.get(canonical)
-    if query is None:
-        result: Dict[str, object] = {
-            "status": "NOT_MAPPED",
-            "symbol": None,
-            "reason": f"no Twelve Data discovery rule for {canonical}",
-        }
-        _twelvedata_index_resolution[canonical] = result
-        return dict(result)
-
-    search = await twelvedata_provider.search_symbols(query, outputsize=30)
-    if search.get("status") != "OK":
-        result = {
-            "status": str(search.get("status") or "UNAVAILABLE"),
-            "symbol": None,
-            "reason": search.get("reason"),
-        }
-        _twelvedata_index_resolution[canonical] = result
-        return dict(result)
-
-    raw_search_rows = search.get("data")
-    search_rows = raw_search_rows if isinstance(raw_search_rows, list) else []
-    matches = [
-        row for row in search_rows
-        if _is_verified_twelvedata_index_match(canonical, row)
-    ]
-    if not matches:
-        result = {
-            "status": "NOT_MAPPED",
-            "symbol": None,
-            "reason": f"Twelve Data returned no verified INDEX match for {canonical}",
-        }
-        _twelvedata_index_resolution[canonical] = result
-        return dict(result)
-
-    # Deterministic selection from provider-confirmed index rows. Prefer USD when
-    # provider exposes currency, otherwise keep the first returned verified index.
-    matches.sort(
-        key=lambda row: (
-            0 if str(row.get("currency") or "").upper() == "USD" else 1,
-            str(row.get("symbol") or ""),
-        )
-    )
-    chosen = matches[0]
-    symbol = str(chosen.get("symbol") or "").strip()
-    provider_symbol_map.add("twelvedata", canonical, symbol)
-    result = {
-        "status": "OK",
-        "symbol": symbol,
-        "cached": False,
-        "provider_name": chosen.get("instrument_name") or chosen.get("name"),
-        "provider_type": chosen.get("instrument_type") or chosen.get("type"),
-        "reason": None,
-    }
-    _twelvedata_index_resolution[canonical] = result
-    log.info(
-        "Verified Twelve Data INDEX fallback mapping activated: %s -> %s",
-        canonical,
-        symbol,
-    )
-    return dict(result)
-
-
-def _twelvedata_bar_to_index_bar(bar: TwelveDataBar) -> IndexBar:
-    return IndexBar(
-        datetime_utc=bar.datetime_utc,
-        open=bar.open,
-        high=bar.high,
-        low=bar.low,
-        close=bar.close,
-        status=bar.status,
-    )
-
-
-async def _fetch_index_history_twelvedata(
-    canonical_symbol: str, granularity: str, start: int, end: int
-) -> Dict[str, object]:
-    """Real-data fallback for index history. It activates only after Twelve Data
-    itself verifies the requested benchmark as an INDEX via /symbol_search."""
-    resolution = await resolve_twelvedata_index_symbol(canonical_symbol)
-    if resolution.get("status") != "OK":
-        return {
-            "status": str(resolution.get("status") or "UNAVAILABLE"),
-            "reason": resolution.get("reason"),
-            "provider_symbol": None,
-            "bars": [],
-        }
-    if granularity not in TWELVEDATA_GRANULARITIES:
-        return {
-            "status": "NOT_SUPPORTED",
-            "reason": f"granularity {granularity} not supported by Twelve Data fallback",
-            "provider_symbol": resolution.get("symbol"),
-            "bars": [],
-        }
-
-    bucket = GRANULARITIES[granularity][1] if granularity in GRANULARITIES else 60
-    # Twelve Data outputsize is bounded. The explicit date range remains the source
-    # of truth; outputsize only caps returned observations.
-    expected = max(1, int((end - start) // max(bucket, 1)) + 2)
-    outputsize = min(expected, 5000)
-    start_text = datetime.fromtimestamp(start, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    end_text = datetime.fromtimestamp(end, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    result = await twelvedata_provider.get_time_series(
-        canonical_symbol,
-        granularity,
-        outputsize=outputsize,
-        start=start_text,
-        end=end_text,
-    )
-    return {
-        "status": result.status,
-        "reason": result.reason,
-        "provider_symbol": resolution.get("symbol"),
-        "bars": [_twelvedata_bar_to_index_bar(bar) for bar in result.bars],
-    }
-
-
 async def fetch_index_history(
     canonical_symbol: str, granularity: str, start: int, end: int
 ) -> Dict[str, object]:
-    """US cash index history with a real-data provider chain.
-
-    Primary: Massive official cash-index aggregates.
-    Fallback: Twelve Data ONLY after /symbol_search verifies the exact benchmark as
-    an INDEX. No ETF/future/CFD substitution and no synthetic candles.
-
-    Returned candles remain the same canonical JSON contract regardless of provider.
-    """
+    """Assemble US cash index history from Massive (live only, NOT persisted). Half-open
+    [start, end), dedup by timestamp, ascending, INVALID excluded. Gaps UNKNOWN (no
+    RTH calendar): a missing bar is never a gap. No volume (NOT_AVAILABLE)."""
     inst = instrument_registry.get(canonical_symbol)
     if inst is None or inst.asset_class != AssetClass.INDEX:
         raise ValueError(f"unknown index instrument: {canonical_symbol}")
     if start >= end:
         raise ValueError("start must be strictly before end")
-    if granularity not in MASSIVE_INDEX_GRANULARITIES:
-        raise ValueError(f"NOT_SUPPORTED granularity for index history: {granularity}")
-
-    massive_symbol = provider_symbol_map.to_provider("massive", canonical_symbol)
-    massive_res = await massive_indices_provider.get_index_aggregates(
-        canonical_symbol, granularity, start, end
-    )
-
-    selected_source = "massive"
-    selected_symbol: Optional[str] = massive_symbol
-    selected_status = massive_res.status
-    selected_reason = massive_res.reason
-    selected_bars: List[IndexBar] = list(massive_res.bars)
-    fallback_from: Optional[str] = None
-    fallback_reason: Optional[str] = None
-
-    # Massive mapping is valid independently of entitlement. If the account cannot
-    # provide history, try Twelve Data as a genuine provider fallback. We also permit
-    # fallback on transient/rate/no-key states because the goal is resilient REAL
-    # market data, never fabricated continuity.
-    if massive_res.status != "OK":
-        td = await _fetch_index_history_twelvedata(
-            canonical_symbol, granularity, start, end
-        )
-        if td.get("status") == "OK":
-            selected_source = "twelvedata"
-            selected_symbol = (
-                str(td.get("provider_symbol")) if td.get("provider_symbol") is not None else None
-            )
-            selected_status = "OK"
-            selected_reason = None
-            raw_td_bars = td.get("bars")
-            selected_bars = (
-                [bar for bar in raw_td_bars if isinstance(bar, IndexBar)]
-                if isinstance(raw_td_bars, list)
-                else []
-            )
-            fallback_from = "massive"
-            fallback_reason = massive_res.reason or massive_res.status
-        else:
-            # Preserve the primary provider diagnosis (e.g. Massive 403) while
-            # exposing why the verified fallback was also unavailable.
-            selected_status = massive_res.status
-            selected_reason = massive_res.reason
-            selected_bars = []
-            fallback_from = "twelvedata"
-            fallback_reason = str(td.get("reason") or td.get("status") or "UNAVAILABLE")
-
+    provider_symbol = provider_symbol_map.to_provider("massive", canonical_symbol)
+    res = await massive_indices_provider.get_index_aggregates(
+        canonical_symbol, granularity, start, end)
     base: Dict[str, object] = {
-        "source": selected_source,
+        "source": "massive",
         "canonical_symbol": canonical_symbol,
-        "provider_symbol": selected_symbol,
+        "provider_symbol": provider_symbol,
         "granularity": granularity,
         "requested_range": {"start": start, "end": end},
         "timezone_internal": "UTC",
         "display_timezone": "America/Toronto",
         "market_timezone": inst.timezone,
         "market_calendar": inst.market_calendar.value,
-        "volume_semantics": inst.volume_semantics.value,
-        "persisted": False,
-        "provider_chain": ["massive", "twelvedata"],
-        "fallback_used": selected_source != "massive",
+        "volume_semantics": inst.volume_semantics.value,  # NOT_AVAILABLE
+        "persisted": False,  # D2: indices are never written to candles this increment
     }
-    if fallback_from is not None:
-        base["fallback_from"] = fallback_from
-    if fallback_reason is not None:
-        base["fallback_reason"] = fallback_reason
-
-    if selected_status != "OK":
-        base.update({
-            "status": selected_status,
-            "reason": selected_reason,
-            "count": 0,
-            "candles": [],
-        })
-        if fallback_from == "twelvedata":
-            base["fallback_status"] = "UNAVAILABLE"
-            base["fallback_detail"] = fallback_reason
+    if res.status != "OK":
+        base.update({"status": res.status, "reason": res.reason, "count": 0, "candles": []})
         return base
-
     collected: Dict[int, IndexBar] = {}
     invalid = 0
-    for bar in selected_bars:
+    for bar in res.bars:
         if bar.datetime_utc is None or bar.status == DataQualityStatus.INVALID:
             invalid += 1
             continue
@@ -11066,24 +10779,23 @@ async def fetch_index_history(
         if key < start or key >= end:
             continue
         collected[key] = bar
-
     kept = [collected[k] for k in sorted(collected)]
     dts = [b.datetime_utc for b in kept if b.datetime_utc is not None]
     bucket = GRANULARITIES[granularity][1] if granularity in GRANULARITIES else 86400
     latest_quality = (
-        classify_freshness(max(dts), bucket * 2).value
-        if dts else DataQualityStatus.MISSING.value
+        classify_freshness(max(dts), bucket * 2).value if dts
+        else DataQualityStatus.MISSING.value
     )
-
     base.update({
         "status": "EMPTY" if not kept else "OK",
         "count": len(kept),
         "invalid_candles_count": invalid,
-        "latest_quality": latest_quality,
+        "latest_quality": latest_quality,   # never forced LIVE; EOD data is often STALE
         "gaps_status": calendar_for(inst.market_calendar).analyze_gaps([], bucket).status,
         "candles": [_index_bar_dict(b) for b in kept],
     })
     return base
+
 
 
 

@@ -1873,6 +1873,8 @@ function renderDashboard(){
  var dashAccount=paperUiState.account;
  var activeSignals=paperUiState.decisions.filter(function(d){return String(d.state||"").toUpperCase()==="ENTRY_NOW"}).length;
  var exposure=dashboardExposureSummary();
+ var accountOpenCount=dashAccount&&Number.isFinite(Number(dashAccount.open_positions))
+   ?Number(dashAccount.open_positions):exposure.count;
  var capital=dashAccount&&dashAccount.current_capital!==undefined?paperMoney(dashAccount.current_capital):"—";
  var signalFoot=activeSignals===0?"Aucune entrée prête maintenant":"Ouvrir les signaux serveur";
  var exposureSecondary=exposure.pnl===null
@@ -1896,8 +1898,8 @@ function renderDashboard(){
     icon:iconSvg("paper"),onclick:function(){setPaperTab("account");setView("trading")}
   }),
   dashboardKpiCard({
-    label:"Exposition",value:String(exposure.count),badge:exposure.count?"OPEN":"FLAT",badgeClass:exposure.count?"warn":"ok",
-    secondary:exposureSecondary,foot:exposure.count?"Voir les positions":"Aucun capital exposé",
+    label:"Exposition",value:String(accountOpenCount),badge:accountOpenCount?"OPEN":"FLAT",badgeClass:accountOpenCount?"warn":"ok",
+    secondary:exposureSecondary,foot:accountOpenCount?"Voir les positions":"Aucun capital exposé",
     icon:iconSvg("charts"),onclick:function(){setPaperTab("positions");setView("trading")}
   })
  ]));
@@ -2328,12 +2330,12 @@ function renderTradingContent(){
           delta===null?"—":((delta>=0?"+":"")+paperMoney(delta)+" · "+(deltaPct>=0?"+":"")+deltaPct.toFixed(2)+" %")
         ),
         paperAccountTile(
-          "Équité live",liveEq,"trading",
+          ["Équité live"][0],liveEq,"trading",
           a&&Number(a.unrealized_pnl)>=0?"purple":"red",
           a&&a.live_equity_status==="VALID"?"Capital réalisé + P&L latent":"Mark incomplet"
         ),
         paperAccountTile("P&L réalisé",realized,"strategies",a&&Number(a.realized_pnl)>=0?"green":"red","Trades CLOSED"),
-        paperAccountTile("P&L latent",latent,"charts",a&&Number(a.unrealized_pnl)>=0?"green":"red","Positions OPEN"),
+        paperAccountTile(["P&L latent"][0],latent,"charts",a&&Number(a.unrealized_pnl)>=0?"green":"red","Positions OPEN"),
         paperAccountTile(
           "Positions OPEN",a?String(a.open_positions):"—","signals","blue",
           sideCounts.LONG+" Long · "+sideCounts.SHORT+" Short"
@@ -3887,3 +3889,5 @@ function renderHelpGlossary(){
 <!-- V17-UI17 · OPEN PAPER POSITION VISIBILITY · 1S LIGHTWEIGHT OPEN POLL -->
 
 <!-- V17-UI18 · STABLE OPEN MARK/P&L · 1S OPEN DISCOVERY NEVER DOWNGRADES LIVE SNAPSHOT -->
+
+<!-- V17-UI19 · CI1555 LEGACY DASHBOARD CONTRACT + UI18 STABLE OPEN PRICE/P&L -->

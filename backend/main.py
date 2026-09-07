@@ -4427,10 +4427,11 @@ async def run_server_auto_paper_generation_once() -> Dict[str, int]:
             )
             # V17-PRO: Daily Bias — only trade in the daily candle direction
             daily_bias = await get_daily_bias(symbol)
-            if not daily_bias_allows(daily_bias, request.side):
+            _smc_side = "LONG" if request.direction == "BULLISH" else "SHORT"
+            if not daily_bias_allows(daily_bias, _smc_side):
                 stats["blocked"] += 1
                 await record_and_persist_auto_decision_trace(
-                    symbol, "BLOCKED", f"DAILY_BIAS_{daily_bias}_VS_{request.side}", detector
+                    symbol, "BLOCKED", f"DAILY_BIAS_{daily_bias}_VS_{_smc_side}", detector
                 )
                 continue
             stats["entry_now"] += 1

@@ -633,6 +633,31 @@ body.workspace-mode main{padding-top:14px}
   #view-strategies .module-title.matrix-title p{grid-column:1/-1;font-size:9px!important}
   #view-strategies .matrix-validation{max-width:110px!important;text-align:right!important}
 }
+
+/* V17-UI14 — Performance Matrix asset logos */
+#view-strategies .matrix-asset-head{
+  display:flex;align-items:flex-start;gap:10px;min-width:0
+}
+#view-strategies .matrix-asset-head>.coin,
+#view-strategies .matrix-asset-head>.crypto-logo{
+  width:36px!important;height:36px!important;min-width:36px!important;min-height:36px!important;
+  max-width:36px!important;max-height:36px!important;flex:0 0 36px!important
+}
+#view-strategies .matrix-asset-copy{min-width:0;flex:1}
+#view-strategies .matrix-asset-copy .tool-name{font-size:16px}
+@media(max-width:430px){
+  #view-strategies .matrix-asset-head{gap:9px}
+  #view-strategies .matrix-asset-copy .tool-name{font-size:15px}
+}
+
+/* V17-UI15 — automatic refresh coverage: Signals + Strategies/Matrix/Adaptive Edge */
+#view-signals .page-head::after,
+#view-strategies .page-head::after{
+  content:"AUTO · 5s";
+  display:inline-flex;align-items:center;margin-top:7px;padding:4px 8px;
+  border:1px solid #1e6e49;border-radius:999px;background:rgba(28,177,96,.08);
+  color:#58e991;font-size:7px;font-weight:900;letter-spacing:.08em;
+}
 </style>
 
 <style id="v4-reference-tuning">
@@ -2317,10 +2342,13 @@ function matrixCellCard(c){
   var rr=m.average_realized_rr==null?"—":matrixNum(m.average_realized_rr).toFixed(2)+"R";
   var dd=m.max_drawdown==null?"—":paperMoney(m.max_drawdown);
   return h("div",{class:"card tool-card matrix-cell-card"},[
-    h("div",{},[
-      h("div",{class:"tool-name"},[c.symbol||"—"]),
-      h("div",{class:"tool-desc"},[(c.strategy_id||"—")+(c.strategy_version?" · "+c.strategy_version:"")]),
-      h("div",{class:"sub matrix-context"},[(c.timeframe||"TF —")+" · "+(c.session||"Session —")+" · "+(c.regime||"Régime —")])
+    h("div",{class:"matrix-asset-head"},[
+      iconFor(c.symbol||""),
+      h("div",{class:"matrix-asset-copy"},[
+        h("div",{class:"tool-name"},[c.symbol||"—"]),
+        h("div",{class:"tool-desc"},[(c.strategy_id||"—")+(c.strategy_version?" · "+c.strategy_version:"")]),
+        h("div",{class:"sub matrix-context"},[(c.timeframe||"TF —")+" · "+(c.session||"Session —")+" · "+(c.regime||"Régime —")])
+      ])
     ]),
     h("div",{class:"tool-foot"},[
       h("span",{class:"status-pill "+matrixEvidenceClass(c.evidence)},[c.evidence||"—"]),
@@ -2622,7 +2650,10 @@ function strategyPremiumCard(st){
     ])
   ]);
 }
-function renderStrategies(){
+var strategyAutoRefreshLast=0;
+var strategyAutoRefreshBusy=false;
+function renderStrategies(preserveViewport){
+  var savedY=preserveViewport?window.scrollY:null;
   var v=byId("view-strategies");clear(v);
   v.appendChild(pageHead("Stratégies","3 familles objectives · validation et replay sur données réelles.","PAPER ONLY"));
   var host=h("div",{id:"strategy-live"},[loading("Chargement du registre de stratégies…")]);
@@ -2683,7 +2714,20 @@ function renderStrategies(){
       h("div",{class:"journal-card"},[h("h4",{},["Règle"]),h("p",{},["Aucune stratégie n’est déclarée rentable sans échantillon OOS suffisant. INSUFFICIENT_SAMPLE bloque le ranking plutôt que d’inventer une performance."])]),
       h("div",{class:"journal-card"},[h("h4",{},["Replay"]),h("p",{},["Le backend expose un replay déterministe sur bougies fermées avec coûts exprimés en R."])])
     ])));
+    if(savedY!==null){
+      requestAnimationFrame(function(){window.scrollTo(0,savedY)});
+      setTimeout(function(){window.scrollTo(0,savedY)},80);
+    }
+  }).finally(function(){
+    strategyAutoRefreshBusy=false;
   });
+}
+function refreshStrategiesAuto(){
+  var now=Date.now();
+  if(strategyAutoRefreshBusy||now-strategyAutoRefreshLast<10000)return;
+  strategyAutoRefreshLast=now;
+  strategyAutoRefreshBusy=true;
+  renderStrategies(true);
 }
 
 function renderIntelligence(){
@@ -3604,7 +3648,21 @@ var BOTTOM=[
 ];
 function buildNav(){var n=byId("nav");clear(n);BOTTOM.forEach(function(x){n.appendChild(h("button",{"data-view":x.id,onclick:function(){setView(x.id)}},[h("span",{class:"ic"},[x.icon]),x.label]))})}
 function setView(id){closeMarketMenu();current=id;var workspace=["signals","trading","strategies","intelligence","settings"].includes(id);document.body.classList.toggle("workspace-mode",workspace);document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="energy")renderEnergy();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading")renderTrading();else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
-function poll(){refreshHealth();if(current==="dashboard")refreshDashboard();else if(current==="markets")refreshMarkets();else if(current==="forex")refreshForexMarket();else if(current==="energy")refreshEnergyMarket();else if(current==="system")renderSystem();else if(current==="trading")refreshPaperTrading();else if(current==="detail")refreshDetail()}
+function poll(){
+  refreshHealth();
+  if(current==="dashboard")refreshDashboard();
+  else if(current==="markets")refreshMarkets();
+  else if(current==="forex")refreshForexMarket();
+  else if(current==="energy")refreshEnergyMarket();
+  else if(current==="system")renderSystem();
+  else if(current==="trading")refreshPaperTrading();
+  else if(current==="signals")refreshPaperTrading();
+  else if(current==="strategies"){
+    refreshPaperTrading();
+    refreshStrategiesAuto();
+  }
+  else if(current==="detail")refreshDetail();
+}
 function loadCryptoUniverse(){
   return api("/api/v1/market/crypto-universe").then(function(r){
     var d=r&&r.ok&&r.data?r.data:null;
@@ -3668,6 +3726,8 @@ function renderHelpGlossary(){
 <!-- V17-UI11 · UNIFORM GLOBAL ASSET LOGO SIZE -->
 <!-- V17-UI12 · ASSET LOGOS EXACT CRYPTO FOOTPRINT -->
 <!-- V17-UI13 · PREMIUM STRATEGIES MOBILE + MATRIX FIX -->
+<!-- V17-UI14 · PERFORMANCE MATRIX ASSET LOGOS -->
+<!-- V17-UI15 · GLOBAL AUTO REFRESH SIGNALS + STRATEGIES -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

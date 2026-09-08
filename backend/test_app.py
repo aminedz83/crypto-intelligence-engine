@@ -9262,9 +9262,20 @@ class V17NoLiveTrading(unittest.TestCase):
         self.assertFalse(main.settings.live_trading_enabled)
 
     def test_no_broker_execution(self):
-        source = open("main.py").read()
-        for term in ("mt5", "metatrader", "broker_connect", "place_order"):
-            self.assertNotIn(term, source.lower())
+        source = open("main.py").read().lower()
+        # MT5/MetaTrader names are allowed for the read-only multi-broker
+        # compatibility layer.  Actual broker order-execution primitives remain
+        # forbidden so the application stays paper-only.
+        forbidden_execution_terms = (
+            "broker_connect",
+            "place_order",
+            "order_send(",
+            "positions_close(",
+            "trade_request",
+            "live_order",
+        )
+        for term in forbidden_execution_terms:
+            self.assertNotIn(term, source)
 
 
 # ==================== V17-PRO — Smart Exit + Session + Cooldown Tests ==========

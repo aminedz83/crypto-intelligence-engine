@@ -9779,3 +9779,128 @@ class V17SymbolPerfInOrchestratorsTests(unittest.TestCase):
         )
         block = src[idx:idx + 3000]
         self.assertIn("is_symbol_performance_allowed", block)
+# ==================== V17-MT5-MULTIBROKER-2 — full broker catalogue tests =====
+
+
+class V17MT5MultiBrokerV2Tests(unittest.IsolatedAsyncioTestCase):
+    """Full broker catalogues are accepted without guessing canonical mappings."""
+
+    def setUp(self):
+        main._mt5_broker_profiles.clear()
+        main._mt5_active_broker_id = None
+        self.now = datetime.now(timezone.utc)
+
+    def spec(self, broker_symbol="BTCUSD", canonical_symbol="BTC-USD", **updates):
+        values = {
+            "broker_symbol": broker_symbol,
+            "canonical_symbol": canonical_symbol,
+            "digits": 2,
+            "point": Decimal("0.01"),
+            "tick_size": Decimal("0.01"),
+            "tick_value": Decimal("1"),
+            "contract_size": Decimal("1"),
+            "volume_min": Decimal("0.01"),
+            "volume_max": Decimal("100"),
+            "volume_step": Decimal("0.01"),
+            "currency_base": "BTC",
+            "currency_profit": "USD",
+            "currency_margin": "USD",
+            "trade_mode": "FULL",
+            "visible": True,
+            "observed_at": self.now,
+        }
+        values.update(updates)
+        return main.MT5BrokerSymbolSpec(**values)
+
+    def request(self, symbols):
+        return main.MT5BrokerSyncRequest(
+            broker_name="Test Broker", server="Demo-1", account_currency="USD", symbols=symbols
+        )
+
+    def test_v2_version_is_explicit(self):
+        self.assertEqual(main.MT5_MULTI_BROKER_VERSION, "V17_MT5_MULTIBROKER_COMPAT_V2")
+
+    def test_unmapped_symbol_is_catalogued_not_ready(self):
+        row = main.mt5_symbol_compatibility(self.spec("EXOTIC.x", None))
+        self.assertEqual(row["status"], "CATALOGUED_UNMAPPED")
+        self.assertIn("CANONICAL_MAPPING_REQUIRED", row["blockers"])
+
+    async def test_sync_accepts_large_unmapped_catalogue(self):
+        symbols = [self.spec(f"SYM{i}.x", None) for i in range(2000)]
+        result = await main.sync_mt5_broker_profile("broker-a", self.request(symbols))
+        self.assertEqual(result["symbol_count"], 2000)
+        self.assertEqual(result["unmapped_symbols"], 2000)
+        self.assertEqual(result["ready_symbols"], 0)
+
+    async def test_mapped_and_unmapped_symbols_coexist(self):
+        symbols = [self.spec(), self.spec("SYNTHETIC.abc", None)]
+        result = await main.sync_mt5_broker_profile("broker-a", self.request(symbols))
+        self.assertEqual(result["mapped_symbols"], 1)
+        self.assertEqual(result["unmapped_symbols"], 1)
+        self.assertEqual(result["ready_symbols"], 1)
+
+    async def test_exact_broker_symbol_suffix_is_preserved(self):
+        await main.sync_mt5_broker_profile(
+            "broker-a", self.request([self.spec("BTCUSD.m", "BTC-USD")])
+        )
+        result = await main.get_mt5_broker_symbol("broker-a", "BTC-USD")
+        self.assertEqual(result["broker_symbol"], "BTCUSD.m")
+
+    async def test_duplicate_broker_symbol_rejected_case_insensitive(self):
+        with self.assertRaises(main.HTTPException) as ctx:
+            await main.sync_mt5_broker_profile(
+                "broker-a",
+                self.request([self.spec("BTCUSD", "BTC-USD"), self.spec("btcusd", None)]),
+            )
+        self.assertEqual(ctx.exception.detail["reason"], "DUPLICATE_BROKER_SYMBOL")
+
+    async def test_duplicate_canonical_mapping_rejected(self):
+        with self.assertRaises(main.HTTPException) as ctx:
+            await main.sync_mt5_broker_profile(
+                "broker-a",
+                self.request([self.spec("BTCUSD", "BTC-USD"), self.spec("BTCUSD.m", "BTC-USD")]),
+            )
+        self.assertEqual(ctx.exception.detail["reason"], "DUPLICATE_CANONICAL_SYMBOL")
+
+    async def test_broker_switch_keeps_profiles_independent(self):
+        await main.sync_mt5_broker_profile("broker-a", self.request([self.spec("BTCUSD")]))
+        await main.sync_mt5_broker_profile("broker-b", self.request([self.spec("BTCUSD.pro")]))
+        await main.activate_mt5_broker_profile("broker-b")
+        self.assertEqual(main._mt5_active_broker_id, "broker-b")
+        a = await main.get_mt5_broker_symbol("broker-a", "BTC-USD")
+        b = await main.get_mt5_broker_symbol("broker-b", "BTC-USD")
+        self.assertEqual(a["broker_symbol"], "BTCUSD")
+        self.assertEqual(b["broker_symbol"], "BTCUSD.pro")
+
+    async def test_catalog_endpoint_returns_all_symbols(self):
+        await main.sync_mt5_broker_profile(
+            "broker-a", self.request([self.spec(), self.spec("UNMAPPED.zz", None)])
+        )
+        result = await main.get_mt5_broker_catalog("broker-a")
+        self.assertEqual(result["symbol_count"], 2)
+        self.assertEqual(len(result["symbols"]), 2)
+
+    async def test_lookup_unmapped_by_exact_broker_symbol(self):
+        await main.sync_mt5_broker_profile(
+            "broker-a",
+            self.request([self.spec("US100.cash", None, metadata={"custom": "kept"})]),
+        )
+        result = await main.get_mt5_catalog_symbol("broker-a", "US100.cash")
+        self.assertEqual(result["status"], "CATALOGUED_UNMAPPED")
+        self.assertEqual(result["metadata"]["custom"], "kept")
+
+    async def test_missing_critical_specs_still_fail_closed(self):
+        await main.sync_mt5_broker_profile(
+            "broker-a", self.request([self.spec(tick_value=None)])
+        )
+        result = await main.get_mt5_broker_symbol("broker-a", "BTC-USD")
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("TICK_VALUE_NOT_VERIFIED", result["blockers"])
+
+    async def test_full_catalogue_remains_paper_only(self):
+        result = await main.sync_mt5_broker_profile(
+            "broker-a", self.request([self.spec(), self.spec("OTHER", None)])
+        )
+        self.assertTrue(result["paper_only"])
+        self.assertFalse(result["live_trading"])
+        self.assertFalse(result["execution"])

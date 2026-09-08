@@ -414,7 +414,10 @@ class DynamicCryptoUniverseFrontendV16M5B28AUiTests(unittest.TestCase):
     def test_universe_load_precedes_realtime_start(self):
         # UI21 paints Dashboard immediately, but realtime subscriptions must
         # still start only after the server-authoritative crypto universe loads.
-        marker = 'loadCryptoUniverse().then(function(){if(current==="dashboard")renderDashboard();startCryptoRealtime()})'
+        marker = (
+            'loadCryptoUniverse().then(function(){if(current==="dashboard")'
+            'renderDashboard();startCryptoRealtime()})'
+        )
         self.assertIn(marker, self.html)
 
     def test_market_ui_exposes_active_count(self):

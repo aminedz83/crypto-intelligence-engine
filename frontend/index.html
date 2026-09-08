@@ -1228,7 +1228,15 @@ function assetLogo(name){return ASSET_LOGOS[name]||''}
 function h(tag,attrs,kids){var e=document.createElement(tag);attrs=attrs||{};for(var k in attrs){if(k==="class")e.className=attrs[k];else if(k==="html")e.innerHTML=attrs[k];else if(k.slice(0,2)==="on"&&typeof attrs[k]==="function")e.addEventListener(k.slice(2),attrs[k]);else if(attrs[k]!==null)e.setAttribute(k,attrs[k]);}(kids||[]).forEach(function(c){if(c==null)return;e.appendChild(typeof c==="string"?document.createTextNode(c):c)});return e}
 function clear(n){while(n&&n.firstChild)n.removeChild(n.firstChild)}function byId(id){return document.getElementById(id)}
 function apiRequest(path,options){var ctrl=new AbortController(),to=setTimeout(function(){ctrl.abort()},8000),opts=options||{};opts.headers=Object.assign({"Accept":"application/json"},opts.headers||{});opts.signal=ctrl.signal;return fetch(path,opts).then(function(res){clearTimeout(to);return res.text().then(function(txt){var data=null;try{data=txt?JSON.parse(txt):null}catch(e){}return{ok:res.ok,status:res.status,data:data}})}).catch(function(err){clearTimeout(to);return{ok:false,status:0,data:null,netError:err&&err.name==="AbortError"?"timeout":"network"}})}
-function api(path){return apiRequest(path,{method:"GET"})}
+var apiGetInflight={};
+function api(path){
+  if(apiGetInflight[path])return apiGetInflight[path];
+  var request=apiRequest(path,{method:"GET"});
+  apiGetInflight[path]=request;
+  return request.finally(function(){
+    if(apiGetInflight[path]===request)delete apiGetInflight[path];
+  });
+}
 function apiPost(path,body){return apiRequest(path,{method:"POST",headers:{"Content-Type":"application/json"},body:body===undefined?undefined:JSON.stringify(body)})}
 var paperUiState={account:null,positions:[],performance:null,decisions:[],edgeReplay:[],edgeImpact:null,edgeCalibration:null,edgePolicy:null,edgePolicyImpact:null,watchdog:null,runtime:null,multiAsset:null,error:null,sectionErrors:{},loading:false,updatedAt:null,serverSnapshotAt:null,decisionSymbol:"",decisionState:""};
 function paperMetric(v,suffix){
@@ -1455,6 +1463,18 @@ function refreshPaperOpenPositions(){
   }).finally(function(){
     paperOpenRefreshBusy=false;
   });
+}
+
+
+var paperHeavyRefreshTimer=null;
+function schedulePaperHeavyRefresh(){
+  if(paperHeavyRefreshTimer!==null)return;
+  paperHeavyRefreshTimer=setTimeout(function(){
+    paperHeavyRefreshTimer=null;
+    if(current!=="trading")return;
+    if(paperActiveTab==="positions")return;
+    refreshPaperTrading();
+  },1200);
 }
 
 function refreshPaperTrading(){
@@ -2112,7 +2132,31 @@ function refreshDashboard(){
 
 /* Existing market views */
 function renderMarkets(){var v=byId("view-markets");clear(v);v.appendChild(h("h2",{class:"section"},["Crypto · Coinbase · univers dynamique réel"]));v.appendChild(h("div",{class:"sub"},["Actifs actifs: "+String(CRYPTO_SYMBOLS.length)+" / cible "+String(CRYPTO_UNIVERSE_STATE.target_count||100)+" · source Coinbase"]));if(!CRYPTO_SYMBOLS.length){v.appendChild(emptyState("Univers crypto indisponible","Aucun symbole Coinbase vérifié n’est actif."));return}var c=h("div",{class:"card listcard"},[]);CRYPTO_SYMBOLS.forEach(function(sym){c.appendChild(h("div",{class:"row tap",onclick:function(){openDetail("crypto",sym)}},[h("div",{class:"asset"},[iconFor(sym),h("div",{},[h("div",{class:"sym"},[sym]),h("div",{class:"aname"},["Coinbase"])])]),h("div",{class:"right"},[h("span",{class:"price","data-price":sym},["…"]),h("span",{"data-badge":sym},[])])]))});v.appendChild(c);refreshMarkets()}
-function refreshMarkets(){CRYPTO_SYMBOLS.forEach(function(sym){api("/api/v1/market/ticker/"+encodeURIComponent(sym)).then(function(r){var p=document.querySelector('[data-price="'+sym+'"]'),b=document.querySelector('[data-badge="'+sym+'"]');if(!p||!b)return;clear(p);clear(b);if(!r.ok||!r.data){p.textContent="—";b.appendChild(qualityBadge("UNKNOWN"));return}p.appendChild(priceCell(r.data.value));b.appendChild(qualityBadge(r.data.quality))})})}
+var marketRefreshBusy=false;
+function refreshMarkets(){
+  if(current!=="markets"||marketRefreshBusy)return Promise.resolve();
+  marketRefreshBusy=true;
+  var queue=CRYPTO_SYMBOLS.slice(),workers=[],concurrency=Math.min(8,queue.length);
+  function worker(){
+    var sym=queue.shift();
+    if(!sym)return Promise.resolve();
+    return api("/api/v1/market/ticker/"+encodeURIComponent(sym)).then(function(r){
+      if(current!=="markets")return;
+      var p=document.querySelector('[data-price="'+sym+'"]');
+      var b=document.querySelector('[data-badge="'+sym+'"]');
+      if(!p||!b)return;
+      var nextPrice=r.ok&&r.data?(fmtNum(r.data.value)||"—"):"—";
+      var nextQuality=r.ok&&r.data?(r.data.quality||"UNKNOWN"):"UNKNOWN";
+      if(p.textContent!==nextPrice)p.textContent=nextPrice;
+      if(b.getAttribute("data-quality")!==nextQuality){
+        clear(b);b.appendChild(qualityBadge(nextQuality));
+        b.setAttribute("data-quality",nextQuality);
+      }
+    }).then(worker);
+  }
+  for(var i=0;i<concurrency;i++)workers.push(worker());
+  return Promise.all(workers).finally(function(){marketRefreshBusy=false});
+}
 
 function renderForex(){var v=byId("view-forex");clear(v);v.appendChild(h("h2",{class:"section"},["Forex · Massive · données réelles"]));v.appendChild(h("div",{class:"sub",title:"Horaires du marché Forex"},["ⓘ Horaires du marché Forex · état réel fourni par le backend, sessions indicatives."]));v.appendChild(h("div",{class:"card",id:"fx-state"},[loading("État du marché…")]));v.appendChild(h("div",{id:"fx-map"},[loading("Mappings…")]));refreshForexMarket();api("/api/v1/market/forex/mappings").then(function(r){var w=byId("fx-map");clear(w);if(!r.ok||!r.data){w.appendChild(emptyState("Forex indisponible",errorMessage(r)));return}var c=h("div",{class:"card listcard"},[]);(r.data.mappings||[]).forEach(function(m){var mapped=m.status === "MAPPED";c.appendChild(h("div",{class:"row "+(mapped?"tap":""),onclick:mapped?function(){openDetail("forex",m.canonical)}:null},[h("div",{class:"asset"},[forexPairIcon(m.canonical),h("div",{},[h("div",{class:"sym"},[m.canonical]),h("div",{class:"sub"},[mapped?"Massive · "+(m.provider_symbol||""):"Non disponible"])])]),qualityBadge(mapped ? "MAPPED" : "NOT_MAPPED")]))});w.appendChild(c)})}
 function refreshForexMarket(){api("/api/v1/market/forex/market-state").then(function(r){var w=byId("fx-state");if(!w)return;clear(w);var d=(r.ok&&r.data)?r.data:{market_state:"UNKNOWN"},st=d.market_state||"UNKNOWN";w.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["État du marché"]),h("span",{},[st])]));if(d.current_session)w.appendChild(h("div",{class:"kv"},[h("span",{class:"k"},["Session indicative"]),h("span",{},[d.current_session])]))})}
@@ -2334,7 +2378,10 @@ function setPaperTab(id){
   paperActiveTab=id;
   var nextHash=id==="account"?"#paper-account":id==="positions"?"#paper-positions":"#paper-history";
   if(location.hash!==nextHash){location.hash=nextHash;return;}
-  if(current==="trading")renderTrading();
+  if(current==="trading"){
+    renderTrading();
+    if(id!=="positions")schedulePaperHeavyRefresh();
+  }
 }
 // iOS compatibility layer: the tabs are native hash links first; touchend only
 // synchronizes state early and never cancels the browser's native navigation.
@@ -2349,6 +2396,7 @@ window.addEventListener("hashchange",function(){
   if(current!=="trading")return;
   paperActiveTab=paperTabFromHash();
   renderTrading();
+  if(paperActiveTab!=="positions")schedulePaperHeavyRefresh();
 });
 function setIntelligenceTab(id){
   intelligenceActiveTab=id;
@@ -3188,7 +3236,7 @@ function mergeRealtimeFiveMinuteCandle(c){
 }
 function refreshCryptoRealtime(){
   if(!realtimeCore.started){startCryptoRealtime();return}
-  var symbols=[];if(current==="detail"&&detailCtx&&detailCtx.kind==="crypto")symbols=[detailCtx.symbol];else if(current==="markets"||current==="dashboard")symbols=CRYPTO_SYMBOLS.slice();else return;
+  var symbols=[];if(current==="detail"&&detailCtx&&detailCtx.kind==="crypto")symbols=[detailCtx.symbol];else if(current==="markets")symbols=CRYPTO_SYMBOLS.slice();else if(current==="dashboard")symbols=CRYPTO_SYMBOLS.slice(0,12);else return;
   symbols.forEach(function(sym){api("/api/v1/market/realtime/"+encodeURIComponent(sym)).then(function(r){
     if(!r.ok||!r.data)return;var d=r.data,t=d.ticker,c=d.candle;
     if(t&&t.value!=null){realtimeCore.lastTickerAt=t.received_at||null;var price=Number(t.value);
@@ -3932,21 +3980,35 @@ var BOTTOM=[
  {id:"settings",label:"Réglages",icon:"⚙"}
 ];
 function buildNav(){var n=byId("nav");clear(n);BOTTOM.forEach(function(x){n.appendChild(h("button",{"data-view":x.id,onclick:function(){setView(x.id)}},[h("span",{class:"ic"},[x.icon]),x.label]))})}
-function setView(id){closeMarketMenu();current=id;var workspace=["signals","trading","strategies","intelligence","settings"].includes(id);document.body.classList.toggle("workspace-mode",workspace);document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="energy")renderEnergy();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading"){renderTrading();refreshPaperFastStart();refreshPaperOpenPositions();refreshPaperTrading();}else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
+function setView(id){closeMarketMenu();current=id;if(appRefreshLast&&Object.prototype.hasOwnProperty.call(appRefreshLast,id))appRefreshLast[id]=0;var workspace=["signals","trading","strategies","intelligence","settings"].includes(id);document.body.classList.toggle("workspace-mode",workspace);document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="energy")renderEnergy();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading"){renderTrading();refreshPaperFastStart();refreshPaperOpenPositions();if(paperActiveTab!=="positions")schedulePaperHeavyRefresh();}else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
+var appRefreshLast={health:0,dashboard:0,markets:0,forex:0,energy:0,system:0,
+  signals:0,strategies:0,detail:0};
+function refreshDue(key,intervalMs,fn){
+  var now=Date.now();
+  if(now-(appRefreshLast[key]||0)<intervalMs)return;
+  appRefreshLast[key]=now;
+  fn();
+}
 function poll(){
-  refreshHealth();
-  if(current==="dashboard")refreshDashboard();
-  else if(current==="markets")refreshMarkets();
-  else if(current==="forex")refreshForexMarket();
-  else if(current==="energy")refreshEnergyMarket();
-  else if(current==="system")renderSystem();
-  else if(current==="trading")refreshPaperTrading();
-  else if(current==="signals")refreshPaperTrading();
-  else if(current==="strategies"){
-    refreshPaperTrading();
-    refreshStrategiesAuto();
+  if(document.hidden)return;
+  refreshDue("health",15000,refreshHealth);
+  if(current==="dashboard")refreshDue("dashboard",5000,refreshDashboard);
+  else if(current==="markets")refreshDue("markets",10000,refreshMarkets);
+  else if(current==="forex")refreshDue("forex",10000,refreshForexMarket);
+  else if(current==="energy")refreshDue("energy",5000,refreshEnergyMarket);
+  else if(current==="system")refreshDue("system",15000,renderSystem);
+  else if(current==="trading"){
+    refreshPaperFastStart();
+    refreshPaperOpenPositions();
   }
-  else if(current==="detail")refreshDetail();
+  else if(current==="signals")refreshDue("signals",3000,refreshPaperTrading);
+  else if(current==="strategies"){
+    refreshDue("strategies",30000,function(){
+      refreshPaperTrading();
+      refreshStrategiesAuto();
+    });
+  }
+  else if(current==="detail")refreshDue("detail",5000,refreshDetail);
 }
 
 var paperForegroundRefreshBusy=false;
@@ -3996,7 +4058,28 @@ function loadCryptoUniverse(){
   });
 }
 
-buildNav();refreshHealth();setView("dashboard");refreshPaperFastStart();loadCryptoUniverse().then(function(){if(current==="dashboard")renderDashboard();startCryptoRealtime()});setInterval(poll,POLL_MS);setInterval(refreshCryptoRealtime,REALTIME_POLL_MS);setInterval(refreshForexRealtime,REALTIME_POLL_MS);setInterval(refreshGoldRealtime,REALTIME_POLL_MS);setInterval(refreshIndexRealtime,REALTIME_POLL_MS);setInterval(refreshPaperOpenPositions,PAPER_OPEN_POLL_MS);
+function runVisibleRealtime(){
+  if(document.hidden)return;
+  refreshCryptoRealtime();
+  refreshForexRealtime();
+  refreshGoldRealtime();
+  refreshIndexRealtime();
+}
+function runVisibleOpenPositions(){
+  if(document.hidden)return;
+  refreshPaperOpenPositions();
+}
+buildNav();
+refreshHealth();
+setView("dashboard");
+refreshPaperFastStart();
+loadCryptoUniverse().then(function(){
+  if(current==="dashboard")renderDashboard();
+  startCryptoRealtime();
+});
+setInterval(poll,POLL_MS);
+setInterval(runVisibleRealtime,REALTIME_POLL_MS);
+setInterval(runVisibleOpenPositions,PAPER_OPEN_POLL_MS);
 
 
 function applyOfficialAssetLogos(){
@@ -4012,7 +4095,7 @@ function applyOfficialAssetLogos(){
   });
 }
 
-setInterval(applyOfficialAssetLogos,500);setTimeout(applyOfficialAssetLogos,0);
+setInterval(function(){if(!document.hidden)applyOfficialAssetLogos()},30000);setTimeout(applyOfficialAssetLogos,0);
 
 
 function renderHelpGlossary(){
@@ -4046,7 +4129,7 @@ function renderHelpGlossary(){
 <!-- V17-UI14 · PERFORMANCE MATRIX ASSET LOGOS -->
 <!-- V17-UI15 · GLOBAL AUTO REFRESH SIGNALS + STRATEGIES -->
 <!-- V17-UI16 · CHANGE-AWARE NO-FLICKER AUTO REFRESH -->
-<!-- V17-UI21 · FAST START + LIVE RENDER + OPEN POSITION SYNC · FOREGROUND RECOVERY · PAPER ONLY -->
+<!-- V17-UI23 · FULL APP PERFORMANCE · VIEW-AWARE SCHEDULER · DEDUPED API · PAPER ONLY -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

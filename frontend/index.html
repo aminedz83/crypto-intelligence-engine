@@ -1279,34 +1279,136 @@ function paperViewFingerprint(view){
 
 var PAPER_OPEN_POLL_MS=1000;
 var paperOpenRefreshBusy=false;
+var paperFastStartBusy=false;
+var paperClosedRefreshBusy=false;
+var paperOpenAuthorityReady=false;
+var paperOpenAuthoritativeIds={};
+
+function paperOpenIdSet(rows){
+  var ids={};
+  (rows||[]).forEach(function(row){
+    if(row&&row.position_id)ids[row.position_id]=true;
+  });
+  return ids;
+}
+
+function paperRenderChangedViews(){
+  if(current==="trading"){
+    var fTrading=paperViewFingerprint("trading");
+    if(fTrading!==paperRenderFingerprints.trading){
+      paperRenderFingerprints.trading=fTrading;
+      renderTrading();
+    }
+  }
+  if(current==="signals"){
+    var fSignals=paperViewFingerprint("signals");
+    if(fSignals!==paperRenderFingerprints.signals){
+      paperRenderFingerprints.signals=fSignals;
+      renderSignals();
+    }
+  }
+  if(current==="dashboard"){
+    var fDashboard=paperViewFingerprint("dashboard");
+    if(fDashboard!==paperRenderFingerprints.dashboard){
+      paperRenderFingerprints.dashboard=fDashboard;
+      renderDashboard();
+    }
+  }
+}
+
+function refreshPaperClosedHistory(){
+  if(paperClosedRefreshBusy)return Promise.resolve();
+  paperClosedRefreshBusy=true;
+  return api("/api/v1/paper/positions?status_filter=CLOSED").then(function(r){
+    if(!r||!r.ok||!r.data||!Array.isArray(r.data.positions))return;
+    var open=(paperUiState.positions||[]).filter(function(row){
+      return String(row&&row.status||"").toUpperCase()==="OPEN";
+    });
+    paperUiState.positions=r.data.positions.concat(open);
+    paperUiState.updatedAt=new Date().toISOString();
+    paperRenderChangedViews();
+  }).finally(function(){
+    paperClosedRefreshBusy=false;
+  });
+}
+
+/*
+ * V17-UI21 FAST START
+ * Load only the data required to make the account and OPEN positions useful.
+ * Heavy history/performance/Adaptive Edge sections continue in refreshPaperTrading().
+ */
+function refreshPaperFastStart(){
+  if(paperFastStartBusy)return Promise.resolve();
+  paperFastStartBusy=true;
+  return Promise.all([
+    api("/api/v1/paper/account/live"),
+    api("/api/v1/paper/positions?status_filter=OPEN"),
+    api("/api/v1/paper/positions/live")
+  ]).then(function(results){
+    var accountResult=results[0],openResult=results[1],liveResult=results[2];
+    if(accountResult&&accountResult.ok&&accountResult.data){
+      paperUiState.account=accountResult.data;
+    }
+    if(openResult&&openResult.ok&&openResult.data&&Array.isArray(openResult.data.positions)){
+      var persistedOpen=openResult.data.positions;
+      var liveRows=liveResult&&liveResult.ok&&liveResult.data&&Array.isArray(liveResult.data.positions)
+        ?liveResult.data.positions:[];
+      var liveById={};
+      liveRows.forEach(function(row){
+        if(row&&row.position_id)liveById[row.position_id]=row;
+      });
+      var mergedOpen=persistedOpen.map(function(row){
+        var liveRow=liveById[row.position_id];
+        return liveRow?Object.assign({},row,liveRow):row;
+      });
+      paperOpenAuthoritativeIds=paperOpenIdSet(persistedOpen);
+      paperOpenAuthorityReady=true;
+      var closed=(paperUiState.positions||[]).filter(function(row){
+        return String(row&&row.status||"").toUpperCase()!=="OPEN";
+      });
+      paperUiState.positions=closed.concat(mergedOpen);
+    }
+    paperUiState.error=null;
+    paperUiState.updatedAt=new Date().toISOString();
+    paperRenderChangedViews();
+  }).finally(function(){
+    paperFastStartBusy=false;
+  });
+}
+
 function refreshPaperOpenPositions(){
   if(current!=="trading"||paperOpenRefreshBusy)return Promise.resolve();
   paperOpenRefreshBusy=true;
   return api("/api/v1/paper/positions?status_filter=OPEN").then(function(r){
     if(!r||!r.ok||!r.data||!Array.isArray(r.data.positions))return;
     var incoming=r.data.positions;
+    var incomingIds=paperOpenIdSet(incoming);
     var known={};
+    var previousOpen=[];
     (paperUiState.positions||[]).forEach(function(row){
-      if(row&&row.position_id)known[row.position_id]=row;
+      if(row&&row.position_id){
+        known[row.position_id]=row;
+        if(String(row.status||"").toUpperCase()==="OPEN")previousOpen.push(row);
+      }
     });
+
     var changed=false;
+    var newPositionDetected=false;
+    var removedPositionDetected=false;
     var mergedOpen=[];
+
     incoming.forEach(function(row){
       if(!row||!row.position_id)return;
       var previous=known[row.position_id];
       if(!previous){
         mergedOpen.push(row);
         changed=true;
+        newPositionDetected=true;
         return;
       }
       /*
-       * UI18: the 1s OPEN endpoint is persistence-oriented and can omit the
-       * enriched live mark/P&L supplied by /paper/ui-snapshot. Never replace
-       * an already enriched OPEN row with the lighter persisted row, otherwise
-       * "Prix actuel" and latent P&L flicker between a value and "—".
-       *
-       * Keep the richer existing row while refreshing persisted metadata.
-       * The authoritative 5s snapshot continues to update live mark/P&L.
+       * Keep richer live mark/P&L already supplied by /positions/live or
+       * /paper/ui-snapshot while refreshing persisted OPEN metadata.
        */
       var merged=Object.assign({},row,previous);
       mergedOpen.push(merged);
@@ -1314,16 +1416,52 @@ function refreshPaperOpenPositions(){
         changed=true;
       }
     });
+
+    previousOpen.forEach(function(row){
+      if(row&&row.position_id&&!incomingIds[row.position_id]){
+        changed=true;
+        removedPositionDetected=true;
+      }
+    });
+
+    paperOpenAuthoritativeIds=incomingIds;
+    paperOpenAuthorityReady=true;
+
     if(!changed)return;
     var closed=(paperUiState.positions||[]).filter(function(row){
-      return String(row.status||"").toUpperCase()!=="OPEN";
+      return String(row&&row.status||"").toUpperCase()!=="OPEN";
     });
     paperUiState.positions=closed.concat(mergedOpen);
-    var fp=paperViewFingerprint("trading");
-    if(fp!==paperRenderFingerprints.trading){
-      paperRenderFingerprints.trading=fp;
-      renderTrading();
+    paperUiState.updatedAt=new Date().toISOString();
+    paperRenderChangedViews();
+
+    /*
+     * A newly opened position is already visible from the persisted endpoint.
+     * Fetch live enrichment once so mark/P&L arrives without waiting for the
+     * slower full snapshot.  If a position disappeared from OPEN, refresh only
+     * CLOSED history immediately so it moves to Historique without blocking UI.
+     */
+    if(newPositionDetected){
+      api("/api/v1/paper/positions/live").then(function(liveResult){
+        if(!liveResult||!liveResult.ok||!liveResult.data||!Array.isArray(liveResult.data.positions))return;
+        var liveById={};
+        liveResult.data.positions.forEach(function(row){
+          if(row&&row.position_id)liveById[row.position_id]=row;
+        });
+        var currentClosed=(paperUiState.positions||[]).filter(function(row){
+          return String(row&&row.status||"").toUpperCase()!=="OPEN";
+        });
+        var enrichedOpen=(paperUiState.positions||[]).filter(function(row){
+          return String(row&&row.status||"").toUpperCase()==="OPEN";
+        }).map(function(row){
+          return liveById[row.position_id]?Object.assign({},row,liveById[row.position_id]):row;
+        });
+        paperUiState.positions=currentClosed.concat(enrichedOpen);
+        paperUiState.updatedAt=new Date().toISOString();
+        paperRenderChangedViews();
+      });
     }
+    if(removedPositionDetected)refreshPaperClosedHistory();
   }).finally(function(){
     paperOpenRefreshBusy=false;
   });
@@ -1377,36 +1515,35 @@ function refreshPaperTrading(){
     if(runtime)paperUiState.runtime=runtime;
     if(positions){
       var persisted=positions.positions||[],liveRows=live&&live.positions||[],liveById={};
-      liveRows.forEach(function(row){liveById[row.position_id]=row});
-      paperUiState.positions=persisted.map(function(row){
-        return row.status==="OPEN"&&liveById[row.position_id]?liveById[row.position_id]:row;
+      liveRows.forEach(function(row){if(row&&row.position_id)liveById[row.position_id]=row});
+      var snapshotById={};
+      var mergedPersisted=persisted.map(function(row){
+        if(row&&row.position_id)snapshotById[row.position_id]=row;
+        return row.status==="OPEN"&&liveById[row.position_id]
+          ?Object.assign({},row,liveById[row.position_id]):row;
       });
+
+      /*
+       * Snapshot requests are heavier and can finish after a newer 1s OPEN poll.
+       * Never let an older snapshot erase a freshly discovered OPEN position.
+       * A CLOSED row present in the snapshot still wins immediately.
+       */
+      if(paperOpenAuthorityReady){
+        (paperUiState.positions||[]).forEach(function(row){
+          if(!row||!row.position_id)return;
+          if(String(row.status||"").toUpperCase()!=="OPEN")return;
+          if(!paperOpenAuthoritativeIds[row.position_id])return;
+          if(snapshotById[row.position_id])return;
+          mergedPersisted.push(row);
+        });
+      }
+      paperUiState.positions=mergedPersisted;
     }
     paperUiState.error=null;
     paperUiState.updatedAt=new Date().toISOString();
   }).finally(function(){
     paperUiState.loading=false;
-    if(current==="trading"){
-      var fTrading=paperViewFingerprint("trading");
-      if(fTrading!==paperRenderFingerprints.trading){
-        paperRenderFingerprints.trading=fTrading;
-        renderTrading();
-      }
-    }
-    if(current==="signals"){
-      var fSignals=paperViewFingerprint("signals");
-      if(fSignals!==paperRenderFingerprints.signals){
-        paperRenderFingerprints.signals=fSignals;
-        renderSignals();
-      }
-    }
-    if(current==="dashboard"){
-      var fDashboard=paperViewFingerprint("dashboard");
-      if(fDashboard!==paperRenderFingerprints.dashboard){
-        paperRenderFingerprints.dashboard=fDashboard;
-        renderDashboard();
-      }
-    }
+    paperRenderChangedViews();
   });
 }
 
@@ -3805,7 +3942,7 @@ var BOTTOM=[
  {id:"settings",label:"Réglages",icon:"⚙"}
 ];
 function buildNav(){var n=byId("nav");clear(n);BOTTOM.forEach(function(x){n.appendChild(h("button",{"data-view":x.id,onclick:function(){setView(x.id)}},[h("span",{class:"ic"},[x.icon]),x.label]))})}
-function setView(id){closeMarketMenu();current=id;var workspace=["signals","trading","strategies","intelligence","settings"].includes(id);document.body.classList.toggle("workspace-mode",workspace);document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="energy")renderEnergy();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading"){renderTrading();refreshPaperTrading();refreshPaperOpenPositions();}else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
+function setView(id){closeMarketMenu();current=id;var workspace=["signals","trading","strategies","intelligence","settings"].includes(id);document.body.classList.toggle("workspace-mode",workspace);document.querySelectorAll(".view").forEach(function(v){v.classList.toggle("active",v.getAttribute("data-view")===id)});document.querySelectorAll(".mtab").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-mtab")===id)});document.querySelectorAll("#nav button").forEach(function(b){if(b.getAttribute("data-view")===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});if(id==="dashboard")renderDashboard();else if(id==="markets")renderMarkets();else if(id==="forex")renderForex();else if(id==="metal")renderMetal();else if(id==="energy")renderEnergy();else if(id==="index")renderIndex();else if(id==="system")renderSystem();else if(id==="signals")renderSignals();else if(id==="trading"){renderTrading();refreshPaperFastStart();refreshPaperOpenPositions();refreshPaperTrading();}else if(id==="strategies")renderStrategies();else if(id==="intelligence")renderIntelligence();else if(id==="settings")renderSettings();else if(id==="detail"){renderDetail();setTimeout(renderChartShell,0)}}
 function poll(){
   refreshHealth();
   if(current==="dashboard")refreshDashboard();
@@ -3837,7 +3974,7 @@ function loadCryptoUniverse(){
   });
 }
 
-buildNav();refreshHealth();loadCryptoUniverse().then(function(){setView("dashboard");startCryptoRealtime()});setInterval(poll,POLL_MS);setInterval(refreshCryptoRealtime,REALTIME_POLL_MS);setInterval(refreshForexRealtime,REALTIME_POLL_MS);setInterval(refreshGoldRealtime,REALTIME_POLL_MS);setInterval(refreshIndexRealtime,REALTIME_POLL_MS);setInterval(refreshPaperOpenPositions,PAPER_OPEN_POLL_MS);
+buildNav();refreshHealth();setView("dashboard");refreshPaperFastStart();loadCryptoUniverse().then(function(){if(current==="dashboard")renderDashboard();startCryptoRealtime()});setInterval(poll,POLL_MS);setInterval(refreshCryptoRealtime,REALTIME_POLL_MS);setInterval(refreshForexRealtime,REALTIME_POLL_MS);setInterval(refreshGoldRealtime,REALTIME_POLL_MS);setInterval(refreshIndexRealtime,REALTIME_POLL_MS);setInterval(refreshPaperOpenPositions,PAPER_OPEN_POLL_MS);
 
 
 function applyOfficialAssetLogos(){
@@ -3887,6 +4024,7 @@ function renderHelpGlossary(){
 <!-- V17-UI14 · PERFORMANCE MATRIX ASSET LOGOS -->
 <!-- V17-UI15 · GLOBAL AUTO REFRESH SIGNALS + STRATEGIES -->
 <!-- V17-UI16 · CHANGE-AWARE NO-FLICKER AUTO REFRESH -->
+<!-- V17-UI21 · FAST START + OPEN POSITION SYNC FIX · ESSENTIAL DATA FIRST · PAPER ONLY -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

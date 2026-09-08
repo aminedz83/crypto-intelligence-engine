@@ -9999,3 +9999,94 @@ class V17UI21LiveRenderRecoveryTests(unittest.TestCase):
     def test_pageshow_and_network_recovery_trigger_refresh(self):
         self.assertIn('window.addEventListener("pageshow"', self.html)
         self.assertIn('window.addEventListener("online"', self.html)
+
+
+# ==================== V17-UI22 — TRADING PRIORITY / LIGHTWEIGHT UI ===========
+
+
+class V17UI22TradingPriorityTests(unittest.TestCase):
+    """Trade-critical live data stays hot while heavy analytics load lazily."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_ui22_marker_exists(self):
+        self.assertIn("V17-UI22", self.html)
+        self.assertIn("TRADING PRIORITY", self.html)
+
+    def test_trading_poll_uses_lightweight_live_paths(self):
+        self.assertIn(
+            'else if(current==="trading"){refreshPaperFastStart();'
+            'refreshPaperOpenPositions();}',
+            self.html,
+        )
+
+    def test_heavy_paper_snapshot_is_deferred_off_positions_tab(self):
+        self.assertIn("function schedulePaperHeavyRefresh()", self.html)
+        self.assertIn('if(paperActiveTab==="positions")return;', self.html)
+
+    def test_dashboard_realtime_limits_crypto_fanout(self):
+        self.assertIn(
+            'else if(current==="dashboard")symbols=CRYPTO_SYMBOLS.slice(0,12);',
+            self.html,
+        )
+        self.assertIn(
+            'else if(current==="markets")symbols=CRYPTO_SYMBOLS.slice();',
+            self.html,
+        )
+
+    def test_logo_dom_scan_is_not_run_twice_per_second(self):
+        self.assertIn("setInterval(applyOfficialAssetLogos,10000)", self.html)
+        self.assertNotIn("setInterval(applyOfficialAssetLogos,500)", self.html)
+
+
+# ==================== V17-UI23 — FULL APP PERFORMANCE =========================
+
+
+class V17UI23FullAppPerformanceTests(unittest.TestCase):
+    """All views use bounded, view-aware refresh work on mobile."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_ui23_marker_exists(self):
+        self.assertIn("V17-UI23", self.html)
+        self.assertIn("FULL APP PERFORMANCE", self.html)
+
+    def test_get_requests_are_coalesced_by_endpoint(self):
+        self.assertIn("var apiGetInflight={};", self.html)
+        self.assertIn("if(apiGetInflight[path])return apiGetInflight[path];", self.html)
+
+    def test_crypto_market_refresh_has_bounded_concurrency(self):
+        self.assertIn("concurrency=Math.min(8,queue.length)", self.html)
+        self.assertIn("return Promise.all(workers)", self.html)
+
+    def test_background_page_pauses_periodic_refresh_work(self):
+        self.assertIn("if(document.hidden)return;", self.html)
+        self.assertIn("function runVisibleRealtime()", self.html)
+        self.assertIn("function runVisibleOpenPositions()", self.html)
+
+    def test_refresh_scheduler_is_view_aware(self):
+        self.assertIn("function refreshDue(key,intervalMs,fn)", self.html)
+        self.assertIn('current==="signals"', self.html)
+        self.assertIn('current==="strategies"', self.html)
+        self.assertIn('current==="detail"', self.html)
+
+    def test_signals_remain_higher_priority_than_strategy_analytics(self):
+        self.assertIn(
+            'refreshDue("signals",3000,refreshPaperTrading)',
+            self.html,
+        )
+        self.assertIn('refreshDue("strategies",30000,function(){', self.html)
+
+    def test_health_refresh_is_not_forced_every_five_seconds(self):
+        self.assertIn('refreshDue("health",15000,refreshHealth)', self.html)
+
+    def test_logo_dom_scan_is_reduced_to_thirty_seconds(self):
+        self.assertIn(
+            "if(!document.hidden)applyOfficialAssetLogos()",
+            self.html,
+        )
+        self.assertIn(",30000);setTimeout(applyOfficialAssetLogos,0);", self.html)

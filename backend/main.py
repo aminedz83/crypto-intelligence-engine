@@ -1,3 +1,4 @@
+# V17-MT5-MULTIBROKER-1 — read-only broker profile + MT5 symbol/spec compatibility foundation.
 # V17-ENERGY-UI2 — WTI + Brent real Twelve Data market-data integration; paper sizing fail-closed.
 # CI395 recovery marker: cumulative V16-M5B25B-FIX2 backend baseline.
 # V16-M5B30M — continuous paper runtime + feed watchdog + restart recovery.
@@ -14125,6 +14126,312 @@ async def crypto_logo(symbol: str) -> Response:
             headers={'Cache-Control': 'public, max-age=86400, immutable'},
         )
 
+
+
+# V17-MT5-MULTIBROKER-1 — broker-agnostic MT5 compatibility foundation
+# ---------------------------------------------------------------------------
+# This layer intentionally does NOT submit, modify, or close broker orders.  A
+# Windows/VPS bridge may publish symbol metadata observed from an authenticated
+# MT5 terminal, and the paper engine can then validate whether its canonical
+# instruments are representable under that broker's real contract rules.
+# Switching broker therefore changes only the active compatibility profile; the
+# strategy engine continues to use canonical symbols (BTC-USD, XAU-USD, etc.).
+MT5_MULTI_BROKER_VERSION = "V17_MT5_MULTIBROKER_COMPAT_V1"
+
+
+class MT5BrokerSymbolSpec(BaseModel):
+    """Broker symbol metadata copied from the MT5 terminal, never guessed."""
+
+    canonical_symbol: str
+    broker_symbol: str
+    digits: Optional[int] = Field(default=None, ge=0, le=12)
+    point: Optional[Decimal] = None
+    tick_size: Optional[Decimal] = None
+    tick_value: Optional[Decimal] = None
+    contract_size: Optional[Decimal] = None
+    volume_min: Optional[Decimal] = None
+    volume_max: Optional[Decimal] = None
+    volume_step: Optional[Decimal] = None
+    currency_profit: Optional[str] = None
+    currency_margin: Optional[str] = None
+    trade_mode: Optional[str] = None
+    visible: Optional[bool] = None
+    observed_at: datetime
+    source: str = "MT5_TERMINAL"
+
+
+class MT5BrokerSyncRequest(BaseModel):
+    """A read-only snapshot sent by the future Windows/VPS MT5 bridge."""
+
+    broker_name: str
+    server: Optional[str] = None
+    account_currency: Optional[str] = None
+    symbols: List[MT5BrokerSymbolSpec]
+
+
+@dataclass
+class MT5BrokerProfileSnapshot:
+    broker_id: str
+    broker_name: str
+    server: Optional[str]
+    account_currency: Optional[str]
+    observed_at: datetime
+    symbols: Dict[str, MT5BrokerSymbolSpec] = field(default_factory=dict)
+
+
+_mt5_broker_profiles: Dict[str, MT5BrokerProfileSnapshot] = {}
+_mt5_active_broker_id: Optional[str] = None
+
+
+def _normalize_mt5_broker_id(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9._-]+", "-", value.strip().lower()).strip("-")
+    if not normalized:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "BROKER_ID_INVALID"},
+        )
+    return normalized[:80]
+
+
+def _normalize_canonical_symbol(value: str) -> str:
+    return value.strip().upper().replace("/", "-")
+
+
+def _positive_decimal(value: Optional[Decimal]) -> bool:
+    return value is not None and value.is_finite() and value > 0
+
+
+def mt5_symbol_compatibility(spec: MT5BrokerSymbolSpec) -> Dict[str, object]:
+    """Fail closed until the broker has supplied every sizing-critical field."""
+    canonical = _normalize_canonical_symbol(spec.canonical_symbol)
+    blockers: List[str] = []
+    instrument = instrument_registry.get(canonical)
+    if instrument is None:
+        blockers.append("CANONICAL_INSTRUMENT_NOT_REGISTERED")
+    if not spec.broker_symbol.strip():
+        blockers.append("BROKER_SYMBOL_MISSING")
+    if spec.observed_at.tzinfo is None:
+        blockers.append("OBSERVED_AT_NOT_TIMEZONE_AWARE")
+    for field_name in (
+        "point",
+        "tick_size",
+        "tick_value",
+        "contract_size",
+        "volume_min",
+        "volume_max",
+        "volume_step",
+    ):
+        if not _positive_decimal(getattr(spec, field_name)):
+            blockers.append(f"{field_name.upper()}_NOT_VERIFIED")
+    if (
+        _positive_decimal(spec.volume_min)
+        and _positive_decimal(spec.volume_max)
+        and spec.volume_min is not None
+        and spec.volume_max is not None
+        and spec.volume_min > spec.volume_max
+    ):
+        blockers.append("VOLUME_RANGE_INVALID")
+    trade_mode = str(spec.trade_mode or "").upper()
+    if trade_mode in {"DISABLED", "CLOSEONLY", "CLOSE_ONLY"}:
+        blockers.append("BROKER_SYMBOL_NOT_OPENABLE")
+
+    return {
+        "validation": MT5_MULTI_BROKER_VERSION,
+        "canonical_symbol": canonical,
+        "broker_symbol": spec.broker_symbol,
+        "asset_class": instrument.asset_class.value if instrument else None,
+        "status": "PAPER_BROKER_READY" if not blockers else "BLOCKED",
+        "blockers": blockers,
+        "paper_only": True,
+        "live_trading": False,
+        "execution": False,
+        "spec_source": spec.source,
+        "observed_at": spec.observed_at.isoformat(),
+    }
+
+
+def mt5_broker_compatibility(broker_id: str) -> Dict[str, object]:
+    normalized = _normalize_mt5_broker_id(broker_id)
+    profile = _mt5_broker_profiles.get(normalized)
+    if profile is None:
+        return {
+            "validation": MT5_MULTI_BROKER_VERSION,
+            "broker_id": normalized,
+            "status": "NOT_SYNCED",
+            "paper_only": True,
+            "live_trading": False,
+            "execution": False,
+            "symbols": [],
+        }
+    rows = [mt5_symbol_compatibility(spec) for spec in profile.symbols.values()]
+    ready = sum(1 for row in rows if row["status"] == "PAPER_BROKER_READY")
+    blocked = len(rows) - ready
+    return {
+        "validation": MT5_MULTI_BROKER_VERSION,
+        "broker_id": profile.broker_id,
+        "broker_name": profile.broker_name,
+        "server": profile.server,
+        "account_currency": profile.account_currency,
+        "active": profile.broker_id == _mt5_active_broker_id,
+        "status": "READY" if rows and blocked == 0 else ("PARTIAL" if ready else "BLOCKED"),
+        "ready_symbols": ready,
+        "blocked_symbols": blocked,
+        "symbol_count": len(rows),
+        "symbols": rows,
+        "observed_at": profile.observed_at.isoformat(),
+        "paper_only": True,
+        "live_trading": False,
+        "execution": False,
+    }
+
+
+@api_router.post("/mt5/brokers/{broker_id}/sync")
+async def sync_mt5_broker_profile(
+    broker_id: str, req: MT5BrokerSyncRequest
+) -> Dict[str, object]:
+    """Store a read-only MT5 symbol snapshot for paper/broker compatibility."""
+    normalized = _normalize_mt5_broker_id(broker_id)
+    if not req.broker_name.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "BROKER_NAME_REQUIRED"},
+        )
+    symbol_map: Dict[str, MT5BrokerSymbolSpec] = {}
+    for raw_spec in req.symbols:
+        if raw_spec.observed_at.tzinfo is None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "status": "INVALID",
+                    "reason": "OBSERVED_AT_NOT_TIMEZONE_AWARE",
+                    "symbol": raw_spec.canonical_symbol,
+                },
+            )
+        canonical = _normalize_canonical_symbol(raw_spec.canonical_symbol)
+        if canonical in symbol_map:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "status": "INVALID",
+                    "reason": "DUPLICATE_CANONICAL_SYMBOL",
+                    "symbol": canonical,
+                },
+            )
+        # Keep the canonical form stored in the snapshot so strategy/provider names
+        # never leak into the broker-facing mapping layer.
+        spec = raw_spec.model_copy(update={"canonical_symbol": canonical})
+        symbol_map[canonical] = spec
+
+    observed_at = max(
+        (spec.observed_at for spec in symbol_map.values()),
+        default=utcnow(),
+    )
+    _mt5_broker_profiles[normalized] = MT5BrokerProfileSnapshot(
+        broker_id=normalized,
+        broker_name=req.broker_name.strip(),
+        server=req.server.strip() if req.server else None,
+        account_currency=req.account_currency.upper().strip() if req.account_currency else None,
+        observed_at=observed_at,
+        symbols=symbol_map,
+    )
+    return mt5_broker_compatibility(normalized)
+
+
+@api_router.get("/mt5/brokers")
+async def list_mt5_broker_profiles() -> Dict[str, object]:
+    return {
+        "validation": MT5_MULTI_BROKER_VERSION,
+        "active_broker_id": _mt5_active_broker_id,
+        "brokers": [
+            {
+                "broker_id": profile.broker_id,
+                "broker_name": profile.broker_name,
+                "server": profile.server,
+                "account_currency": profile.account_currency,
+                "symbol_count": len(profile.symbols),
+                "active": profile.broker_id == _mt5_active_broker_id,
+                "observed_at": profile.observed_at.isoformat(),
+            }
+            for profile in _mt5_broker_profiles.values()
+        ],
+        "paper_only": True,
+        "live_trading": False,
+        "execution": False,
+    }
+
+
+@api_router.get("/mt5/brokers/{broker_id}/compatibility")
+async def get_mt5_broker_compatibility(broker_id: str) -> Dict[str, object]:
+    return mt5_broker_compatibility(broker_id)
+
+
+@api_router.get("/mt5/brokers/{broker_id}/symbols/{canonical_symbol}")
+async def get_mt5_broker_symbol(
+    broker_id: str, canonical_symbol: str
+) -> Dict[str, object]:
+    normalized = _normalize_mt5_broker_id(broker_id)
+    profile = _mt5_broker_profiles.get(normalized)
+    canonical = _normalize_canonical_symbol(canonical_symbol)
+    if profile is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"status": "NOT_FOUND", "reason": "BROKER_PROFILE_NOT_SYNCED"},
+        )
+    spec = profile.symbols.get(canonical)
+    if spec is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "status": "NOT_FOUND",
+                "reason": "BROKER_SYMBOL_NOT_MAPPED",
+                "canonical_symbol": canonical,
+            },
+        )
+    compatibility = mt5_symbol_compatibility(spec)
+    compatibility["spec"] = {
+        "digits": spec.digits,
+        "point": str(spec.point) if spec.point is not None else None,
+        "tick_size": str(spec.tick_size) if spec.tick_size is not None else None,
+        "tick_value": str(spec.tick_value) if spec.tick_value is not None else None,
+        "contract_size": str(spec.contract_size) if spec.contract_size is not None else None,
+        "volume_min": str(spec.volume_min) if spec.volume_min is not None else None,
+        "volume_max": str(spec.volume_max) if spec.volume_max is not None else None,
+        "volume_step": str(spec.volume_step) if spec.volume_step is not None else None,
+        "currency_profit": spec.currency_profit,
+        "currency_margin": spec.currency_margin,
+        "trade_mode": spec.trade_mode,
+        "visible": spec.visible,
+    }
+    return compatibility
+
+
+@api_router.post("/mt5/brokers/{broker_id}/activate")
+async def activate_mt5_broker_profile(broker_id: str) -> Dict[str, object]:
+    global _mt5_active_broker_id
+    normalized = _normalize_mt5_broker_id(broker_id)
+    if normalized not in _mt5_broker_profiles:
+        raise HTTPException(
+            status_code=404,
+            detail={"status": "NOT_FOUND", "reason": "BROKER_PROFILE_NOT_SYNCED"},
+        )
+    _mt5_active_broker_id = normalized
+    result = mt5_broker_compatibility(normalized)
+    result["activation"] = "ACTIVE_PROFILE_CHANGED"
+    return result
+
+
+@api_router.get("/mt5/active-broker")
+async def get_active_mt5_broker_profile() -> Dict[str, object]:
+    if _mt5_active_broker_id is None:
+        return {
+            "validation": MT5_MULTI_BROKER_VERSION,
+            "status": "NONE",
+            "active_broker_id": None,
+            "paper_only": True,
+            "live_trading": False,
+            "execution": False,
+        }
+    return mt5_broker_compatibility(_mt5_active_broker_id)
 
 # App must be built only after every router decorator above has executed.
 app = create_app()

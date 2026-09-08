@@ -9964,3 +9964,38 @@ class V17UI21FastStartOpenSyncTests(unittest.TestCase):
             'startCryptoRealtime()})'
         )
         self.assertIn(marker, self.html)
+
+
+# ==================== V17-UI21 — LIVE RENDER / FOREGROUND RECOVERY ===========
+
+
+class V17UI21LiveRenderRecoveryTests(unittest.TestCase):
+    """Visible paper data refreshes without requiring a tab change."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_open_poll_fetches_live_enrichment_every_cycle(self):
+        start = self.html.index("function refreshPaperOpenPositions(){")
+        end = self.html.index("function refreshPaperTrading(){", start)
+        block = self.html[start:end]
+        self.assertIn('api("/api/v1/paper/positions/live")', block)
+        self.assertIn("Promise.all([", block)
+
+    def test_live_row_wins_when_merging_visible_open_position(self):
+        self.assertIn(
+            "var merged=Object.assign({},row,previous||{},liveRow||{});",
+            self.html,
+        )
+
+    def test_foreground_visibility_triggers_immediate_refresh(self):
+        self.assertIn('document.addEventListener("visibilitychange"', self.html)
+        self.assertIn(
+            'if(document.visibilityState==="visible")refreshVisibleViewNow();',
+            self.html,
+        )
+
+    def test_pageshow_and_network_recovery_trigger_refresh(self):
+        self.assertIn('window.addEventListener("pageshow"', self.html)
+        self.assertIn('window.addEventListener("online"', self.html)

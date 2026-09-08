@@ -3751,9 +3751,10 @@ _position_peaks: Dict[str, Decimal] = {}
 
 
 def is_crypto_session_active(now_utc: datetime) -> bool:
-    """V17-PRO: session filter DISABLED for 24/7 A/B testing.
-    session_at_entry attribution still tags each trade DAY or NIGHT."""
-    return True
+    """Return True during London/NY session (08:00-21:00 UTC).
+    A/B test confirmed: night trades lose money. Filter stays ON."""
+    hour = now_utc.hour
+    return CRYPTO_SESSION_LONDON_START_UTC <= hour < CRYPTO_SESSION_NY_END_UTC
 
 
 def compute_smart_sl(

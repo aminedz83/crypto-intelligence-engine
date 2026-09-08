@@ -37,7 +37,7 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "1577"
+      EXPECTED_TESTS: "1581"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -171,4 +171,4 @@ jobs:
 
 # V17-MT5-MULTIBROKER-2: EXPECTED_TESTS=1567 (12 full broker catalogue tests)
 
-# V17-UI21: EXPECTED_TESTS=1577 (10 fast-start/open-position sync tests)
+# V17-UI21: EXPECTED_TESTS=1581 (fast-start/open-sync/live-render tests)

@@ -1379,9 +1379,28 @@ function refreshPaperFastStart(){
 function refreshPaperOpenPositions(){
   if(current!=="trading"||paperOpenRefreshBusy)return Promise.resolve();
   paperOpenRefreshBusy=true;
-  return api("/api/v1/paper/positions?status_filter=OPEN").then(function(r){
-    if(!r||!r.ok||!r.data||!Array.isArray(r.data.positions))return;
-    var incoming=r.data.positions;
+  /*
+   * UI21-LIVE: refresh persisted OPEN state and live mark/P&L together.
+   * Previously /positions/live was fetched only when a NEW position appeared,
+   * so an already-open card could wait for the slower 5s snapshot or a tab
+   * change before its visible mark/P&L changed.
+   */
+  return Promise.all([
+    api("/api/v1/paper/positions?status_filter=OPEN"),
+    api("/api/v1/paper/positions/live")
+  ]).then(function(results){
+    var openResult=results[0],liveResult=results[1];
+    if(!openResult||!openResult.ok||!openResult.data||
+       !Array.isArray(openResult.data.positions))return;
+
+    var incoming=openResult.data.positions;
+    var liveRows=liveResult&&liveResult.ok&&liveResult.data&&
+      Array.isArray(liveResult.data.positions)?liveResult.data.positions:[];
+    var liveById={};
+    liveRows.forEach(function(row){
+      if(row&&row.position_id)liveById[row.position_id]=row;
+    });
+
     var incomingIds=paperOpenIdSet(incoming);
     var known={};
     var previousOpen=[];
@@ -1393,26 +1412,22 @@ function refreshPaperOpenPositions(){
     });
 
     var changed=false;
-    var newPositionDetected=false;
     var removedPositionDetected=false;
     var mergedOpen=[];
 
     incoming.forEach(function(row){
       if(!row||!row.position_id)return;
       var previous=known[row.position_id];
-      if(!previous){
-        mergedOpen.push(row);
-        changed=true;
-        newPositionDetected=true;
-        return;
-      }
+      var liveRow=liveById[row.position_id];
       /*
-       * Keep richer live mark/P&L already supplied by /positions/live or
-       * /paper/ui-snapshot while refreshing persisted OPEN metadata.
+       * Persisted metadata is the base; live data wins for current mark/P&L.
+       * If live enrichment is temporarily unavailable, preserve the richer
+       * previous row instead of flickering fields back to "—".
        */
-      var merged=Object.assign({},row,previous);
+      var merged=Object.assign({},row,previous||{},liveRow||{});
       mergedOpen.push(merged);
-      if(stableUiFingerprint(previous)!==stableUiFingerprint(merged)){
+      if(!previous||
+         stableUiFingerprint(previous)!==stableUiFingerprint(merged)){
         changed=true;
       }
     });
@@ -1427,40 +1442,15 @@ function refreshPaperOpenPositions(){
     paperOpenAuthoritativeIds=incomingIds;
     paperOpenAuthorityReady=true;
 
-    if(!changed)return;
-    var closed=(paperUiState.positions||[]).filter(function(row){
-      return String(row&&row.status||"").toUpperCase()!=="OPEN";
-    });
-    paperUiState.positions=closed.concat(mergedOpen);
-    paperUiState.updatedAt=new Date().toISOString();
-    paperRenderChangedViews();
-
-    /*
-     * A newly opened position is already visible from the persisted endpoint.
-     * Fetch live enrichment once so mark/P&L arrives without waiting for the
-     * slower full snapshot.  If a position disappeared from OPEN, refresh only
-     * CLOSED history immediately so it moves to Historique without blocking UI.
-     */
-    if(newPositionDetected){
-      api("/api/v1/paper/positions/live").then(function(liveResult){
-        if(!liveResult||!liveResult.ok||!liveResult.data||!Array.isArray(liveResult.data.positions))return;
-        var liveById={};
-        liveResult.data.positions.forEach(function(row){
-          if(row&&row.position_id)liveById[row.position_id]=row;
-        });
-        var currentClosed=(paperUiState.positions||[]).filter(function(row){
-          return String(row&&row.status||"").toUpperCase()!=="OPEN";
-        });
-        var enrichedOpen=(paperUiState.positions||[]).filter(function(row){
-          return String(row&&row.status||"").toUpperCase()==="OPEN";
-        }).map(function(row){
-          return liveById[row.position_id]?Object.assign({},row,liveById[row.position_id]):row;
-        });
-        paperUiState.positions=currentClosed.concat(enrichedOpen);
-        paperUiState.updatedAt=new Date().toISOString();
-        paperRenderChangedViews();
+    if(changed){
+      var closed=(paperUiState.positions||[]).filter(function(row){
+        return String(row&&row.status||"").toUpperCase()!=="OPEN";
       });
+      paperUiState.positions=closed.concat(mergedOpen);
+      paperUiState.updatedAt=new Date().toISOString();
+      paperRenderChangedViews();
     }
+
     if(removedPositionDetected)refreshPaperClosedHistory();
   }).finally(function(){
     paperOpenRefreshBusy=false;
@@ -3958,6 +3948,38 @@ function poll(){
   }
   else if(current==="detail")refreshDetail();
 }
+
+var paperForegroundRefreshBusy=false;
+function refreshVisibleViewNow(){
+  if(paperForegroundRefreshBusy)return Promise.resolve();
+  paperForegroundRefreshBusy=true;
+  var work=[];
+  if(current==="trading"){
+    work.push(refreshPaperFastStart());
+    work.push(refreshPaperOpenPositions());
+  }else if(current==="dashboard"||current==="signals"||current==="strategies"){
+    work.push(refreshPaperFastStart());
+  }
+  if(current==="dashboard")work.push(refreshDashboard());
+  else if(current==="markets")work.push(refreshMarkets());
+  else if(current==="forex")work.push(refreshForexMarket());
+  else if(current==="energy")work.push(refreshEnergyMarket());
+  else if(current==="detail")work.push(refreshDetail());
+  return Promise.all(work).finally(function(){
+    paperForegroundRefreshBusy=false;
+  });
+}
+
+document.addEventListener("visibilitychange",function(){
+  if(document.visibilityState==="visible")refreshVisibleViewNow();
+});
+window.addEventListener("pageshow",function(){
+  refreshVisibleViewNow();
+});
+window.addEventListener("online",function(){
+  refreshVisibleViewNow();
+});
+
 function loadCryptoUniverse(){
   return api("/api/v1/market/crypto-universe").then(function(r){
     var d=r&&r.ok&&r.data?r.data:null;
@@ -4024,7 +4046,7 @@ function renderHelpGlossary(){
 <!-- V17-UI14 · PERFORMANCE MATRIX ASSET LOGOS -->
 <!-- V17-UI15 · GLOBAL AUTO REFRESH SIGNALS + STRATEGIES -->
 <!-- V17-UI16 · CHANGE-AWARE NO-FLICKER AUTO REFRESH -->
-<!-- V17-UI21 · FAST START + OPEN POSITION SYNC FIX · ESSENTIAL DATA FIRST · PAPER ONLY -->
+<!-- V17-UI21 · FAST START + LIVE RENDER + OPEN POSITION SYNC · FOREGROUND RECOVERY · PAPER ONLY -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

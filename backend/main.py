@@ -14197,7 +14197,7 @@ def _normalize_canonical_symbol(value: str) -> str:
     return value.strip().upper().replace("/", "-")
 
 
-def _positive_decimal(value: Optional[Decimal]) -> bool:
+def _is_positive_decimal(value: Optional[Decimal]) -> bool:
     return value is not None and value.is_finite() and value > 0
 
 
@@ -14221,11 +14221,11 @@ def mt5_symbol_compatibility(spec: MT5BrokerSymbolSpec) -> Dict[str, object]:
         "volume_max",
         "volume_step",
     ):
-        if not _positive_decimal(getattr(spec, field_name)):
+        if not _is_positive_decimal(getattr(spec, field_name)):
             blockers.append(f"{field_name.upper()}_NOT_VERIFIED")
     if (
-        _positive_decimal(spec.volume_min)
-        and _positive_decimal(spec.volume_max)
+        _is_positive_decimal(spec.volume_min)
+        and _is_positive_decimal(spec.volume_max)
         and spec.volume_min is not None
         and spec.volume_max is not None
         and spec.volume_min > spec.volume_max

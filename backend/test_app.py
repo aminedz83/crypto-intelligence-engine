@@ -412,7 +412,9 @@ class DynamicCryptoUniverseFrontendV16M5B28AUiTests(unittest.TestCase):
         self.assertIn('symbols=CRYPTO_SYMBOLS.slice()', self.html)
 
     def test_universe_load_precedes_realtime_start(self):
-        marker = 'loadCryptoUniverse().then(function(){setView("dashboard");startCryptoRealtime()})'
+        # UI21 paints Dashboard immediately, but realtime subscriptions must
+        # still start only after the server-authoritative crypto universe loads.
+        marker = 'loadCryptoUniverse().then(function(){if(current==="dashboard")renderDashboard();startCryptoRealtime()})'
         self.assertIn(marker, self.html)
 
     def test_market_ui_exposes_active_count(self):
@@ -9906,3 +9908,56 @@ class V17MT5MultiBrokerV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["paper_only"])
         self.assertFalse(result["live_trading"])
         self.assertFalse(result["execution"])
+
+
+# ==================== V17-UI21 — FAST START + OPEN POSITION SYNC FIX =========
+
+
+class V17UI21FastStartOpenSyncTests(unittest.TestCase):
+    """UI21: essential paper data first; OPEN positions stay authoritative."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_ui21_marker_exists(self):
+        self.assertIn("V17-UI21", self.html)
+
+    def test_fast_start_function_exists(self):
+        self.assertIn("function refreshPaperFastStart()", self.html)
+
+    def test_fast_start_reads_live_account(self):
+        self.assertIn('/api/v1/paper/account/live', self.html)
+
+    def test_fast_start_reads_open_positions(self):
+        self.assertIn('/api/v1/paper/positions?status_filter=OPEN', self.html)
+
+    def test_fast_start_reads_live_position_marks(self):
+        self.assertIn('/api/v1/paper/positions/live', self.html)
+
+    def test_open_poll_tracks_authoritative_ids(self):
+        self.assertIn("paperOpenAuthoritativeIds", self.html)
+        self.assertIn("paperOpenAuthorityReady", self.html)
+
+    def test_closed_transition_refreshes_history(self):
+        self.assertIn("function refreshPaperClosedHistory()", self.html)
+        self.assertIn("if(removedPositionDetected)refreshPaperClosedHistory()", self.html)
+
+    def test_snapshot_cannot_erase_newer_open_position(self):
+        self.assertIn("if(!paperOpenAuthoritativeIds[row.position_id])return;", self.html)
+        self.assertIn("mergedPersisted.push(row);", self.html)
+
+    def test_trading_view_starts_fast_path_before_full_snapshot(self):
+        marker = (
+            'else if(id==="trading"){renderTrading();refreshPaperFastStart();'
+            'refreshPaperOpenPositions();refreshPaperTrading();}'
+        )
+        self.assertIn(marker, self.html)
+
+    def test_dashboard_first_paint_does_not_wait_for_crypto_universe(self):
+        marker = (
+            'buildNav();refreshHealth();setView("dashboard");refreshPaperFastStart();'
+            'loadCryptoUniverse().then(function(){if(current==="dashboard")renderDashboard();'
+            'startCryptoRealtime()})'
+        )
+        self.assertIn(marker, self.html)

@@ -414,11 +414,13 @@ class DynamicCryptoUniverseFrontendV16M5B28AUiTests(unittest.TestCase):
     def test_universe_load_precedes_realtime_start(self):
         # UI21 paints Dashboard immediately, but realtime subscriptions must
         # still start only after the server-authoritative crypto universe loads.
-        marker = (
-            'loadCryptoUniverse().then(function(){if(current==="dashboard")'
-            'renderDashboard();startCryptoRealtime()})'
+        universe_pos = self.html.index("loadCryptoUniverse().then(function(){")
+        realtime_pos = self.html.index("startCryptoRealtime();", universe_pos)
+        self.assertGreater(realtime_pos, universe_pos)
+        self.assertIn(
+            'if(current==="dashboard")renderDashboard();',
+            self.html[universe_pos:realtime_pos],
         )
-        self.assertIn(marker, self.html)
 
     def test_market_ui_exposes_active_count(self):
         self.assertIn('"Actifs actifs: "+String(CRYPTO_SYMBOLS.length)', self.html)
@@ -4668,7 +4670,9 @@ class TestPaperTradingUiV16I(unittest.TestCase):
 
     def test_paper_ui_poll_refreshes_trading(self):
         html = INDEX.read_text(encoding="utf-8")
-        self.assertIn('current==="trading")refreshPaperTrading()', html)
+        self.assertIn('else if(current==="trading"){', html)
+        self.assertIn("refreshPaperFastStart();", html)
+        self.assertIn("refreshPaperOpenPositions();", html)
 
     def test_paper_ui_help_is_present(self):
         html = INDEX.read_text(encoding="utf-8")
@@ -9951,19 +9955,23 @@ class V17UI21FastStartOpenSyncTests(unittest.TestCase):
         self.assertIn("mergedPersisted.push(row);", self.html)
 
     def test_trading_view_starts_fast_path_before_full_snapshot(self):
-        marker = (
-            'else if(id==="trading"){renderTrading();refreshPaperFastStart();'
-            'refreshPaperOpenPositions();refreshPaperTrading();}'
+        start = self.html.index('else if(id==="trading"){')
+        end = self.html.index('else if(id==="strategies")', start)
+        block = self.html[start:end]
+        self.assertLess(
+            block.index("refreshPaperFastStart()"),
+            block.index("schedulePaperHeavyRefresh()"),
         )
-        self.assertIn(marker, self.html)
+        self.assertIn("refreshPaperOpenPositions()", block)
 
     def test_dashboard_first_paint_does_not_wait_for_crypto_universe(self):
-        marker = (
-            'buildNav();refreshHealth();setView("dashboard");refreshPaperFastStart();'
-            'loadCryptoUniverse().then(function(){if(current==="dashboard")renderDashboard();'
-            'startCryptoRealtime()})'
+        dashboard_pos = self.html.index('setView("dashboard");')
+        universe_pos = self.html.index("loadCryptoUniverse().then(function(){", dashboard_pos)
+        self.assertLess(dashboard_pos, universe_pos)
+        self.assertIn(
+            "refreshPaperFastStart();",
+            self.html[dashboard_pos:universe_pos],
         )
-        self.assertIn(marker, self.html)
 
 
 # ==================== V17-UI21 — LIVE RENDER / FOREGROUND RECOVERY ===========
@@ -10011,16 +10019,18 @@ class V17UI22TradingPriorityTests(unittest.TestCase):
     def setUpClass(cls):
         cls.html = INDEX.read_text(encoding="utf-8")
 
-    def test_ui22_marker_exists(self):
-        self.assertIn("V17-UI22", self.html)
-        self.assertIn("TRADING PRIORITY", self.html)
+    def test_ui22_behavior_is_preserved_by_ui23(self):
+        self.assertIn("V17-UI23", self.html)
+        self.assertIn("function schedulePaperHeavyRefresh()", self.html)
+        self.assertIn("refreshPaperFastStart()", self.html)
 
     def test_trading_poll_uses_lightweight_live_paths(self):
-        self.assertIn(
-            'else if(current==="trading"){refreshPaperFastStart();'
-            'refreshPaperOpenPositions();}',
-            self.html,
-        )
+        start = self.html.index('else if(current==="trading"){')
+        end = self.html.index('else if(current==="signals")', start)
+        block = self.html[start:end]
+        self.assertIn("refreshPaperFastStart();", block)
+        self.assertIn("refreshPaperOpenPositions();", block)
+        self.assertNotIn("refreshPaperTrading();", block)
 
     def test_heavy_paper_snapshot_is_deferred_off_positions_tab(self):
         self.assertIn("function schedulePaperHeavyRefresh()", self.html)
@@ -10037,7 +10047,11 @@ class V17UI22TradingPriorityTests(unittest.TestCase):
         )
 
     def test_logo_dom_scan_is_not_run_twice_per_second(self):
-        self.assertIn("setInterval(applyOfficialAssetLogos,10000)", self.html)
+        self.assertIn(
+            "if(!document.hidden)applyOfficialAssetLogos()",
+            self.html,
+        )
+        self.assertIn(",30000);setTimeout(applyOfficialAssetLogos,0);", self.html)
         self.assertNotIn("setInterval(applyOfficialAssetLogos,500)", self.html)
 
 

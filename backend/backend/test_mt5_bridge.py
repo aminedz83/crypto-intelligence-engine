@@ -1,6 +1,7 @@
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
@@ -10,6 +11,7 @@ BRIDGE_PATH = Path(__file__).resolve().parents[1] / "mt5_bridge" / "mt5_readonly
 SPEC = importlib.util.spec_from_file_location("mt5_readonly_bridge", BRIDGE_PATH)
 bridge = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
+sys.modules[SPEC.name] = bridge
 SPEC.loader.exec_module(bridge)
 
 

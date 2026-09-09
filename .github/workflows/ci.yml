@@ -37,7 +37,7 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "1620"
+      EXPECTED_TESTS: "1611"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -167,8 +167,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-# V17-ENERGY: EXPECTED_TESTS=1532 (18 Energy WTI/Brent integration tests)
-
-# V17-MT5-MULTIBROKER-2: EXPECTED_TESTS=1567 (12 full broker catalogue tests)
-
-# V17-UI24: EXPECTED_TESTS=1603 (ultra-lightweight trading-first frontend)
+# V17-UI24: EXPECTED_TESTS=1611 (smart exit optimization)

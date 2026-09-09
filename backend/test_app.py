@@ -9291,13 +9291,13 @@ class V17NoLiveTrading(unittest.TestCase):
 
 
 class V17SmartExitBreakevenTests(unittest.TestCase):
-    """Break-even: after +1.2R, effective SL moves to entry."""
+    """Break-even: after +1R, effective SL moves to entry."""
 
     def test_long_breakeven_at_1r(self):
         entry = Decimal("100")
         sl = Decimal("98")  # risk = 2
-        # Peak reached +1.2R (102.4) → SL should be at entry (100)
-        result = main.compute_smart_sl("LONG", entry, sl, Decimal("102.4"), Decimal("101"))
+        # Peak reached +1R (102) → SL should be at entry (100)
+        result = main.compute_smart_sl("LONG", entry, sl, Decimal("102"), Decimal("101"))
         self.assertEqual(result, entry)
 
     def test_long_below_1r_keeps_original_sl(self):
@@ -9310,8 +9310,8 @@ class V17SmartExitBreakevenTests(unittest.TestCase):
     def test_short_breakeven_at_1r(self):
         entry = Decimal("100")
         sl = Decimal("102")  # risk = 2
-        # Peak reached +1.2R (97.6) → SL should be at entry (100)
-        result = main.compute_smart_sl("SHORT", entry, sl, Decimal("97.6"), Decimal("99"))
+        # Peak reached +1R (98) → SL should be at entry (100)
+        result = main.compute_smart_sl("SHORT", entry, sl, Decimal("98"), Decimal("99"))
         self.assertEqual(result, entry)
 
     def test_short_below_1r_keeps_original_sl(self):
@@ -9322,41 +9322,41 @@ class V17SmartExitBreakevenTests(unittest.TestCase):
 
 
 class V17SmartExitTrailingTests(unittest.TestCase):
-    """Trailing: after +1.8R, SL trails at 1R behind peak."""
+    """Trailing: after +1.5R, SL trails at 0.75R behind peak."""
 
     def test_long_trailing_at_1_5r(self):
         entry = Decimal("100")
         sl = Decimal("98")  # risk = 2
-        # Peak at +2R (104) → trail SL = 104 - 1*2 = 102
+        # Peak at +2R (104) → trail SL = 104 - 0.75*2 = 102.5
         result = main.compute_smart_sl("LONG", entry, sl, Decimal("104"), Decimal("103"))
-        self.assertEqual(result, Decimal("102"))
+        self.assertEqual(result, Decimal("102.5"))
 
     def test_short_trailing_at_1_5r(self):
         entry = Decimal("100")
         sl = Decimal("102")  # risk = 2
-        # Peak at +2R (96) → trail SL = 96 + 1*2 = 98
+        # Peak at +2R (96) → trail SL = 96 + 0.75*2 = 97.5
         result = main.compute_smart_sl("SHORT", entry, sl, Decimal("96"), Decimal("97"))
-        self.assertEqual(result, Decimal("98"))
+        self.assertEqual(result, Decimal("97.5"))
 
     def test_trailing_never_worse_than_entry(self):
         entry = Decimal("100")
         sl = Decimal("98")
-        # Edge case: peak barely at 1.8R → trailing SL must not go below entry
-        result = main.compute_smart_sl("LONG", entry, sl, Decimal("103.6"), Decimal("102"))
+        # Edge case: peak barely at 1.5R → trailing SL must not go below entry
+        result = main.compute_smart_sl("LONG", entry, sl, Decimal("103"), Decimal("102"))
         self.assertGreaterEqual(result, entry)
 
 
 class V17TimeStopTests(unittest.TestCase):
-    """Time stop: close after 8 hours of no TP hit."""
+    """Time stop: close after 5 hours of no TP hit."""
 
     def test_within_time_limit(self):
         opened = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
-        now = datetime(2026, 1, 1, 17, 0, tzinfo=timezone.utc)  # 7h < 8h
+        now = datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc)  # 4h < 5h
         self.assertFalse(main.should_time_stop(opened, now))
 
     def test_beyond_time_limit(self):
         opened = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
-        now = datetime(2026, 1, 1, 18, 1, tzinfo=timezone.utc)  # 8h01 > 8h
+        now = datetime(2026, 1, 1, 15, 1, tzinfo=timezone.utc)  # 5h01 > 5h
         self.assertTrue(main.should_time_stop(opened, now))
 
 
@@ -9426,16 +9426,16 @@ class V17SmartExitConstantsTests(unittest.TestCase):
     """Verify smart exit constants exist and are reasonable."""
 
     def test_breakeven_threshold(self):
-        self.assertEqual(main.SMART_EXIT_BREAKEVEN_R, Decimal("1.2"))
+        self.assertEqual(main.SMART_EXIT_BREAKEVEN_R, Decimal("1"))
 
     def test_trailing_activation(self):
-        self.assertEqual(main.SMART_EXIT_TRAILING_ACTIVATION_R, Decimal("1.8"))
+        self.assertEqual(main.SMART_EXIT_TRAILING_ACTIVATION_R, Decimal("1.5"))
 
     def test_trailing_distance(self):
-        self.assertEqual(main.SMART_EXIT_TRAILING_DISTANCE_R, Decimal("1"))
+        self.assertEqual(main.SMART_EXIT_TRAILING_DISTANCE_R, Decimal("0.75"))
 
     def test_time_stop_minutes(self):
-        self.assertEqual(main.SMART_EXIT_TIME_STOP_MINUTES, 480)
+        self.assertEqual(main.SMART_EXIT_TIME_STOP_MINUTES, 300)
 
     def test_session_hours(self):
         self.assertEqual(main.CRYPTO_SESSION_LONDON_START_UTC, 8)

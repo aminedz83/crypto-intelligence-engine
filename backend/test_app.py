@@ -9020,7 +9020,7 @@ class DynamicUiControlHardeningV16M5B28B3Tests(unittest.TestCase):
         cls.html = INDEX.read_text(encoding="utf-8")
 
     def test_trading_tabs_have_state(self):
-        self.assertIn('var paperActiveTab="account";', self.html)
+        self.assertIn('var paperActiveTab="positions";', self.html)
 
     def test_positions_tab_calls_setter(self):
         self.assertIn('tabButton("Positions","positions",paperActiveTab,setPaperTab)', self.html)
@@ -10018,7 +10018,7 @@ class V17UI22TradingPriorityTests(unittest.TestCase):
         cls.html = INDEX.read_text(encoding="utf-8")
 
     def test_ui22_behavior_is_preserved_by_ui23(self):
-        self.assertIn("V17-UI23", self.html)
+        self.assertIn("V17-UI24", self.html)
         self.assertIn("function schedulePaperHeavyRefresh()", self.html)
         self.assertIn("refreshPaperFastStart()", self.html)
 
@@ -10036,7 +10036,7 @@ class V17UI22TradingPriorityTests(unittest.TestCase):
 
     def test_dashboard_realtime_limits_crypto_fanout(self):
         self.assertIn(
-            'else if(current==="dashboard")symbols=CRYPTO_SYMBOLS.slice(0,12);',
+            'else if(current==="dashboard")symbols=CRYPTO_SYMBOLS.slice(0,6);',
             self.html,
         )
         self.assertIn(
@@ -10064,8 +10064,8 @@ class V17UI23FullAppPerformanceTests(unittest.TestCase):
         cls.html = INDEX.read_text(encoding="utf-8")
 
     def test_ui23_marker_exists(self):
-        self.assertIn("V17-UI23", self.html)
-        self.assertIn("FULL APP PERFORMANCE", self.html)
+        self.assertIn("V17-UI24", self.html)
+        self.assertIn("ULTRA LIGHTWEIGHT TRADING FIRST", self.html)
 
     def test_get_requests_are_coalesced_by_endpoint(self):
         self.assertIn("var apiGetInflight={};", self.html)
@@ -10102,3 +10102,49 @@ class V17UI23FullAppPerformanceTests(unittest.TestCase):
             self.html,
         )
         self.assertIn(",30000);setTimeout(applyOfficialAssetLogos,0);", self.html)
+
+
+# ==================== V17-UI24 — ULTRA LIGHTWEIGHT TRADING FIRST ==============
+
+class V17UI24UltraLightweightTradingFirstTests(unittest.TestCase):
+    """Critical trading data stays fast while advanced UI remains available."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_ui24_marker_exists(self):
+        self.assertIn("V17-UI24", self.html)
+        self.assertIn("ULTRA LIGHTWEIGHT TRADING FIRST", self.html)
+
+    def test_positions_are_default_trading_tab(self):
+        self.assertIn('var paperActiveTab="positions";', self.html)
+        self.assertIn('return "positions";', self.html)
+
+    def test_open_positions_keep_one_second_priority_poll(self):
+        self.assertIn("var PAPER_OPEN_POLL_MS=1000;", self.html)
+        self.assertIn("setInterval(runVisibleOpenPositions,PAPER_OPEN_POLL_MS)", self.html)
+
+    def test_dashboard_live_crypto_fanout_is_six(self):
+        self.assertIn("CRYPTO_SYMBOLS.slice(0,6)", self.html)
+
+    def test_full_crypto_universe_is_preserved_in_markets(self):
+        self.assertIn('else if(current==="markets")symbols=CRYPTO_SYMBOLS.slice();', self.html)
+
+    def test_advanced_paper_analytics_remain_lazy(self):
+        self.assertIn("function schedulePaperHeavyRefresh()", self.html)
+        self.assertIn('if(paperActiveTab==="positions")return;', self.html)
+        self.assertIn("},2000);", self.html)
+
+    def test_signals_keep_three_second_priority_refresh(self):
+        self.assertIn('refreshDue("signals",3000,refreshPaperTrading)', self.html)
+
+    def test_noncritical_market_views_use_slower_refresh(self):
+        self.assertIn('refreshDue("markets",15000,refreshMarkets)', self.html)
+        self.assertIn('refreshDue("forex",15000,refreshForexMarket)', self.html)
+        self.assertIn('refreshDue("energy",10000,refreshEnergyMarket)', self.html)
+        self.assertIn('refreshDue("detail",10000,refreshDetail)', self.html)
+
+    def test_ui24_remains_paper_only(self):
+        self.assertIn("PAPER ONLY", self.html)
+        self.assertIn("CRITICAL PATH", self.html)

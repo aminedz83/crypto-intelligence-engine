@@ -1474,7 +1474,7 @@ function schedulePaperHeavyRefresh(){
     if(current!=="trading")return;
     if(paperActiveTab==="positions")return;
     refreshPaperTrading();
-  },1200);
+  },2000);
 }
 
 function refreshPaperTrading(){
@@ -2341,7 +2341,7 @@ function renderSignals(){
 }
 
 
-var paperActiveTab="account";
+var paperActiveTab="positions";
 var paperHistoryFilter="ALL";
 var intelligenceActiveTab="regime";
 var settingsActiveTab="interface";
@@ -3236,7 +3236,7 @@ function mergeRealtimeFiveMinuteCandle(c){
 }
 function refreshCryptoRealtime(){
   if(!realtimeCore.started){startCryptoRealtime();return}
-  var symbols=[];if(current==="detail"&&detailCtx&&detailCtx.kind==="crypto")symbols=[detailCtx.symbol];else if(current==="markets")symbols=CRYPTO_SYMBOLS.slice();else if(current==="dashboard")symbols=CRYPTO_SYMBOLS.slice(0,12);else return;
+  var symbols=[];if(current==="detail"&&detailCtx&&detailCtx.kind==="crypto")symbols=[detailCtx.symbol];else if(current==="markets")symbols=CRYPTO_SYMBOLS.slice();else if(current==="dashboard")symbols=CRYPTO_SYMBOLS.slice(0,6);else return;
   symbols.forEach(function(sym){api("/api/v1/market/realtime/"+encodeURIComponent(sym)).then(function(r){
     if(!r.ok||!r.data)return;var d=r.data,t=d.ticker,c=d.candle;
     if(t&&t.value!=null){realtimeCore.lastTickerAt=t.received_at||null;var price=Number(t.value);
@@ -3993,9 +3993,9 @@ function poll(){
   if(document.hidden)return;
   refreshDue("health",15000,refreshHealth);
   if(current==="dashboard")refreshDue("dashboard",5000,refreshDashboard);
-  else if(current==="markets")refreshDue("markets",10000,refreshMarkets);
-  else if(current==="forex")refreshDue("forex",10000,refreshForexMarket);
-  else if(current==="energy")refreshDue("energy",5000,refreshEnergyMarket);
+  else if(current==="markets")refreshDue("markets",15000,refreshMarkets);
+  else if(current==="forex")refreshDue("forex",15000,refreshForexMarket);
+  else if(current==="energy")refreshDue("energy",10000,refreshEnergyMarket);
   else if(current==="system")refreshDue("system",15000,renderSystem);
   else if(current==="trading"){
     refreshPaperFastStart();
@@ -4008,7 +4008,7 @@ function poll(){
       refreshStrategiesAuto();
     });
   }
-  else if(current==="detail")refreshDue("detail",5000,refreshDetail);
+  else if(current==="detail")refreshDue("detail",10000,refreshDetail);
 }
 
 var paperForegroundRefreshBusy=false;
@@ -4129,7 +4129,8 @@ function renderHelpGlossary(){
 <!-- V17-UI14 · PERFORMANCE MATRIX ASSET LOGOS -->
 <!-- V17-UI15 · GLOBAL AUTO REFRESH SIGNALS + STRATEGIES -->
 <!-- V17-UI16 · CHANGE-AWARE NO-FLICKER AUTO REFRESH -->
-<!-- V17-UI23 · FULL APP PERFORMANCE · VIEW-AWARE SCHEDULER · DEDUPED API · PAPER ONLY -->
+<!-- V17-UI24 · ULTRA LIGHTWEIGHT TRADING FIRST · LAZY ADVANCED VIEWS · PAPER ONLY -->
+<!-- V17-UI24 CRITICAL PATH: SIGNALS + OPEN POSITIONS FIRST; ADVANCED ANALYTICS LAZY -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

@@ -1904,7 +1904,12 @@ function paperCompactHistoryCard(p){
         h("div",{class:"paper-trade-level"},[h("span",{},[result.reason==="STOP_LOSS"?"SL":"TP"]),h("b",{},[fmtNum(result.reason==="STOP_LOSS"?p.stop_loss:p.take_profit)||"—"])]),
         h("div",{class:"paper-trade-level"},[h("span",{},["RR"]),h("b",{},[rr===null?"—":(rr>=0?"+":"")+rr.toFixed(2)+"R"])])
       ]),
-      h("div",{class:"paper-trade-outcome"},[h("b",{class:result.klass},[(result.label==="WIN"?"✓ ":result.label==="LOSS"?"✕ ":"")+result.reason.replaceAll("_"," ")]),h("span",{},[paperTradeDuration(p)]),h("span",{class:"paper-trade-more"},["Détails ›"])])
+      h("div",{class:"paper-trade-outcome"},[
+        h("b",{class:result.klass},[(result.label==="WIN"?"✓ WIN":result.label==="LOSS"?"✕ LOSS":result.label)]),
+        h("span",{},[result.reason.replaceAll("_"," ")]),
+        h("span",{},[paperTradeDuration(p)]),
+        h("span",{class:"paper-trade-more"},["Détails ›"])
+      ])
     ]),
     h("div",{class:"paper-trade-details"},[paperCompactHistoryDetails(p,result,rr,pnlText,strategyRaw)])
   ]);
@@ -2380,6 +2385,7 @@ function setPaperTab(id){
   if(location.hash!==nextHash){location.hash=nextHash;return;}
   if(current==="trading"){
     renderTrading();
+    if(id==="history")refreshPaperClosedHistory();
     if(id!=="positions")schedulePaperHeavyRefresh();
   }
 }
@@ -2396,6 +2402,7 @@ window.addEventListener("hashchange",function(){
   if(current!=="trading")return;
   paperActiveTab=paperTabFromHash();
   renderTrading();
+  if(paperActiveTab==="history")refreshPaperClosedHistory();
   if(paperActiveTab!=="positions")schedulePaperHeavyRefresh();
 });
 function setIntelligenceTab(id){

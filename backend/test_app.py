@@ -9390,13 +9390,11 @@ class V17SessionFilterTests(unittest.TestCase):
             datetime(2026, 1, 1, 20, 59, tzinfo=timezone.utc)))
 
     def test_asian_session_inactive(self):
-        # Session filter disabled for 24/7 A/B test — always True
-        self.assertTrue(main.is_crypto_session_active(
+        self.assertFalse(main.is_crypto_session_active(
             datetime(2026, 1, 1, 3, 0, tzinfo=timezone.utc)))
 
     def test_after_ny_close_inactive(self):
-        # Session filter disabled for 24/7 A/B test — always True
-        self.assertTrue(main.is_crypto_session_active(
+        self.assertFalse(main.is_crypto_session_active(
             datetime(2026, 1, 1, 21, 0, tzinfo=timezone.utc)))
 
 
@@ -10121,7 +10119,7 @@ class V17UI24UltraLightweightTradingFirstTests(unittest.TestCase):
 
     def test_positions_are_default_trading_tab(self):
         self.assertIn('var paperActiveTab="positions";', self.html)
-        self.assertIn('return m?m[1]:"positions"', self.html)
+        self.assertIn('return "positions";', self.html)
 
     def test_open_positions_keep_one_second_priority_poll(self):
         self.assertIn("var PAPER_OPEN_POLL_MS=1000;", self.html)

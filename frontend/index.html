@@ -2347,9 +2347,9 @@ var intelligenceActiveTab="regime";
 var settingsActiveTab="interface";
 
 function paperTabFromHash(){
-  if(location.hash==="#paper-positions")return "positions";
+  if(location.hash==="#paper-account")return "account";
   if(location.hash==="#paper-history")return "history";
-  return "account";
+  return "positions";
 }
 function tabButton(label,id,active,setter){
   var attrs={

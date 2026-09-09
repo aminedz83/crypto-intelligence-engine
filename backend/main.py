@@ -3635,10 +3635,10 @@ AUTO_ENTRY_ORCHESTRATOR_INTERVAL_SECONDS = 5.0
 # Break-even: after +1R, effective SL moves to entry (zero risk).
 # Trailing: after +1.5R, effective SL trails at 0.75R behind peak.
 # Time stop: position open > 60 candles (5h on 5m) without hitting TP → close.
-SMART_EXIT_BREAKEVEN_R = Decimal("1.2")
-SMART_EXIT_TRAILING_ACTIVATION_R = Decimal("1.8")
-SMART_EXIT_TRAILING_DISTANCE_R = Decimal("1")
-SMART_EXIT_TIME_STOP_MINUTES = 480  # 8 hours
+SMART_EXIT_BREAKEVEN_R = Decimal("1")
+SMART_EXIT_TRAILING_ACTIVATION_R = Decimal("1.5")
+SMART_EXIT_TRAILING_DISTANCE_R = Decimal("0.75")
+SMART_EXIT_TIME_STOP_MINUTES = 300  # 5 hours
 
 # Session filter: only trade during London and NY sessions (UTC).
 # Outside these windows, setups are lower quality (less institutional flow).

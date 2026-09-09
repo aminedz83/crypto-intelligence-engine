@@ -1385,7 +1385,7 @@ function refreshPaperFastStart(){
 }
 
 function refreshPaperOpenPositions(){
-  if(current!=="trading"||paperOpenRefreshBusy)return Promise.resolve();
+  if(paperOpenRefreshBusy)return Promise.resolve();
   paperOpenRefreshBusy=true;
   /*
    * UI21-LIVE: refresh persisted OPEN state and live mark/P&L together.

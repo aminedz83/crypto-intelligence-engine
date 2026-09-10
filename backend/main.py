@@ -3821,9 +3821,16 @@ def paper_entry_hour_utc(opened_at: object) -> Optional[int]:
 
 def paper_entry_window_utc(hour: object) -> Optional[str]:
     """Map an entry hour to a small, predeclared UTC window to limit data mining."""
-    try:
+    if isinstance(hour, bool):
         value = int(hour)
-    except (TypeError, ValueError):
+    elif isinstance(hour, int):
+        value = hour
+    elif isinstance(hour, (str, bytes, bytearray)):
+        try:
+            value = int(hour)
+        except (TypeError, ValueError):
+            return None
+    else:
         return None
     if value < 0 or value > 23:
         return None

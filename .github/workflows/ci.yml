@@ -37,7 +37,7 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "1638"
+      EXPECTED_TESTS: "1650"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -171,4 +171,4 @@ jobs:
 
 # V17-MT5-MULTIBROKER-2: EXPECTED_TESTS=1567 (12 full broker catalogue tests)
 
-# V17-PERFORMANCE-INTELLIGENCE-1: EXPECTED_TESTS=1638 (1621 engine + 17 MT5 bridge)
+# V17-PERFORMANCE-INTELLIGENCE-2: EXPECTED_TESTS=1650 (1633 engine + 17 MT5 bridge)

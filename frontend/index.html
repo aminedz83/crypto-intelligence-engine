@@ -1175,6 +1175,44 @@ body.market-menu-open .market-tabs-wrap{display:block!important}
 }
 </style>
 
+
+<style id="v17-performance-intelligence-ui2">
+/* V17-PERFORMANCE-INTELLIGENCE-2 — professional observation dashboard */
+.pi-shell{margin-top:12px;border:1px solid #20314a;border-radius:16px;background:linear-gradient(180deg,#0a1422 0%,#07111d 100%);overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,.18)}
+.pi-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:16px;border-bottom:1px solid #1d2b3e}
+.pi-head-copy{min-width:0}.pi-eyebrow{font-size:7px;letter-spacing:.12em;text-transform:uppercase;color:#8291a6;font-weight:800}
+.pi-title{display:flex;align-items:center;gap:8px;margin-top:4px}.pi-title h3{font-size:15px;margin:0;color:#f4f7fb}.pi-title p{margin:5px 0 0;color:#8796aa;font-size:8px;line-height:1.45}
+.pi-live-badge{display:inline-flex;align-items:center;gap:6px;border:1px solid #2e425e;background:#0b192a;border-radius:999px;padding:6px 9px;font-size:7px;font-weight:800;color:#b9c7d9;white-space:nowrap}
+.pi-live-dot{width:7px;height:7px;border-radius:50%;background:#7e8da2;box-shadow:0 0 0 3px rgba(126,141,162,.12)}
+.pi-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:11px 14px;border-bottom:1px solid #17263a;background:#08131f;overflow:auto}
+.pi-periods,.pi-dims{display:flex;gap:5px;overflow:auto;scrollbar-width:none}.pi-periods::-webkit-scrollbar,.pi-dims::-webkit-scrollbar{display:none}
+.pi-chip{appearance:none;border:1px solid #263951;background:#0a1725;color:#91a0b4;border-radius:8px;padding:7px 10px;font-size:7px;font-weight:800;white-space:nowrap}
+.pi-chip.active{border-color:#6f4ed3;background:#24183f;color:#e6dbff}
+.pi-overview{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:12px 14px}
+.pi-kpi{border:1px solid #1f3047;background:#08131f;border-radius:12px;padding:11px;min-width:0}
+.pi-kpi span{display:block;color:#7f8fa5;font-size:6.5px;text-transform:uppercase;letter-spacing:.06em}.pi-kpi b{display:block;margin-top:4px;font-size:13px;color:#f0f4fa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pi-kpi small{display:block;margin-top:3px;color:#63738a;font-size:6.5px}
+.pi-policy{margin:0 14px 12px;padding:10px 11px;border:1px solid #2b3650;background:#0b1422;border-radius:11px;display:flex;align-items:flex-start;gap:9px}
+.pi-policy-icon{width:26px;height:26px;border:1px solid #33465f;border-radius:8px;display:flex;align-items:center;justify-content:center;flex:0 0 auto;color:#9ba9bd}
+.pi-policy b{font-size:8px;color:#dbe4ef}.pi-policy p{margin:3px 0 0;color:#7e8da2;font-size:7px;line-height:1.45}
+.pi-table-wrap{padding:0 14px 14px;overflow:auto}
+.pi-table{width:100%;border-collapse:separate;border-spacing:0 6px;min-width:640px}
+.pi-table th{padding:0 9px 3px;color:#6f8097;font-size:6.5px;text-align:left;text-transform:uppercase;letter-spacing:.06em}
+.pi-table td{padding:10px 9px;background:#08131f;border-top:1px solid #1d2e44;border-bottom:1px solid #1d2e44;font-size:8px;color:#d9e1eb}
+.pi-table td:first-child{border-left:1px solid #1d2e44;border-radius:10px 0 0 10px}.pi-table td:last-child{border-right:1px solid #1d2e44;border-radius:0 10px 10px 0}
+.pi-group{display:flex;align-items:center;gap:8px}.pi-group-mark{width:7px;height:7px;border-radius:50%;background:#56677d}.pi-group b{font-size:8px}.pi-group small{display:block;color:#718198;font-size:6.5px;margin-top:2px}
+.pi-evidence{display:inline-flex;align-items:center;border-radius:999px;padding:5px 7px;font-size:6.5px;font-weight:900;letter-spacing:.03em;border:1px solid #334158;background:#111a28;color:#a7b3c4}
+.pi-evidence.promising{border-color:#24553f;background:#0c261c;color:#8bd8b2}.pi-evidence.candidate{border-color:#67424b;background:#29171c;color:#f0a0b1}.pi-evidence.observe{border-color:#5c5330;background:#241f0f;color:#dccd83}.pi-evidence.insufficient{border-color:#354154;background:#111927;color:#8493a7}
+.pi-positive{color:#80d6aa!important}.pi-negative{color:#efa0af!important}.pi-neutral{color:#9eacbf!important}
+.pi-empty{padding:24px 14px;text-align:center;color:#7d8ca1;font-size:8px}.pi-empty b{display:block;color:#d7e0ec;font-size:10px;margin-bottom:5px}
+.pi-foot{padding:10px 14px;border-top:1px solid #17263a;color:#64758c;font-size:6.5px;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
+@media(max-width:700px){
+  .pi-head{padding:13px 12px}.pi-title h3{font-size:13px}.pi-head{flex-direction:column}.pi-live-badge{align-self:flex-start}
+  .pi-toolbar{display:block;padding:9px 10px}.pi-dims{margin-top:6px}
+  .pi-overview{grid-template-columns:1fr 1fr;padding:10px;gap:6px}.pi-kpi{padding:9px}.pi-kpi b{font-size:11px}
+  .pi-policy{margin:0 10px 10px}.pi-table-wrap{padding:0 10px 10px}
+}
+</style>
+
 </head>
 <body>
 <header class="header">
@@ -1385,7 +1423,7 @@ function refreshPaperFastStart(){
 }
 
 function refreshPaperOpenPositions(){
-  if(paperOpenRefreshBusy)return Promise.resolve();
+  if(current!=="trading"||paperOpenRefreshBusy)return Promise.resolve();
   paperOpenRefreshBusy=true;
   /*
    * UI21-LIVE: refresh persisted OPEN state and live mark/P&L together.
@@ -2979,6 +3017,197 @@ function strategyPremiumCard(st){
     ])
   ]);
 }
+
+// V17-PERFORMANCE-INTELLIGENCE-2 — professional read-only analytics UI.
+var performanceIntelUiState={period:"ALL",dimension:"ENTRY_WINDOW_UTC",data:null,busy:false,fingerprint:""};
+
+function performanceIntelEvidenceClass(value){
+  var v=String(value||"").toUpperCase();
+  if(v==="PROMISING")return "promising";
+  if(v==="CANDIDATE_WEAK")return "candidate";
+  if(v==="OBSERVE")return "observe";
+  return "insufficient";
+}
+function performanceIntelEvidenceLabel(value){
+  var v=String(value||"").toUpperCase();
+  if(v==="PROMISING")return "PROMETTEUR";
+  if(v==="CANDIDATE_WEAK")return "CANDIDAT FAIBLE";
+  if(v==="OBSERVE")return "À OBSERVER";
+  return "ÉCHANTILLON INSUFFISANT";
+}
+function performanceIntelMetricClass(value,mode){
+  if(value===null||value===undefined||value==="")return "pi-neutral";
+  var n=Number(value);
+  if(!Number.isFinite(n))return "pi-neutral";
+  if(mode==="pf")return n>1?"pi-positive":n<1?"pi-negative":"pi-neutral";
+  return n>0?"pi-positive":n<0?"pi-negative":"pi-neutral";
+}
+function performanceIntelFmt(value,digits,suffix){
+  if(value===null||value===undefined||value==="")return "—";
+  var n=Number(value);
+  if(!Number.isFinite(n))return String(value);
+  return n.toFixed(digits==null?2:digits)+(suffix||"");
+}
+function performanceIntelDimensionLabel(key){
+  return ({
+    ENTRY_HOUR_UTC:"Heure UTC",
+    ENTRY_WINDOW_UTC:"Fenêtre UTC",
+    SYMBOL:"Actif",
+    STRATEGY:"Stratégie",
+    TIMEFRAME:"Timeframe",
+    SESSION:"Session",
+    REGIME:"Régime",
+    VOLATILITY_REGIME:"Volatilité",
+    EXIT_CONFIG_VERSION:"Config. sortie"
+  })[key]||key;
+}
+function performanceIntelSetPeriod(period){
+  performanceIntelUiState.period=period;
+  performanceIntelUiState.fingerprint="";
+  renderPerformanceIntelligence(true);
+}
+function performanceIntelSetDimension(dimension){
+  performanceIntelUiState.dimension=dimension;
+  renderPerformanceIntelligence(false);
+}
+function performanceIntelTable(data){
+  var dimension=performanceIntelUiState.dimension;
+  var rows=data&&data.segments&&Array.isArray(data.segments[dimension])?data.segments[dimension]:[];
+  if(!rows.length){
+    return h("div",{class:"pi-empty"},[
+      h("b",{},["Aucune donnée fermée pour ce segment"]),
+      "Le moteur n’invente aucune statistique quand l’échantillon est absent."
+    ]);
+  }
+  var table=h("table",{class:"pi-table"},[
+    h("thead",{},[h("tr",{},[
+      h("th",{},[performanceIntelDimensionLabel(dimension)]),
+      h("th",{},["Trades"]),
+      h("th",{},["Win rate"]),
+      h("th",{},["Profit Factor"]),
+      h("th",{},["Expectancy R"]),
+      h("th",{},["P&L net"]),
+      h("th",{},["Drawdown"]),
+      h("th",{},["Evidence"])
+    ])]),
+    h("tbody",{},rows.map(function(row){
+      var m=row.metrics||{};
+      var wr=m.win_rate_pct==null?m.win_rate:m.win_rate_pct;
+      var pf=m.profit_factor;
+      var exp=m.average_realized_rr;
+      var pnl=m.net_pnl;
+      var dd=m.max_drawdown_pct==null?m.max_drawdown:m.max_drawdown_pct;
+      return h("tr",{},[
+        h("td",{},[h("div",{class:"pi-group"},[
+          h("span",{class:"pi-group-mark"},[]),
+          h("div",{},[h("b",{},[String(row.group||"UNKNOWN")]),h("small",{},["Entrées observées"])])
+        ])]),
+        h("td",{},[String(m.closed_trades==null?"0":m.closed_trades)]),
+        h("td",{},[performanceIntelFmt(wr,1,"%")]),
+        h("td",{class:performanceIntelMetricClass(pf,"pf")},[performanceIntelFmt(pf,2,"")]),
+        h("td",{class:performanceIntelMetricClass(exp,"signed")},[performanceIntelFmt(exp,3,"R")]),
+        h("td",{class:performanceIntelMetricClass(pnl,"signed")},[performanceIntelFmt(pnl,2," $")]),
+        h("td",{},[performanceIntelFmt(dd,1,"%")]),
+        h("td",{},[h("span",{class:"pi-evidence "+performanceIntelEvidenceClass(row.evidence)},[
+          performanceIntelEvidenceLabel(row.evidence)
+        ])])
+      ]);
+    }))
+  ]);
+  return h("div",{class:"pi-table-wrap"},[table]);
+}
+function performanceIntelPanel(data){
+  var coverage=data.coverage||{};
+  var policy=data.policy||{};
+  var exitCfg=data.current_exit_config||{};
+  var total=Number(coverage.closed_trades||0);
+  var exitKnown=Number(coverage.exit_config_version_known||0);
+  var volKnown=Number(coverage.volatility_regime_known||0);
+  var exitPct=total>0?Math.round(exitKnown*100/total):0;
+  var volPct=total>0?Math.round(volKnown*100/total):0;
+
+  return h("div",{class:"pi-shell"},[
+    h("div",{class:"pi-head"},[
+      h("div",{class:"pi-head-copy"},[
+        h("div",{class:"pi-eyebrow"},["PERFORMANCE INTELLIGENCE · SERVER DATA"]),
+        h("div",{class:"pi-title"},[h("h3",{},["Où le moteur possède réellement un avantage ?"])]),
+        h("p",{},["Analyse des trades PAPER fermés par contexte d’entrée. Observation uniquement : aucun filtre NO-TRADE n’est appliqué automatiquement."])
+      ]),
+      h("span",{class:"pi-live-badge"},[
+        h("span",{class:"pi-live-dot"},[]),
+        String(policy.mode||"OBSERVATION_ONLY").replaceAll("_"," ")
+      ])
+    ]),
+    h("div",{class:"pi-toolbar"},[
+      h("div",{class:"pi-periods"},["ALL","DAY","WEEK","MONTH","YEAR"].map(function(p){
+        return h("button",{class:"pi-chip "+(performanceIntelUiState.period===p?"active":""),type:"button",onclick:function(){performanceIntelSetPeriod(p)}},[
+          ({ALL:"Tout",DAY:"Jour",WEEK:"Semaine",MONTH:"Mois",YEAR:"Année"})[p]
+        ]);
+      })),
+      h("div",{class:"pi-dims"},(data.dimensions||[]).map(function(d){
+        return h("button",{class:"pi-chip "+(performanceIntelUiState.dimension===d?"active":""),type:"button",onclick:function(){performanceIntelSetDimension(d)}},[
+          performanceIntelDimensionLabel(d)
+        ]);
+      }))
+    ]),
+    h("div",{class:"pi-overview"},[
+      h("div",{class:"pi-kpi"},[h("span",{},["Trades fermés"]),h("b",{},[String(total)]),h("small",{},["PAPER persisté"])]),
+      h("div",{class:"pi-kpi"},[h("span",{},["Config sortie tracée"]),h("b",{},[exitPct+"%"]),h("small",{},[exitKnown+" / "+total+" trades"])]),
+      h("div",{class:"pi-kpi"},[h("span",{},["Volatilité tracée"]),h("b",{},[volPct+"%"]),h("small",{},[volKnown+" / "+total+" trades"])]),
+      h("div",{class:"pi-kpi"},[h("span",{},["Baseline sortie"]),h("b",{},["1R · 1.5R · 0.75R"]),h("small",{},[(exitCfg.time_stop_minutes||300)+" min"])]),
+    ]),
+    h("div",{class:"pi-policy"},[
+      h("div",{class:"pi-policy-icon",html:iconSvg("scanner")},[]),
+      h("div",{},[
+        h("b",{},["Pipeline de validation protégé"]),
+        h("p",{},[
+          "Découverte ≥ "+String(policy.discovery_min_sample||20)+" trades · candidat ≥ "+String(policy.candidate_min_sample||30)+
+          " · validation ≥ "+String(policy.validation_min_sample||50)+
+          " · confirmation OOS obligatoire. Un segment faible reste CANDIDATE_FILTER tant qu’il n’est pas validé."
+        ])
+      ])
+    ]),
+    performanceIntelTable(data),
+    h("div",{class:"pi-foot"},[
+      h("span",{},["Version: "+String(data.validation||"—")]),
+      h("span",{},["PAPER ONLY · aucune exécution broker · aucune performance inventée"])
+    ])
+  ]);
+}
+function renderPerformanceIntelligence(forceFetch){
+  var mount=byId("performance-intelligence-live");
+  if(!mount)return;
+  if(performanceIntelUiState.data&&!forceFetch){
+    clear(mount);
+    mount.appendChild(performanceIntelPanel(performanceIntelUiState.data));
+    return;
+  }
+  if(performanceIntelUiState.busy)return;
+  performanceIntelUiState.busy=true;
+  if(!performanceIntelUiState.data){
+    clear(mount);mount.appendChild(loading("Analyse des performances par contexte…"));
+  }
+  api("/api/v1/paper/performance/intelligence?period="+encodeURIComponent(performanceIntelUiState.period)).then(function(r){
+    if(!r.ok||!r.data){
+      clear(mount);
+      mount.appendChild(emptyState("Performance Intelligence indisponible",errorMessage(r)));
+      return;
+    }
+    performanceIntelUiState.data=r.data;
+    performanceIntelUiState.fingerprint=stableUiFingerprint(r.data);
+    var dims=Array.isArray(r.data.dimensions)?r.data.dimensions:[];
+    if(dims.length&&dims.indexOf(performanceIntelUiState.dimension)<0)performanceIntelUiState.dimension=dims[0];
+    clear(mount);
+    mount.appendChild(performanceIntelPanel(r.data));
+  }).finally(function(){performanceIntelUiState.busy=false});
+}
+function performanceIntelligenceProfessionalCard(){
+  var wrap=h("div",{id:"performance-intelligence-live"},[loading("Analyse des performances par contexte…")]);
+  setTimeout(function(){renderPerformanceIntelligence(false)},0);
+  return wrap;
+}
+
+
 var strategyAutoRefreshLast=0;
 var strategyAutoRefreshBusy=false;
 var strategyRegistryFingerprint="";
@@ -3045,6 +3274,7 @@ function renderStrategies(preserveViewport){
     strategies.forEach(function(st){g.appendChild(strategyPremiumCard(st))});
     host.appendChild(g);
 
+    host.appendChild(performanceIntelligenceProfessionalCard());
     host.appendChild(strategyPerformanceMatrix());
     host.appendChild(adaptiveEdgeImpactValidation());
     host.appendChild(adaptivePolicyCalibration());
@@ -4138,6 +4368,7 @@ function renderHelpGlossary(){
 <!-- V17-UI16 · CHANGE-AWARE NO-FLICKER AUTO REFRESH -->
 <!-- V17-UI24 · ULTRA LIGHTWEIGHT TRADING FIRST · LAZY ADVANCED VIEWS · PAPER ONLY -->
 <!-- V17-UI24 CRITICAL PATH: SIGNALS + OPEN POSITIONS FIRST; ADVANCED ANALYTICS LAZY -->
+<!-- V17-PERFORMANCE-INTELLIGENCE-2 · PROFESSIONAL OBSERVATION DASHBOARD · PAPER ONLY -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

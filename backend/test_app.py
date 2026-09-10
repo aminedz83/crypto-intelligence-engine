@@ -10363,3 +10363,28 @@ class PerformanceIntelligenceProfessionalUiV17Tests(unittest.TestCase):
         self.assertIn("Performance Intelligence indisponible", self.html)
         self.assertIn("aucune performance inventée", self.html)
 
+
+
+class PerformanceIntelligenceProfessionalUiFix3V17Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_fix3_marker_exists(self):
+        self.assertIn("V17-PERFORMANCE-INTELLIGENCE-2-FIX3", self.html)
+
+    def test_win_rate_uses_backend_percent_contract(self):
+        self.assertIn("var wr=m.win_rate_percent;", self.html)
+        self.assertNotIn("win_rate_pct", self.html)
+
+    def test_drawdown_uses_backend_percent_contract(self):
+        self.assertIn("var dd=m.max_drawdown_percent;", self.html)
+        self.assertNotIn("max_drawdown_pct", self.html)
+
+    def test_drawdown_does_not_fallback_to_dollar_metric(self):
+        self.assertNotIn("m.max_drawdown:m.max_drawdown_pct", self.html)
+
+    def test_exit_configuration_is_explicit_analysis_dimension(self):
+        self.assertIn('EXIT_CONFIG_VERSION:"Version de sortie"', self.html)
+        self.assertIn("séparer les anciennes configurations", self.html)
+

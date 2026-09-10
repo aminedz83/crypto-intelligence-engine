@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from typing import Optional
 
 import httpx
 from fastapi.testclient import TestClient
@@ -10148,3 +10149,152 @@ class V17UI24UltraLightweightTradingFirstTests(unittest.TestCase):
     def test_ui24_remains_paper_only(self):
         self.assertIn("PAPER ONLY", self.html)
         self.assertIn("CRITICAL PATH", self.html)
+
+# ---------------- V17-PERFORMANCE-INTELLIGENCE-1 ----------------
+class PerformanceIntelligenceV17Tests(unittest.TestCase):
+    def _trade(
+        self,
+        hour: int,
+        close_price: str = "102",
+        setup_context: Optional[str] = None,
+    ):
+        opened = datetime(2026, 9, 1, hour, 0, tzinfo=timezone.utc)
+        return {
+            "position_id": f"p-{hour}-{close_price}",
+            "symbol": "BTC-USD",
+            "side": "LONG",
+            "entry": Decimal("100"),
+            "close_price": Decimal(close_price),
+            "size": Decimal("1"),
+            "risk_money": Decimal("2"),
+            "opened_at": opened,
+            "closed_at": opened + timedelta(hours=1),
+            "source": "strategy:SMC@1",
+            "quote_to_usd": None,
+            "strategy_id": "SMC",
+            "strategy_version": "1",
+            "timeframe": "5m",
+            "session": "24_7",
+            "market_regime": "TREND",
+            "setup_context": setup_context,
+        }
+
+    def test_smart_exit_baseline_version_is_explicit(self):
+        self.assertEqual(
+            main.SMART_EXIT_CONFIG_VERSION,
+            "SMART_EXIT_BASELINE_1R_1P5R_0P75R_5H_V1",
+        )
+
+    def test_original_smart_exit_parameters_remain_frozen(self):
+        self.assertEqual(main.SMART_EXIT_BREAKEVEN_R, Decimal("1"))
+        self.assertEqual(main.SMART_EXIT_TRAILING_ACTIVATION_R, Decimal("1.5"))
+        self.assertEqual(main.SMART_EXIT_TRAILING_DISTANCE_R, Decimal("0.75"))
+        self.assertEqual(main.SMART_EXIT_TIME_STOP_MINUTES, 300)
+
+    def test_runtime_context_captures_entry_hour_and_exit_version(self):
+        raw = main.performance_setup_context_with_runtime_metadata(
+            None, datetime(2026, 9, 1, 13, 4, tzinfo=timezone.utc)
+        )
+        parsed = json.loads(raw)
+        self.assertEqual(parsed["entry_hour_utc"], 13)
+        self.assertEqual(parsed["exit_config_version"], main.SMART_EXIT_CONFIG_VERSION)
+
+    def test_runtime_context_preserves_existing_fields(self):
+        raw = main.performance_setup_context_with_runtime_metadata(
+            '{"detector":"x"}',
+            datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc),
+            "EXPANSION",
+        )
+        parsed = json.loads(raw)
+        self.assertEqual(parsed["detector"], "x")
+        self.assertEqual(parsed["volatility_regime"], "EXPANSION")
+
+    def test_runtime_context_keeps_legacy_non_json_explicit(self):
+        raw = main.performance_setup_context_with_runtime_metadata(
+            "legacy-text",
+            datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(json.loads(raw)["legacy_context"], "legacy-text")
+
+    def test_entry_hour_requires_aware_datetime(self):
+        naive = datetime(2026, 9, 1, 9, 0)
+        self.assertIsNone(main.paper_entry_hour_utc(naive))
+
+    def test_entry_hour_normalizes_to_utc(self):
+        stamp = datetime.fromisoformat("2026-09-01T09:00:00-04:00")
+        self.assertEqual(main.paper_entry_hour_utc(stamp), 13)
+
+    def test_entry_window_boundaries(self):
+        self.assertEqual(main.paper_entry_window_utc(0), "00-04")
+        self.assertEqual(main.paper_entry_window_utc(8), "08-12")
+        self.assertEqual(main.paper_entry_window_utc(20), "16-21")
+        self.assertEqual(main.paper_entry_window_utc(23), "21-24")
+
+    def test_entry_window_rejects_invalid_hour(self):
+        self.assertIsNone(main.paper_entry_window_utc(-1))
+        self.assertIsNone(main.paper_entry_window_utc(24))
+
+    def test_intelligence_small_sample_is_insufficient(self):
+        metrics = {"closed_trades": 19, "average_realized_rr": "-1", "profit_factor": "0.1"}
+        self.assertEqual(
+            main.paper_performance_intelligence_label(metrics),
+            "INSUFFICIENT_SAMPLE",
+        )
+
+    def test_intelligence_20_to_29_is_observe_only(self):
+        metrics = {"closed_trades": 25, "average_realized_rr": "-1", "profit_factor": "0.1"}
+        self.assertEqual(main.paper_performance_intelligence_label(metrics), "OBSERVE")
+
+    def test_intelligence_negative_30_plus_becomes_candidate_not_block(self):
+        metrics = {"closed_trades": 30, "average_realized_rr": "-0.2", "profit_factor": "0.8"}
+        self.assertEqual(
+            main.paper_performance_intelligence_label(metrics),
+            "CANDIDATE_WEAK",
+        )
+
+    def test_intelligence_positive_30_plus_is_promising(self):
+        metrics = {"closed_trades": 30, "average_realized_rr": "0.2", "profit_factor": "1.3"}
+        self.assertEqual(main.paper_performance_intelligence_label(metrics), "PROMISING")
+
+    def test_builder_groups_by_entry_hour_not_close_hour(self):
+        rows = [self._trade(8), self._trade(8), self._trade(12)]
+        segments = main.build_paper_performance_intelligence(rows, Decimal("1000"))
+        hour_counts = {
+            item["group"]: item["metrics"]["closed_trades"]
+            for item in segments["ENTRY_HOUR_UTC"]
+        }
+        self.assertEqual(hour_counts["08"], 2)
+        self.assertEqual(hour_counts["12"], 1)
+
+    def test_builder_exposes_predeclared_entry_windows(self):
+        rows = [self._trade(8), self._trade(17)]
+        segments = main.build_paper_performance_intelligence(rows, Decimal("1000"))
+        groups = {item["group"] for item in segments["ENTRY_WINDOW_UTC"]}
+        self.assertEqual(groups, {"08-12", "16-21"})
+
+    def test_builder_reads_volatility_and_exit_config_from_persisted_context(self):
+        ctx = json.dumps(
+            {
+                "volatility_regime": "EXPANSION",
+                "exit_config_version": "BASELINE-X",
+            }
+        )
+        segments = main.build_paper_performance_intelligence(
+            [self._trade(8, setup_context=ctx)], Decimal("1000")
+        )
+        self.assertEqual(segments["VOLATILITY_REGIME"][0]["group"], "EXPANSION")
+        self.assertEqual(segments["EXIT_CONFIG_VERSION"][0]["group"], "BASELINE-X")
+
+    def test_builder_never_sets_automatic_no_trade(self):
+        rows = [self._trade(8, close_price="98") for _ in range(30)]
+        segments = main.build_paper_performance_intelligence(rows, Decimal("1000"))
+        for items in segments.values():
+            for item in items:
+                self.assertFalse(item["automatic_no_trade"])
+
+    def test_endpoint_is_observation_only_and_warns_about_session_scope(self):
+        source = inspect.getsource(main.get_paper_performance_intelligence)
+        self.assertIn('"mode": "OBSERVATION_ONLY"', source)
+        self.assertIn('"automatic_no_trade": False', source)
+        self.assertIn("outside-window performance cannot be inferred", source)
+

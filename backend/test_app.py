@@ -9451,35 +9451,35 @@ class V17SmartExitConstantsTests(unittest.TestCase):
 
 
 class V17SessionAllPathsTests(unittest.TestCase):
-    """Session filter must block entries on ALL orchestrators, not just SMC."""
+    """V17 24H PAPER observation supersedes the legacy crypto session gate."""
 
     def test_session_filter_in_smc_orchestrator(self):
-        src = open("main.py").read()
-        # find run_server_auto_paper_generation_once and check session filter
-        idx = src.index("async def run_server_auto_paper_generation_once")
-        block = src[idx:idx + 500]
-        self.assertIn("is_crypto_session_active", block)
+        source = inspect.getsource(main.run_server_auto_paper_generation_once)
+        self.assertNotIn("if not is_crypto_session_active", source)
+        self.assertTrue(main.CRYPTO_24H_PAPER_OBSERVATION_ENABLED)
 
     def test_session_filter_in_trend_pullback_orchestrator(self):
-        src = open("main.py").read()
-        idx = src.index("async def run_trend_pullback_paper_generation_once")
-        block = src[idx:idx + 500]
-        self.assertIn("is_crypto_session_active", block)
+        source = inspect.getsource(main.run_trend_pullback_paper_generation_once)
+        self.assertNotIn("if not is_crypto_session_active", source)
+        self.assertTrue(main.CRYPTO_24H_PAPER_OBSERVATION_ENABLED)
 
     def test_session_filter_in_breakout_orchestrator(self):
-        src = open("main.py").read()
-        idx = src.index("async def run_breakout_expansion_paper_generation_once")
-        block = src[idx:idx + 500]
-        self.assertIn("is_crypto_session_active", block)
+        source = inspect.getsource(main.run_breakout_expansion_paper_generation_once)
+        self.assertNotIn("if not is_crypto_session_active", source)
+        self.assertTrue(main.CRYPTO_24H_PAPER_OBSERVATION_ENABLED)
 
     def test_cooldown_in_all_orchestrators(self):
-        src = open("main.py").read()
-        for func in ("run_server_auto_paper_generation_once",
-                     "run_trend_pullback_paper_generation_once",
-                     "run_breakout_expansion_paper_generation_once"):
-            idx = src.index(f"async def {func}")
-            block = src[idx:idx + 800]
-            self.assertIn("is_cooldown_active", block, f"cooldown missing in {func}")
+        for func in (
+            main.run_server_auto_paper_generation_once,
+            main.run_trend_pullback_paper_generation_once,
+            main.run_breakout_expansion_paper_generation_once,
+        ):
+            source = inspect.getsource(func)
+            self.assertIn(
+                "is_cooldown_active",
+                source,
+                f"cooldown missing in {func.__name__}",
+            )
 
 
 class V17AttributionTests(unittest.TestCase):
@@ -9715,22 +9715,14 @@ class V17DailyBiasInOrchestratorsTests(unittest.TestCase):
         self.assertIn("DAILY_BIAS", block)
 
     def test_daily_bias_in_trend_pullback_orchestrator(self):
-        src = open("main.py").read()
-        idx = src.index(
-            "async def run_trend_pullback_paper_generation_once"
-        )
-        block = src[idx:idx + 2500]
-        self.assertIn("get_daily_bias", block)
-        self.assertIn("daily_bias_allows", block)
+        source = inspect.getsource(main.run_trend_pullback_paper_generation_once)
+        self.assertIn("get_daily_bias", source)
+        self.assertIn("daily_bias_allows", source)
 
     def test_daily_bias_in_breakout_orchestrator(self):
-        src = open("main.py").read()
-        idx = src.index(
-            "async def run_breakout_expansion_paper_generation_once"
-        )
-        block = src[idx:idx + 2500]
-        self.assertIn("get_daily_bias", block)
-        self.assertIn("daily_bias_allows", block)
+        source = inspect.getsource(main.run_breakout_expansion_paper_generation_once)
+        self.assertIn("get_daily_bias", source)
+        self.assertIn("daily_bias_allows", source)
 
     def test_daily_bias_cache_constant(self):
         self.assertTrue(hasattr(main, "DAILY_BIAS_CACHE_SECONDS"))
@@ -9775,20 +9767,12 @@ class V17SymbolPerfInOrchestratorsTests(unittest.TestCase):
         self.assertIn("SYMBOL_LOSING_RECORD", block)
 
     def test_symbol_perf_in_trend_pullback(self):
-        src = open("main.py").read()
-        idx = src.index(
-            "async def run_trend_pullback_paper_generation_once"
-        )
-        block = src[idx:idx + 3000]
-        self.assertIn("is_symbol_performance_allowed", block)
+        source = inspect.getsource(main.run_trend_pullback_paper_generation_once)
+        self.assertIn("is_symbol_performance_allowed", source)
 
     def test_symbol_perf_in_breakout(self):
-        src = open("main.py").read()
-        idx = src.index(
-            "async def run_breakout_expansion_paper_generation_once"
-        )
-        block = src[idx:idx + 3000]
-        self.assertIn("is_symbol_performance_allowed", block)
+        source = inspect.getsource(main.run_breakout_expansion_paper_generation_once)
+        self.assertIn("is_symbol_performance_allowed", source)
 # ==================== V17-MT5-MULTIBROKER-2 — full broker catalogue tests =====
 
 
@@ -10296,7 +10280,8 @@ class PerformanceIntelligenceV17Tests(unittest.TestCase):
         source = inspect.getsource(main.get_paper_performance_intelligence)
         self.assertIn('"mode": "OBSERVATION_ONLY"', source)
         self.assertIn('"automatic_no_trade": False', source)
-        self.assertIn("outside-window performance cannot be inferred", source)
+        self.assertIn('"mode": "PAPER_24H_OBSERVATION"', source)
+        self.assertIn('"active_for_new_crypto_paper_entries": False', source)
 
 
 
@@ -10386,18 +10371,22 @@ class PerformanceIntelligenceProfessionalUiFix3V17Tests(unittest.TestCase):
 
     def test_exit_configuration_is_explicit_analysis_dimension(self):
         self.assertIn('EXIT_CONFIG_VERSION:"Version de sortie"', self.html)
-        self.assertIn("séparer les anciennes configurations", self.html)
+        self.assertIn("séparant les versions de sortie", self.html)
 
 
 
 class GlobalMarketRegime24HPaperIntelligenceV17Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.source = MAIN.read_text(encoding="utf-8")
+        cls.source = Path(main.__file__).read_text(encoding="utf-8")
         cls.html = INDEX.read_text(encoding="utf-8")
 
     def test_global_regime_version_is_explicit(self):
-        self.assertIn('GLOBAL_MARKET_REGIME_INTELLIGENCE_VERSION = "GLOBAL_MARKET_REGIME_INTELLIGENCE_V1"', self.source)
+        self.assertIn(
+            'GLOBAL_MARKET_REGIME_INTELLIGENCE_VERSION = "'
+            '"GLOBAL_MARKET_REGIME_INTELLIGENCE_V1"',
+            self.source,
+        )
 
     def test_crypto_24h_paper_observation_is_explicit(self):
         self.assertIn("CRYPTO_24H_PAPER_OBSERVATION_ENABLED = True", self.source)
@@ -10419,7 +10408,10 @@ class GlobalMarketRegime24HPaperIntelligenceV17Tests(unittest.TestCase):
         self.assertIn("GLOBAL_MARKET_BREADTH_MIN_COMPONENTS = 20", self.source)
 
     def test_risk_off_requires_breadth_and_btc_bearish(self):
-        self.assertIn('down_pct >= GLOBAL_MARKET_RISK_OFF_DOWN_PCT and btc_bias == "BEARISH"', self.source)
+        self.assertIn(
+            'down_pct >= GLOBAL_MARKET_RISK_OFF_DOWN_PCT and btc_bias == "BEARISH"',
+            self.source,
+        )
 
     def test_unknown_is_preserved_when_evidence_is_unavailable(self):
         self.assertIn('"regime": "UNKNOWN"', self.source)
@@ -10447,7 +10439,10 @@ class GlobalMarketRegime24HPaperIntelligenceV17Tests(unittest.TestCase):
         self.assertIn("await enrich_crypto_request_with_global_intelligence(request)", self.source)
 
     def test_24h_windows_remain_predeclared(self):
-        for window in ['"00-04"', '"04-08"', '"08-12"', '"12-16"', '"16-21"', '"21-24"']:
+        for window in [
+            '"00-04"', '"04-08"', '"08-12"',
+            '"12-16"', '"16-21"', '"21-24"',
+        ]:
             self.assertIn(window, self.source)
 
     def test_professional_ui_mentions_24h_global_context(self):

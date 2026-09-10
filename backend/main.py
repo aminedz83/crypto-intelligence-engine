@@ -1,3 +1,4 @@
+# V17-PERFORMANCE-INTELLIGENCE-1 — observation-only entry-context analytics; no auto NO-TRADE.
 # V17-MT5-MULTIBROKER-2 — full broker catalogue + canonical mapping; paper-only compatibility.
 # V17-ENERGY-UI2 — WTI + Brent real Twelve Data market-data integration; paper sizing fail-closed.
 # CI395 recovery marker: cumulative V16-M5B25B-FIX2 backend baseline.
@@ -3639,6 +3640,7 @@ SMART_EXIT_BREAKEVEN_R = Decimal("1")
 SMART_EXIT_TRAILING_ACTIVATION_R = Decimal("1.5")
 SMART_EXIT_TRAILING_DISTANCE_R = Decimal("0.75")
 SMART_EXIT_TIME_STOP_MINUTES = 300  # 5 hours
+SMART_EXIT_CONFIG_VERSION = "SMART_EXIT_BASELINE_1R_1P5R_0P75R_5H_V1"
 
 # Session filter: only trade during London and NY sessions (UTC).
 # Outside these windows, setups are lower quality (less institutional flow).
@@ -3745,6 +3747,169 @@ async def is_symbol_performance_allowed(symbol: str) -> bool:
         return allowed
     except Exception:  # noqa: BLE001
         return True  # fail-open
+
+
+PERFORMANCE_INTELLIGENCE_VERSION = "SERVER_PERFORMANCE_INTELLIGENCE_V1"
+PERFORMANCE_INTELLIGENCE_DISCOVERY_MIN_SAMPLE = 20
+PERFORMANCE_INTELLIGENCE_CANDIDATE_MIN_SAMPLE = 30
+PERFORMANCE_INTELLIGENCE_VALIDATION_MIN_SAMPLE = 50
+PERFORMANCE_INTELLIGENCE_ENTRY_WINDOWS = (
+    (0, 4, "00-04"),
+    (4, 8, "04-08"),
+    (8, 12, "08-12"),
+    (12, 16, "12-16"),
+    (16, 21, "16-21"),
+    (21, 24, "21-24"),
+)
+
+
+def performance_setup_context_with_runtime_metadata(
+    raw_context: Optional[str],
+    opened_at: datetime,
+    volatility_regime: Optional[object] = None,
+) -> str:
+    """Persist entry-time analytics metadata without reconstructing history later.
+
+    Existing JSON object fields are preserved. Non-object legacy context is kept in
+    ``legacy_context``. The smart-exit version is captured at entry and never inferred
+    from a later configuration.
+    """
+    context: Dict[str, object] = {}
+    if raw_context:
+        try:
+            parsed = json.loads(raw_context)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            context.update(parsed)
+        else:
+            context["legacy_context"] = str(raw_context)
+
+    entry_stamp = opened_at
+    if entry_stamp.tzinfo is None:
+        entry_stamp = entry_stamp.replace(tzinfo=timezone.utc)
+    else:
+        entry_stamp = entry_stamp.astimezone(timezone.utc)
+
+    context.setdefault("entry_hour_utc", entry_stamp.hour)
+    context.setdefault("exit_config_version", SMART_EXIT_CONFIG_VERSION)
+    if volatility_regime is not None and "volatility_regime" not in context:
+        context["volatility_regime"] = str(volatility_regime)
+    return json.dumps(context, default=str, sort_keys=True)
+
+
+def paper_parse_setup_context(raw_context: object) -> Dict[str, object]:
+    """Read persisted entry context. Invalid/legacy content stays explicitly unknown."""
+    if not isinstance(raw_context, str) or not raw_context.strip():
+        return {}
+    try:
+        parsed = json.loads(raw_context)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def paper_entry_hour_utc(opened_at: object) -> Optional[int]:
+    """Return the persisted entry hour in UTC; never infer from close time/current time."""
+    if not isinstance(opened_at, datetime):
+        return None
+    stamp = opened_at
+    if stamp.tzinfo is None:
+        return None
+    return stamp.astimezone(timezone.utc).hour
+
+
+def paper_entry_window_utc(hour: object) -> Optional[str]:
+    """Map an entry hour to a small, predeclared UTC window to limit data mining."""
+    try:
+        value = int(hour)
+    except (TypeError, ValueError):
+        return None
+    if value < 0 or value > 23:
+        return None
+    for start, end, label in PERFORMANCE_INTELLIGENCE_ENTRY_WINDOWS:
+        if start <= value < end:
+            return label
+    return None
+
+
+def paper_performance_intelligence_label(metrics: Dict[str, object]) -> str:
+    """Discovery label only. It can never authorize an automatic NO-TRADE."""
+    trades = int(str(metrics.get("closed_trades") or 0))
+    if trades < PERFORMANCE_INTELLIGENCE_DISCOVERY_MIN_SAMPLE:
+        return "INSUFFICIENT_SAMPLE"
+    if trades < PERFORMANCE_INTELLIGENCE_CANDIDATE_MIN_SAMPLE:
+        return "OBSERVE"
+
+    expectancy_r = _edge_decimal(metrics.get("average_realized_rr"))
+    profit_factor_raw = metrics.get("profit_factor")
+    profit_factor = (
+        _edge_decimal(profit_factor_raw)
+        if profit_factor_raw is not None
+        else None
+    )
+    if expectancy_r < 0 and (profit_factor is None or profit_factor < Decimal("1")):
+        return "CANDIDATE_WEAK"
+    if expectancy_r > 0 and profit_factor is not None and profit_factor > Decimal("1"):
+        return "PROMISING"
+    return "OBSERVE"
+
+
+def build_paper_performance_intelligence(
+    closed_positions: List[Dict[str, object]],
+    initial_capital: Decimal,
+) -> Dict[str, List[Dict[str, object]]]:
+    """Independent evidence breakdowns; no cross-product mining and no trade blocking."""
+    def entry_hour_label(row: Dict[str, object]) -> str:
+        hour = paper_entry_hour_utc(row.get("opened_at"))
+        return f"{hour:02d}" if hour is not None else "UNKNOWN"
+
+    dimensions: Dict[str, Callable[[Dict[str, object]], str]] = {
+        "ENTRY_HOUR_UTC": entry_hour_label,
+        "ENTRY_WINDOW_UTC": lambda row: (
+            paper_entry_window_utc(paper_entry_hour_utc(row.get("opened_at"))) or "UNKNOWN"
+        ),
+        "SYMBOL": lambda row: str(row.get("symbol") or "UNKNOWN").upper(),
+        "STRATEGY": lambda row: str(
+            row.get("strategy_id")
+            or paper_strategy_from_source(row.get("source")).get("strategy_id")
+            or "UNKNOWN"
+        ),
+        "TIMEFRAME": lambda row: str(row.get("timeframe") or "UNKNOWN"),
+        "SESSION": lambda row: str(row.get("session") or "UNKNOWN"),
+        "REGIME": lambda row: str(row.get("market_regime") or "UNKNOWN"),
+        "VOLATILITY_REGIME": lambda row: str(
+            paper_parse_setup_context(row.get("setup_context")).get(
+                "volatility_regime", "UNKNOWN"
+            )
+        ),
+        "EXIT_CONFIG_VERSION": lambda row: str(
+            paper_parse_setup_context(row.get("setup_context")).get(
+                "exit_config_version", "UNKNOWN"
+            )
+        ),
+    }
+
+    output: Dict[str, List[Dict[str, object]]] = {}
+    for dimension, key_fn in dimensions.items():
+        grouped: Dict[str, List[Dict[str, object]]] = {}
+        for row in closed_positions:
+            key = key_fn(row)
+            grouped.setdefault(key, []).append(row)
+        items: List[Dict[str, object]] = []
+        for key in sorted(grouped):
+            metrics = calculate_paper_performance_metrics(grouped[key], initial_capital)
+            items.append(
+                {
+                    "group": key,
+                    "metrics": metrics,
+                    "evidence": paper_performance_intelligence_label(metrics),
+                    "automatic_no_trade": False,
+                }
+            )
+        output[dimension] = items
+    return output
+
 
 # Peak price tracking for trailing stop (in-memory, per position).
 _position_peaks: Dict[str, Decimal] = {}
@@ -4467,6 +4632,7 @@ async def run_server_auto_paper_generation_once() -> Dict[str, int]:
                     "setup_state": detector.get("setup_state"),
                     "direction": detector.get("direction"),
                     "latest_closed_timestamp": detector.get("latest_closed_timestamp"),
+                    "volatility_regime": regime_snapshot.get("volatility"),
                 },
                 default=str,
                 sort_keys=True,
@@ -4736,6 +4902,10 @@ async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
         )
     validate_paper_position_create(req)
     now = utcnow()
+    enriched_setup_context = performance_setup_context_with_runtime_metadata(
+        req.performance_setup_context,
+        req.opened_at,
+    )
     values = {
         "position_id": req.position_id, "symbol": req.symbol.upper(), "side": req.side,
         "status": "OPEN", "entry": req.entry, "stop_loss": req.stop_loss,
@@ -4761,7 +4931,7 @@ async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
                 req.performance_timeframe,
                 req.performance_session,
                 req.performance_market_regime,
-                req.performance_setup_context,
+                enriched_setup_context,
             )
             if any(value is not None for value in context_values):
                 await conn.execute(
@@ -4772,7 +4942,7 @@ async def create_paper_position(req: PaperPositionCreate) -> Dict[str, object]:
                         timeframe=req.performance_timeframe,
                         session=req.performance_session,
                         market_regime=req.performance_market_regime,
-                        setup_context=req.performance_setup_context,
+                        setup_context=enriched_setup_context,
                         captured_at=now,
                     ).on_conflict_do_nothing(index_elements=["position_id"])
                 )
@@ -6556,6 +6726,118 @@ async def get_paper_performance_matrix(period: str = "ALL") -> Dict[str, object]
         "paper_only": True,
         "execution": False,
     }
+
+
+@api_router.get("/paper/performance/intelligence")
+async def get_paper_performance_intelligence(period: str = "ALL") -> Dict[str, object]:
+    """Observation-only entry-context analytics from persisted CLOSED paper trades."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+    normalized_period = period.upper()
+    try:
+        period_start = paper_performance_period_start(normalized_period)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "INVALID", "reason": "unsupported performance period"},
+        ) from exc
+
+    try:
+        async with engine.connect() as conn:
+            account_result = await conn.execute(
+                text(
+                    "SELECT initial_capital FROM paper_account "
+                    "WHERE account_id=:account_id"
+                ),
+                {"account_id": PAPER_ACCOUNT_ID},
+            )
+            account = account_result.fetchone()
+            if account is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"status": "UNAVAILABLE", "reason": "paper account not initialized"},
+                )
+            sql = (
+                "SELECT p.position_id, p.symbol, p.side, p.entry, p.close_price, p.size, "
+                "p.risk_money, p.opened_at, p.closed_at, p.source, fx.quote_to_usd, "
+                "ctx.strategy_id, ctx.strategy_version, ctx.timeframe, ctx.session, "
+                "ctx.market_regime, ctx.setup_context "
+                "FROM paper_positions p LEFT JOIN paper_fx_conversion_snapshots fx "
+                "ON fx.position_id=p.position_id AND fx.phase='CLOSE' "
+                "LEFT JOIN paper_position_context ctx ON ctx.position_id=p.position_id "
+                "WHERE p.status='CLOSED' AND p.close_price IS NOT NULL"
+            )
+            params: Dict[str, object] = {}
+            if period_start is not None:
+                sql += " AND p.closed_at>=:period_start"
+                params["period_start"] = period_start
+            sql += " ORDER BY p.opened_at ASC, p.position_id ASC"
+            result = await conn.execute(text(sql), params)
+            rows = [dict(row._mapping) for row in result.fetchall()]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        persistence_state.mark_runtime_error(str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "paper persistence failed"},
+        ) from exc
+
+    initial_capital = Decimal(str(account._mapping["initial_capital"]))
+    segments = build_paper_performance_intelligence(rows, initial_capital)
+    known_exit_config = sum(
+        1
+        for row in rows
+        if paper_parse_setup_context(row.get("setup_context")).get("exit_config_version")
+    )
+    known_volatility = sum(
+        1
+        for row in rows
+        if paper_parse_setup_context(row.get("setup_context")).get("volatility_regime")
+    )
+    return {
+        "status": "OK",
+        "validation": PERFORMANCE_INTELLIGENCE_VERSION,
+        "period": normalized_period,
+        "period_start": period_start.isoformat() if period_start is not None else None,
+        "segments": segments,
+        "dimensions": list(segments.keys()),
+        "coverage": {
+            "closed_trades": len(rows),
+            "exit_config_version_known": known_exit_config,
+            "volatility_regime_known": known_volatility,
+        },
+        "policy": {
+            "mode": "OBSERVATION_ONLY",
+            "automatic_no_trade": False,
+            "discovery_min_sample": PERFORMANCE_INTELLIGENCE_DISCOVERY_MIN_SAMPLE,
+            "candidate_min_sample": PERFORMANCE_INTELLIGENCE_CANDIDATE_MIN_SAMPLE,
+            "validation_min_sample": PERFORMANCE_INTELLIGENCE_VALIDATION_MIN_SAMPLE,
+            "requires_out_of_sample_confirmation": True,
+            "one_filter_change_at_a_time": True,
+        },
+        "current_crypto_entry_scope_utc": {
+            "start_hour": CRYPTO_SESSION_LONDON_START_UTC,
+            "end_hour_exclusive": CRYPTO_SESSION_NY_END_UTC,
+            "note": (
+                "Current crypto session gate limits executed paper evidence to this "
+                "window; outside-window performance cannot be inferred from missing trades."
+            ),
+        },
+        "current_exit_config": {
+            "version": SMART_EXIT_CONFIG_VERSION,
+            "break_even_r": str(SMART_EXIT_BREAKEVEN_R),
+            "trailing_activation_r": str(SMART_EXIT_TRAILING_ACTIVATION_R),
+            "trailing_distance_r": str(SMART_EXIT_TRAILING_DISTANCE_R),
+            "time_stop_minutes": SMART_EXIT_TIME_STOP_MINUTES,
+        },
+        "paper_only": True,
+        "execution": False,
+    }
+
 
 
 # V16-M5B30D — Adaptive Edge Ranking Engine V1.
@@ -13654,7 +13936,12 @@ async def run_trend_pullback_paper_generation_once() -> Dict[str, int]:
             plan["performance_session"] = session_snapshot.get("current_session")
             plan["performance_market_regime"] = regime.get("regime")
             plan["performance_setup_context"] = json.dumps(
-                {"detector": detection}, default=str, sort_keys=True
+                {
+                    "detector": detection,
+                    "volatility_regime": regime.get("volatility"),
+                },
+                default=str,
+                sort_keys=True,
             )
             if plan.get("status") != "ENTRY_NOW":
                 stats["blocked"] += 1
@@ -13916,7 +14203,12 @@ async def run_breakout_expansion_paper_generation_once() -> Dict[str, int]:
             plan["performance_session"] = session_snapshot.get("current_session")
             plan["performance_market_regime"] = regime.get("regime")
             plan["performance_setup_context"] = json.dumps(
-                {"detector": detection}, default=str, sort_keys=True
+                {
+                    "detector": detection,
+                    "volatility_regime": regime.get("volatility"),
+                },
+                default=str,
+                sort_keys=True,
             )
             if plan.get("status") != "ENTRY_NOW":
                 stats["blocked"] += 1

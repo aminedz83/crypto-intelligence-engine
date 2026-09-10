@@ -10383,7 +10383,7 @@ class GlobalMarketRegime24HPaperIntelligenceV17Tests(unittest.TestCase):
 
     def test_global_regime_version_is_explicit(self):
         self.assertIn(
-            'GLOBAL_MARKET_REGIME_INTELLIGENCE_VERSION = "'
+            'GLOBAL_MARKET_REGIME_INTELLIGENCE_VERSION = '
             '"GLOBAL_MARKET_REGIME_INTELLIGENCE_V1"',
             self.source,
         )

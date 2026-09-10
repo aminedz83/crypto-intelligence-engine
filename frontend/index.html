@@ -3058,7 +3058,7 @@ function performanceIntelDimensionLabel(key){
     SESSION:"Session",
     REGIME:"Régime",
     VOLATILITY_REGIME:"Volatilité",
-    EXIT_CONFIG_VERSION:"Version de sortie"
+    EXIT_CONFIG_VERSION:"Version de sortie",DIRECTION:"Direction",GLOBAL_MARKET_REGIME:"Régime global",MARKET_BREADTH:"Breadth marché"
   })[key]||key;
 }
 function performanceIntelSetPeriod(period){
@@ -3131,7 +3131,7 @@ function performanceIntelPanel(data){
       h("div",{class:"pi-head-copy"},[
         h("div",{class:"pi-eyebrow"},["PERFORMANCE INTELLIGENCE · SERVER DATA"]),
         h("div",{class:"pi-title"},[h("h3",{},["Où le moteur possède réellement un avantage ?"])]),
-        h("p",{},["Analyse des trades PAPER fermés par contexte d’entrée. Utilise « Version de sortie » pour séparer les anciennes configurations de la baseline actuelle. Observation uniquement : aucun filtre NO-TRADE n’est appliqué automatiquement."])
+        h("p",{},["Analyse PAPER 24/7 par contexte d’entrée. Le moteur distingue maintenant Direction, Régime global et Breadth marché, tout en séparant les versions de sortie. Observation uniquement : aucun filtre NO-TRADE n’est appliqué automatiquement."])
       ]),
       h("span",{class:"pi-live-badge"},[
         h("span",{class:"pi-live-dot"},[]),
@@ -4370,6 +4370,7 @@ function renderHelpGlossary(){
 <!-- V17-UI24 CRITICAL PATH: SIGNALS + OPEN POSITIONS FIRST; ADVANCED ANALYTICS LAZY -->
 <!-- V17-PERFORMANCE-INTELLIGENCE-2 · PROFESSIONAL OBSERVATION DASHBOARD · PAPER ONLY -->
 <!-- V17-PERFORMANCE-INTELLIGENCE-2-FIX3 · WIN RATE + DRAWDOWN CONTRACT FIX · EXIT CONFIG SPLIT -->
+<!-- V17-GLOBAL-MARKET-REGIME-24H-1 · PROFESSIONAL 24H PAPER OBSERVATION · GLOBAL BREADTH · NO AUTO BLOCK -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

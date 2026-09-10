@@ -3835,7 +3835,18 @@ def paper_entry_window_utc(hour: object) -> Optional[str]:
 
 def paper_performance_intelligence_label(metrics: Dict[str, object]) -> str:
     """Discovery label only. It can never authorize an automatic NO-TRADE."""
-    trades = int(str(metrics.get("closed_trades") or 0))
+    trades_raw = metrics.get("closed_trades")
+    if isinstance(trades_raw, bool):
+        trades = int(trades_raw)
+    elif isinstance(trades_raw, int):
+        trades = trades_raw
+    elif isinstance(trades_raw, (str, bytes, bytearray)):
+        try:
+            trades = int(trades_raw)
+        except (TypeError, ValueError):
+            trades = 0
+    else:
+        trades = 0
     if trades < PERFORMANCE_INTELLIGENCE_DISCOVERY_MIN_SAMPLE:
         return "INSUFFICIENT_SAMPLE"
     if trades < PERFORMANCE_INTELLIGENCE_CANDIDATE_MIN_SAMPLE:

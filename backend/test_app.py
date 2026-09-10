@@ -10298,3 +10298,68 @@ class PerformanceIntelligenceV17Tests(unittest.TestCase):
         self.assertIn('"automatic_no_trade": False', source)
         self.assertIn("outside-window performance cannot be inferred", source)
 
+
+
+# ---------------- V17-PERFORMANCE-INTELLIGENCE-2 UI ----------------
+class PerformanceIntelligenceProfessionalUiV17Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_professional_performance_intelligence_marker_exists(self):
+        self.assertIn("V17-PERFORMANCE-INTELLIGENCE-2", self.html)
+
+    def test_professional_panel_is_mounted_in_strategies(self):
+        self.assertIn("performanceIntelligenceProfessionalCard()", self.html)
+        self.assertIn('id:"performance-intelligence-live"', self.html)
+
+    def test_frontend_consumes_performance_intelligence_endpoint(self):
+        self.assertIn('/api/v1/paper/performance/intelligence?period=', self.html)
+
+    def test_period_filters_match_backend_contract(self):
+        for period in ["ALL", "DAY", "WEEK", "MONTH", "YEAR"]:
+            self.assertIn(period, self.html)
+
+    def test_dimension_filters_include_entry_context(self):
+        for dimension in [
+            "ENTRY_HOUR_UTC",
+            "ENTRY_WINDOW_UTC",
+            "SYMBOL",
+            "STRATEGY",
+            "TIMEFRAME",
+            "SESSION",
+            "REGIME",
+            "VOLATILITY_REGIME",
+            "EXIT_CONFIG_VERSION",
+        ]:
+            self.assertIn(dimension, self.html)
+
+    def test_ui_explicitly_remains_observation_only(self):
+        self.assertIn("OBSERVATION_ONLY", self.html)
+        self.assertIn("aucun filtre NO-TRADE", self.html)
+
+    def test_ui_exposes_candidate_not_automatic_blocking(self):
+        self.assertIn("CANDIDATE_FILTER", self.html)
+        self.assertIn("confirmation OOS obligatoire", self.html)
+
+    def test_ui_shows_baseline_exit_configuration(self):
+        self.assertIn("1R · 1.5R · 0.75R", self.html)
+        self.assertIn("Baseline sortie", self.html)
+
+    def test_ui_exposes_sample_thresholds_from_server_policy(self):
+        self.assertIn("policy.discovery_min_sample", self.html)
+        self.assertIn("policy.candidate_min_sample", self.html)
+        self.assertIn("policy.validation_min_sample", self.html)
+
+    def test_ui_has_mobile_professional_layout(self):
+        self.assertIn("@media(max-width:700px)", self.html)
+        self.assertIn(".pi-overview{grid-template-columns:1fr 1fr", self.html)
+
+    def test_ui_never_labels_data_as_guaranteed_profit(self):
+        self.assertNotIn("GAIN GARANTI", self.html)
+        self.assertNotIn("PROFIT GARANTI", self.html)
+
+    def test_ui_failure_path_does_not_invent_statistics(self):
+        self.assertIn("Performance Intelligence indisponible", self.html)
+        self.assertIn("aucune performance inventée", self.html)
+

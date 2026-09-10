@@ -10388,3 +10388,79 @@ class PerformanceIntelligenceProfessionalUiFix3V17Tests(unittest.TestCase):
         self.assertIn('EXIT_CONFIG_VERSION:"Version de sortie"', self.html)
         self.assertIn("séparer les anciennes configurations", self.html)
 
+
+
+class GlobalMarketRegime24HPaperIntelligenceV17Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = MAIN.read_text(encoding="utf-8")
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_global_regime_version_is_explicit(self):
+        self.assertIn('GLOBAL_MARKET_REGIME_INTELLIGENCE_VERSION = "GLOBAL_MARKET_REGIME_INTELLIGENCE_V1"', self.source)
+
+    def test_crypto_24h_paper_observation_is_explicit(self):
+        self.assertIn("CRYPTO_24H_PAPER_OBSERVATION_ENABLED = True", self.source)
+        self.assertIn('"mode": "PAPER_24H_OBSERVATION"', self.source)
+
+    def test_legacy_session_gate_is_not_active_for_new_paper_entries(self):
+        self.assertIn('"active_for_new_crypto_paper_entries": False', self.source)
+
+    def test_global_regime_never_auto_blocks_in_v1(self):
+        self.assertIn('"automatic_no_trade": False', self.source)
+        self.assertIn("Observation-only; never gates V1", self.source)
+
+    def test_global_breadth_uses_real_coinbase_public_products(self):
+        self.assertIn("list_public_spot_products", self.source)
+        self.assertIn("price_percentage_change_24h", self.source)
+        self.assertIn("COINBASE_PUBLIC_TOP100_USD_SPOT_24H", self.source)
+
+    def test_global_breadth_requires_minimum_components(self):
+        self.assertIn("GLOBAL_MARKET_BREADTH_MIN_COMPONENTS = 20", self.source)
+
+    def test_risk_off_requires_breadth_and_btc_bearish(self):
+        self.assertIn('down_pct >= GLOBAL_MARKET_RISK_OFF_DOWN_PCT and btc_bias == "BEARISH"', self.source)
+
+    def test_unknown_is_preserved_when_evidence_is_unavailable(self):
+        self.assertIn('"regime": "UNKNOWN"', self.source)
+
+    def test_trade_direction_dimension_exists(self):
+        self.assertIn('"DIRECTION": lambda row', self.source)
+        self.assertIn('DIRECTION:"Direction"', self.html)
+
+    def test_global_market_regime_dimension_exists(self):
+        self.assertIn('"GLOBAL_MARKET_REGIME": lambda row', self.source)
+        self.assertIn('GLOBAL_MARKET_REGIME:"Régime global"', self.html)
+
+    def test_market_breadth_dimension_exists(self):
+        self.assertIn('"MARKET_BREADTH": lambda row', self.source)
+        self.assertIn('MARKET_BREADTH:"Breadth marché"', self.html)
+
+    def test_entry_context_records_breadth_percentages(self):
+        self.assertIn('"market_breadth_advancing_percent"', self.source)
+        self.assertIn('"market_breadth_declining_percent"', self.source)
+
+    def test_entry_context_records_btc_bias(self):
+        self.assertIn('"btc_daily_bias"', self.source)
+
+    def test_smc_is_enriched_with_global_intelligence(self):
+        self.assertIn("await enrich_crypto_request_with_global_intelligence(request)", self.source)
+
+    def test_24h_windows_remain_predeclared(self):
+        for window in ['"00-04"', '"04-08"', '"08-12"', '"12-16"', '"16-21"', '"21-24"']:
+            self.assertIn(window, self.source)
+
+    def test_professional_ui_mentions_24h_global_context(self):
+        self.assertIn("Analyse PAPER 24/7", self.html)
+        self.assertIn("Régime global", self.html)
+
+    def test_no_broker_execution_is_enabled(self):
+        self.assertIn('"execution": False', self.source)
+        self.assertIn("PAPER ONLY", self.html)
+
+    def test_exit_baseline_is_unchanged(self):
+        self.assertIn('SMART_EXIT_BREAKEVEN_R = Decimal("1")', self.source)
+        self.assertIn('SMART_EXIT_TRAILING_ACTIVATION_R = Decimal("1.5")', self.source)
+        self.assertIn('SMART_EXIT_TRAILING_DISTANCE_R = Decimal("0.75")', self.source)
+        self.assertIn("SMART_EXIT_TIME_STOP_MINUTES = 300", self.source)
+

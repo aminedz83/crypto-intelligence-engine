@@ -3749,7 +3749,150 @@ async def is_symbol_performance_allowed(symbol: str) -> bool:
         return True  # fail-open
 
 
-PERFORMANCE_INTELLIGENCE_VERSION = "SERVER_PERFORMANCE_INTELLIGENCE_V1"
+
+GLOBAL_MARKET_REGIME_INTELLIGENCE_VERSION = "GLOBAL_MARKET_REGIME_INTELLIGENCE_V1"
+CRYPTO_24H_PAPER_OBSERVATION_ENABLED = True
+GLOBAL_MARKET_BREADTH_CACHE_SECONDS = 300
+GLOBAL_MARKET_BREADTH_MIN_COMPONENTS = 20
+GLOBAL_MARKET_RISK_OFF_DOWN_PCT = Decimal("70")
+GLOBAL_MARKET_DIRECTIONAL_PCT = Decimal("55")
+_global_market_breadth_cache: Optional[Tuple[Dict[str, object], float]] = None
+
+
+def _coinbase_24h_change_percent(product: object) -> Optional[Decimal]:
+    """Parse Coinbase's real public 24h percentage field; never synthesize a change."""
+    if not isinstance(product, dict):
+        return None
+    raw = product.get("price_percentage_change_24h")
+    if raw is None:
+        return None
+    try:
+        value = Decimal(str(raw))
+    except (ArithmeticError, ValueError):
+        return None
+    return value if value.is_finite() else None
+
+
+async def get_global_crypto_market_regime() -> Dict[str, object]:
+    """Read-only global crypto context from Coinbase Top-100 USD spot breadth + BTC bias.
+
+    If Coinbase does not expose enough valid 24h changes, the regime stays UNKNOWN.
+    This function never blocks a trade in V1.
+    """
+    global _global_market_breadth_cache
+    now_ts = utcnow().timestamp()
+    cached = _global_market_breadth_cache
+    if cached is not None and now_ts < cached[1]:
+        return dict(cached[0])
+
+    snapshot: Dict[str, object] = {
+        "version": GLOBAL_MARKET_REGIME_INTELLIGENCE_VERSION,
+        "regime": "UNKNOWN",
+        "btc_daily_bias": "NEUTRAL",
+        "components": 0,
+        "advancing": 0,
+        "declining": 0,
+        "unchanged": 0,
+        "advancing_percent": None,
+        "declining_percent": None,
+        "source": "COINBASE_PUBLIC_TOP100_USD_SPOT_24H",
+        "automatic_no_trade": False,
+        "paper_only": True,
+        "execution": False,
+    }
+    try:
+        payload = await market_provider.list_public_spot_products(
+            CRYPTO_UNIVERSE_DISCOVERY_LIMIT
+        )
+        products = select_coinbase_top_usd_spot_products(payload)
+        changes = [
+            value
+            for value in (_coinbase_24h_change_percent(product) for product in products)
+            if value is not None
+        ]
+        advancing = sum(1 for value in changes if value > 0)
+        declining = sum(1 for value in changes if value < 0)
+        unchanged = len(changes) - advancing - declining
+        snapshot["components"] = len(changes)
+        snapshot["advancing"] = advancing
+        snapshot["declining"] = declining
+        snapshot["unchanged"] = unchanged
+        if changes:
+            total = Decimal(len(changes))
+            snapshot["advancing_percent"] = str(
+                (Decimal(advancing) * Decimal("100") / total).quantize(Decimal("0.1"))
+            )
+            snapshot["declining_percent"] = str(
+                (Decimal(declining) * Decimal("100") / total).quantize(Decimal("0.1"))
+            )
+        btc_bias = await get_daily_bias("BTC-USD")
+        snapshot["btc_daily_bias"] = btc_bias
+        if len(changes) >= GLOBAL_MARKET_BREADTH_MIN_COMPONENTS:
+            down_pct = Decimal(str(snapshot["declining_percent"]))
+            up_pct = Decimal(str(snapshot["advancing_percent"]))
+            if down_pct >= GLOBAL_MARKET_RISK_OFF_DOWN_PCT and btc_bias == "BEARISH":
+                snapshot["regime"] = "RISK_OFF"
+            elif down_pct >= GLOBAL_MARKET_DIRECTIONAL_PCT:
+                snapshot["regime"] = "BEARISH"
+            elif up_pct >= GLOBAL_MARKET_DIRECTIONAL_PCT:
+                snapshot["regime"] = "BULLISH"
+            else:
+                snapshot["regime"] = "NEUTRAL"
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        pass
+
+    _global_market_breadth_cache = (
+        dict(snapshot),
+        now_ts + GLOBAL_MARKET_BREADTH_CACHE_SECONDS,
+    )
+    return snapshot
+
+
+def merge_performance_setup_context(
+    raw_context: Optional[str], additions: Dict[str, object]
+) -> str:
+    """Merge observation metadata into setup context without deleting strategy evidence."""
+    context: Dict[str, object] = {}
+    if raw_context:
+        try:
+            parsed = json.loads(raw_context)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            context.update(parsed)
+        else:
+            context["legacy_context"] = str(raw_context)
+    for key, value in additions.items():
+        if value is not None:
+            context[key] = value
+    return json.dumps(context, default=str, sort_keys=True)
+
+
+async def enrich_crypto_request_with_global_intelligence(
+    request: VerifiedAutoPaperEntryRequest,
+) -> None:
+    """Attach global market evidence at entry. Observation-only; never gates V1."""
+    snapshot = await get_global_crypto_market_regime()
+    request.performance_setup_context = merge_performance_setup_context(
+        request.performance_setup_context,
+        {
+            "trade_direction": (
+                "LONG" if request.direction == "BULLISH"
+                else "SHORT" if request.direction == "BEARISH"
+                else str(request.direction)
+            ),
+            "global_market_regime": snapshot.get("regime"),
+            "market_breadth_advancing_percent": snapshot.get("advancing_percent"),
+            "market_breadth_declining_percent": snapshot.get("declining_percent"),
+            "market_breadth_components": snapshot.get("components"),
+            "btc_daily_bias": snapshot.get("btc_daily_bias"),
+            "global_market_regime_version": GLOBAL_MARKET_REGIME_INTELLIGENCE_VERSION,
+        },
+    )
+
+PERFORMANCE_INTELLIGENCE_VERSION = "SERVER_PERFORMANCE_INTELLIGENCE_V2_GLOBAL_REGIME_24H"
 PERFORMANCE_INTELLIGENCE_DISCOVERY_MIN_SAMPLE = 20
 PERFORMANCE_INTELLIGENCE_CANDIDATE_MIN_SAMPLE = 30
 PERFORMANCE_INTELLIGENCE_VALIDATION_MIN_SAMPLE = 50
@@ -3888,6 +4031,33 @@ def build_paper_performance_intelligence(
             paper_entry_window_utc(paper_entry_hour_utc(row.get("opened_at"))) or "UNKNOWN"
         ),
         "SYMBOL": lambda row: str(row.get("symbol") or "UNKNOWN").upper(),
+        "DIRECTION": lambda row: str(row.get("side") or "UNKNOWN").upper(),
+        "GLOBAL_MARKET_REGIME": lambda row: str(
+            paper_parse_setup_context(row.get("setup_context")).get(
+                "global_market_regime", "UNKNOWN"
+            )
+        ),
+        "MARKET_BREADTH": lambda row: (
+            "DECLINING_70_PLUS"
+            if _edge_decimal(
+                paper_parse_setup_context(row.get("setup_context")).get(
+                    "market_breadth_declining_percent"
+                )
+            ) >= Decimal("70")
+            else "DECLINING_55_70"
+            if _edge_decimal(
+                paper_parse_setup_context(row.get("setup_context")).get(
+                    "market_breadth_declining_percent"
+                )
+            ) >= Decimal("55")
+            else "ADVANCING_55_PLUS"
+            if _edge_decimal(
+                paper_parse_setup_context(row.get("setup_context")).get(
+                    "market_breadth_advancing_percent"
+                )
+            ) >= Decimal("55")
+            else "MIXED_OR_UNKNOWN"
+        ),
         "STRATEGY": lambda row: str(
             row.get("strategy_id")
             or paper_strategy_from_source(row.get("source")).get("strategy_id")
@@ -4584,10 +4754,9 @@ async def run_server_auto_paper_generation_once() -> Dict[str, int]:
     }
     if not persistence_state.ready:
         return stats
-    # V17-PRO: session filter — only trade during London/NY (08-21 UTC)
+    # V17-GLOBAL-REGIME-24H: paper observation runs 24/7 for crypto.
+    # The historical 08-21 session function remains available for analytics only.
     now = utcnow()
-    if not is_crypto_session_active(now):
-        return stats
     # V17-PRO: cooldown — pause after consecutive losses
     if is_cooldown_active(now):
         return stats
@@ -4655,6 +4824,7 @@ async def run_server_auto_paper_generation_once() -> Dict[str, int]:
                 default=str,
                 sort_keys=True,
             )
+            await enrich_crypto_request_with_global_intelligence(request)
             # V17-PRO: Daily Bias — only trade in the daily candle direction
             daily_bias = await get_daily_bias(symbol)
             _smc_side = "LONG" if request.direction == "BULLISH" else "SHORT"
@@ -6838,11 +7008,17 @@ async def get_paper_performance_intelligence(period: str = "ALL") -> Dict[str, o
             "one_filter_change_at_a_time": True,
         },
         "current_crypto_entry_scope_utc": {
-            "start_hour": CRYPTO_SESSION_LONDON_START_UTC,
-            "end_hour_exclusive": CRYPTO_SESSION_NY_END_UTC,
+            "mode": "PAPER_24H_OBSERVATION",
+            "start_hour": 0,
+            "end_hour_exclusive": 24,
+            "legacy_session_gate": {
+                "start_hour": CRYPTO_SESSION_LONDON_START_UTC,
+                "end_hour_exclusive": CRYPTO_SESSION_NY_END_UTC,
+                "active_for_new_crypto_paper_entries": False,
+            },
             "note": (
-                "Current crypto session gate limits executed paper evidence to this "
-                "window; outside-window performance cannot be inferred from missing trades."
+                "Crypto PAPER observation is intentionally 24/7 so 00-04, 04-08 and "
+                "21-24 can accumulate evidence. This does not authorize broker execution."
             ),
         },
         "current_exit_config": {
@@ -13922,8 +14098,7 @@ async def run_trend_pullback_paper_generation_once() -> Dict[str, int]:
         return stats
     # V17-PRO: session filter + cooldown (same as SMC orchestrator)
     now = utcnow()
-    if not is_crypto_session_active(now):
-        return stats
+    # V17-GLOBAL-REGIME-24H: no crypto session gate in PAPER observation mode.
     if is_cooldown_active(now):
         return stats
     for instrument in instrument_registry.all():
@@ -13960,6 +14135,19 @@ async def run_trend_pullback_paper_generation_once() -> Dict[str, int]:
                 },
                 default=str,
                 sort_keys=True,
+            )
+            global_snapshot = await get_global_crypto_market_regime()
+            plan["performance_setup_context"] = merge_performance_setup_context(
+                str(plan["performance_setup_context"]),
+                {
+                    "trade_direction": plan.get("side"),
+                    "global_market_regime": global_snapshot.get("regime"),
+                    "market_breadth_advancing_percent": global_snapshot.get("advancing_percent"),
+                    "market_breadth_declining_percent": global_snapshot.get("declining_percent"),
+                    "market_breadth_components": global_snapshot.get("components"),
+                    "btc_daily_bias": global_snapshot.get("btc_daily_bias"),
+                    "global_market_regime_version": GLOBAL_MARKET_REGIME_INTELLIGENCE_VERSION,
+                },
             )
             if plan.get("status") != "ENTRY_NOW":
                 stats["blocked"] += 1
@@ -14189,8 +14377,7 @@ async def run_breakout_expansion_paper_generation_once() -> Dict[str, int]:
         return stats
     # V17-PRO: session filter + cooldown (same as SMC orchestrator)
     now = utcnow()
-    if not is_crypto_session_active(now):
-        return stats
+    # V17-GLOBAL-REGIME-24H: no crypto session gate in PAPER observation mode.
     if is_cooldown_active(now):
         return stats
     for instrument in instrument_registry.all():
@@ -14227,6 +14414,19 @@ async def run_breakout_expansion_paper_generation_once() -> Dict[str, int]:
                 },
                 default=str,
                 sort_keys=True,
+            )
+            global_snapshot = await get_global_crypto_market_regime()
+            plan["performance_setup_context"] = merge_performance_setup_context(
+                str(plan["performance_setup_context"]),
+                {
+                    "trade_direction": plan.get("side"),
+                    "global_market_regime": global_snapshot.get("regime"),
+                    "market_breadth_advancing_percent": global_snapshot.get("advancing_percent"),
+                    "market_breadth_declining_percent": global_snapshot.get("declining_percent"),
+                    "market_breadth_components": global_snapshot.get("components"),
+                    "btc_daily_bias": global_snapshot.get("btc_daily_bias"),
+                    "global_market_regime_version": GLOBAL_MARKET_REGIME_INTELLIGENCE_VERSION,
+                },
             )
             if plan.get("status") != "ENTRY_NOW":
                 stats["blocked"] += 1

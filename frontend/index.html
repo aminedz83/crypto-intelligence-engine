@@ -3116,6 +3116,66 @@ function performanceIntelTable(data){
   ]);
   return h("div",{class:"pi-table-wrap"},[table]);
 }
+function performanceIntelCrossTable(data){
+  var diagnostic=data&&data.cross_diagnostic?data.cross_diagnostic:{};
+  var rows=Array.isArray(diagnostic.rows)?diagnostic.rows:[];
+  if(!rows.length){
+    return h("div",{class:"pi-empty"},[
+      h("b",{},["Aucun diagnostic croisé disponible"]),
+      "Les anciens trades sans contexte global restent UNKNOWN; aucune donnée n’est inventée."
+    ]);
+  }
+  var table=h("table",{class:"pi-table"},[
+    h("thead",{},[h("tr",{},[
+      h("th",{},["Fenêtre"]),
+      h("th",{},["Direction"]),
+      h("th",{},["Régime global"]),
+      h("th",{},["Breadth"]),
+      h("th",{},["Stratégie"]),
+      h("th",{},["Trades"]),
+      h("th",{},["PF"]),
+      h("th",{},["Expectancy R"]),
+      h("th",{},["P&L net"]),
+      h("th",{},["Evidence"])
+    ])]),
+    h("tbody",{},rows.map(function(row){
+      var m=row.metrics||{};
+      return h("tr",{},[
+        h("td",{},[h("b",{},[String(row.entry_window_utc||"UNKNOWN")])]),
+        h("td",{},[String(row.direction||"UNKNOWN")]),
+        h("td",{},[String(row.global_market_regime||"UNKNOWN")]),
+        h("td",{},[String(row.market_breadth||"UNKNOWN").replaceAll("_"," ")]),
+        h("td",{},[String(row.strategy||"UNKNOWN")]),
+        h("td",{},[String(m.closed_trades==null?0:m.closed_trades)]),
+        h("td",{class:performanceIntelMetricClass(m.profit_factor,"pf")},[
+          performanceIntelFmt(m.profit_factor,2,"")
+        ]),
+        h("td",{class:performanceIntelMetricClass(m.average_realized_rr,"signed")},[
+          performanceIntelFmt(m.average_realized_rr,3,"R")
+        ]),
+        h("td",{class:performanceIntelMetricClass(m.net_pnl,"signed")},[
+          performanceIntelFmt(m.net_pnl,2," $")
+        ]),
+        h("td",{},[h("span",{class:"pi-evidence "+performanceIntelEvidenceClass(row.evidence)},[
+          performanceIntelEvidenceLabel(row.evidence)
+        ])])
+      ]);
+    }))
+  ]);
+  return h("div",{},[
+    h("div",{class:"pi-policy"},[
+      h("div",{class:"pi-policy-icon",html:iconSvg("scanner")},[]),
+      h("div",{},[
+        h("b",{},["Diagnostic croisé · observation uniquement"]),
+        h("p",{},[
+          "Fenêtre UTC × Direction × Régime global × Breadth × Stratégie. "+
+          "Les lignes sont triées par taille d’échantillon. Aucun filtre automatique n’est appliqué."
+        ])
+      ])
+    ]),
+    h("div",{class:"pi-table-wrap"},[table])
+  ]);
+}
 function performanceIntelPanel(data){
   var coverage=data.coverage||{};
   var policy=data.policy||{};
@@ -3131,7 +3191,7 @@ function performanceIntelPanel(data){
       h("div",{class:"pi-head-copy"},[
         h("div",{class:"pi-eyebrow"},["PERFORMANCE INTELLIGENCE · SERVER DATA"]),
         h("div",{class:"pi-title"},[h("h3",{},["Où le moteur possède réellement un avantage ?"])]),
-        h("p",{},["Analyse PAPER 24/7 par contexte d’entrée. Le moteur distingue maintenant Direction, Régime global et Breadth marché, tout en séparant les versions de sortie. Observation uniquement : aucun filtre NO-TRADE n’est appliqué automatiquement."])
+        h("p",{},["Analyse PAPER 24/7 par contexte d’entrée avec Diagnostic croisé professionnel : Fenêtre UTC × Direction × Régime global × Breadth × Stratégie. Observation uniquement : aucun filtre NO-TRADE n’est appliqué automatiquement."])
       ]),
       h("span",{class:"pi-live-badge"},[
         h("span",{class:"pi-live-dot"},[]),
@@ -3148,7 +3208,11 @@ function performanceIntelPanel(data){
         return h("button",{class:"pi-chip "+(performanceIntelUiState.dimension===d?"active":""),type:"button",onclick:function(){performanceIntelSetDimension(d)}},[
           performanceIntelDimensionLabel(d)
         ]);
-      }))
+      }).concat([
+        h("button",{class:"pi-chip "+(performanceIntelUiState.dimension==="CROSS_DIAGNOSTIC"?"active":""),type:"button",onclick:function(){performanceIntelSetDimension("CROSS_DIAGNOSTIC")}},[
+          "Diagnostic croisé"
+        ])
+      ]))
     ]),
     h("div",{class:"pi-overview"},[
       h("div",{class:"pi-kpi"},[h("span",{},["Trades fermés"]),h("b",{},[String(total)]),h("small",{},["PAPER persisté"])]),
@@ -3167,7 +3231,7 @@ function performanceIntelPanel(data){
         ])
       ])
     ]),
-    performanceIntelTable(data),
+    performanceIntelUiState.dimension==="CROSS_DIAGNOSTIC"?performanceIntelCrossTable(data):performanceIntelTable(data),
     h("div",{class:"pi-foot"},[
       h("span",{},["Version: "+String(data.validation||"—")]),
       h("span",{},["PAPER ONLY · aucune exécution broker · aucune performance inventée"])
@@ -4370,7 +4434,7 @@ function renderHelpGlossary(){
 <!-- V17-UI24 CRITICAL PATH: SIGNALS + OPEN POSITIONS FIRST; ADVANCED ANALYTICS LAZY -->
 <!-- V17-PERFORMANCE-INTELLIGENCE-2 · PROFESSIONAL OBSERVATION DASHBOARD · PAPER ONLY -->
 <!-- V17-PERFORMANCE-INTELLIGENCE-2-FIX3 · WIN RATE + DRAWDOWN CONTRACT FIX · EXIT CONFIG SPLIT -->
-<!-- V17-GLOBAL-MARKET-REGIME-24H-1 · PROFESSIONAL 24H PAPER OBSERVATION · GLOBAL BREADTH · NO AUTO BLOCK -->
+<!-- V17-PERFORMANCE-INTELLIGENCE-CROSS-DIAGNOSTIC-1 · PROFESSIONAL · OBSERVATION ONLY -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

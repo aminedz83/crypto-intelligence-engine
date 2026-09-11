@@ -664,6 +664,23 @@ body.workspace-mode main{padding-top:14px}
 .crypto-logo-img{transition:opacity .12s linear}
 .crypto-logo-fallback{opacity:1}
 .crypto-logo.logo-loaded .crypto-logo-fallback{opacity:0}
+
+/* V17 CROSS VIEW FIX3 — permanently visible iPhone CTA */
+.pi-cross-primary{
+  width:100%;margin:12px 0 14px;padding:13px 15px;
+  display:flex;align-items:flex-start;justify-content:space-between;gap:12px;
+  border:1px solid rgba(154,99,255,.72);border-radius:15px;
+  background:linear-gradient(145deg,rgba(154,99,255,.16),rgba(18,184,255,.06));
+  color:var(--text);text-align:left;cursor:pointer
+}
+.pi-cross-primary.active{box-shadow:0 0 0 1px rgba(154,99,255,.32) inset}
+.pi-cross-primary-title{font-size:12px;font-weight:900;white-space:nowrap;color:#d4b9ff}
+.pi-cross-primary-sub{font-size:8px;line-height:1.4;color:#93a3b9;text-align:right}
+@media(max-width:640px){
+  .pi-cross-primary{flex-direction:column;gap:4px}
+  .pi-cross-primary-sub{text-align:left}
+}
+
 </style>
 
 <style id="v4-reference-tuning">
@@ -3215,6 +3232,16 @@ function performanceIntelPanel(data){
       ]))
     ]),
     h("div",{class:"pi-overview"},[
+    h("button",{
+      type:"button",
+      class:"pi-cross-primary "+(performanceIntelUiState.dimension==="CROSS_VIEW"?"active":""),
+      onclick:function(){performanceIntelSetDimension("CROSS_VIEW")}
+    },[
+      h("span",{class:"pi-cross-primary-title"},["Diagnostic croisé"]),
+      h("span",{class:"pi-cross-primary-sub"},[
+        "Fenêtre UTC × Direction × Régime global × Breadth × Stratégie"
+      ])
+    ]),
       h("div",{class:"pi-kpi"},[h("span",{},["Trades fermés"]),h("b",{},[String(total)]),h("small",{},["PAPER persisté"])]),
       h("div",{class:"pi-kpi"},[h("span",{},["Config sortie tracée"]),h("b",{},[exitPct+"%"]),h("small",{},[exitKnown+" / "+total+" trades"])]),
       h("div",{class:"pi-kpi"},[h("span",{},["Volatilité tracée"]),h("b",{},[volPct+"%"]),h("small",{},[volKnown+" / "+total+" trades"])]),
@@ -4434,7 +4461,7 @@ function renderHelpGlossary(){
 <!-- V17-UI24 CRITICAL PATH: SIGNALS + OPEN POSITIONS FIRST; ADVANCED ANALYTICS LAZY -->
 <!-- V17-PERFORMANCE-INTELLIGENCE-2 · PROFESSIONAL OBSERVATION DASHBOARD · PAPER ONLY -->
 <!-- V17-PERFORMANCE-INTELLIGENCE-2-FIX3 · WIN RATE + DRAWDOWN CONTRACT FIX · EXIT CONFIG SPLIT -->
-<!-- V17 Performance Intelligence Cross Diagnostic 1 · Professional · Observation Only -->
+<!-- V17 Cross View FIX3 · visible iPhone CTA · observation only -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

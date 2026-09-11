@@ -4151,15 +4151,24 @@ def build_paper_cross_diagnostic(
                 "automatic_no_trade": False,
             }
         )
-    output.sort(
-        key=lambda item: (
-            -int(item["metrics"].get("closed_trades", 0)),
-            str(item["entry_window_utc"]),
-            str(item["direction"]),
-            str(item["global_market_regime"]),
-            str(item["strategy"]),
+    def cross_diagnostic_sort_key(
+        item: Dict[str, object],
+    ) -> Tuple[int, str, str, str, str]:
+        raw_metrics = item.get("metrics")
+        closed_trades = 0
+        if isinstance(raw_metrics, dict):
+            raw_closed_trades = raw_metrics.get("closed_trades", 0)
+            if isinstance(raw_closed_trades, (int, float, Decimal)):
+                closed_trades = int(raw_closed_trades)
+        return (
+            -closed_trades,
+            str(item.get("entry_window_utc", "UNKNOWN")),
+            str(item.get("direction", "UNKNOWN")),
+            str(item.get("global_market_regime", "UNKNOWN")),
+            str(item.get("strategy", "UNKNOWN")),
         )
-    )
+
+    output.sort(key=cross_diagnostic_sort_key)
     return output
 
 

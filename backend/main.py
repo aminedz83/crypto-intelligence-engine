@@ -3892,7 +3892,7 @@ async def enrich_crypto_request_with_global_intelligence(
         },
     )
 
-PERFORMANCE_INTELLIGENCE_VERSION = "SERVER_PERFORMANCE_INTELLIGENCE_V2_GLOBAL_REGIME_24H"
+PERFORMANCE_INTELLIGENCE_VERSION = "SERVER_PERFORMANCE_INTELLIGENCE_V3_CROSS_DIAGNOSTIC"
 PERFORMANCE_INTELLIGENCE_DISCOVERY_MIN_SAMPLE = 20
 PERFORMANCE_INTELLIGENCE_CANDIDATE_MIN_SAMPLE = 30
 PERFORMANCE_INTELLIGENCE_VALIDATION_MIN_SAMPLE = 50
@@ -4096,6 +4096,70 @@ def build_paper_performance_intelligence(
                 }
             )
         output[dimension] = items
+    return output
+
+
+CROSS_DIAGNOSTIC_VERSION = "PAPER_CROSS_DIAGNOSTIC_V1"
+
+
+def build_paper_cross_diagnostic(
+    closed_positions: List[Dict[str, object]],
+    initial_capital: Decimal,
+) -> List[Dict[str, object]]:
+    """Targeted diagnostic: window × direction × global regime × breadth × strategy.
+
+    Observation-only. It describes persisted entry-time context and never changes
+    signal generation, sizing, exits, or broker execution.
+    """
+    grouped: Dict[Tuple[str, str, str, str, str], List[Dict[str, object]]] = {}
+    for row in closed_positions:
+        context = paper_parse_setup_context(row.get("setup_context"))
+        hour = paper_entry_hour_utc(row.get("opened_at"))
+        window = paper_entry_window_utc(hour) or "UNKNOWN"
+        direction = str(row.get("side") or "UNKNOWN").upper()
+        global_regime = str(context.get("global_market_regime") or "UNKNOWN").upper()
+        declining = _edge_decimal(context.get("market_breadth_declining_percent"))
+        advancing = _edge_decimal(context.get("market_breadth_advancing_percent"))
+        if declining >= Decimal("70"):
+            breadth = "DECLINING_70_PLUS"
+        elif declining >= Decimal("55"):
+            breadth = "DECLINING_55_70"
+        elif advancing >= Decimal("55"):
+            breadth = "ADVANCING_55_PLUS"
+        else:
+            breadth = "MIXED_OR_UNKNOWN"
+        strategy = str(
+            row.get("strategy_id")
+            or paper_strategy_from_source(row.get("source")).get("strategy_id")
+            or "UNKNOWN"
+        )
+        key = (window, direction, global_regime, breadth, strategy)
+        grouped.setdefault(key, []).append(row)
+
+    output: List[Dict[str, object]] = []
+    for key, rows in grouped.items():
+        metrics = calculate_paper_performance_metrics(rows, initial_capital)
+        output.append(
+            {
+                "entry_window_utc": key[0],
+                "direction": key[1],
+                "global_market_regime": key[2],
+                "market_breadth": key[3],
+                "strategy": key[4],
+                "metrics": metrics,
+                "evidence": paper_performance_intelligence_label(metrics),
+                "automatic_no_trade": False,
+            }
+        )
+    output.sort(
+        key=lambda item: (
+            -int(item["metrics"].get("closed_trades", 0)),
+            str(item["entry_window_utc"]),
+            str(item["direction"]),
+            str(item["global_market_regime"]),
+            str(item["strategy"]),
+        )
+    )
     return output
 
 
@@ -6976,6 +7040,7 @@ async def get_paper_performance_intelligence(period: str = "ALL") -> Dict[str, o
 
     initial_capital = Decimal(str(account._mapping["initial_capital"]))
     segments = build_paper_performance_intelligence(rows, initial_capital)
+    cross_diagnostic = build_paper_cross_diagnostic(rows, initial_capital)
     known_exit_config = sum(
         1
         for row in rows
@@ -6993,6 +7058,16 @@ async def get_paper_performance_intelligence(period: str = "ALL") -> Dict[str, o
         "period_start": period_start.isoformat() if period_start is not None else None,
         "segments": segments,
         "dimensions": list(segments.keys()),
+        "cross_diagnostic": {
+            "version": CROSS_DIAGNOSTIC_VERSION,
+            "dimensions": [
+                "ENTRY_WINDOW_UTC", "DIRECTION", "GLOBAL_MARKET_REGIME",
+                "MARKET_BREADTH", "STRATEGY",
+            ],
+            "rows": cross_diagnostic,
+            "observation_only": True,
+            "automatic_no_trade": False,
+        },
         "coverage": {
             "closed_trades": len(rows),
             "exit_config_version_known": known_exit_config,

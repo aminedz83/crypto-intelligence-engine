@@ -10501,10 +10501,9 @@ class PerformanceIntelligenceCrossDiagnosticV17Tests(unittest.TestCase):
         self.assertIn('"rows": cross_diagnostic', self.source)
 
     def test_cross_diagnostic_sorts_by_sample_size(self):
-        self.assertIn(
-            '-int(item["metrics"].get("closed_trades", 0))',
-            self.source,
-        )
+        self.assertIn("def cross_diagnostic_sort_key(", self.source)
+        self.assertIn("-closed_trades", self.source)
+        self.assertIn("output.sort(key=cross_diagnostic_sort_key)", self.source)
 
     def test_professional_ui_has_cross_diagnostic_button(self):
         self.assertIn('"Diagnostic croisé"', self.html)

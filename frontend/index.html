@@ -3191,7 +3191,7 @@ function performanceIntelPanel(data){
       h("div",{class:"pi-head-copy"},[
         h("div",{class:"pi-eyebrow"},["PERFORMANCE INTELLIGENCE · SERVER DATA"]),
         h("div",{class:"pi-title"},[h("h3",{},["Où le moteur possède réellement un avantage ?"])]),
-        h("p",{},["Analyse PAPER 24/7 par contexte d’entrée avec Diagnostic croisé professionnel : Fenêtre UTC × Direction × Régime global × Breadth × Stratégie. Observation uniquement : aucun filtre NO-TRADE n’est appliqué automatiquement."])
+        h("p",{},["Analyse PAPER 24/7 par contexte d’entrée avec Diagnostic croisé professionnel : Fenêtre UTC × Direction × Régime global × Breadth × Stratégie, en séparant les versions de sortie. Observation uniquement : aucun filtre NO-TRADE n’est appliqué automatiquement."])
       ]),
       h("span",{class:"pi-live-badge"},[
         h("span",{class:"pi-live-dot"},[]),
@@ -3209,7 +3209,7 @@ function performanceIntelPanel(data){
           performanceIntelDimensionLabel(d)
         ]);
       }).concat([
-        h("button",{class:"pi-chip "+(performanceIntelUiState.dimension==="CROSS_DIAGNOSTIC"?"active":""),type:"button",onclick:function(){performanceIntelSetDimension("CROSS_DIAGNOSTIC")}},[
+        h("button",{class:"pi-chip "+(performanceIntelUiState.dimension==="CROSS_VIEW"?"active":""),type:"button",onclick:function(){performanceIntelSetDimension("CROSS_VIEW")}},[
           "Diagnostic croisé"
         ])
       ]))
@@ -3231,7 +3231,7 @@ function performanceIntelPanel(data){
         ])
       ])
     ]),
-    performanceIntelUiState.dimension==="CROSS_DIAGNOSTIC"?performanceIntelCrossTable(data):performanceIntelTable(data),
+    performanceIntelUiState.dimension==="CROSS_VIEW"?performanceIntelCrossTable(data):performanceIntelTable(data),
     h("div",{class:"pi-foot"},[
       h("span",{},["Version: "+String(data.validation||"—")]),
       h("span",{},["PAPER ONLY · aucune exécution broker · aucune performance inventée"])
@@ -4434,7 +4434,7 @@ function renderHelpGlossary(){
 <!-- V17-UI24 CRITICAL PATH: SIGNALS + OPEN POSITIONS FIRST; ADVANCED ANALYTICS LAZY -->
 <!-- V17-PERFORMANCE-INTELLIGENCE-2 · PROFESSIONAL OBSERVATION DASHBOARD · PAPER ONLY -->
 <!-- V17-PERFORMANCE-INTELLIGENCE-2-FIX3 · WIN RATE + DRAWDOWN CONTRACT FIX · EXIT CONFIG SPLIT -->
-<!-- V17-PERFORMANCE-INTELLIGENCE-CROSS-DIAGNOSTIC-1 · PROFESSIONAL · OBSERVATION ONLY -->
+<!-- V17 Performance Intelligence Cross Diagnostic 1 · Professional · Observation Only -->
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

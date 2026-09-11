@@ -10459,3 +10459,78 @@ class GlobalMarketRegime24HPaperIntelligenceV17Tests(unittest.TestCase):
         self.assertIn('SMART_EXIT_TRAILING_DISTANCE_R = Decimal("0.75")', self.source)
         self.assertIn("SMART_EXIT_TIME_STOP_MINUTES = 300", self.source)
 
+
+
+class PerformanceIntelligenceCrossDiagnosticV17Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = Path(main.__file__).read_text(encoding="utf-8")
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_cross_diagnostic_version_is_explicit(self):
+        self.assertIn(
+            'CROSS_DIAGNOSTIC_VERSION = "PAPER_CROSS_DIAGNOSTIC_V1"',
+            self.source,
+        )
+
+    def test_cross_diagnostic_builder_exists(self):
+        self.assertIn("def build_paper_cross_diagnostic(", self.source)
+
+    def test_cross_diagnostic_uses_entry_window(self):
+        self.assertIn("paper_entry_window_utc(hour)", self.source)
+
+    def test_cross_diagnostic_uses_direction(self):
+        self.assertIn('direction = str(row.get("side")', self.source)
+
+    def test_cross_diagnostic_uses_global_regime(self):
+        self.assertIn('context.get("global_market_regime")', self.source)
+
+    def test_cross_diagnostic_uses_market_breadth(self):
+        self.assertIn('context.get("market_breadth_declining_percent")', self.source)
+        self.assertIn('context.get("market_breadth_advancing_percent")', self.source)
+
+    def test_cross_diagnostic_uses_strategy(self):
+        self.assertIn('row.get("strategy_id")', self.source)
+
+    def test_cross_diagnostic_is_observation_only(self):
+        self.assertIn('"observation_only": True', self.source)
+        self.assertIn('"automatic_no_trade": False', self.source)
+
+    def test_cross_diagnostic_is_returned_by_intelligence_endpoint(self):
+        self.assertIn('"cross_diagnostic": {', self.source)
+        self.assertIn('"rows": cross_diagnostic', self.source)
+
+    def test_cross_diagnostic_sorts_by_sample_size(self):
+        self.assertIn(
+            '-int(item["metrics"].get("closed_trades", 0))',
+            self.source,
+        )
+
+    def test_professional_ui_has_cross_diagnostic_button(self):
+        self.assertIn('"Diagnostic croisé"', self.html)
+
+    def test_professional_ui_has_cross_diagnostic_table(self):
+        self.assertIn("function performanceIntelCrossTable", self.html)
+
+    def test_cross_ui_exposes_five_context_columns(self):
+        for label in (
+            '"Fenêtre"', '"Direction"', '"Régime global"', '"Breadth"', '"Stratégie"',
+        ):
+            self.assertIn(label, self.html)
+
+    def test_cross_ui_preserves_core_metrics(self):
+        for label in ('"Trades"', '"PF"', '"Expectancy R"', '"P&L net"', '"Evidence"'):
+            self.assertIn(label, self.html)
+
+    def test_cross_ui_states_no_automatic_filter(self):
+        self.assertIn("Aucun filtre automatique n’est appliqué", self.html)
+
+    def test_exit_baseline_remains_frozen(self):
+        self.assertIn('SMART_EXIT_BREAKEVEN_R = Decimal("1")', self.source)
+        self.assertIn('SMART_EXIT_TRAILING_ACTIVATION_R = Decimal("1.5")', self.source)
+        self.assertIn('SMART_EXIT_TRAILING_DISTANCE_R = Decimal("0.75")', self.source)
+        self.assertIn("SMART_EXIT_TIME_STOP_MINUTES = 300", self.source)
+
+    def test_paper_only_execution_guard_remains(self):
+        self.assertIn('"paper_only": True', self.source)
+        self.assertIn('"execution": False', self.source)

@@ -4104,32 +4104,62 @@ CROSS_DIAGNOSTIC_VERSION = "PAPER_CROSS_DIAGNOSTIC_V1"
 
 AGGREGATE_DIAGNOSTIC_VERSION = "PAPER_AGGREGATE_DIAGNOSTIC_V1"
 
-def build_paper_aggregate_diagnostic(closed_positions: List[Dict[str, object]], initial_capital: Decimal) -> Dict[str, List[Dict[str, object]]]:
+def build_paper_aggregate_diagnostic(
+    closed_positions: List[Dict[str, object]],
+    initial_capital: Decimal,
+) -> Dict[str, List[Dict[str, object]]]:
     """Fixed aggregate diagnostics. Observation only; never a trading gate."""
     specs: Dict[str, Tuple[str, ...]] = {
         "DIRECTION_STRATEGY": ("direction", "strategy"),
-        "DIRECTION_STRATEGY_GLOBAL_REGIME": ("direction", "strategy", "global_market_regime"),
+        "DIRECTION_STRATEGY_GLOBAL_REGIME": (
+            "direction",
+            "strategy",
+            "global_market_regime",
+        ),
     }
-    grouped: Dict[str, Dict[Tuple[str, ...], List[Dict[str, object]]]] = {name: {} for name in specs}
+    grouped: Dict[
+        str,
+        Dict[Tuple[str, ...], List[Dict[str, object]]],
+    ] = {name: {} for name in specs}
+
     for row in closed_positions:
         context = paper_parse_setup_context(row.get("setup_context"))
+        strategy = str(
+            row.get("strategy_id")
+            or paper_strategy_from_source(row.get("source")).get("strategy_id")
+            or "UNKNOWN"
+        )
         values = {
             "direction": str(row.get("side") or "UNKNOWN").upper(),
-            "strategy": str(row.get("strategy_id") or paper_strategy_from_source(row.get("source")).get("strategy_id") or "UNKNOWN"),
-            "global_market_regime": str(context.get("global_market_regime") or "UNKNOWN").upper(),
+            "strategy": strategy,
+            "global_market_regime": str(
+                context.get("global_market_regime") or "UNKNOWN"
+            ).upper(),
         }
         for name, fields in specs.items():
             key = tuple(values[field] for field in fields)
             grouped[name].setdefault(key, []).append(row)
+
     result: Dict[str, List[Dict[str, object]]] = {}
     for name, fields in specs.items():
         items: List[Dict[str, object]] = []
         for key, rows in grouped[name].items():
             metrics = calculate_paper_performance_metrics(rows, initial_capital)
-            item: Dict[str, object] = {field: key[i] for i, field in enumerate(fields)}
-            item.update({"metrics": metrics, "evidence": paper_performance_intelligence_label(metrics),
-                         "automatic_no_trade": False, "candidate_filter_only": True, "oos_confirmation_required": True})
+            item: Dict[str, object] = {
+                field: key[i]
+                for i, field in enumerate(fields)
+            }
+            item.update(
+                {
+                    "metrics": metrics,
+                    "evidence": paper_performance_intelligence_label(metrics),
+                    "automatic_no_trade": False,
+                    "candidate_filter_only": True,
+                    "oos_confirmation_required": True,
+                }
+            )
             items.append(item)
+
         def aggregate_sort_key(item: Dict[str, object]) -> Tuple[int, str]:
             metrics_obj = item.get("metrics")
             count = 0

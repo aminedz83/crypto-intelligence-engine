@@ -681,6 +681,13 @@ body.workspace-mode main{padding-top:14px}
   .pi-cross-primary-sub{text-align:left}
 }
 
+
+/* V17 Aggregate Diagnostic V1 */
+.pi-aggregate-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin:12px 0 0}
+.pi-agg-btn{border:1px solid #29415d;background:#081522;color:#d8e1ee;border-radius:14px;padding:11px 13px;text-align:left;display:flex;flex-direction:column;gap:3px}
+.pi-agg-btn b{font-size:10px}.pi-agg-btn span{font-size:8px;color:#8193aa}.pi-agg-btn.active{border-color:#9a63ff;background:rgba(154,99,255,.13)}
+@media(max-width:640px){.pi-aggregate-actions{grid-template-columns:1fr}}
+
 </style>
 
 <style id="v4-reference-tuning">
@@ -3133,6 +3140,21 @@ function performanceIntelTable(data){
   ]);
   return h("div",{class:"pi-table-wrap"},[table]);
 }
+function performanceIntelAggregateTable(data,viewName){
+  var agg=data&&data.aggregate_diagnostic?data.aggregate_diagnostic:{}, views=agg.views||{};
+  var rows=Array.isArray(views[viewName])?views[viewName]:[], withRegime=viewName==="DIRECTION_STRATEGY_GLOBAL_REGIME";
+  if(!rows.length)return h("div",{class:"pi-empty"},[h("b",{},["Aucune donnée agrégée disponible"]),"Trades PAPER persistés uniquement."]);
+  return h("div",{},[
+    h("div",{class:"pi-policy"},[h("div",{class:"pi-policy-icon",html:iconSvg("scanner")},[]),h("div",{},[
+      h("b",{},["Diagnostic agrégé · CANDIDATE_FILTER uniquement"]),
+      h("p",{},["Aucun blocage automatique. Une confirmation OOS reste obligatoire avant toute activation."])
+    ])]),
+    h("div",{class:"pi-table-wrap"},[h("table",{class:"pi-table"},[
+      h("thead",{},[h("tr",{},[h("th",{},["Direction"]),h("th",{},["Stratégie"]),withRegime?h("th",{},["Régime global"]):null,h("th",{},["Trades"]),h("th",{},["Win Rate"]),h("th",{},["PF"]),h("th",{},["Expectancy R"]),h("th",{},["P&L net"]),h("th",{},["Drawdown"]),h("th",{},["Evidence"])].filter(Boolean))]),
+      h("tbody",{},rows.map(function(row){var m=row.metrics||{},cells=[h("td",{},[h("b",{},[String(row.direction||"UNKNOWN")])]),h("td",{},[String(row.strategy||"UNKNOWN")])];if(withRegime)cells.push(h("td",{},[String(row.global_market_regime||"UNKNOWN")]));return h("tr",{},cells.concat([h("td",{},[String(m.closed_trades==null?0:m.closed_trades)]),h("td",{},[performanceIntelFmt(m.win_rate_percent,1,"%")]),h("td",{class:performanceIntelMetricClass(m.profit_factor,"pf")},[performanceIntelFmt(m.profit_factor,2,"")]),h("td",{class:performanceIntelMetricClass(m.average_realized_rr,"signed")},[performanceIntelFmt(m.average_realized_rr,3,"R")]),h("td",{class:performanceIntelMetricClass(m.net_pnl,"signed")},[performanceIntelFmt(m.net_pnl,2," $")]),h("td",{},[performanceIntelFmt(m.max_drawdown_percent,1,"%")]),h("td",{},[h("span",{class:"pi-evidence "+performanceIntelEvidenceClass(row.evidence)},[performanceIntelEvidenceLabel(row.evidence)])])]))}))
+    ])])
+  ]);
+}
 function performanceIntelCrossTable(data){
   var diagnostic=data&&data.cross_diagnostic?data.cross_diagnostic:{};
   var rows=Array.isArray(diagnostic.rows)?diagnostic.rows:[];
@@ -3232,6 +3254,14 @@ function performanceIntelPanel(data){
       ]))
     ]),
     h("div",{class:"pi-overview"},[
+    h("div",{class:"pi-aggregate-actions"},[
+      h("button",{type:"button",class:"pi-agg-btn "+(performanceIntelUiState.dimension==="AGG_DIRECTION_STRATEGY"?"active":""),onclick:function(){performanceIntelSetDimension("AGG_DIRECTION_STRATEGY")}},[
+        h("b",{},["Direction × Stratégie"]),h("span",{},["Diagnostic agrégé"])
+      ]),
+      h("button",{type:"button",class:"pi-agg-btn "+(performanceIntelUiState.dimension==="AGG_DIRECTION_STRATEGY_REGIME"?"active":""),onclick:function(){performanceIntelSetDimension("AGG_DIRECTION_STRATEGY_REGIME")}},[
+        h("b",{},["Direction × Stratégie × Régime"]),h("span",{},["Contexte global"])
+      ])
+    ]),
     h("button",{
       type:"button",
       class:"pi-cross-primary "+(performanceIntelUiState.dimension==="CROSS_VIEW"?"active":""),
@@ -3258,6 +3288,8 @@ function performanceIntelPanel(data){
         ])
       ])
     ]),
+    performanceIntelUiState.dimension==="AGG_DIRECTION_STRATEGY"?performanceIntelAggregateTable(data,"DIRECTION_STRATEGY"):
+    performanceIntelUiState.dimension==="AGG_DIRECTION_STRATEGY_REGIME"?performanceIntelAggregateTable(data,"DIRECTION_STRATEGY_GLOBAL_REGIME"):
     performanceIntelUiState.dimension==="CROSS_VIEW"?performanceIntelCrossTable(data):performanceIntelTable(data),
     h("div",{class:"pi-foot"},[
       h("span",{},["Version: "+String(data.validation||"—")]),

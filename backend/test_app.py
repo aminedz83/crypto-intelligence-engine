@@ -10533,3 +10533,52 @@ class PerformanceIntelligenceCrossDiagnosticV17Tests(unittest.TestCase):
     def test_paper_only_execution_guard_remains(self):
         self.assertIn('"paper_only": True', self.source)
         self.assertIn('"execution": False', self.source)
+
+
+class PerformanceIntelligenceAggregateDiagnosticV17Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = Path(main.__file__).read_text(encoding="utf-8")
+        cls.html = INDEX.read_text(encoding="utf-8")
+
+    def test_aggregate_version_explicit(self):
+        self.assertIn('AGGREGATE_DIAGNOSTIC_VERSION = "PAPER_AGGREGATE_DIAGNOSTIC_V1"', self.source)
+
+    def test_aggregate_builder_exists(self):
+        self.assertIn("def build_paper_aggregate_diagnostic(", self.source)
+
+    def test_direction_strategy_is_predeclared(self):
+        self.assertIn('"DIRECTION_STRATEGY": ("direction", "strategy")', self.source)
+
+    def test_direction_strategy_regime_is_predeclared(self):
+        self.assertIn('"DIRECTION_STRATEGY_GLOBAL_REGIME"', self.source)
+
+    def test_aggregate_reuses_server_metrics(self):
+        self.assertIn("calculate_paper_performance_metrics(rows, initial_capital)", self.source)
+
+    def test_aggregate_never_auto_blocks(self):
+        self.assertIn('"automatic_no_trade": False', self.source)
+
+    def test_candidate_filter_only(self):
+        self.assertIn('"candidate_filter_only": True', self.source)
+
+    def test_oos_confirmation_required(self):
+        self.assertIn('"oos_confirmation_required": True', self.source)
+
+    def test_endpoint_returns_aggregate_diagnostic(self):
+        self.assertIn('"aggregate_diagnostic": {', self.source)
+
+    def test_ui_has_direction_strategy_button(self):
+        self.assertIn('"Direction × Stratégie"', self.html)
+
+    def test_ui_has_direction_strategy_regime_button(self):
+        self.assertIn('"Direction × Stratégie × Régime"', self.html)
+
+    def test_ui_has_aggregate_renderer(self):
+        self.assertIn("function performanceIntelAggregateTable", self.html)
+
+    def test_ui_states_no_auto_block(self):
+        self.assertIn("Aucun blocage automatique", self.html)
+
+    def test_ui_states_oos_requirement(self):
+        self.assertIn("confirmation OOS", self.html)

@@ -37,7 +37,7 @@ jobs:
       POSTGRES_DB: cie
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      EXPECTED_TESTS: "1690"
+      EXPECTED_TESTS: "1704"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

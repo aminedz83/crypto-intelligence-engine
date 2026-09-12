@@ -3892,7 +3892,7 @@ async def enrich_crypto_request_with_global_intelligence(
         },
     )
 
-PERFORMANCE_INTELLIGENCE_VERSION = "SERVER_PERFORMANCE_INTELLIGENCE_V3_CROSS_DIAGNOSTIC"
+PERFORMANCE_INTELLIGENCE_VERSION = "SERVER_PERFORMANCE_INTELLIGENCE_V4_AGGREGATE_DIAGNOSTIC"
 PERFORMANCE_INTELLIGENCE_DISCOVERY_MIN_SAMPLE = 20
 PERFORMANCE_INTELLIGENCE_CANDIDATE_MIN_SAMPLE = 30
 PERFORMANCE_INTELLIGENCE_VALIDATION_MIN_SAMPLE = 50
@@ -4100,6 +4100,47 @@ def build_paper_performance_intelligence(
 
 
 CROSS_DIAGNOSTIC_VERSION = "PAPER_CROSS_DIAGNOSTIC_V1"
+
+
+AGGREGATE_DIAGNOSTIC_VERSION = "PAPER_AGGREGATE_DIAGNOSTIC_V1"
+
+def build_paper_aggregate_diagnostic(closed_positions: List[Dict[str, object]], initial_capital: Decimal) -> Dict[str, List[Dict[str, object]]]:
+    """Fixed aggregate diagnostics. Observation only; never a trading gate."""
+    specs: Dict[str, Tuple[str, ...]] = {
+        "DIRECTION_STRATEGY": ("direction", "strategy"),
+        "DIRECTION_STRATEGY_GLOBAL_REGIME": ("direction", "strategy", "global_market_regime"),
+    }
+    grouped: Dict[str, Dict[Tuple[str, ...], List[Dict[str, object]]]] = {name: {} for name in specs}
+    for row in closed_positions:
+        context = paper_parse_setup_context(row.get("setup_context"))
+        values = {
+            "direction": str(row.get("side") or "UNKNOWN").upper(),
+            "strategy": str(row.get("strategy_id") or paper_strategy_from_source(row.get("source")).get("strategy_id") or "UNKNOWN"),
+            "global_market_regime": str(context.get("global_market_regime") or "UNKNOWN").upper(),
+        }
+        for name, fields in specs.items():
+            key = tuple(values[field] for field in fields)
+            grouped[name].setdefault(key, []).append(row)
+    result: Dict[str, List[Dict[str, object]]] = {}
+    for name, fields in specs.items():
+        items: List[Dict[str, object]] = []
+        for key, rows in grouped[name].items():
+            metrics = calculate_paper_performance_metrics(rows, initial_capital)
+            item: Dict[str, object] = {field: key[i] for i, field in enumerate(fields)}
+            item.update({"metrics": metrics, "evidence": paper_performance_intelligence_label(metrics),
+                         "automatic_no_trade": False, "candidate_filter_only": True, "oos_confirmation_required": True})
+            items.append(item)
+        def aggregate_sort_key(item: Dict[str, object]) -> Tuple[int, str]:
+            metrics_obj = item.get("metrics")
+            count = 0
+            if isinstance(metrics_obj, dict):
+                raw = metrics_obj.get("closed_trades", 0)
+                if isinstance(raw, int):
+                    count = raw
+            return (-count, str(item))
+        items.sort(key=aggregate_sort_key)
+        result[name] = items
+    return result
 
 
 def build_paper_cross_diagnostic(
@@ -7050,6 +7091,7 @@ async def get_paper_performance_intelligence(period: str = "ALL") -> Dict[str, o
     initial_capital = Decimal(str(account._mapping["initial_capital"]))
     segments = build_paper_performance_intelligence(rows, initial_capital)
     cross_diagnostic = build_paper_cross_diagnostic(rows, initial_capital)
+    aggregate_diagnostic = build_paper_aggregate_diagnostic(rows, initial_capital)
     known_exit_config = sum(
         1
         for row in rows
@@ -7067,6 +7109,15 @@ async def get_paper_performance_intelligence(period: str = "ALL") -> Dict[str, o
         "period_start": period_start.isoformat() if period_start is not None else None,
         "segments": segments,
         "dimensions": list(segments.keys()),
+        "aggregate_diagnostic": {
+            "version": AGGREGATE_DIAGNOSTIC_VERSION,
+            "predeclared_views": ["DIRECTION_STRATEGY", "DIRECTION_STRATEGY_GLOBAL_REGIME"],
+            "views": aggregate_diagnostic,
+            "observation_only": True,
+            "automatic_no_trade": False,
+            "candidate_filter_only": True,
+            "oos_confirmation_required": True,
+        },
         "cross_diagnostic": {
             "version": CROSS_DIAGNOSTIC_VERSION,
             "dimensions": [

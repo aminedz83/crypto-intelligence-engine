@@ -2182,12 +2182,13 @@ function minimalPositionRow(p){
 }
 function renderDashboard(){
  var v=byId("view-dashboard");clear(v);document.body.classList.add("minimal-home");
- var account=paperUiState.account||null;
+ var dashAccount=paperUiState.account||null;
+ var account=dashAccount;
  var open=(paperUiState.positions||[]).filter(function(p){return String(p.status||"").toUpperCase()==="OPEN"});
  var valid=open.filter(function(p){return p.unrealized_pnl!==null&&p.unrealized_pnl!==undefined&&Number.isFinite(Number(p.unrealized_pnl))});
  var openPnl=valid.length?valid.reduce(function(a,p){return a+Number(p.unrealized_pnl)},0):null;
  var decisions=(paperUiState.decisions||[]).filter(function(d){return String(d.state||"").toUpperCase()==="ENTRY_NOW"});
- var capital=account&&account.current_capital!==undefined?paperMoney(account.current_capital):"—";
+ var capital=dashAccount&&dashAccount.current_capital!==undefined?paperMoney(dashAccount.current_capital):"—";
  var updated=paperUiState.updatedAt?formatMontrealTime(paperUiState.updatedAt):"En attente";
 
  v.appendChild(h("div",{class:"mh-shell"},[

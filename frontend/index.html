@@ -4494,6 +4494,155 @@ function renderHelpGlossary(){
 <!-- V17-PERFORMANCE-INTELLIGENCE-2 · PROFESSIONAL OBSERVATION DASHBOARD · PAPER ONLY -->
 <!-- V17-PERFORMANCE-INTELLIGENCE-2-FIX3 · WIN RATE + DRAWDOWN CONTRACT FIX · EXIT CONFIG SPLIT -->
 <!-- V17 Cross View FIX3 · visible iPhone CTA · observation only -->
+
+<style id="v17-minimal-rebuild-v2">
+/* V17 MINIMAL REBUILD V2 — structural, not a reskin */
+:root{
+  --m-bg:#070b11;--m-panel:#0c121b;--m-line:#1a2634;--m-text:#e7edf6;--m-muted:#7e8da3;
+  --m-green:#35d07f;--m-red:#ff6677;--m-blue:#70a5ff;--m-purple:#b38cff;
+}
+html,body{background:var(--m-bg)!important;color:var(--m-text)!important}
+body{font-size:12px!important;letter-spacing:0!important}
+.header{min-height:48px!important;padding:8px 14px!important;background:rgba(7,11,17,.96)!important;border-bottom:1px solid var(--m-line)!important;box-shadow:none!important}
+.header .brand,.header h1,.header .title{font-size:14px!important;line-height:1.2!important;letter-spacing:0!important}
+.header .subtitle,.header small{font-size:9px!important}
+.market-tabs-wrap{display:none!important}
+main{padding:10px 10px 82px!important;max-width:980px!important;margin:0 auto!important}
+.view{gap:8px!important}
+h1,h2,h3,h4,.section,.module-title h3,.page-head h2{font-size:14px!important;line-height:1.25!important;letter-spacing:0!important;margin:0!important}
+.sub,.page-head p,.tool-desc,.aname,.note,.paper-account-section-note{font-size:10px!important;line-height:1.35!important;color:var(--m-muted)!important}
+.page-head{padding:4px 1px 8px!important;margin:0!important;border:0!important;background:transparent!important;min-height:0!important}
+.page-head .module-badge,.page-head .status-pill{font-size:8px!important;min-height:18px!important;padding:0 6px!important}
+.card,.mod-card,.journal-card,.tool-card,.paper-account-hero,.paper-account-section,.strategy-policy-card,.strategy-premium-card,.performance-intel-card,.paper-position-card,.paper-history-card{background:var(--m-panel)!important;border:1px solid var(--m-line)!important;border-radius:10px!important;box-shadow:none!important}
+.card,.mod-card,.journal-card,.tool-card{padding:10px!important}
+.grid-2,.grid-3,.grid-4,.paper-account-grid,.metric-strip,.strategy-overview-grid{gap:7px!important}
+.row{min-height:46px!important;padding:7px 8px!important;border-bottom:1px solid var(--m-line)!important}
+.sym,.tool-name,.kv b,.setting-row b{font-size:11px!important}
+.price,.right,.kv,.setting-row,.status-pill,.module-badge,.pill,.badge{font-size:10px!important}
+.status-pill,.module-badge,.pill,.badge{min-height:20px!important;padding:0 7px!important;border-radius:999px!important}
+.subtabs{display:flex!important;gap:5px!important;padding:3px!important;background:#0a1018!important;border:1px solid var(--m-line)!important;border-radius:9px!important;overflow:auto!important}
+.subtabs button{min-height:30px!important;padding:0 10px!important;font-size:10px!important;border-radius:7px!important}
+.actions{gap:7px!important}
+.action{min-height:72px!important;padding:10px!important}
+.action b{font-size:11px!important}.action span{font-size:9px!important}
+.nav{height:64px!important;padding:6px 6px max(6px,env(safe-area-inset-bottom))!important;background:rgba(6,10,15,.98)!important;border:1px solid var(--m-line)!important;border-radius:18px 18px 0 0!important;box-shadow:none!important}
+.nav button{font-size:9px!important;gap:3px!important;min-width:0!important}
+.nav button svg{width:18px!important;height:18px!important}.nav button .ico{font-size:16px!important}
+/* Hide legacy decorative / dense dashboard-only sections; new dashboard is rendered structurally below */
+#view-dashboard .hours,#view-dashboard .fav,#view-dashboard .dash-kpi-grid,#view-dashboard .actions,#view-dashboard .note{display:none!important}
+/* Minimal dashboard */
+.min-home{display:flex;flex-direction:column;gap:8px}
+.min-home-top{display:grid;grid-template-columns:1.5fr .75fr .75fr;gap:7px}
+.min-stat{background:var(--m-panel);border:1px solid var(--m-line);border-radius:10px;padding:10px;min-height:70px;display:flex;flex-direction:column;justify-content:space-between}
+.min-stat span{font-size:9px;color:var(--m-muted);text-transform:uppercase;letter-spacing:.08em}
+.min-stat b{font-size:15px;line-height:1.05;font-weight:700}
+.min-stat small{font-size:9px;color:var(--m-muted)}
+.min-section{background:var(--m-panel);border:1px solid var(--m-line);border-radius:10px;overflow:hidden}
+.min-section-head{display:flex;align-items:center;justify-content:space-between;padding:9px 10px;border-bottom:1px solid var(--m-line)}
+.min-section-head b{font-size:11px}.min-section-head button{font-size:9px;color:var(--m-blue);background:none;border:0;padding:4px}
+.min-signal-row,.min-quick-row{display:grid;grid-template-columns:1fr auto;align-items:center;gap:10px;padding:10px;border-bottom:1px solid var(--m-line)}
+.min-signal-row:last-child,.min-quick-row:last-child{border-bottom:0}
+.min-signal-main{display:flex;align-items:center;gap:8px;min-width:0}.min-signal-main .asset-icon{width:24px!important;height:24px!important;flex:0 0 24px!important}
+.min-signal-main b{font-size:11px}.min-signal-main small{display:block;font-size:9px;color:var(--m-muted);margin-top:2px}
+.min-state{font-size:9px;font-weight:800;padding:4px 7px;border-radius:999px;border:1px solid var(--m-line)}
+.min-state.long,.min-state.entry_now{color:var(--m-green);border-color:rgba(53,208,127,.45)}
+.min-state.short{color:var(--m-red);border-color:rgba(255,102,119,.45)}
+.min-state.wait{color:#9aa8bb}
+.min-quick{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+.min-quick button{background:var(--m-panel);border:1px solid var(--m-line);border-radius:10px;color:var(--m-text);min-height:58px;padding:9px;text-align:left}
+.min-quick button b{display:block;font-size:10px;margin-bottom:3px}.min-quick button span{font-size:9px;color:var(--m-muted)}
+/* Flat markets */
+.min-market-head{display:flex;align-items:end;justify-content:space-between;padding:3px 2px 7px}
+.min-market-head b{font-size:13px}.min-market-head span{font-size:9px;color:var(--m-muted)}
+#view-markets .listcard{padding:0!important;overflow:hidden!important}
+#view-markets .row{border-radius:0!important;background:transparent!important}
+/* flatten all advanced views rather than card-on-card */
+#view-signals .mod-card,#view-trading .mod-card,#view-strategies .mod-card,#view-intelligence .mod-card,#view-settings .mod-card{margin:0!important}
+#view-strategies .performance-intel-card,#view-strategies .strategy-policy-card{padding:9px!important}
+#view-strategies table,#view-trading table{font-size:9px!important}
+th,td{padding:6px 5px!important}
+.paper-account-hero{padding:10px!important;min-height:0!important}.paper-account-hero h3{font-size:12px!important}.paper-account-hero-icon{width:28px!important;height:28px!important}
+.paper-account-section{padding:9px!important}.paper-account-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.paper-account-tile{min-height:72px!important;padding:9px!important;border-radius:8px!important}
+.paper-account-tile b{font-size:13px!important}.paper-account-tile span,.paper-account-tile small{font-size:9px!important}
+.setting-row{padding:9px 0!important;min-height:0!important}.setting-row small{font-size:9px!important}
+.tool-card{min-height:0!important}
+@media(max-width:700px){
+  main{padding:8px 8px 78px!important}.header{padding:7px 10px!important}
+  .min-home-top{grid-template-columns:1.4fr .8fr .8fr}.min-stat{padding:9px;min-height:62px}.min-stat b{font-size:13px}
+  .min-quick{grid-template-columns:repeat(3,1fr)}
+  .grid-2,.grid-3,.grid-4{grid-template-columns:1fr!important}
+  .paper-account-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+  .module-title.matrix-title h3{font-size:13px!important}
+  .performance-intel-table-wrap{overflow:auto!important}
+}
+</style>
+<script id="v17-minimal-rebuild-v2-script">
+(function(){
+  function stateClass(s){s=String(s||'WAIT').toLowerCase();return s==='entry_now'?'entry_now':s}
+  function compactState(d){
+    var s=String((d&&d.state)||'WAIT').toUpperCase();
+    if(s==='ENTRY_NOW') return String((d.side||d.direction||'ENTRY')).toUpperCase();
+    if(s==='LONG'||s==='SHORT') return s;
+    return s==='WAIT'?'WAIT':s.replaceAll('_',' ');
+  }
+  window.renderDashboard=function(){
+    var v=byId('view-dashboard');clear(v);
+    var a=paperUiState.account;
+    var open=paperUiState.positions.filter(function(p){return String(p.status||'').toUpperCase()==='OPEN'});
+    var entry=paperUiState.decisions.filter(function(d){return String(d.state||'').toUpperCase()==='ENTRY_NOW'});
+    var cap=a&&a.current_capital!==undefined?paperMoney(a.current_capital):'—';
+    var pnl=a&&a.realized_pnl!==undefined?paperMoney(a.realized_pnl):'—';
+    var root=h('div',{class:'min-home'},[]);
+    root.appendChild(h('div',{class:'min-home-top'},[
+      h('div',{class:'min-stat'},[h('span',{},['Capital paper']),h('b',{},[cap]),h('small',{},['P&L réalisé '+pnl])]),
+      h('div',{class:'min-stat'},[h('span',{},['Positions']),h('b',{},[String(open.length)]),h('small',{},['OPEN'])]),
+      h('div',{class:'min-stat'},[h('span',{},['Entrées']),h('b',{},[String(entry.length)]),h('small',{},['ENTRY NOW'])])
+    ]));
+    var signals=(entry.length?entry:paperUiState.decisions).slice(0,3);
+    var sec=h('div',{class:'min-section'},[
+      h('div',{class:'min-section-head'},[h('b',{},['Opportunités']),h('button',{type:'button',onclick:function(){setView('signals')}},['Tout voir'])])
+    ]);
+    if(!signals.length){sec.appendChild(h('div',{class:'min-signal-row'},[h('div',{class:'min-signal-main'},[h('div',{},[h('b',{},['Aucun signal']),h('small',{},['Le moteur attend une confirmation'])])]),h('span',{class:'min-state wait'},['WAIT'])]));}
+    signals.forEach(function(d){
+      var symbol=String(d.symbol||'—'), st=compactState(d), cls=stateClass(st);
+      sec.appendChild(h('div',{class:'min-signal-row tap',onclick:function(){setView('signals')}},[
+        h('div',{class:'min-signal-main'},[iconFor(symbol),h('div',{},[h('b',{},[symbol]),h('small',{},[String(d.strategy_id||d.strategy||'Décision serveur').replaceAll('_',' ')])])]),
+        h('span',{class:'min-state '+cls},[st])
+      ]));
+    });
+    root.appendChild(sec);
+    root.appendChild(h('div',{class:'min-quick'},[
+      h('button',{type:'button',onclick:function(){setView('markets')}},[h('b',{},['Marchés']),h('span',{},['Prix réels'])]),
+      h('button',{type:'button',onclick:function(){setPaperTab('positions');setView('trading')}},[h('b',{},['Trading']),h('span',{},['Positions'])]),
+      h('button',{type:'button',onclick:function(){setView('strategies')}},[h('b',{},['Performance']),h('span',{},['Résultats'])])
+    ]));
+    v.appendChild(root);
+    if(!paperUiState.loading&&!paperUiState.updatedAt)refreshPaperTrading();
+  };
+
+  window.renderMarkets=function(){
+    var v=byId('view-markets');clear(v);
+    v.appendChild(h('div',{class:'min-market-head'},[h('b',{},['Crypto']),h('span',{},[String(CRYPTO_SYMBOLS.length)+' actifs · Coinbase'])]));
+    if(!CRYPTO_SYMBOLS.length){v.appendChild(emptyState('Univers indisponible','Aucun symbole Coinbase vérifié.'));return}
+    var c=h('div',{class:'card listcard'},[]);
+    CRYPTO_SYMBOLS.forEach(function(sym){
+      c.appendChild(h('div',{class:'row tap',onclick:function(){openDetail('crypto',sym)}},[
+        h('div',{class:'asset'},[iconFor(sym),h('div',{},[h('div',{class:'sym'},[sym]),h('div',{class:'aname'},['Coinbase'])])]),
+        h('div',{class:'right'},[h('span',{class:'price','data-price':sym},['…']),h('span',{'data-badge':sym},[])])
+      ]));
+    });
+    v.appendChild(c);refreshMarkets();
+  };
+
+  function compactHeaders(){
+    document.querySelectorAll('.page-head').forEach(function(el){el.classList.add('minimalized')});
+  }
+  var oldSetView=window.setView;
+  window.setView=function(id){oldSetView(id);setTimeout(compactHeaders,0)};
+  try{renderDashboard();compactHeaders()}catch(e){}
+})();
+</script>
+
 </body>
 </html>
 <!-- V16-M5B28B9 · PREMIUM HISTORY + DECISION CARDS · REAL DATA / LOGOS PRESERVED -->

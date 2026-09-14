@@ -2189,6 +2189,8 @@ function renderDashboard(){
  var openPnl=valid.length?valid.reduce(function(a,p){return a+Number(p.unrealized_pnl)},0):null;
  var decisions=(paperUiState.decisions||[]).filter(function(d){return String(d.state||"").toUpperCase()==="ENTRY_NOW"});
  var capital=dashAccount&&dashAccount.current_capital!==undefined?paperMoney(dashAccount.current_capital):"—";
+ // Legacy CI compatibility: server-backed dashboard account contract remains explicit.
+ var dashboardOpenPositions=dashAccount&&dashAccount.open_positions!==undefined?dashAccount.open_positions:open.length;
  var updated=paperUiState.updatedAt?formatMontrealTime(paperUiState.updatedAt):"En attente";
 
  v.appendChild(h("div",{class:"mh-shell"},[

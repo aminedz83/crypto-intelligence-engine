@@ -15307,7 +15307,8 @@ async def postgres_storage_diagnostic() -> Dict[str, object]:
 
     raw_database_bytes = database_row["database_bytes"]
     database_bytes = int(raw_database_bytes) if isinstance(raw_database_bytes, (int, str)) else 0
-    top_table_bytes = int(tables[0]["total_bytes"]) if tables else 0
+    raw_top_table_bytes = tables[0]["total_bytes"] if tables else 0
+    top_table_bytes = int(raw_top_table_bytes) if isinstance(raw_top_table_bytes, (int, str)) else 0
     return {
         "status": "OK",
         "diagnostic": "V17_STORAGE_DIAGNOSTIC_1",

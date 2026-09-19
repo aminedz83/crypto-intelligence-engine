@@ -15370,13 +15370,19 @@ async def signal_history_storage_diagnostic() -> Dict[str, object]:
             COALESCE(SUM(pg_column_size(state)), 0)::bigint AS state_bytes,
             COALESCE(SUM(pg_column_size(reason)), 0)::bigint AS reason_bytes,
             COALESCE(SUM(pg_column_size(setup_state)), 0)::bigint AS setup_state_bytes,
-            COALESCE(SUM(pg_column_size(latest_closed_timestamp)), 0)::bigint AS latest_closed_timestamp_bytes,
+            COALESCE(
+                SUM(pg_column_size(latest_closed_timestamp)), 0
+            )::bigint AS latest_closed_timestamp_bytes,
             COALESCE(SUM(pg_column_size(detector_context)), 0)::bigint AS detector_context_bytes,
             COALESCE(SUM(pg_column_size(paper_only)), 0)::bigint AS paper_only_bytes,
             COALESCE(SUM(pg_column_size(execution)), 0)::bigint AS execution_bytes,
             COALESCE(SUM(pg_column_size(created_at)), 0)::bigint AS created_at_bytes,
-            COALESCE(AVG(pg_column_size(detector_context)), 0)::numeric AS avg_detector_context_bytes,
-            COALESCE(MAX(pg_column_size(detector_context)), 0)::bigint AS max_detector_context_bytes,
+            COALESCE(
+                AVG(pg_column_size(detector_context)), 0
+            )::numeric AS avg_detector_context_bytes,
+            COALESCE(
+                MAX(pg_column_size(detector_context)), 0
+            )::bigint AS max_detector_context_bytes,
             MIN("timestamp") AS oldest_timestamp,
             MAX("timestamp") AS newest_timestamp
         FROM signal_decision_history AS t

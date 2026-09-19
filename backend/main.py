@@ -15432,6 +15432,128 @@ async def signal_history_storage_diagnostic() -> Dict[str, object]:
     }
 
 
+
+# ============================ V17-STORAGE-DIAGNOSTIC-3 ============================
+# Catalog-only physical footprint: no heap scan, no maintenance, no writes.
+
+@api_router.get("/diagnostics/storage/physical")
+async def signal_history_physical_diagnostic() -> Dict[str, object]:
+    """Read bounded PostgreSQL catalog statistics, not historical decision rows."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+
+    physical_sql = text("""
+        SELECT
+            c.relpages::bigint AS estimated_heap_pages,
+            c.reltuples::bigint AS estimated_rows_at_last_analyze,
+            current_setting('block_size')::bigint AS block_size_bytes,
+            pg_relation_size(c.oid)::bigint AS heap_bytes,
+            pg_indexes_size(c.oid)::bigint AS index_bytes,
+            pg_total_relation_size(c.oid)::bigint AS total_bytes,
+            pg_total_relation_size(c.reltoastrelid)::bigint AS toast_total_bytes,
+            s.n_live_tup::bigint AS estimated_live_rows,
+            s.n_dead_tup::bigint AS estimated_dead_rows,
+            s.n_tup_ins::bigint AS inserted_rows_since_stats_reset,
+            s.n_tup_upd::bigint AS updated_rows_since_stats_reset,
+            s.n_tup_del::bigint AS deleted_rows_since_stats_reset,
+            s.n_tup_hot_upd::bigint AS hot_updates_since_stats_reset,
+            s.last_vacuum,
+            s.last_autovacuum,
+            s.last_analyze,
+            s.last_autoanalyze,
+            s.vacuum_count::bigint AS manual_vacuum_count,
+            s.autovacuum_count::bigint AS autovacuum_count,
+            s.analyze_count::bigint AS manual_analyze_count,
+            s.autoanalyze_count::bigint AS autoanalyze_count,
+            EXISTS (
+                SELECT 1 FROM pg_extension WHERE extname = 'pgstattuple'
+            ) AS pgstattuple_extension_installed
+        FROM pg_class AS c
+        LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
+        WHERE c.oid = 'signal_decision_history'::regclass
+    """)
+    try:
+        async with engine.connect() as conn:
+            async with conn.begin():
+                await conn.execute(text("SELECT set_config('statement_timeout', '3000', true)"))
+                row = (await conn.execute(physical_sql)).mappings().one()
+    except Exception as exc:
+        log.error("Physical storage catalog diagnostic failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "physical storage diagnostic failed"},
+        ) from exc
+
+    def _integer(value: object) -> Optional[int]:
+        if isinstance(value, (int, str, Decimal)):
+            return int(value)
+        return None
+
+    def _timestamp(value: object) -> Optional[str]:
+        return value.isoformat() if isinstance(value, datetime) else None
+
+    heap_bytes = _integer(row["heap_bytes"])
+    live_rows = _integer(row["estimated_live_rows"])
+    return {
+        "status": "OK",
+        "diagnostic": "V17_STORAGE_DIAGNOSTIC_3",
+        "mode": "READ_ONLY_CATALOG_ONLY",
+        "generated_at": utcnow().isoformat(),
+        "relation": {
+            "heap_bytes": heap_bytes,
+            "index_bytes": _integer(row["index_bytes"]),
+            "total_bytes": _integer(row["total_bytes"]),
+            "toast_total_bytes": _integer(row["toast_total_bytes"]),
+            "estimated_heap_pages_at_last_analyze": _integer(row["estimated_heap_pages"]),
+            "block_size_bytes": _integer(row["block_size_bytes"]),
+            "estimated_rows_at_last_analyze": _integer(row["estimated_rows_at_last_analyze"]),
+            "estimated_live_rows": live_rows,
+            "estimated_dead_rows": _integer(row["estimated_dead_rows"]),
+            "heap_bytes_per_estimated_live_row": (
+                round(heap_bytes / live_rows, 2)
+                if heap_bytes is not None and live_rows is not None and live_rows > 0
+                else None
+            ),
+        },
+        "activity_since_stats_reset": {
+            "inserted_rows": _integer(row["inserted_rows_since_stats_reset"]),
+            "updated_rows": _integer(row["updated_rows_since_stats_reset"]),
+            "deleted_rows": _integer(row["deleted_rows_since_stats_reset"]),
+            "hot_updates": _integer(row["hot_updates_since_stats_reset"]),
+        },
+        "maintenance": {
+            "last_vacuum": _timestamp(row["last_vacuum"]),
+            "last_autovacuum": _timestamp(row["last_autovacuum"]),
+            "last_analyze": _timestamp(row["last_analyze"]),
+            "last_autoanalyze": _timestamp(row["last_autoanalyze"]),
+            "manual_vacuum_count": _integer(row["manual_vacuum_count"]),
+            "autovacuum_count": _integer(row["autovacuum_count"]),
+            "manual_analyze_count": _integer(row["manual_analyze_count"]),
+            "autoanalyze_count": _integer(row["autoanalyze_count"]),
+        },
+        "capabilities": {
+            "pgstattuple_extension_installed": bool(
+                row["pgstattuple_extension_installed"]
+            ),
+            "exact_bloat_bytes_measured": False,
+        },
+        "interpretation": {
+            "row_counts_are_estimates": True,
+            "heap_bytes_include_free_space_and_dead_tuples": True,
+            "reclaimable_bytes_not_established": True,
+        },
+        "safety": {
+            "paper_only": True,
+            "mutates_database": False,
+            "contains_credentials": False,
+            "scans_history_rows": False,
+            "statement_timeout_ms": 3000,
+        },
+    }
+
 app = create_app()
 
 # V17-ENERGY-FIX3 — runtime route binding hardening.

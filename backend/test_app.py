@@ -10632,39 +10632,39 @@ class V17StorageDiagnostic1Tests(unittest.TestCase):
         self.assertIn("status_code=503", source)
 
 class V17StorageDiagnostic2Tests(unittest.TestCase):
-    def test_signal_history_storage_route_exists(self):
+    def test_route_exists(self):
         paths = [getattr(route, "path", "") for route in main.api_router.routes]
         self.assertIn("/diagnostics/storage/signal-history", paths)
 
-    def test_signal_history_diagnostic_marker_exists(self):
+    def test_light_diagnostic_marker(self):
         source = inspect.getsource(main.signal_history_storage_diagnostic)
-        self.assertIn("V17_STORAGE_DIAGNOSTIC_2", source)
+        self.assertIn("V17_STORAGE_DIAGNOSTIC_2_LIGHT", source)
         self.assertIn('"mode": "READ_ONLY"', source)
 
-    def test_signal_history_measures_column_sizes(self):
+    def test_bounded_sampling(self):
         source = inspect.getsource(main.signal_history_storage_diagnostic)
-        self.assertIn("pg_column_size(detector_context)", source)
-        self.assertIn("columns_by_logical_size", source)
+        self.assertIn("TABLESAMPLE SYSTEM (1)", source)
+        self.assertIn("LIMIT 20", source)
+        self.assertNotIn("ORDER BY pg_column_size", source)
 
-    def test_signal_history_measures_toast(self):
+    def test_toast_size(self):
         source = inspect.getsource(main.signal_history_storage_diagnostic)
         self.assertIn("reltoastrelid", source)
         self.assertIn("toast_total_bytes", source)
 
-    def test_signal_history_reports_largest_rows_without_payload(self):
+    def test_no_payload_exposure(self):
         source = inspect.getsource(main.signal_history_storage_diagnostic)
-        self.assertIn("largest_rows", source)
         self.assertIn('"returns_detector_context_payload": False', source)
         self.assertNotIn('"detector_context": str(row', source)
 
-    def test_signal_history_has_no_mutating_sql(self):
-        source = inspect.getsource(main.signal_history_storage_diagnostic).upper()
+    def test_timeout_and_no_mutating_sql(self):
+        source = inspect.getsource(main.signal_history_storage_diagnostic)
+        self.assertIn("statement_timeout", source)
         for token in ("DELETE FROM", "TRUNCATE ", "UPDATE SIGNAL_DECISION_HISTORY",
                       "INSERT INTO", "VACUUM ", "ALTER TABLE", "DROP TABLE"):
-            self.assertNotIn(token, source)
+            self.assertNotIn(token, source.upper())
 
-    def test_signal_history_fails_closed_without_persistence(self):
+    def test_fails_closed(self):
         source = inspect.getsource(main.signal_history_storage_diagnostic)
         self.assertIn("if not persistence_state.ready", source)
         self.assertIn("status_code=503", source)
-

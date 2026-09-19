@@ -15589,7 +15589,7 @@ async def signal_history_free_space_diagnostic() -> Dict[str, object]:
                 block_bytes = int(raw_block) if isinstance(raw_block, (int, str)) else 8192
                 heap_pages = heap_bytes // block_bytes if block_bytes > 0 else 0
                 installed = bool(capability["freespace_extension_installed"])
-                sampled = []
+                sampled: List[Any] = []
                 if installed and heap_pages > 0:
                     # One page from each of 16 equally spaced heap regions.
                     sample_sql = text("""
@@ -15605,10 +15605,10 @@ async def signal_history_free_space_diagnostic() -> Dict[str, object]:
                         ) AS selected_pages
                         ORDER BY page_number
                     """)
-                    sampled = (await conn.execute(sample_sql, {
+                    sampled = list((await conn.execute(sample_sql, {
                         "last_page": heap_pages - 1,
                         "page_count": heap_pages,
-                    })).mappings().all()
+                    })).mappings().all())
     except Exception as exc:
         log.error("Free space diagnostic failed: %s", exc)
         raise HTTPException(

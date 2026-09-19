@@ -167,8 +167,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-# V17-ENERGY: EXPECTED_TESTS=1532 (18 Energy WTI/Brent integration tests)
+# V17-ENERGY: EXPECTED_TESTS=1711 (18 Energy WTI/Brent integration tests)
 
-# V17-MT5-MULTIBROKER-2: EXPECTED_TESTS=1567 (12 full broker catalogue tests)
+# V17-MT5-MULTIBROKER-2: EXPECTED_TESTS=1711 (12 full broker catalogue tests)
 
-# V17-PERFORMANCE-INTELLIGENCE-CROSS-DIAGNOSTIC-1: EXPECTED_TESTS=1690 (1673 engine + 17 MT5 bridge)
+# V17-PERFORMANCE-INTELLIGENCE-CROSS-DIAGNOSTIC-1: EXPECTED_TESTS=1711 (1673 engine + 17 MT5 bridge)
+
+# V17-STORAGE-DIAGNOSTIC-1: EXPECTED_TESTS=1711 (1704 baseline + 7 read-only storage diagnostic tests)

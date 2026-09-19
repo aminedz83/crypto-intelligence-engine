@@ -15344,177 +15344,90 @@ async def postgres_storage_diagnostic() -> Dict[str, object]:
     }
 
 
-# ============================ V17-STORAGE-DIAGNOSTIC-2 ============================
-# Deep read-only diagnosis of signal_decision_history. This endpoint measures
-# per-column payload size and the largest rows without returning stored payloads.
-# SELECT-only: no DELETE/TRUNCATE/VACUUM/UPDATE/INSERT and no schema mutation.
+# ============================ V17-STORAGE-DIAGNOSTIC-2-LIGHT ============================
+# Bounded, read-only sample. Never scan/order all historical decisions.
 
 @api_router.get("/diagnostics/storage/signal-history")
 async def signal_history_storage_diagnostic() -> Dict[str, object]:
-    """Measure signal_decision_history payload sizes without exposing payload data."""
+    """Report physical table size and a small, explicitly non-representative sample."""
     if not persistence_state.ready:
         raise HTTPException(
             status_code=503,
             detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
         )
 
-    summary_sql = text("""
-        SELECT
-            COUNT(*)::bigint AS rows,
-            COALESCE(SUM(pg_column_size(t)), 0)::bigint AS logical_row_bytes,
-            COALESCE(AVG(pg_column_size(t)), 0)::numeric AS avg_row_bytes,
-            COALESCE(MAX(pg_column_size(t)), 0)::bigint AS max_row_bytes,
-            COALESCE(SUM(pg_column_size(decision_id)), 0)::bigint AS decision_id_bytes,
-            COALESCE(SUM(pg_column_size("timestamp")), 0)::bigint AS timestamp_bytes,
-            COALESCE(SUM(pg_column_size(symbol)), 0)::bigint AS symbol_bytes,
-            COALESCE(SUM(pg_column_size(state)), 0)::bigint AS state_bytes,
-            COALESCE(SUM(pg_column_size(reason)), 0)::bigint AS reason_bytes,
-            COALESCE(SUM(pg_column_size(setup_state)), 0)::bigint AS setup_state_bytes,
-            COALESCE(
-                SUM(pg_column_size(latest_closed_timestamp)), 0
-            )::bigint AS latest_closed_timestamp_bytes,
-            COALESCE(SUM(pg_column_size(detector_context)), 0)::bigint AS detector_context_bytes,
-            COALESCE(SUM(pg_column_size(paper_only)), 0)::bigint AS paper_only_bytes,
-            COALESCE(SUM(pg_column_size(execution)), 0)::bigint AS execution_bytes,
-            COALESCE(SUM(pg_column_size(created_at)), 0)::bigint AS created_at_bytes,
-            COALESCE(
-                AVG(pg_column_size(detector_context)), 0
-            )::numeric AS avg_detector_context_bytes,
-            COALESCE(
-                MAX(pg_column_size(detector_context)), 0
-            )::bigint AS max_detector_context_bytes,
-            MIN("timestamp") AS oldest_timestamp,
-            MAX("timestamp") AS newest_timestamp
-        FROM signal_decision_history AS t
+    relation_sql = text("""
+        SELECT pg_total_relation_size('signal_decision_history')::bigint AS total_bytes,
+               pg_relation_size('signal_decision_history')::bigint AS table_bytes,
+               pg_indexes_size('signal_decision_history')::bigint AS index_bytes,
+               pg_total_relation_size(c.reltoastrelid)::bigint AS toast_total_bytes,
+               s.n_live_tup::bigint AS approximate_rows
+        FROM pg_class AS c
+        LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
+        WHERE c.oid = 'signal_decision_history'::regclass
     """)
-
-    largest_rows_sql = text("""
-        SELECT
-            decision_id,
-            "timestamp",
-            symbol,
-            state,
-            pg_column_size(t)::bigint AS row_bytes,
-            pg_column_size(detector_context)::bigint AS detector_context_bytes,
-            pg_column_size(reason)::bigint AS reason_bytes
-        FROM signal_decision_history AS t
-        ORDER BY pg_column_size(t) DESC
+    # TABLESAMPLE reads only a fraction of heap pages; LIMIT bounds detoasting.
+    # octet_length on 20 contexts is intentionally NOT a whole-table aggregate.
+    sample_sql = text("""
+        SELECT pg_column_size(t)::bigint AS row_bytes,
+               pg_column_size(detector_context)::bigint AS stored_context_bytes,
+               octet_length(detector_context)::bigint AS context_payload_bytes,
+               pg_column_size(reason)::bigint AS reason_bytes,
+               state
+        FROM signal_decision_history AS t TABLESAMPLE SYSTEM (1)
         LIMIT 20
     """)
-
-    by_state_sql = text("""
-        SELECT
-            state,
-            COUNT(*)::bigint AS rows,
-            COALESCE(SUM(pg_column_size(t)), 0)::bigint AS logical_row_bytes,
-            COALESCE(AVG(pg_column_size(t)), 0)::numeric AS avg_row_bytes,
-            COALESCE(SUM(pg_column_size(detector_context)), 0)::bigint AS detector_context_bytes
-        FROM signal_decision_history AS t
-        GROUP BY state
-        ORDER BY logical_row_bytes DESC, state ASC
-    """)
-
-    relation_sql = text("""
-        SELECT
-            pg_total_relation_size('signal_decision_history')::bigint AS total_bytes,
-            pg_relation_size('signal_decision_history')::bigint AS table_bytes,
-            pg_indexes_size('signal_decision_history')::bigint AS index_bytes,
-            pg_total_relation_size(
-                (SELECT reltoastrelid
-                 FROM pg_class
-                 WHERE oid = 'signal_decision_history'::regclass)
-            )::bigint AS toast_total_bytes
-    """)
-
     try:
         async with engine.connect() as conn:
-            summary_row = (await conn.execute(summary_sql)).mappings().one()
-            largest_rows = (await conn.execute(largest_rows_sql)).mappings().all()
-            state_rows = (await conn.execute(by_state_sql)).mappings().all()
-            relation_row = (await conn.execute(relation_sql)).mappings().one()
+            async with conn.begin():
+                # Transaction-local timeout; no stored data or schema is modified.
+                await conn.execute(text("SELECT set_config('statement_timeout', '8000', true)"))
+                relation = (await conn.execute(relation_sql)).mappings().one()
+                sample = (await conn.execute(sample_sql)).mappings().all()
     except Exception as exc:
-        log.error("Signal history storage diagnostic failed: %s", exc)
+        log.error("Bounded signal history storage diagnostic failed: %s", exc)
         raise HTTPException(
             status_code=503,
-            detail={"status": "UNAVAILABLE", "reason": "signal history diagnostic query failed"},
+            detail={"status": "UNAVAILABLE", "reason": "bounded diagnostic timed out or failed"},
         ) from exc
 
-    def _safe_int(value: object) -> int:
+    def _number(value: object) -> int:
         return int(value) if isinstance(value, (int, str, Decimal)) else 0
 
-    def _safe_iso(value: object) -> Optional[str]:
-        return value.isoformat() if isinstance(value, datetime) else None
-
-    column_bytes = {
-        "decision_id": _safe_int(summary_row["decision_id_bytes"]),
-        "timestamp": _safe_int(summary_row["timestamp_bytes"]),
-        "symbol": _safe_int(summary_row["symbol_bytes"]),
-        "state": _safe_int(summary_row["state_bytes"]),
-        "reason": _safe_int(summary_row["reason_bytes"]),
-        "setup_state": _safe_int(summary_row["setup_state_bytes"]),
-        "latest_closed_timestamp": _safe_int(summary_row["latest_closed_timestamp_bytes"]),
-        "detector_context": _safe_int(summary_row["detector_context_bytes"]),
-        "paper_only": _safe_int(summary_row["paper_only_bytes"]),
-        "execution": _safe_int(summary_row["execution_bytes"]),
-        "created_at": _safe_int(summary_row["created_at_bytes"]),
-    }
-    ranked_columns = [
-        {"column": name, "logical_bytes": size}
-        for name, size in sorted(column_bytes.items(), key=lambda item: item[1], reverse=True)
-    ]
-
-    largest = [
+    sampled_rows = [
         {
-            "decision_id": str(row["decision_id"]),
-            "timestamp": _safe_iso(row["timestamp"]),
-            "symbol": str(row["symbol"]),
+            "row_bytes": _number(row["row_bytes"]),
+            "stored_context_bytes": _number(row["stored_context_bytes"]),
+            "context_payload_bytes": _number(row["context_payload_bytes"]),
+            "reason_bytes": _number(row["reason_bytes"]),
             "state": str(row["state"]),
-            "row_bytes": _safe_int(row["row_bytes"]),
-            "detector_context_bytes": _safe_int(row["detector_context_bytes"]),
-            "reason_bytes": _safe_int(row["reason_bytes"]),
         }
-        for row in largest_rows
+        for row in sample
     ]
-    by_state = [
-        {
-            "state": str(row["state"]),
-            "rows": _safe_int(row["rows"]),
-            "logical_row_bytes": _safe_int(row["logical_row_bytes"]),
-            "avg_row_bytes": _safe_int(row["avg_row_bytes"]),
-            "detector_context_bytes": _safe_int(row["detector_context_bytes"]),
-        }
-        for row in state_rows
-    ]
-
     return {
         "status": "OK",
-        "diagnostic": "V17_STORAGE_DIAGNOSTIC_2",
+        "diagnostic": "V17_STORAGE_DIAGNOSTIC_2_LIGHT",
         "mode": "READ_ONLY",
         "generated_at": utcnow().isoformat(),
         "relation": {
-            "total_bytes": _safe_int(relation_row["total_bytes"]),
-            "table_bytes": _safe_int(relation_row["table_bytes"]),
-            "index_bytes": _safe_int(relation_row["index_bytes"]),
-            "toast_total_bytes": _safe_int(relation_row["toast_total_bytes"]),
+            "total_bytes": _number(relation["total_bytes"]),
+            "table_bytes": _number(relation["table_bytes"]),
+            "index_bytes": _number(relation["index_bytes"]),
+            "toast_total_bytes": _number(relation["toast_total_bytes"]),
+            "approximate_rows": _number(relation["approximate_rows"]),
         },
-        "summary": {
-            "rows": _safe_int(summary_row["rows"]),
-            "logical_row_bytes": _safe_int(summary_row["logical_row_bytes"]),
-            "avg_row_bytes": _safe_int(summary_row["avg_row_bytes"]),
-            "max_row_bytes": _safe_int(summary_row["max_row_bytes"]),
-            "avg_detector_context_bytes": _safe_int(summary_row["avg_detector_context_bytes"]),
-            "max_detector_context_bytes": _safe_int(summary_row["max_detector_context_bytes"]),
-            "oldest_timestamp": _safe_iso(summary_row["oldest_timestamp"]),
-            "newest_timestamp": _safe_iso(summary_row["newest_timestamp"]),
+        "sample": {
+            "method": "SYSTEM_1_PERCENT_LIMIT_20",
+            "sampled_rows": len(sampled_rows),
+            "representative": False,
+            "rows": sampled_rows,
         },
-        "columns_by_logical_size": ranked_columns,
-        "largest_rows": largest,
-        "by_state": by_state,
         "safety": {
             "paper_only": True,
             "mutates_database": False,
             "contains_credentials": False,
             "returns_detector_context_payload": False,
+            "statement_timeout_ms": 8000,
         },
     }
 

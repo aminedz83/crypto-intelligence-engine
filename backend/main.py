@@ -15554,6 +15554,108 @@ async def signal_history_physical_diagnostic() -> Dict[str, object]:
         },
     }
 
+
+# ============================ V17-STORAGE-DIAGNOSTIC-4 ============================
+# Optional free-space-map sampling. No extension installation, maintenance or writes.
+
+@api_router.get("/diagnostics/storage/free-space")
+async def signal_history_free_space_diagnostic() -> Dict[str, object]:
+    """Sample existing FSM data only if pg_freespacemap is already installed."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+
+    capability_sql = text("""
+        SELECT
+            pg_relation_size('signal_decision_history'::regclass)::bigint AS heap_bytes,
+            current_setting('block_size')::integer AS block_size_bytes,
+            EXISTS (
+                SELECT 1 FROM pg_extension WHERE extname = 'pg_freespacemap'
+            ) AS freespace_extension_installed,
+            EXISTS (
+                SELECT 1 FROM pg_extension WHERE extname = 'pgstattuple'
+            ) AS pgstattuple_extension_installed
+    """)
+    try:
+        async with engine.connect() as conn:
+            async with conn.begin():
+                await conn.execute(text("SELECT set_config('statement_timeout', '3000', true)"))
+                capability = (await conn.execute(capability_sql)).mappings().one()
+                raw_heap = capability["heap_bytes"]
+                raw_block = capability["block_size_bytes"]
+                heap_bytes = int(raw_heap) if isinstance(raw_heap, (int, str)) else 0
+                block_bytes = int(raw_block) if isinstance(raw_block, (int, str)) else 8192
+                heap_pages = heap_bytes // block_bytes if block_bytes > 0 else 0
+                installed = bool(capability["freespace_extension_installed"])
+                sampled = []
+                if installed and heap_pages > 0:
+                    # One page from each of 16 equally spaced heap regions.
+                    sample_sql = text("""
+                        SELECT page_number,
+                               pg_freespace('signal_decision_history'::regclass,
+                                            page_number)::bigint AS free_bytes
+                        FROM (
+                            SELECT DISTINCT
+                                LEAST(:last_page,
+                                      FLOOR(n * :page_count / 16.0)::integer)
+                                    AS page_number
+                            FROM generate_series(0, 15) AS n
+                        ) AS selected_pages
+                        ORDER BY page_number
+                    """)
+                    sampled = (await conn.execute(sample_sql, {
+                        "last_page": heap_pages - 1,
+                        "page_count": heap_pages,
+                    })).mappings().all()
+    except Exception as exc:
+        log.error("Free space diagnostic failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "free space diagnostic failed"},
+        ) from exc
+
+    sample_rows = [
+        {"page_number": int(r["page_number"]), "fsm_free_bytes": int(r["free_bytes"])}
+        for r in sampled
+    ]
+    return {
+        "status": "OK",
+        "diagnostic": "V17_STORAGE_DIAGNOSTIC_4",
+        "mode": "READ_ONLY_BOUNDED_FSM_SAMPLE",
+        "generated_at": utcnow().isoformat(),
+        "relation": {"heap_bytes": heap_bytes, "block_size_bytes": block_bytes,
+                     "heap_pages": heap_pages},
+        "capabilities": {
+            "pg_freespacemap_extension_installed": installed,
+            "pgstattuple_extension_installed": bool(
+                capability["pgstattuple_extension_installed"]
+            ),
+        },
+        "sample": {
+            "sampled_pages": len(sample_rows),
+            "pages": sample_rows,
+            "avg_fsm_free_bytes_per_sampled_page": (
+                round(sum(r["fsm_free_bytes"] for r in sample_rows) / len(sample_rows), 2)
+                if sample_rows else None
+            ),
+            "representative": False,
+            "estimated_total_reclaimable_bytes": None,
+        },
+        "interpretation": {
+            "free_space_map_is_approximate": True,
+            "fsm_free_space_is_not_equivalent_to_reclaimable_disk_space": True,
+            "reclaimable_bytes_not_established": True,
+            "measurement_unavailable_reason": (
+                None if installed else "PG_FREESPACEMAP_EXTENSION_NOT_INSTALLED"
+            ),
+        },
+        "safety": {"paper_only": True, "mutates_database": False,
+                   "installs_extensions": False, "scans_history_rows": False,
+                   "statement_timeout_ms": 3000},
+    }
+
 app = create_app()
 
 # V17-ENERGY-FIX3 — runtime route binding hardening.

@@ -15211,6 +15211,137 @@ async def get_active_mt5_broker_profile() -> Dict[str, object]:
     return mt5_broker_compatibility(_mt5_active_broker_id)
 
 # App must be built only after every router decorator above has executed.
+
+# ============================ V17-STORAGE-DIAGNOSTIC-1 ============================
+# PostgreSQL storage observability only. Every SQL statement in this diagnostic is
+# SELECT-only: no DELETE/TRUNCATE/VACUUM/UPDATE/INSERT and no schema mutation.
+
+@api_router.get("/diagnostics/storage")
+async def postgres_storage_diagnostic() -> Dict[str, object]:
+    """Return a strictly read-only PostgreSQL storage diagnostic."""
+    if not persistence_state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "persistence not ready"},
+        )
+
+    database_sql = text("""
+        SELECT
+            current_database() AS database_name,
+            pg_database_size(current_database())::bigint AS database_bytes,
+            pg_size_pretty(pg_database_size(current_database())) AS database_pretty
+    """)
+    tables_sql = text("""
+        SELECT
+            s.relname AS table_name,
+            pg_total_relation_size(s.relid)::bigint AS total_bytes,
+            pg_relation_size(s.relid)::bigint AS table_bytes,
+            pg_indexes_size(s.relid)::bigint AS index_bytes,
+            pg_size_pretty(pg_total_relation_size(s.relid)) AS total_pretty,
+            pg_size_pretty(pg_relation_size(s.relid)) AS table_pretty,
+            pg_size_pretty(pg_indexes_size(s.relid)) AS index_pretty,
+            COALESCE(s.n_live_tup, 0)::bigint AS approximate_rows,
+            COALESCE(s.n_dead_tup, 0)::bigint AS approximate_dead_rows
+        FROM pg_stat_user_tables AS s
+        ORDER BY pg_total_relation_size(s.relid) DESC, s.relname ASC
+    """)
+    candle_total_sql = text("""
+        SELECT
+            COUNT(*)::bigint AS rows,
+            MIN(bucket_start) AS oldest_bucket,
+            MAX(bucket_start) AS newest_bucket,
+            COUNT(DISTINCT product_id)::bigint AS distinct_products
+        FROM candles
+    """)
+    candles_sql = text("""
+        SELECT
+            source,
+            granularity,
+            COUNT(*)::bigint AS rows,
+            MIN(bucket_start) AS oldest_bucket,
+            MAX(bucket_start) AS newest_bucket
+        FROM candles
+        GROUP BY source, granularity
+        ORDER BY COUNT(*) DESC, source ASC, granularity ASC
+    """)
+
+    try:
+        async with engine.connect() as conn:
+            database_row = (await conn.execute(database_sql)).mappings().one()
+            table_rows = (await conn.execute(tables_sql)).mappings().all()
+            candle_total = (await conn.execute(candle_total_sql)).mappings().one()
+            candle_breakdown = (await conn.execute(candles_sql)).mappings().all()
+    except Exception as exc:
+        log.error("Storage diagnostic failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "UNAVAILABLE", "reason": "storage diagnostic query failed"},
+        ) from exc
+
+    def _iso(value: object) -> Optional[str]:
+        return value.isoformat() if isinstance(value, datetime) else None
+
+    tables: List[Dict[str, object]] = []
+    for row in table_rows:
+        tables.append({
+            "table_name": str(row["table_name"]),
+            "total_bytes": int(row["total_bytes"]),
+            "table_bytes": int(row["table_bytes"]),
+            "index_bytes": int(row["index_bytes"]),
+            "total_pretty": str(row["total_pretty"]),
+            "table_pretty": str(row["table_pretty"]),
+            "index_pretty": str(row["index_pretty"]),
+            "approximate_rows": int(row["approximate_rows"]),
+            "approximate_dead_rows": int(row["approximate_dead_rows"]),
+        })
+
+    breakdown: List[Dict[str, object]] = []
+    for row in candle_breakdown:
+        breakdown.append({
+            "source": str(row["source"]),
+            "granularity": str(row["granularity"]),
+            "rows": int(row["rows"]),
+            "oldest_bucket": _iso(row["oldest_bucket"]),
+            "newest_bucket": _iso(row["newest_bucket"]),
+        })
+
+    database_bytes = int(database_row["database_bytes"])
+    top_table_bytes = int(tables[0]["total_bytes"]) if tables else 0
+    return {
+        "status": "OK",
+        "diagnostic": "V17_STORAGE_DIAGNOSTIC_1",
+        "mode": "READ_ONLY",
+        "generated_at": utcnow().isoformat(),
+        "database": {
+            "name": str(database_row["database_name"]),
+            "bytes": database_bytes,
+            "pretty": str(database_row["database_pretty"]),
+        },
+        "summary": {
+            "user_table_count": len(tables),
+            "top_table": tables[0]["table_name"] if tables else None,
+            "top_table_bytes": top_table_bytes,
+            "top_table_percent_of_database": (
+                round((top_table_bytes / database_bytes) * 100.0, 2)
+                if database_bytes > 0 else 0.0
+            ),
+        },
+        "tables": tables,
+        "candles": {
+            "rows": int(candle_total["rows"]),
+            "distinct_products": int(candle_total["distinct_products"]),
+            "oldest_bucket": _iso(candle_total["oldest_bucket"]),
+            "newest_bucket": _iso(candle_total["newest_bucket"]),
+            "by_source_granularity": breakdown,
+        },
+        "safety": {
+            "paper_only": True,
+            "mutates_database": False,
+            "contains_credentials": False,
+        },
+    }
+
+
 app = create_app()
 
 # V17-ENERGY-FIX3 — runtime route binding hardening.

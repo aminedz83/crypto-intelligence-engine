@@ -10707,3 +10707,41 @@ class V17StorageDiagnostic3Tests(unittest.TestCase):
         source = inspect.getsource(main.signal_history_physical_diagnostic)
         self.assertIn('"contains_credentials": False', source)
         self.assertIn('"scans_history_rows": False', source)
+
+class V17StorageDiagnostic4Tests(unittest.TestCase):
+    def test_route(self):
+        paths = [getattr(r, "path", "") for r in main.api_router.routes]
+        self.assertIn("/diagnostics/storage/free-space", paths)
+
+    def test_version_and_mode(self):
+        src = inspect.getsource(main.signal_history_free_space_diagnostic)
+        self.assertIn("V17_STORAGE_DIAGNOSTIC_4", src)
+        self.assertIn("READ_ONLY_BOUNDED_FSM_SAMPLE", src)
+
+    def test_optional_extension(self):
+        src = inspect.getsource(main.signal_history_free_space_diagnostic)
+        self.assertIn("pg_freespacemap", src)
+        self.assertIn("if installed and heap_pages > 0", src)
+
+    def test_bounded_page_sample(self):
+        src = inspect.getsource(main.signal_history_free_space_diagnostic)
+        self.assertIn("generate_series(0, 15)", src)
+        self.assertIn("representative", src)
+
+    def test_no_unjustified_reclaim_claim(self):
+        src = inspect.getsource(main.signal_history_free_space_diagnostic)
+        self.assertIn('"estimated_total_reclaimable_bytes": None', src)
+        self.assertIn('"reclaimable_bytes_not_established": True', src)
+
+    def test_no_mutating_sql(self):
+        src = inspect.getsource(main.signal_history_free_space_diagnostic).upper()
+        for token in ("DELETE FROM", "TRUNCATE ", "VACUUM ", "UPDATE SIGNAL_",
+                      "INSERT INTO", "ALTER TABLE", "DROP TABLE", "CREATE EXTENSION"):
+            self.assertNotIn(token, src)
+
+    def test_timeout_and_fail_closed(self):
+        src = inspect.getsource(main.signal_history_free_space_diagnostic)
+        self.assertIn("statement_timeout", src)
+        self.assertIn("if not persistence_state.ready", src)
+        self.assertIn("status_code=503", src)
+

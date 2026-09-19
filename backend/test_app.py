@@ -10582,3 +10582,52 @@ class PerformanceIntelligenceAggregateDiagnosticV17Tests(unittest.TestCase):
 
     def test_ui_states_oos_requirement(self):
         self.assertIn("confirmation OOS", self.html)
+
+
+# ==================== V17-STORAGE-DIAGNOSTIC-1 — READ ONLY ====================
+
+class V17StorageDiagnostic1Tests(unittest.TestCase):
+    """Storage observability must remain strictly read-only."""
+
+    def test_storage_diagnostic_route_exists(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/diagnostics/storage", paths)
+
+    def test_storage_diagnostic_marker_exists(self):
+        source = inspect.getsource(main.postgres_storage_diagnostic)
+        self.assertIn("V17_STORAGE_DIAGNOSTIC_1", source)
+        self.assertIn('"mode": "READ_ONLY"', source)
+
+    def test_storage_diagnostic_reports_database_size(self):
+        source = inspect.getsource(main.postgres_storage_diagnostic)
+        self.assertIn("pg_database_size(current_database())", source)
+        self.assertIn("pg_total_relation_size", source)
+        self.assertIn("pg_indexes_size", source)
+
+    def test_storage_diagnostic_reports_candle_age_and_breakdown(self):
+        source = inspect.getsource(main.postgres_storage_diagnostic)
+        self.assertIn("MIN(bucket_start)", source)
+        self.assertIn("MAX(bucket_start)", source)
+        self.assertIn("GROUP BY source, granularity", source)
+        self.assertIn("COUNT(DISTINCT product_id)", source)
+
+    def test_storage_diagnostic_has_no_mutating_sql(self):
+        source = inspect.getsource(main.postgres_storage_diagnostic).upper()
+        forbidden = (
+            "DELETE FROM", "TRUNCATE ", "VACUUM ", "UPDATE ",
+            "INSERT INTO", "ALTER TABLE", "DROP TABLE", "CREATE TABLE",
+        )
+        for token in forbidden:
+            self.assertNotIn(token, source)
+
+    def test_storage_diagnostic_does_not_expose_credentials(self):
+        source = inspect.getsource(main.postgres_storage_diagnostic)
+        self.assertNotIn("postgres_password", source)
+        self.assertNotIn("database_url", source.lower())
+        self.assertIn('"contains_credentials": False', source)
+
+    def test_storage_diagnostic_fails_closed_without_persistence(self):
+        source = inspect.getsource(main.postgres_storage_diagnostic)
+        self.assertIn("if not persistence_state.ready", source)
+        self.assertIn("status_code=503", source)
+

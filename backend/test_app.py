@@ -10631,3 +10631,40 @@ class V17StorageDiagnostic1Tests(unittest.TestCase):
         self.assertIn("if not persistence_state.ready", source)
         self.assertIn("status_code=503", source)
 
+class V17StorageDiagnostic2Tests(unittest.TestCase):
+    def test_signal_history_storage_route_exists(self):
+        paths = [getattr(route, "path", "") for route in main.api_router.routes]
+        self.assertIn("/diagnostics/storage/signal-history", paths)
+
+    def test_signal_history_diagnostic_marker_exists(self):
+        source = inspect.getsource(main.signal_history_storage_diagnostic)
+        self.assertIn("V17_STORAGE_DIAGNOSTIC_2", source)
+        self.assertIn('"mode": "READ_ONLY"', source)
+
+    def test_signal_history_measures_column_sizes(self):
+        source = inspect.getsource(main.signal_history_storage_diagnostic)
+        self.assertIn("pg_column_size(detector_context)", source)
+        self.assertIn("columns_by_logical_size", source)
+
+    def test_signal_history_measures_toast(self):
+        source = inspect.getsource(main.signal_history_storage_diagnostic)
+        self.assertIn("reltoastrelid", source)
+        self.assertIn("toast_total_bytes", source)
+
+    def test_signal_history_reports_largest_rows_without_payload(self):
+        source = inspect.getsource(main.signal_history_storage_diagnostic)
+        self.assertIn("largest_rows", source)
+        self.assertIn('"returns_detector_context_payload": False', source)
+        self.assertNotIn('"detector_context": str(row', source)
+
+    def test_signal_history_has_no_mutating_sql(self):
+        source = inspect.getsource(main.signal_history_storage_diagnostic).upper()
+        for token in ("DELETE FROM", "TRUNCATE ", "UPDATE SIGNAL_DECISION_HISTORY",
+                      "INSERT INTO", "VACUUM ", "ALTER TABLE", "DROP TABLE"):
+            self.assertNotIn(token, source)
+
+    def test_signal_history_fails_closed_without_persistence(self):
+        source = inspect.getsource(main.signal_history_storage_diagnostic)
+        self.assertIn("if not persistence_state.ready", source)
+        self.assertIn("status_code=503", source)
+

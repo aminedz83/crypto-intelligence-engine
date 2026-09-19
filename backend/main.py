@@ -15305,7 +15305,8 @@ async def postgres_storage_diagnostic() -> Dict[str, object]:
             "newest_bucket": _iso(row["newest_bucket"]),
         })
 
-    database_bytes = int(database_row["database_bytes"])
+    raw_database_bytes = database_row["database_bytes"]
+    database_bytes = int(raw_database_bytes) if isinstance(raw_database_bytes, (int, str)) else 0
     top_table_bytes = int(tables[0]["total_bytes"]) if tables else 0
     return {
         "status": "OK",

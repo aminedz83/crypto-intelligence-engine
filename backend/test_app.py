@@ -10668,3 +10668,42 @@ class V17StorageDiagnostic2Tests(unittest.TestCase):
         source = inspect.getsource(main.signal_history_storage_diagnostic)
         self.assertIn("if not persistence_state.ready", source)
         self.assertIn("status_code=503", source)
+
+
+class V17StorageDiagnostic3Tests(unittest.TestCase):
+    def test_physical_route_exists(self):
+        paths = [getattr(route, "path", "") for route in main.api_router.routes]
+        self.assertIn("/diagnostics/storage/physical", paths)
+
+    def test_catalog_only_marker(self):
+        source = inspect.getsource(main.signal_history_physical_diagnostic)
+        self.assertIn("V17_STORAGE_DIAGNOSTIC_3", source)
+        self.assertIn("READ_ONLY_CATALOG_ONLY", source)
+
+    def test_catalog_stats_and_maintenance(self):
+        source = inspect.getsource(main.signal_history_physical_diagnostic)
+        self.assertIn("pg_stat_user_tables", source)
+        self.assertIn("last_autovacuum", source)
+        self.assertIn("relpages", source)
+
+    def test_no_history_row_scan_or_bloat_claim(self):
+        source = inspect.getsource(main.signal_history_physical_diagnostic)
+        self.assertNotIn("FROM signal_decision_history AS", source)
+        self.assertIn('"reclaimable_bytes_not_established": True', source)
+
+    def test_timeout_and_fail_closed(self):
+        source = inspect.getsource(main.signal_history_physical_diagnostic)
+        self.assertIn("statement_timeout", source)
+        self.assertIn("if not persistence_state.ready", source)
+        self.assertIn("status_code=503", source)
+
+    def test_no_mutating_sql(self):
+        source = inspect.getsource(main.signal_history_physical_diagnostic).upper()
+        for token in ("DELETE FROM", "TRUNCATE ", "VACUUM ", "UPDATE SIGNAL_",
+                      "INSERT INTO", "ALTER TABLE", "DROP TABLE"):
+            self.assertNotIn(token, source)
+
+    def test_no_credentials_or_payload(self):
+        source = inspect.getsource(main.signal_history_physical_diagnostic)
+        self.assertIn('"contains_credentials": False', source)
+        self.assertIn('"scans_history_rows": False', source)

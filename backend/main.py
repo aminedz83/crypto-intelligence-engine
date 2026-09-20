@@ -4458,9 +4458,19 @@ async def persist_auto_decision_trace(
     symbol = str(entry.get("symbol", ""))
     state = str(entry.get("state", ""))
     reason = str(entry.get("reason", ""))
-    identity = f"{timestamp_raw}|{symbol}|{state}|{reason}"
-    decision_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     context = json.dumps(detector, sort_keys=True, default=str) if detector else None
+    # Only identical WAIT snapshots for the SAME closed candle are idempotent.
+    # Missing candle identity and all transitions/events retain timestamp IDs.
+    closed_candle = entry.get("latest_closed_timestamp")
+    if state == "WAIT" and closed_candle and context is not None:
+        context_digest = hashlib.sha256(context.encode("utf-8")).hexdigest()
+        identity = (
+            f"WAIT_CANDLE_V1|{symbol}|{closed_candle}|{state}|{reason}|"
+            f"{entry.get('setup_state')}|{context_digest}"
+        )
+    else:
+        identity = f"{timestamp_raw}|{symbol}|{state}|{reason}"
+    decision_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     values = {
         "decision_id": decision_id,
         "timestamp": timestamp,

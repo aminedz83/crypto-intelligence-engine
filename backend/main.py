@@ -4442,6 +4442,33 @@ def record_auto_decision_trace(
     return entry
 
 
+# Process-local, bounded diagnostic counters; never writes diagnostic data to DB.
+# Counters reset on restart and are not an exhaustive history of database rows.
+_wait_verify_started_at = utcnow()
+_wait_verify = {"attempted": 0, "inserted": 0, "conflicts": 0,
+                "errors": 0, "missing_candle": 0, "same_candle_retries": 0,
+                "same_candle_changed_context": 0}
+_wait_verify_last: Dict[tuple, str] = {}
+_WAIT_VERIFY_MAX_KEYS = 512
+
+
+@api_router.get("/diagnostics/storage/wait-dedup-verification")
+async def wait_dedup_verification() -> Dict[str, object]:
+    """Read-only snapshot of in-process WAIT persistence outcomes, not DB totals."""
+    return {
+        "status": "OK", "diagnostic": "V17_WAIT_DEDUP_VERIFICATION_1",
+        "mode": "READ_ONLY_PROCESS_COUNTERS", "generated_at": utcnow().isoformat(),
+        "since": _wait_verify_started_at.isoformat(),
+        "counters": dict(_wait_verify),
+        "tracked_symbol_candles": len(_wait_verify_last),
+        "limits": {"process_local": True, "resets_on_restart": True,
+                   "multi_worker_aggregate": False, "tracks_last_context_only": True,
+                   "max_tracked_symbol_candles": _WAIT_VERIFY_MAX_KEYS,
+                   "database_rows_scanned": 0, "context_payload_exposed": False},
+        "safety": {"paper_only": True, "mutates_database": False},
+    }
+
+
 async def persist_auto_decision_trace(
     entry: Dict[str, object], detector: Optional[Dict[str, object]] = None
 ) -> bool:
@@ -4471,6 +4498,22 @@ async def persist_auto_decision_trace(
     else:
         identity = f"{timestamp_raw}|{symbol}|{state}|{reason}"
     decision_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    wait_key = None
+    if state == "WAIT":
+        _wait_verify["attempted"] += 1
+        if not closed_candle:
+            _wait_verify["missing_candle"] += 1
+        else:
+            wait_key = (symbol, str(closed_candle), reason, str(entry.get("setup_state")))
+            context_digest = hashlib.sha256((context or "").encode("utf-8")).hexdigest()
+            previous = _wait_verify_last.get(wait_key)
+            if previous is not None:
+                _wait_verify["same_candle_retries"] += 1
+                if previous != context_digest:
+                    _wait_verify["same_candle_changed_context"] += 1
+            if wait_key not in _wait_verify_last and len(_wait_verify_last) >= _WAIT_VERIFY_MAX_KEYS:
+                _wait_verify_last.pop(next(iter(_wait_verify_last)))
+            _wait_verify_last[wait_key] = context_digest
     values = {
         "decision_id": decision_id,
         "timestamp": timestamp,
@@ -4492,8 +4535,15 @@ async def persist_auto_decision_trace(
         async with engine.begin() as conn:
             stmt = pg_insert(signal_decision_history_table).values(values)
             stmt = stmt.on_conflict_do_nothing(index_elements=["decision_id"])
-            await conn.execute(stmt)
+            result = await conn.execute(stmt)
+            if state == "WAIT":
+                if result.rowcount == 1:
+                    _wait_verify["inserted"] += 1
+                elif result.rowcount == 0:
+                    _wait_verify["conflicts"] += 1
     except Exception as exc:  # noqa: BLE001
+        if state == "WAIT":
+            _wait_verify["errors"] += 1
         log.error("Decision history persistence failed: %s", exc)
         return False
     return True

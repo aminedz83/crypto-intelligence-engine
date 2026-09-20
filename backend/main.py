@@ -4511,7 +4511,10 @@ async def persist_auto_decision_trace(
                 _wait_verify["same_candle_retries"] += 1
                 if previous != context_digest:
                     _wait_verify["same_candle_changed_context"] += 1
-            if wait_key not in _wait_verify_last and len(_wait_verify_last) >= _WAIT_VERIFY_MAX_KEYS:
+            if (
+                wait_key not in _wait_verify_last
+                and len(_wait_verify_last) >= _WAIT_VERIFY_MAX_KEYS
+            ):
                 _wait_verify_last.pop(next(iter(_wait_verify_last)))
             _wait_verify_last[wait_key] = context_digest
     values = {

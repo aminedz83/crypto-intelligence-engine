@@ -4540,9 +4540,12 @@ async def persist_auto_decision_trace(
             stmt = stmt.on_conflict_do_nothing(index_elements=["decision_id"])
             result = await conn.execute(stmt)
             if state == "WAIT":
-                if result.rowcount == 1:
+                # Some legacy test doubles return None instead of a SQL result.
+                # An unknown row count must not be counted as an insert or conflict.
+                rowcount = getattr(result, "rowcount", None)
+                if rowcount == 1:
                     _wait_verify["inserted"] += 1
-                elif result.rowcount == 0:
+                elif rowcount == 0:
                     _wait_verify["conflicts"] += 1
     except Exception as exc:  # noqa: BLE001
         if state == "WAIT":

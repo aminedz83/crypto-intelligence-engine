@@ -10768,7 +10768,7 @@ class TestWaitCandleDedupV17(unittest.TestCase):
             }
             with (
                 patch.object(main.persistence_state, "ready", True),
-                patch.object(main.engine, "begin", return_value=Tx()),
+                patch.object(main, "engine", type("FakeEngine", (), {"begin": lambda self: Tx()})()),
             ):
                 for ts in (
                     "2026-09-19T23:01:00+00:00",

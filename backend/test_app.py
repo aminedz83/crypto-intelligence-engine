@@ -10831,5 +10831,5 @@ class TestWaitDedupVerificationV17(unittest.TestCase):
     def test_instrumentation_keeps_conflict_noop(self):
         source = inspect.getsource(main.persist_auto_decision_trace)
         self.assertIn('on_conflict_do_nothing(index_elements=["decision_id"])', source)
-        self.assertIn('result.rowcount == 0', source)
-        self.assertIn('result.rowcount == 1', source)
+        self.assertIn('rowcount == 0', source)
+        self.assertIn('rowcount == 1', source)

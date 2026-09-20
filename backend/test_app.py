@@ -10806,3 +10806,30 @@ class TestWaitCandleDedupV17(unittest.TestCase):
     def test_conflict_does_not_modify_existing_history(self):
         source = inspect.getsource(main.persist_auto_decision_trace)
         self.assertIn('on_conflict_do_nothing(index_elements=["decision_id"])', source)
+
+
+class TestWaitDedupVerificationV17(unittest.TestCase):
+    def test_endpoint_is_read_only_and_has_no_context(self):
+        body = asyncio.run(main.wait_dedup_verification())
+        self.assertEqual(body["mode"], "READ_ONLY_PROCESS_COUNTERS")
+        self.assertEqual(body["limits"]["database_rows_scanned"], 0)
+        self.assertFalse(body["limits"]["context_payload_exposed"])
+        self.assertFalse(body["safety"]["mutates_database"])
+
+    def test_endpoint_exposes_counter_names_and_restart_limitation(self):
+        body = asyncio.run(main.wait_dedup_verification())
+        self.assertTrue(body["limits"]["resets_on_restart"])
+        self.assertTrue(body["limits"]["process_local"])
+        self.assertTrue({"attempted", "inserted", "conflicts", "errors",
+                         "same_candle_retries", "same_candle_changed_context"}
+                        <= set(body["counters"]))
+
+    def test_endpoint_registered(self):
+        paths = {route.path for route in main.api_router.routes}
+        self.assertIn("/diagnostics/storage/wait-dedup-verification", paths)
+
+    def test_instrumentation_keeps_conflict_noop(self):
+        source = inspect.getsource(main.persist_auto_decision_trace)
+        self.assertIn('on_conflict_do_nothing(index_elements=["decision_id"])', source)
+        self.assertIn('result.rowcount == 0', source)
+        self.assertIn('result.rowcount == 1', source)

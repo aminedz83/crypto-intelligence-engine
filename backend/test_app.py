@@ -10749,9 +10749,7 @@ class V17StorageDiagnostic4Tests(unittest.TestCase):
 
 class TestWaitCandleDedupV17(unittest.TestCase):
     def test_identical_wait_same_candle_has_stable_id(self):
-        import hashlib
-        import json
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         async def capture():
             ids = []
@@ -10763,10 +10761,27 @@ class TestWaitCandleDedupV17(unittest.TestCase):
                     return Conn()
                 async def __aexit__(self, *args):
                     return False
-            detector = {"setup_state": "WAIT", "latest_closed_timestamp": "2026-09-19T23:00:00+00:00", "signal": 1}
-            with patch.object(main.persistence_state, "ready", True), patch.object(main.engine, "begin", return_value=Tx()):
-                for ts in ("2026-09-19T23:01:00+00:00", "2026-09-19T23:02:00+00:00"):
-                    entry = {"timestamp": ts, "symbol": "BTC-USD", "state": "WAIT", "reason": "NO_SETUP", "setup_state": "WAIT", "latest_closed_timestamp": detector["latest_closed_timestamp"]}
+            detector = {
+                "setup_state": "WAIT",
+                "latest_closed_timestamp": "2026-09-19T23:00:00+00:00",
+                "signal": 1,
+            }
+            with (
+                patch.object(main.persistence_state, "ready", True),
+                patch.object(main.engine, "begin", return_value=Tx()),
+            ):
+                for ts in (
+                    "2026-09-19T23:01:00+00:00",
+                    "2026-09-19T23:02:00+00:00",
+                ):
+                    entry = {
+                        "timestamp": ts,
+                        "symbol": "BTC-USD",
+                        "state": "WAIT",
+                        "reason": "NO_SETUP",
+                        "setup_state": "WAIT",
+                        "latest_closed_timestamp": detector["latest_closed_timestamp"],
+                    }
                     self.assertTrue(await main.persist_auto_decision_trace(entry, detector))
             return ids
         ids = asyncio.run(capture())
@@ -10780,7 +10795,10 @@ class TestWaitCandleDedupV17(unittest.TestCase):
 
     def test_wait_context_changes_produce_distinct_identity(self):
         source = inspect.getsource(main.persist_auto_decision_trace)
-        self.assertIn('context_digest = hashlib.sha256(context.encode("utf-8")).hexdigest()', source)
+        self.assertIn(
+            'context_digest = hashlib.sha256(context.encode("utf-8")).hexdigest()',
+            source,
+        )
         self.assertIn("context_digest}", source)
 
     def test_conflict_does_not_modify_existing_history(self):

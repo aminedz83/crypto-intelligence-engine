@@ -3704,49 +3704,71 @@ def daily_bias_allows(bias: str, side: str) -> bool:
     return False
 
 
-# V17-PRO Symbol Performance Filter: focus on winning symbols.
-# Symbols with >= MIN_TRADES closed and a losing record are blocked.
-# New symbols (< MIN_TRADES) are allowed (discovery mode).
-SYMBOL_PERF_MIN_TRADES = 3
-SYMBOL_PERF_MIN_WIN_RATE = Decimal("30")  # block below 30% win rate
+# V17-STRATEGY-QUALITY-1 — performance isolation gate.
+# A strategy/direction needs a statistically useful sample before historical
+# performance is allowed to block new PAPER discovery.  Wins are determined
+# from realized price direction, not close_reason: a profitable trailing-stop
+# exit is a win even though its close_reason is STOP_LOSS.
+SYMBOL_PERF_MIN_TRADES = 30
+SYMBOL_PERF_MIN_WIN_RATE = Decimal("30")
 SYMBOL_PERF_CACHE_SECONDS = 600  # 10 minutes
-_symbol_perf_cache: Dict[str, tuple] = {}  # symbol → (allowed, expiry)
+_symbol_perf_cache: Dict[tuple, tuple] = {}
 
 
-async def is_symbol_performance_allowed(symbol: str) -> bool:
-    """Return True if symbol has no losing track record, or not enough data."""
+async def is_symbol_performance_allowed(
+    symbol: str,
+    strategy_id: Optional[str] = None,
+    side: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+) -> bool:
+    """Return whether an isolated PAPER cohort has enough evidence to allow it.
+
+    The gate never mixes LONG/SHORT or strategy families when those dimensions
+    are supplied.  Samples below SYMBOL_PERF_MIN_TRADES stay in discovery mode.
+    """
     canonical = symbol.upper()
+    strategy = strategy_id.upper() if strategy_id else None
+    direction = side.upper() if side else None
+    version = strategy_version if strategy_version else None
+    cache_key = (canonical, strategy, direction, version)
     now_ts = utcnow().timestamp()
-    cached = _symbol_perf_cache.get(canonical)
+    cached = _symbol_perf_cache.get(cache_key)
     if cached and now_ts < cached[1]:
         return cached[0]
     try:
+        clauses = ["symbol=:symbol", "status='CLOSED'", "close_price IS NOT NULL"]
+        params: Dict[str, object] = {"symbol": canonical}
+        if strategy is not None:
+            clauses.append("performance_strategy_id=:strategy_id")
+            params["strategy_id"] = strategy
+        if direction in {"LONG", "SHORT"}:
+            clauses.append("side=:side")
+            params["side"] = direction
+        if version is not None:
+            clauses.append("performance_strategy_version=:strategy_version")
+            params["strategy_version"] = version
+        query = (
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE "
+            "WHEN side='LONG' AND close_price > entry THEN 1 "
+            "WHEN side='SHORT' AND close_price < entry THEN 1 "
+            "ELSE 0 END) AS wins "
+            "FROM paper_positions WHERE " + " AND ".join(clauses)
+        )
         async with engine.connect() as conn:
-            result = await conn.execute(
-                text(
-                    "SELECT "
-                    "COUNT(*) AS total, "
-                    "SUM(CASE WHEN close_reason='TAKE_PROFIT' THEN 1 ELSE 0 END) AS wins "
-                    "FROM paper_positions "
-                    "WHERE symbol=:symbol AND status='CLOSED'"
-                ),
-                {"symbol": canonical},
-            )
+            result = await conn.execute(text(query), params)
             row = result.fetchone()
         total = int(row.total) if row and row.total else 0
         wins = int(row.wins) if row and row.wins else 0
         if total < SYMBOL_PERF_MIN_TRADES:
-            allowed = True  # not enough data — allow discovery
+            allowed = True
         else:
             win_rate = Decimal(str(wins * 100)) / Decimal(str(total))
             allowed = win_rate >= SYMBOL_PERF_MIN_WIN_RATE
-        _symbol_perf_cache[canonical] = (
-            allowed,
-            now_ts + SYMBOL_PERF_CACHE_SECONDS,
-        )
+        _symbol_perf_cache[cache_key] = (allowed, now_ts + SYMBOL_PERF_CACHE_SECONDS)
         return allowed
     except Exception:  # noqa: BLE001
-        return True  # fail-open
+        return True  # fail-open: diagnostics must never invent a rejection
 
 
 
@@ -12312,12 +12334,12 @@ def server_strategy_registry() -> List[Dict[str, object]]:
         },
         {
             "strategy_id": "BREAKOUT_EXPANSION",
-            "version": "0.1-candidate",
-            "status": "CANDIDATE",
+            "version": BREAKOUT_EXPANSION_PAPER_VERSION,
+            "status": "ACTIVE_PAPER_UNVALIDATED",
             "family": "BREAKOUT",
             "preferred_regimes": ["TREND", "TRANSITION"],
             "preferred_volatility": ["EXPANSION"],
-            "execution_eligible": False,
+            "execution_eligible": True,
             "paper_only": True,
         },
     ]
@@ -12573,6 +12595,10 @@ def detect_breakout_expansion_candidate(
         "range_low": range_low,
         "body_ratio": round(body_ratio, 6),
         "body_multiple": round(body / mean_body, 6),
+        "breakout_margin": round(margin, 8),
+        "breakout_margin_body_ratio": round(margin / body, 6) if body > 0 else None,
+        "range_width": round(range_high - range_low, 8),
+        "breakout_candle_close": float(latest.close),
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
     }
 
@@ -13537,6 +13563,9 @@ def build_smc_multi_asset_paper_plan(
         side = "SHORT"
     else:
         return {**base, "status": "WAIT", "reason": "SMC_DIRECTION_INVALID"}
+    boundary = range_high if side == "LONG" else range_low
+    entry_extension = abs(entry - boundary)
+    range_width = range_high - range_low
     return {
         **base,
         "status": "ENTRY_NOW",
@@ -14297,6 +14326,10 @@ async def run_trend_pullback_paper_generation_once() -> Dict[str, int]:
                 {
                     "detector": detection,
                     "volatility_regime": regime.get("volatility"),
+                    "entry_extension": plan.get("entry_extension"),
+                    "entry_extension_range_ratio": plan.get("entry_extension_range_ratio"),
+                    "breakout_boundary": plan.get("breakout_boundary"),
+                    "entry_quality_mode": plan.get("entry_quality_mode"),
                 },
                 default=str,
                 sort_keys=True,
@@ -14324,7 +14357,9 @@ async def run_trend_pullback_paper_generation_once() -> Dict[str, int]:
                 stats["blocked"] += 1
                 continue
             # V17-PRO: Symbol Performance — block losing symbols
-            if not await is_symbol_performance_allowed(symbol):
+            if not await is_symbol_performance_allowed(
+                symbol, "TREND_PULLBACK", tp_side, TREND_PULLBACK_PAPER_VERSION
+            ):
                 stats["blocked"] += 1
                 continue
             result = await execute_trend_pullback_paper_plan(symbol, plan)
@@ -14418,6 +14453,10 @@ def build_breakout_expansion_paper_plan(
         "stop_loss": stop,
         "take_profit": target,
         "risk_reward": BREAKOUT_EXPANSION_RISK_REWARD,
+        "entry_extension": entry_extension,
+        "entry_extension_range_ratio": (entry_extension / range_width if range_width > 0 else None),
+        "breakout_boundary": boundary,
+        "entry_quality_mode": "OBSERVE_ONLY_V1",
         "source_timestamp": ticker.timestamp,
         "setup_timestamp": detection.get("latest_closed_timestamp"),
         "plan_source": "CLOSED_BREAKOUT_RANGE+REAL_COINBASE_TICKER",
@@ -14603,7 +14642,9 @@ async def run_breakout_expansion_paper_generation_once() -> Dict[str, int]:
                 stats["blocked"] += 1
                 continue
             # V17-PRO: Symbol Performance — block losing symbols
-            if not await is_symbol_performance_allowed(symbol):
+            if not await is_symbol_performance_allowed(
+                symbol, "BREAKOUT_EXPANSION", bo_side, BREAKOUT_EXPANSION_PAPER_VERSION
+            ):
                 stats["blocked"] += 1
                 continue
             result = await execute_breakout_expansion_paper_plan(symbol, plan)

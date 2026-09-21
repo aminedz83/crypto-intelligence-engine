@@ -13563,9 +13563,6 @@ def build_smc_multi_asset_paper_plan(
         side = "SHORT"
     else:
         return {**base, "status": "WAIT", "reason": "SMC_DIRECTION_INVALID"}
-    boundary = range_high if side == "LONG" else range_low
-    entry_extension = abs(entry - boundary)
-    range_width = range_high - range_low
     return {
         **base,
         "status": "ENTRY_NOW",
@@ -14444,6 +14441,9 @@ def build_breakout_expansion_paper_plan(
         side = "SHORT"
     else:
         return {**base, "status": "WAIT", "reason": "BREAKOUT_DIRECTION_INVALID"}
+    boundary = range_high if side == "LONG" else range_low
+    entry_extension = abs(entry - boundary)
+    range_width = range_high - range_low
     return {
         **base,
         "status": "ENTRY_NOW",
@@ -14454,7 +14454,9 @@ def build_breakout_expansion_paper_plan(
         "take_profit": target,
         "risk_reward": BREAKOUT_EXPANSION_RISK_REWARD,
         "entry_extension": entry_extension,
-        "entry_extension_range_ratio": (entry_extension / range_width if range_width > 0 else None),
+        "entry_extension_range_ratio": (
+            entry_extension / range_width if range_width > 0 else None
+        ),
         "breakout_boundary": boundary,
         "entry_quality_mode": "OBSERVE_ONLY_V1",
         "source_timestamp": ticker.timestamp,

@@ -37,7 +37,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote as url_quote
 
 import httpx
@@ -15602,7 +15602,7 @@ async def signal_history_free_space_diagnostic() -> Dict[str, object]:
                 block_bytes = int(raw_block) if isinstance(raw_block, (int, str)) else 8192
                 heap_pages = heap_bytes // block_bytes if block_bytes > 0 else 0
                 installed = bool(capability["freespace_extension_installed"])
-                sampled = []
+                sampled: Sequence[Any] = []
                 if installed and heap_pages > 0:
                     # One page from each of 16 equally spaced heap regions.
                     sample_sql = text("""

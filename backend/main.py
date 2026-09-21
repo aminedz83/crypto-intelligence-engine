@@ -12103,7 +12103,7 @@ def _mount_frontend(app: FastAPI, cfg: Settings) -> None:
 
 # ============================ app factory ============================
 async def start_server_crypto_market_stream() -> bool:
-    """Start the Coinbase ticker stream server-side for autonomous paper monitoring."""
+    """Start Coinbase ticker and 5-minute candle streams for paper monitoring."""
     products = sorted(
         provider_symbol
         for instrument in instrument_registry.all()
@@ -12119,6 +12119,7 @@ async def start_server_crypto_market_stream() -> bool:
         return False
     try:
         await market_ws.subscribe("ticker", products)
+        await market_ws.subscribe("candles", products)
         await market_ws.start()
     except asyncio.CancelledError:
         raise

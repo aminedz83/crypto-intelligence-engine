@@ -10793,7 +10793,10 @@ class V17StrategyQualityUpgrade1Tests(unittest.TestCase):
         self.assertIn("cache_key = (canonical, strategy, direction, version)", source)
 
     def test_breakout_registry_matches_active_paper_version(self):
-        item = next(x for x in main.server_strategy_registry() if x["strategy_id"] == "BREAKOUT_EXPANSION")
+        item = next(
+            x for x in main.server_strategy_registry()
+            if x["strategy_id"] == "BREAKOUT_EXPANSION"
+        )
         self.assertEqual(item["version"], main.BREAKOUT_EXPANSION_PAPER_VERSION)
         self.assertEqual(item["status"], "ACTIVE_PAPER_UNVALIDATED")
         self.assertTrue(item["execution_eligible"])

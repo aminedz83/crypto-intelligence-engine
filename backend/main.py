@@ -3704,71 +3704,49 @@ def daily_bias_allows(bias: str, side: str) -> bool:
     return False
 
 
-# V17-STRATEGY-QUALITY-1 — performance isolation gate.
-# A strategy/direction needs a statistically useful sample before historical
-# performance is allowed to block new PAPER discovery.  Wins are determined
-# from realized price direction, not close_reason: a profitable trailing-stop
-# exit is a win even though its close_reason is STOP_LOSS.
-SYMBOL_PERF_MIN_TRADES = 30
-SYMBOL_PERF_MIN_WIN_RATE = Decimal("30")
+# V17-PRO Symbol Performance Filter: focus on winning symbols.
+# Symbols with >= MIN_TRADES closed and a losing record are blocked.
+# New symbols (< MIN_TRADES) are allowed (discovery mode).
+SYMBOL_PERF_MIN_TRADES = 3
+SYMBOL_PERF_MIN_WIN_RATE = Decimal("30")  # block below 30% win rate
 SYMBOL_PERF_CACHE_SECONDS = 600  # 10 minutes
-_symbol_perf_cache: Dict[tuple, tuple] = {}
+_symbol_perf_cache: Dict[str, tuple] = {}  # symbol → (allowed, expiry)
 
 
-async def is_symbol_performance_allowed(
-    symbol: str,
-    strategy_id: Optional[str] = None,
-    side: Optional[str] = None,
-    strategy_version: Optional[str] = None,
-) -> bool:
-    """Return whether an isolated PAPER cohort has enough evidence to allow it.
-
-    The gate never mixes LONG/SHORT or strategy families when those dimensions
-    are supplied.  Samples below SYMBOL_PERF_MIN_TRADES stay in discovery mode.
-    """
+async def is_symbol_performance_allowed(symbol: str) -> bool:
+    """Return True if symbol has no losing track record, or not enough data."""
     canonical = symbol.upper()
-    strategy = strategy_id.upper() if strategy_id else None
-    direction = side.upper() if side else None
-    version = strategy_version if strategy_version else None
-    cache_key = (canonical, strategy, direction, version)
     now_ts = utcnow().timestamp()
-    cached = _symbol_perf_cache.get(cache_key)
+    cached = _symbol_perf_cache.get(canonical)
     if cached and now_ts < cached[1]:
         return cached[0]
     try:
-        clauses = ["symbol=:symbol", "status='CLOSED'", "close_price IS NOT NULL"]
-        params: Dict[str, object] = {"symbol": canonical}
-        if strategy is not None:
-            clauses.append("performance_strategy_id=:strategy_id")
-            params["strategy_id"] = strategy
-        if direction in {"LONG", "SHORT"}:
-            clauses.append("side=:side")
-            params["side"] = direction
-        if version is not None:
-            clauses.append("performance_strategy_version=:strategy_version")
-            params["strategy_version"] = version
-        query = (
-            "SELECT COUNT(*) AS total, "
-            "SUM(CASE "
-            "WHEN side='LONG' AND close_price > entry THEN 1 "
-            "WHEN side='SHORT' AND close_price < entry THEN 1 "
-            "ELSE 0 END) AS wins "
-            "FROM paper_positions WHERE " + " AND ".join(clauses)
-        )
         async with engine.connect() as conn:
-            result = await conn.execute(text(query), params)
+            result = await conn.execute(
+                text(
+                    "SELECT "
+                    "COUNT(*) AS total, "
+                    "SUM(CASE WHEN close_reason='TAKE_PROFIT' THEN 1 ELSE 0 END) AS wins "
+                    "FROM paper_positions "
+                    "WHERE symbol=:symbol AND status='CLOSED'"
+                ),
+                {"symbol": canonical},
+            )
             row = result.fetchone()
         total = int(row.total) if row and row.total else 0
         wins = int(row.wins) if row and row.wins else 0
         if total < SYMBOL_PERF_MIN_TRADES:
-            allowed = True
+            allowed = True  # not enough data — allow discovery
         else:
             win_rate = Decimal(str(wins * 100)) / Decimal(str(total))
             allowed = win_rate >= SYMBOL_PERF_MIN_WIN_RATE
-        _symbol_perf_cache[cache_key] = (allowed, now_ts + SYMBOL_PERF_CACHE_SECONDS)
+        _symbol_perf_cache[canonical] = (
+            allowed,
+            now_ts + SYMBOL_PERF_CACHE_SECONDS,
+        )
         return allowed
     except Exception:  # noqa: BLE001
-        return True  # fail-open: diagnostics must never invent a rejection
+        return True  # fail-open
 
 
 
@@ -12334,12 +12312,12 @@ def server_strategy_registry() -> List[Dict[str, object]]:
         },
         {
             "strategy_id": "BREAKOUT_EXPANSION",
-            "version": BREAKOUT_EXPANSION_PAPER_VERSION,
-            "status": "ACTIVE_PAPER_UNVALIDATED",
+            "version": "0.1-candidate",
+            "status": "CANDIDATE",
             "family": "BREAKOUT",
             "preferred_regimes": ["TREND", "TRANSITION"],
             "preferred_volatility": ["EXPANSION"],
-            "execution_eligible": True,
+            "execution_eligible": False,
             "paper_only": True,
         },
     ]
@@ -12595,11 +12573,7 @@ def detect_breakout_expansion_candidate(
         "range_low": range_low,
         "body_ratio": round(body_ratio, 6),
         "body_multiple": round(body / mean_body, 6),
-        "breakout_margin": round(margin, 8),
-        "breakout_margin_body_ratio": round(margin / body, 6) if body > 0 else None,
-        "range_width": round(range_high - range_low, 8),
-        "breakout_body": round(body, 8),
-        "breakout_candle_close": float(latest.close),
+        "breakout_body": body,
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
     }
 
@@ -14351,9 +14325,7 @@ async def run_trend_pullback_paper_generation_once() -> Dict[str, int]:
                 stats["blocked"] += 1
                 continue
             # V17-PRO: Symbol Performance — block losing symbols
-            if not await is_symbol_performance_allowed(
-                symbol, "TREND_PULLBACK", tp_side, TREND_PULLBACK_PAPER_VERSION
-            ):
+            if not await is_symbol_performance_allowed(symbol):
                 stats["blocked"] += 1
                 continue
             result = await execute_trend_pullback_paper_plan(symbol, plan)
@@ -14419,12 +14391,22 @@ def build_breakout_expansion_paper_plan(
         range_low = Decimal(str(detection["range_low"]))
     except (KeyError, ValueError, InvalidOperation):
         return {**base, "status": "WAIT", "reason": "BREAKOUT_STRUCTURE_INVALID"}
+    # Experimental, conservative chase guard: no entry beyond one confirmed
+    # breakout candle body from the broken level. Missing/invalid body -> WAIT.
+    try:
+        breakout_body = Decimal(str(detection["breakout_body"]))
+    except (KeyError, ValueError, InvalidOperation, TypeError):
+        return {**base, "status": "WAIT", "reason": "BREAKOUT_BODY_NOT_VALID"}
+    if not breakout_body.is_finite() or breakout_body <= 0:
+        return {**base, "status": "WAIT", "reason": "BREAKOUT_BODY_NOT_VALID"}
     direction = str(detection.get("direction") or "")
     if direction == "BULLISH":
         stop = range_high
         if stop <= 0 or entry <= stop:
             return {**base, "status": "WAIT", "reason": "BULLISH_BREAKOUT_NOT_HELD"}
         risk = entry - stop
+        if risk > breakout_body:
+            return {**base, "status": "WAIT", "reason": "BREAKOUT_ENTRY_TOO_FAR"}
         target = entry + BREAKOUT_EXPANSION_RISK_REWARD * risk
         side = "LONG"
     elif direction == "BEARISH":
@@ -14432,19 +14414,14 @@ def build_breakout_expansion_paper_plan(
         if entry <= 0 or stop <= entry:
             return {**base, "status": "WAIT", "reason": "BEARISH_BREAKOUT_NOT_HELD"}
         risk = stop - entry
+        if risk > breakout_body:
+            return {**base, "status": "WAIT", "reason": "BREAKOUT_ENTRY_TOO_FAR"}
         target = entry - BREAKOUT_EXPANSION_RISK_REWARD * risk
         if target <= 0:
             return {**base, "status": "WAIT", "reason": "BEARISH_TARGET_INVALID"}
         side = "SHORT"
     else:
         return {**base, "status": "WAIT", "reason": "BREAKOUT_DIRECTION_INVALID"}
-    boundary = range_high if side == "LONG" else range_low
-    entry_extension = abs(entry - boundary)
-    range_width = range_high - range_low
-    try:
-        breakout_body = Decimal(str(detection.get("breakout_body") or "0"))
-    except (ValueError, InvalidOperation):
-        breakout_body = Decimal("0")
     return {
         **base,
         "status": "ENTRY_NOW",
@@ -14454,15 +14431,6 @@ def build_breakout_expansion_paper_plan(
         "stop_loss": stop,
         "take_profit": target,
         "risk_reward": BREAKOUT_EXPANSION_RISK_REWARD,
-        "entry_extension": entry_extension,
-        "entry_extension_range_ratio": (
-            entry_extension / range_width if range_width > 0 else None
-        ),
-        "entry_extension_body_ratio": (
-            entry_extension / breakout_body if breakout_body > 0 else None
-        ),
-        "breakout_boundary": boundary,
-        "entry_quality_mode": "OBSERVE_ONLY_V2",
         "source_timestamp": ticker.timestamp,
         "setup_timestamp": detection.get("latest_closed_timestamp"),
         "plan_source": "CLOSED_BREAKOUT_RANGE+REAL_COINBASE_TICKER",
@@ -14621,11 +14589,6 @@ async def run_breakout_expansion_paper_generation_once() -> Dict[str, int]:
                 {
                     "detector": detection,
                     "volatility_regime": regime.get("volatility"),
-                    "entry_extension": plan.get("entry_extension"),
-                    "entry_extension_range_ratio": plan.get("entry_extension_range_ratio"),
-                    "entry_extension_body_ratio": plan.get("entry_extension_body_ratio"),
-                    "breakout_boundary": plan.get("breakout_boundary"),
-                    "entry_quality_mode": plan.get("entry_quality_mode"),
                 },
                 default=str,
                 sort_keys=True,
@@ -14653,9 +14616,7 @@ async def run_breakout_expansion_paper_generation_once() -> Dict[str, int]:
                 stats["blocked"] += 1
                 continue
             # V17-PRO: Symbol Performance — block losing symbols
-            if not await is_symbol_performance_allowed(
-                symbol, "BREAKOUT_EXPANSION", bo_side, BREAKOUT_EXPANSION_PAPER_VERSION
-            ):
+            if not await is_symbol_performance_allowed(symbol):
                 stats["blocked"] += 1
                 continue
             result = await execute_breakout_expansion_paper_plan(symbol, plan)
@@ -15641,7 +15602,7 @@ async def signal_history_free_space_diagnostic() -> Dict[str, object]:
                 block_bytes = int(raw_block) if isinstance(raw_block, (int, str)) else 8192
                 heap_pages = heap_bytes // block_bytes if block_bytes > 0 else 0
                 installed = bool(capability["freespace_extension_installed"])
-                sampled: List[Any] = []
+                sampled = []
                 if installed and heap_pages > 0:
                     # One page from each of 16 equally spaced heap regions.
                     sample_sql = text("""
@@ -15657,10 +15618,10 @@ async def signal_history_free_space_diagnostic() -> Dict[str, object]:
                         ) AS selected_pages
                         ORDER BY page_number
                     """)
-                    sampled = list((await conn.execute(sample_sql, {
+                    sampled = (await conn.execute(sample_sql, {
                         "last_page": heap_pages - 1,
                         "page_count": heap_pages,
-                    })).mappings().all())
+                    })).mappings().all()
     except Exception as exc:
         log.error("Free space diagnostic failed: %s", exc)
         raise HTTPException(
@@ -15706,48 +15667,6 @@ async def signal_history_free_space_diagnostic() -> Dict[str, object]:
         "safety": {"paper_only": True, "mutates_database": False,
                    "installs_extensions": False, "scans_history_rows": False,
                    "statement_timeout_ms": 3000},
-    }
-
-# ======================== V17-STORAGE-DIAGNOSTIC-5 ========================
-# Exact row count is optional: it may time out on a busy database.
-@api_router.get("/diagnostics/storage/exact-count")
-async def signal_history_exact_count_diagnostic() -> Dict[str, object]:
-    """One bounded, read-only count; never retry or scan row payloads."""
-    if not persistence_state.ready:
-        raise HTTPException(status_code=503, detail={
-            "status": "UNAVAILABLE", "reason": "persistence not ready"})
-    try:
-        async with engine.connect() as conn:
-            async with conn.begin():
-                await conn.execute(text("SET TRANSACTION READ ONLY"))
-                await conn.execute(text("SELECT set_config('statement_timeout', '1500', true)"))
-                result = await conn.execute(text(
-                    "SELECT count(*)::bigint FROM signal_decision_history"))
-                exact_count = int(result.scalar_one())
-    except Exception:
-        log.warning("Exact history count unavailable (timeout or database error)")
-        raise HTTPException(status_code=503, detail={
-            "status": "UNAVAILABLE",
-            "reason": "exact count unavailable within bounded read-only query",
-            "statement_timeout_ms": 1500,
-        }) from None
-    return {
-        "status": "OK",
-        "diagnostic": "V17_STORAGE_DIAGNOSTIC_5",
-        "mode": "READ_ONLY_EXACT_COUNT_BOUNDED",
-        "generated_at": utcnow().isoformat(),
-        "relation": {"exact_rows": exact_count},
-        "interpretation": {
-            "exact_count_does_not_establish_reclaimable_bytes": True,
-            "reclaimable_bytes_not_established": True,
-        },
-        "safety": {
-            "paper_only": True,
-            "mutates_database": False,
-            "scans_history_row_payloads": False,
-            "statement_timeout_ms": 1500,
-            "automatic_retries": False,
-        },
     }
 
 app = create_app()

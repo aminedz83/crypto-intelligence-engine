@@ -12598,6 +12598,7 @@ def detect_breakout_expansion_candidate(
         "breakout_margin": round(margin, 8),
         "breakout_margin_body_ratio": round(margin / body, 6) if body > 0 else None,
         "range_width": round(range_high - range_low, 8),
+        "breakout_body": round(body, 8),
         "breakout_candle_close": float(latest.close),
         "latest_closed_timestamp": latest.start.isoformat() if latest.start else None,
     }
@@ -14323,10 +14324,6 @@ async def run_trend_pullback_paper_generation_once() -> Dict[str, int]:
                 {
                     "detector": detection,
                     "volatility_regime": regime.get("volatility"),
-                    "entry_extension": plan.get("entry_extension"),
-                    "entry_extension_range_ratio": plan.get("entry_extension_range_ratio"),
-                    "breakout_boundary": plan.get("breakout_boundary"),
-                    "entry_quality_mode": plan.get("entry_quality_mode"),
                 },
                 default=str,
                 sort_keys=True,
@@ -14444,6 +14441,10 @@ def build_breakout_expansion_paper_plan(
     boundary = range_high if side == "LONG" else range_low
     entry_extension = abs(entry - boundary)
     range_width = range_high - range_low
+    try:
+        breakout_body = Decimal(str(detection.get("breakout_body") or "0"))
+    except (ValueError, InvalidOperation):
+        breakout_body = Decimal("0")
     return {
         **base,
         "status": "ENTRY_NOW",
@@ -14457,8 +14458,11 @@ def build_breakout_expansion_paper_plan(
         "entry_extension_range_ratio": (
             entry_extension / range_width if range_width > 0 else None
         ),
+        "entry_extension_body_ratio": (
+            entry_extension / breakout_body if breakout_body > 0 else None
+        ),
         "breakout_boundary": boundary,
-        "entry_quality_mode": "OBSERVE_ONLY_V1",
+        "entry_quality_mode": "OBSERVE_ONLY_V2",
         "source_timestamp": ticker.timestamp,
         "setup_timestamp": detection.get("latest_closed_timestamp"),
         "plan_source": "CLOSED_BREAKOUT_RANGE+REAL_COINBASE_TICKER",
@@ -14617,6 +14621,11 @@ async def run_breakout_expansion_paper_generation_once() -> Dict[str, int]:
                 {
                     "detector": detection,
                     "volatility_regime": regime.get("volatility"),
+                    "entry_extension": plan.get("entry_extension"),
+                    "entry_extension_range_ratio": plan.get("entry_extension_range_ratio"),
+                    "entry_extension_body_ratio": plan.get("entry_extension_body_ratio"),
+                    "breakout_boundary": plan.get("breakout_boundary"),
+                    "entry_quality_mode": plan.get("entry_quality_mode"),
                 },
                 default=str,
                 sort_keys=True,

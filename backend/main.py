@@ -4442,33 +4442,6 @@ def record_auto_decision_trace(
     return entry
 
 
-# Process-local, bounded diagnostic counters; never writes diagnostic data to DB.
-# Counters reset on restart and are not an exhaustive history of database rows.
-_wait_verify_started_at = utcnow()
-_wait_verify = {"attempted": 0, "inserted": 0, "conflicts": 0,
-                "errors": 0, "missing_candle": 0, "same_candle_retries": 0,
-                "same_candle_changed_context": 0}
-_wait_verify_last: Dict[tuple, str] = {}
-_WAIT_VERIFY_MAX_KEYS = 512
-
-
-@api_router.get("/diagnostics/storage/wait-dedup-verification")
-async def wait_dedup_verification() -> Dict[str, object]:
-    """Read-only snapshot of in-process WAIT persistence outcomes, not DB totals."""
-    return {
-        "status": "OK", "diagnostic": "V17_WAIT_DEDUP_VERIFICATION_1",
-        "mode": "READ_ONLY_PROCESS_COUNTERS", "generated_at": utcnow().isoformat(),
-        "since": _wait_verify_started_at.isoformat(),
-        "counters": dict(_wait_verify),
-        "tracked_symbol_candles": len(_wait_verify_last),
-        "limits": {"process_local": True, "resets_on_restart": True,
-                   "multi_worker_aggregate": False, "tracks_last_context_only": True,
-                   "max_tracked_symbol_candles": _WAIT_VERIFY_MAX_KEYS,
-                   "database_rows_scanned": 0, "context_payload_exposed": False},
-        "safety": {"paper_only": True, "mutates_database": False},
-    }
-
-
 async def persist_auto_decision_trace(
     entry: Dict[str, object], detector: Optional[Dict[str, object]] = None
 ) -> bool:
@@ -4485,38 +4458,9 @@ async def persist_auto_decision_trace(
     symbol = str(entry.get("symbol", ""))
     state = str(entry.get("state", ""))
     reason = str(entry.get("reason", ""))
-    context = json.dumps(detector, sort_keys=True, default=str) if detector else None
-    # Only identical WAIT snapshots for the SAME closed candle are idempotent.
-    # Missing candle identity and all transitions/events retain timestamp IDs.
-    closed_candle = entry.get("latest_closed_timestamp")
-    if state == "WAIT" and closed_candle and context is not None:
-        context_digest = hashlib.sha256(context.encode("utf-8")).hexdigest()
-        identity = (
-            f"WAIT_CANDLE_V1|{symbol}|{closed_candle}|{state}|{reason}|"
-            f"{entry.get('setup_state')}|{context_digest}"
-        )
-    else:
-        identity = f"{timestamp_raw}|{symbol}|{state}|{reason}"
+    identity = f"{timestamp_raw}|{symbol}|{state}|{reason}"
     decision_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-    wait_key = None
-    if state == "WAIT":
-        _wait_verify["attempted"] += 1
-        if not closed_candle:
-            _wait_verify["missing_candle"] += 1
-        else:
-            wait_key = (symbol, str(closed_candle), reason, str(entry.get("setup_state")))
-            context_digest = hashlib.sha256((context or "").encode("utf-8")).hexdigest()
-            previous = _wait_verify_last.get(wait_key)
-            if previous is not None:
-                _wait_verify["same_candle_retries"] += 1
-                if previous != context_digest:
-                    _wait_verify["same_candle_changed_context"] += 1
-            if (
-                wait_key not in _wait_verify_last
-                and len(_wait_verify_last) >= _WAIT_VERIFY_MAX_KEYS
-            ):
-                _wait_verify_last.pop(next(iter(_wait_verify_last)))
-            _wait_verify_last[wait_key] = context_digest
+    context = json.dumps(detector, sort_keys=True, default=str) if detector else None
     values = {
         "decision_id": decision_id,
         "timestamp": timestamp,
@@ -4538,18 +4482,8 @@ async def persist_auto_decision_trace(
         async with engine.begin() as conn:
             stmt = pg_insert(signal_decision_history_table).values(values)
             stmt = stmt.on_conflict_do_nothing(index_elements=["decision_id"])
-            result = await conn.execute(stmt)
-            if state == "WAIT":
-                # Some legacy test doubles return None instead of a SQL result.
-                # An unknown row count must not be counted as an insert or conflict.
-                rowcount = getattr(result, "rowcount", None)
-                if rowcount == 1:
-                    _wait_verify["inserted"] += 1
-                elif rowcount == 0:
-                    _wait_verify["conflicts"] += 1
+            await conn.execute(stmt)
     except Exception as exc:  # noqa: BLE001
-        if state == "WAIT":
-            _wait_verify["errors"] += 1
         log.error("Decision history persistence failed: %s", exc)
         return False
     return True
@@ -12103,7 +12037,7 @@ def _mount_frontend(app: FastAPI, cfg: Settings) -> None:
 
 # ============================ app factory ============================
 async def start_server_crypto_market_stream() -> bool:
-    """Start Coinbase ticker and 5-minute candle streams for paper monitoring."""
+    """Start the Coinbase ticker stream server-side for autonomous paper monitoring."""
     products = sorted(
         provider_symbol
         for instrument in instrument_registry.all()
@@ -12119,7 +12053,6 @@ async def start_server_crypto_market_stream() -> bool:
         return False
     try:
         await market_ws.subscribe("ticker", products)
-        await market_ws.subscribe("candles", products)
         await market_ws.start()
     except asyncio.CancelledError:
         raise
@@ -15721,6 +15654,48 @@ async def signal_history_free_space_diagnostic() -> Dict[str, object]:
         "safety": {"paper_only": True, "mutates_database": False,
                    "installs_extensions": False, "scans_history_rows": False,
                    "statement_timeout_ms": 3000},
+    }
+
+# ======================== V17-STORAGE-DIAGNOSTIC-5 ========================
+# Exact row count is optional: it may time out on a busy database.
+@api_router.get("/diagnostics/storage/exact-count")
+async def signal_history_exact_count_diagnostic() -> Dict[str, object]:
+    """One bounded, read-only count; never retry or scan row payloads."""
+    if not persistence_state.ready:
+        raise HTTPException(status_code=503, detail={
+            "status": "UNAVAILABLE", "reason": "persistence not ready"})
+    try:
+        async with engine.connect() as conn:
+            async with conn.begin():
+                await conn.execute(text("SET TRANSACTION READ ONLY"))
+                await conn.execute(text("SELECT set_config('statement_timeout', '1500', true)"))
+                result = await conn.execute(text(
+                    "SELECT count(*)::bigint FROM signal_decision_history"))
+                exact_count = int(result.scalar_one())
+    except Exception:
+        log.warning("Exact history count unavailable (timeout or database error)")
+        raise HTTPException(status_code=503, detail={
+            "status": "UNAVAILABLE",
+            "reason": "exact count unavailable within bounded read-only query",
+            "statement_timeout_ms": 1500,
+        }) from None
+    return {
+        "status": "OK",
+        "diagnostic": "V17_STORAGE_DIAGNOSTIC_5",
+        "mode": "READ_ONLY_EXACT_COUNT_BOUNDED",
+        "generated_at": utcnow().isoformat(),
+        "relation": {"exact_rows": exact_count},
+        "interpretation": {
+            "exact_count_does_not_establish_reclaimable_bytes": True,
+            "reclaimable_bytes_not_established": True,
+        },
+        "safety": {
+            "paper_only": True,
+            "mutates_database": False,
+            "scans_history_row_payloads": False,
+            "statement_timeout_ms": 1500,
+            "automatic_retries": False,
+        },
     }
 
 app = create_app()

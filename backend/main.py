@@ -6386,14 +6386,15 @@ async def mark_paper_position(position_id: str, req: PaperPositionMark) -> Dict[
             effective_sl = compute_smart_sl(
                 side_str, data["entry"], data["stop_loss"], peak, req.current_price
             )
-            # Time stop: close at market if position open too long
-            outcome: Optional[Tuple[str, Decimal]] = None
-            if should_time_stop(data["opened_at"], req.observed_at):
+            # Protective exits take precedence over the time stop. In particular,
+            # an overdue SHORT already above its SL must never be labelled TIME_STOP.
+            # The existing paper fill convention uses the trigger level for SL/TP;
+            # this is not a guarantee of an executable price in a real market.
+            outcome: Optional[Tuple[str, Decimal]] = evaluate_paper_close(
+                side_str, req.current_price, effective_sl, data["take_profit"]
+            )
+            if outcome is None and should_time_stop(data["opened_at"], req.observed_at):
                 outcome = ("TIME_STOP", req.current_price)
-            else:
-                outcome = evaluate_paper_close(
-                    side_str, req.current_price, effective_sl, data["take_profit"]
-                )
             if outcome is None:
                 payload = paper_position_to_dict(row)
                 payload["mark_price"] = str(req.current_price)

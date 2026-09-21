@@ -10811,7 +10811,7 @@ class V17StrategyQualityUpgrade1Tests(unittest.TestCase):
         source = inspect.getsource(main.build_breakout_expansion_paper_plan)
         self.assertIn('"entry_extension"', source)
         self.assertIn('"entry_extension_range_ratio"', source)
-        self.assertIn('"entry_quality_mode": "OBSERVE_ONLY_V1"', source)
+        self.assertIn('"entry_quality_mode": "OBSERVE_ONLY_V2"', source)
 
     def test_trend_pullback_gate_is_strategy_direction_version_isolated(self):
         source = inspect.getsource(main.run_trend_pullback_paper_generation_once)
@@ -10820,3 +10820,28 @@ class V17StrategyQualityUpgrade1Tests(unittest.TestCase):
     def test_breakout_gate_is_strategy_direction_version_isolated(self):
         source = inspect.getsource(main.run_breakout_expansion_paper_generation_once)
         self.assertIn('"BREAKOUT_EXPANSION", bo_side, BREAKOUT_EXPANSION_PAPER_VERSION', source)
+
+
+class V17BreakoutEntryQualityUpgrade2Tests(unittest.TestCase):
+    def test_breakout_body_is_recorded_from_confirmed_closed_candle(self):
+        source = inspect.getsource(main.detect_breakout_expansion_candidate)
+        self.assertIn('"breakout_body": round(body, 8)', source)
+
+    def test_entry_extension_is_observation_only(self):
+        source = inspect.getsource(main.build_breakout_expansion_paper_plan)
+        self.assertIn('"entry_extension_body_ratio"', source)
+        self.assertIn('"entry_quality_mode": "OBSERVE_ONLY_V2"', source)
+        self.assertNotIn('"ENTRY_EXTENSION_TOO_LARGE"', source)
+
+    def test_breakout_metrics_persist_on_breakout_not_trend(self):
+        breakout = inspect.getsource(main.run_breakout_expansion_paper_generation_once)
+        trend = inspect.getsource(main.run_trend_pullback_paper_generation_once)
+        self.assertIn('"entry_extension_body_ratio": plan.get(', breakout)
+        self.assertIn('"entry_extension_range_ratio": plan.get(', breakout)
+        self.assertNotIn('"entry_extension_body_ratio": plan.get(', trend)
+        self.assertNotIn('"entry_extension_range_ratio": plan.get(', trend)
+
+    def test_breakout_paper_execution_is_not_newly_gated_by_observation(self):
+        source = inspect.getsource(main.run_breakout_expansion_paper_generation_once)
+        self.assertIn('execute_breakout_expansion_paper_plan(symbol, plan)', source)
+        self.assertNotIn('ENTRY_EXTENSION_TOO_LARGE', source)

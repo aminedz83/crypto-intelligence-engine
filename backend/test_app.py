@@ -10765,3 +10765,55 @@ class V17StorageDiagnostic5Tests(unittest.TestCase):
         for token in ("DELETE FROM", "TRUNCATE ", "VACUUM ", "UPDATE SIGNAL_",
                       "INSERT INTO", "ALTER TABLE", "DROP TABLE"):
             self.assertNotIn(token, source)
+
+class V17StrategyQualityUpgrade1Tests(unittest.TestCase):
+    def test_symbol_performance_minimum_sample_is_validation_grade(self):
+        self.assertEqual(main.SYMBOL_PERF_MIN_TRADES, 30)
+
+    def test_symbol_performance_gate_accepts_isolation_dimensions(self):
+        sig = inspect.signature(main.is_symbol_performance_allowed)
+        self.assertIn("strategy_id", sig.parameters)
+        self.assertIn("side", sig.parameters)
+        self.assertIn("strategy_version", sig.parameters)
+
+    def test_symbol_performance_counts_realized_price_wins(self):
+        source = inspect.getsource(main.is_symbol_performance_allowed)
+        self.assertIn("close_price > entry", source)
+        self.assertIn("close_price < entry", source)
+        self.assertNotIn("close_reason='TAKE_PROFIT'", source)
+
+    def test_symbol_performance_filters_strategy_and_direction(self):
+        source = inspect.getsource(main.is_symbol_performance_allowed)
+        self.assertIn("performance_strategy_id=:strategy_id", source)
+        self.assertIn("performance_strategy_version=:strategy_version", source)
+        self.assertIn("side=:side", source)
+
+    def test_symbol_performance_cache_is_cohort_scoped(self):
+        source = inspect.getsource(main.is_symbol_performance_allowed)
+        self.assertIn("cache_key = (canonical, strategy, direction, version)", source)
+
+    def test_breakout_registry_matches_active_paper_version(self):
+        item = next(x for x in main.server_strategy_registry() if x["strategy_id"] == "BREAKOUT_EXPANSION")
+        self.assertEqual(item["version"], main.BREAKOUT_EXPANSION_PAPER_VERSION)
+        self.assertEqual(item["status"], "ACTIVE_PAPER_UNVALIDATED")
+        self.assertTrue(item["execution_eligible"])
+
+    def test_breakout_detector_exposes_geometry_diagnostics(self):
+        source = inspect.getsource(main.detect_breakout_expansion_candidate)
+        self.assertIn('"breakout_margin"', source)
+        self.assertIn('"breakout_margin_body_ratio"', source)
+        self.assertIn('"range_width"', source)
+
+    def test_breakout_plan_exposes_entry_extension_without_new_threshold(self):
+        source = inspect.getsource(main.build_breakout_expansion_paper_plan)
+        self.assertIn('"entry_extension"', source)
+        self.assertIn('"entry_extension_range_ratio"', source)
+        self.assertIn('"entry_quality_mode": "OBSERVE_ONLY_V1"', source)
+
+    def test_trend_pullback_gate_is_strategy_direction_version_isolated(self):
+        source = inspect.getsource(main.run_trend_pullback_paper_generation_once)
+        self.assertIn('"TREND_PULLBACK", tp_side, TREND_PULLBACK_PAPER_VERSION', source)
+
+    def test_breakout_gate_is_strategy_direction_version_isolated(self):
+        source = inspect.getsource(main.run_breakout_expansion_paper_generation_once)
+        self.assertIn('"BREAKOUT_EXPANSION", bo_side, BREAKOUT_EXPANSION_PAPER_VERSION', source)

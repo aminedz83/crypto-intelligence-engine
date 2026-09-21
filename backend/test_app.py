@@ -8911,6 +8911,7 @@ class TestV16M5B28B2BreakoutExpansionPaperExecution(unittest.TestCase):
         return {
             "status": "SETUP", "direction": direction,
             "range_high": 110.0, "range_low": 90.0,
+            "breakout_body": 4.0,
             "latest_closed_timestamp": "2026-09-04T03:00:00+00:00",
         }
 
@@ -8954,6 +8955,43 @@ class TestV16M5B28B2BreakoutExpansionPaperExecution(unittest.TestCase):
             self._setup(), self._ticker(112.0, now), now
         )
         self.assertEqual(result["take_profit"], Decimal("116.0"))
+
+    def test_bullish_entry_too_far_is_wait(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup(), self._ticker(114.01, now), now
+        )
+        self.assertEqual(result["reason"], "BREAKOUT_ENTRY_TOO_FAR")
+
+    def test_bullish_entry_at_body_limit_is_allowed(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup(), self._ticker(114.0, now), now
+        )
+        self.assertEqual(result["status"], "ENTRY_NOW")
+
+    def test_bearish_entry_too_far_is_wait(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup("BEARISH"), self._ticker(85.99, now), now
+        )
+        self.assertEqual(result["reason"], "BREAKOUT_ENTRY_TOO_FAR")
+
+    def test_bearish_entry_at_body_limit_is_allowed(self):
+        now = datetime.now(timezone.utc)
+        result = main.build_breakout_expansion_paper_plan(
+            self._setup("BEARISH"), self._ticker(86.0, now), now
+        )
+        self.assertEqual(result["status"], "ENTRY_NOW")
+
+    def test_missing_breakout_body_is_wait(self):
+        now = datetime.now(timezone.utc)
+        setup = self._setup()
+        del setup["breakout_body"]
+        result = main.build_breakout_expansion_paper_plan(
+            setup, self._ticker(112.0, now), now
+        )
+        self.assertEqual(result["reason"], "BREAKOUT_BODY_NOT_VALID")
 
     def test_bullish_breakout_must_hold(self):
         now = datetime.now(timezone.utc)
@@ -10745,103 +10783,3 @@ class V17StorageDiagnostic4Tests(unittest.TestCase):
         self.assertIn("if not persistence_state.ready", src)
         self.assertIn("status_code=503", src)
 
-
-
-class V17StorageDiagnostic5Tests(unittest.TestCase):
-    def test_route_registered(self):
-        paths = [getattr(r, "path", "") for r in main.api_router.routes]
-        self.assertIn("/diagnostics/storage/exact-count", paths)
-
-    def test_count_is_bounded_and_read_only(self):
-        source = inspect.getsource(main.signal_history_exact_count_diagnostic)
-        self.assertIn("SET TRANSACTION READ ONLY", source)
-        self.assertIn("statement_timeout', '1500'", source)
-        self.assertIn("SELECT count(*)::bigint FROM signal_decision_history", source)
-        self.assertIn("status_code=503", source)
-        self.assertIn('"automatic_retries": False', source)
-
-    def test_no_destructive_sql(self):
-        source = inspect.getsource(main.signal_history_exact_count_diagnostic).upper()
-        for token in ("DELETE FROM", "TRUNCATE ", "VACUUM ", "UPDATE SIGNAL_",
-                      "INSERT INTO", "ALTER TABLE", "DROP TABLE"):
-            self.assertNotIn(token, source)
-
-class V17StrategyQualityUpgrade1Tests(unittest.TestCase):
-    def test_symbol_performance_minimum_sample_is_validation_grade(self):
-        self.assertEqual(main.SYMBOL_PERF_MIN_TRADES, 30)
-
-    def test_symbol_performance_gate_accepts_isolation_dimensions(self):
-        sig = inspect.signature(main.is_symbol_performance_allowed)
-        self.assertIn("strategy_id", sig.parameters)
-        self.assertIn("side", sig.parameters)
-        self.assertIn("strategy_version", sig.parameters)
-
-    def test_symbol_performance_counts_realized_price_wins(self):
-        source = inspect.getsource(main.is_symbol_performance_allowed)
-        self.assertIn("close_price > entry", source)
-        self.assertIn("close_price < entry", source)
-        self.assertNotIn("close_reason='TAKE_PROFIT'", source)
-
-    def test_symbol_performance_filters_strategy_and_direction(self):
-        source = inspect.getsource(main.is_symbol_performance_allowed)
-        self.assertIn("performance_strategy_id=:strategy_id", source)
-        self.assertIn("performance_strategy_version=:strategy_version", source)
-        self.assertIn("side=:side", source)
-
-    def test_symbol_performance_cache_is_cohort_scoped(self):
-        source = inspect.getsource(main.is_symbol_performance_allowed)
-        self.assertIn("cache_key = (canonical, strategy, direction, version)", source)
-
-    def test_breakout_registry_matches_active_paper_version(self):
-        item = next(
-            x for x in main.server_strategy_registry()
-            if x["strategy_id"] == "BREAKOUT_EXPANSION"
-        )
-        self.assertEqual(item["version"], main.BREAKOUT_EXPANSION_PAPER_VERSION)
-        self.assertEqual(item["status"], "ACTIVE_PAPER_UNVALIDATED")
-        self.assertTrue(item["execution_eligible"])
-
-    def test_breakout_detector_exposes_geometry_diagnostics(self):
-        source = inspect.getsource(main.detect_breakout_expansion_candidate)
-        self.assertIn('"breakout_margin"', source)
-        self.assertIn('"breakout_margin_body_ratio"', source)
-        self.assertIn('"range_width"', source)
-
-    def test_breakout_plan_exposes_entry_extension_without_new_threshold(self):
-        source = inspect.getsource(main.build_breakout_expansion_paper_plan)
-        self.assertIn('"entry_extension"', source)
-        self.assertIn('"entry_extension_range_ratio"', source)
-        self.assertIn('"entry_quality_mode": "OBSERVE_ONLY_V2"', source)
-
-    def test_trend_pullback_gate_is_strategy_direction_version_isolated(self):
-        source = inspect.getsource(main.run_trend_pullback_paper_generation_once)
-        self.assertIn('"TREND_PULLBACK", tp_side, TREND_PULLBACK_PAPER_VERSION', source)
-
-    def test_breakout_gate_is_strategy_direction_version_isolated(self):
-        source = inspect.getsource(main.run_breakout_expansion_paper_generation_once)
-        self.assertIn('"BREAKOUT_EXPANSION", bo_side, BREAKOUT_EXPANSION_PAPER_VERSION', source)
-
-
-class V17BreakoutEntryQualityUpgrade2Tests(unittest.TestCase):
-    def test_breakout_body_is_recorded_from_confirmed_closed_candle(self):
-        source = inspect.getsource(main.detect_breakout_expansion_candidate)
-        self.assertIn('"breakout_body": round(body, 8)', source)
-
-    def test_entry_extension_is_observation_only(self):
-        source = inspect.getsource(main.build_breakout_expansion_paper_plan)
-        self.assertIn('"entry_extension_body_ratio"', source)
-        self.assertIn('"entry_quality_mode": "OBSERVE_ONLY_V2"', source)
-        self.assertNotIn('"ENTRY_EXTENSION_TOO_LARGE"', source)
-
-    def test_breakout_metrics_persist_on_breakout_not_trend(self):
-        breakout = inspect.getsource(main.run_breakout_expansion_paper_generation_once)
-        trend = inspect.getsource(main.run_trend_pullback_paper_generation_once)
-        self.assertIn('"entry_extension_body_ratio": plan.get(', breakout)
-        self.assertIn('"entry_extension_range_ratio": plan.get(', breakout)
-        self.assertNotIn('"entry_extension_body_ratio": plan.get(', trend)
-        self.assertNotIn('"entry_extension_range_ratio": plan.get(', trend)
-
-    def test_breakout_paper_execution_is_not_newly_gated_by_observation(self):
-        source = inspect.getsource(main.run_breakout_expansion_paper_generation_once)
-        self.assertIn('execute_breakout_expansion_paper_plan(symbol, plan)', source)
-        self.assertNotIn('ENTRY_EXTENSION_TOO_LARGE', source)

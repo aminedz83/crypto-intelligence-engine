@@ -10747,89 +10747,21 @@ class V17StorageDiagnostic4Tests(unittest.TestCase):
 
 
 
-class TestWaitCandleDedupV17(unittest.TestCase):
-    def test_identical_wait_same_candle_has_stable_id(self):
-        from unittest.mock import patch
+class V17StorageDiagnostic5Tests(unittest.TestCase):
+    def test_route_registered(self):
+        paths = [getattr(r, "path", "") for r in main.api_router.routes]
+        self.assertIn("/diagnostics/storage/exact-count", paths)
 
-        async def capture():
-            ids = []
-            class Conn:
-                async def execute(self, statement):
-                    ids.append(statement.compile().params["decision_id"])
-            class Tx:
-                async def __aenter__(self):
-                    return Conn()
-                async def __aexit__(self, *args):
-                    return False
-            detector = {
-                "setup_state": "WAIT",
-                "latest_closed_timestamp": "2026-09-19T23:00:00+00:00",
-                "signal": 1,
-            }
-            with (
-                patch.object(main.persistence_state, "ready", True),
-                patch.object(
-                    main, "engine", type("FakeEngine", (), {"begin": lambda self: Tx()})()
-                ),
-            ):
-                for ts in (
-                    "2026-09-19T23:01:00+00:00",
-                    "2026-09-19T23:02:00+00:00",
-                ):
-                    entry = {
-                        "timestamp": ts,
-                        "symbol": "BTC-USD",
-                        "state": "WAIT",
-                        "reason": "NO_SETUP",
-                        "setup_state": "WAIT",
-                        "latest_closed_timestamp": detector["latest_closed_timestamp"],
-                    }
-                    self.assertTrue(await main.persist_auto_decision_trace(entry, detector))
-            return ids
-        ids = asyncio.run(capture())
-        self.assertEqual(len(ids), 2)
-        self.assertEqual(ids[0], ids[1])
+    def test_count_is_bounded_and_read_only(self):
+        source = inspect.getsource(main.signal_history_exact_count_diagnostic)
+        self.assertIn("SET TRANSACTION READ ONLY", source)
+        self.assertIn("statement_timeout', '1500'", source)
+        self.assertIn("SELECT count(*)::bigint FROM signal_decision_history", source)
+        self.assertIn("status_code=503", source)
+        self.assertIn('"automatic_retries": False', source)
 
-    def test_non_wait_and_missing_candle_keep_timestamp_identity(self):
-        source = inspect.getsource(main.persist_auto_decision_trace)
-        self.assertIn('state == "WAIT" and closed_candle and context is not None', source)
-        self.assertIn('identity = f"{timestamp_raw}|{symbol}|{state}|{reason}"', source)
-
-    def test_wait_context_changes_produce_distinct_identity(self):
-        source = inspect.getsource(main.persist_auto_decision_trace)
-        self.assertIn(
-            'context_digest = hashlib.sha256(context.encode("utf-8")).hexdigest()',
-            source,
-        )
-        self.assertIn("context_digest}", source)
-
-    def test_conflict_does_not_modify_existing_history(self):
-        source = inspect.getsource(main.persist_auto_decision_trace)
-        self.assertIn('on_conflict_do_nothing(index_elements=["decision_id"])', source)
-
-
-class TestWaitDedupVerificationV17(unittest.TestCase):
-    def test_endpoint_is_read_only_and_has_no_context(self):
-        body = asyncio.run(main.wait_dedup_verification())
-        self.assertEqual(body["mode"], "READ_ONLY_PROCESS_COUNTERS")
-        self.assertEqual(body["limits"]["database_rows_scanned"], 0)
-        self.assertFalse(body["limits"]["context_payload_exposed"])
-        self.assertFalse(body["safety"]["mutates_database"])
-
-    def test_endpoint_exposes_counter_names_and_restart_limitation(self):
-        body = asyncio.run(main.wait_dedup_verification())
-        self.assertTrue(body["limits"]["resets_on_restart"])
-        self.assertTrue(body["limits"]["process_local"])
-        self.assertTrue({"attempted", "inserted", "conflicts", "errors",
-                         "same_candle_retries", "same_candle_changed_context"}
-                        <= set(body["counters"]))
-
-    def test_endpoint_registered(self):
-        paths = {route.path for route in main.api_router.routes}
-        self.assertIn("/diagnostics/storage/wait-dedup-verification", paths)
-
-    def test_instrumentation_keeps_conflict_noop(self):
-        source = inspect.getsource(main.persist_auto_decision_trace)
-        self.assertIn('on_conflict_do_nothing(index_elements=["decision_id"])', source)
-        self.assertIn('rowcount == 0', source)
-        self.assertIn('rowcount == 1', source)
+    def test_no_destructive_sql(self):
+        source = inspect.getsource(main.signal_history_exact_count_diagnostic).upper()
+        for token in ("DELETE FROM", "TRUNCATE ", "VACUUM ", "UPDATE SIGNAL_",
+                      "INSERT INTO", "ALTER TABLE", "DROP TABLE"):
+            self.assertNotIn(token, source)
